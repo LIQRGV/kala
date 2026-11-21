@@ -1,0 +1,15 @@
+[package]
+name = "kala-core"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "kala_core"
+
+[dependencies]
+crc32fast = "1.5.5"
+
+[dev-dependencies]
+proptest = "1.12.0"
+tempfile = "3.27.0"
+crc32fast = "1.5.5"

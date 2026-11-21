@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 76926f493074817b63c8dfcded8f7f682458cb57fca543c6a1364d309a798444 # shrinks to batch1 = [TxnSpec { mode: Commit, default: None, ops: [Write { assert: true, ent: 32, attr: 6, val: 1, tick: None, defect: 0 }], check: false }], batch2 = [TxnSpec { mode: Commit, default: None, ops: [Write { assert: true, ent: 20, attr: 6, val: 1, tick: Some(-250), defect: 0 }], check: false }]

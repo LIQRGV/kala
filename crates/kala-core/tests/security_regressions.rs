@@ -1,0 +1,606 @@
+//! Item 17: security regressions (H1 mid-log damage must never silently cut
+//! committed transactions; H2 exclusive lock on the log file).
+//!
+//! Contract: "Security fixes (item 17)".
+//! - H1(a): when `open` finds bytes past the valid prefix, a Commit-shaped
+//!   frame NEWER than the torn txn's would-be tx anywhere in the tail ->
+//!   `Err(Error::Corrupt(_))`, file untouched; `read_log` -> `Err(Corrupt)`.
+//! - H1(b): before cutting a torn tail, `open` writes the cut bytes to
+//!   `<path>.torn-<valid_len>` (`-1`, `-2`, ... if it exists), then cuts.
+//! - H2: `World::create` / `World::open` hold an exclusive lock for the
+//!   World's lifetime; a second `open` -> `Err(Error::WorldLocked)`.
+//!   `read_log` takes no lock.
+
+use kala_core::log::read_log;
+use kala_core::*;
+use proptest::prelude::*;
+use std::path::{Path, PathBuf};
+
+const HEADER_LEN: usize = 12;
+
+fn schema() -> Schema {
+    Schema::new().node_type("CHARACTER").attribute(AttrDef::new(
+        "name",
+        ValueType::Str,
+        Kind::State,
+        Cardinality::Many,
+    ))
+}
+
+/// A file-backed world with genesis (tx0) + tx1 (entity) + tx2 + tx3 (facts).
+/// Returns the tempdir guard and the log path; the World is dropped (lock freed).
+fn build() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("world.kala");
+    {
+        let mut w = World::create(&path, schema()).expect("create");
+        let e = w.create_entity("CHARACTER", Some("edwin")).expect("entity");
+        w.assert(e, "name", Value::Str("Edwin".into()), Some(Tick(1)))
+            .expect("tx2");
+        w.assert(e, "name", Value::Str("Greg".into()), Some(Tick(2)))
+            .expect("tx3");
+        assert_eq!(w.latest_tx(), TxId(3));
+    }
+    (dir, path)
+}
+
+/// Frame spans `(start, end, kind)` of a well-formed log.
+fn frames(bytes: &[u8]) -> Vec<(usize, usize, u8)> {
+    let mut out = Vec::new();
+    let mut at = HEADER_LEN;
+    while at < bytes.len() {
+        let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        out.push((at, at + 4 + len, bytes[at + 4]));
+        at += 4 + len;
+    }
+    out
+}
+
+/// Frame spans grouped per committed transaction (index 0 = genesis).
+fn txns(bytes: &[u8]) -> Vec<Vec<(usize, usize)>> {
+    let mut out = Vec::new();
+    let mut cur = Vec::new();
+    for (s, e, kind) in frames(bytes) {
+        cur.push((s, e));
+        if kind == 5 {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    assert!(cur.is_empty());
+    out
+}
+
+fn open_err(path: &Path) -> Error {
+    match World::open(path) {
+        Err(e) => e,
+        Ok(_) => panic!("open unexpectedly succeeded"),
+    }
+}
+
+fn is_corrupt(e: &Error) -> bool {
+    matches!(e, Error::Corrupt(_))
+}
+
+fn quarantine_files(path: &Path) -> Vec<PathBuf> {
+    let prefix = format!("{}.torn-", path.file_name().unwrap().to_string_lossy());
+    let mut v: Vec<PathBuf> = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&prefix)
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+fn qpath(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// Damages the file with `f`, then asserts open and read_log both refuse
+/// with Corrupt and the file is byte-identical afterwards.
+fn assert_damage_refused(path: &Path, f: impl FnOnce(&mut Vec<u8>)) {
+    let mut bytes = std::fs::read(path).unwrap();
+    f(&mut bytes);
+    std::fs::write(path, &bytes).unwrap();
+    let e = open_err(path);
+    assert!(is_corrupt(&e), "open: expected Corrupt, got {e:?}");
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        bytes,
+        "open modified the file"
+    );
+    let e = read_log(path).expect_err("read_log must refuse");
+    assert!(is_corrupt(&e), "read_log: expected Corrupt, got {e:?}");
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        bytes,
+        "read_log modified the file"
+    );
+    assert!(
+        quarantine_files(path).is_empty(),
+        "no quarantine on refusal"
+    );
+}
+
+fn len_at(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+}
+
+fn set_len(bytes: &mut [u8], at: usize, v: u32) {
+    bytes[at..at + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+// ---------- T1: length-field damage in a non-last transaction ----------
+
+fn length_damage(tx_index: usize, mode: &str) {
+    let (_d, path) = build();
+    let start = txns(&std::fs::read(&path).unwrap())[tx_index][0].0;
+    assert_damage_refused(&path, |b| match mode {
+        "plus256" => b[start + 1] ^= 1,
+        "max" => set_len(b, start, u32::MAX),
+        "minus1" => {
+            let l = len_at(b, start);
+            set_len(b, start, l - 1);
+        }
+        _ => unreachable!(),
+    });
+}
+
+#[test]
+fn t1_tx1_length_plus_256_is_corrupt() {
+    length_damage(1, "plus256");
+}
+
+#[test]
+fn t1_tx1_length_u32_max_is_corrupt() {
+    length_damage(1, "max");
+}
+
+#[test]
+fn t1_tx1_length_minus_1_is_corrupt() {
+    length_damage(1, "minus1");
+}
+
+#[test]
+fn t1_tx2_length_plus_256_is_corrupt() {
+    length_damage(2, "plus256");
+}
+
+#[test]
+fn t1_tx2_length_u32_max_is_corrupt() {
+    length_damage(2, "max");
+}
+
+#[test]
+fn t1_tx2_length_minus_1_is_corrupt() {
+    length_damage(2, "minus1");
+}
+
+// ---------- T2: random bit flip in any non-last committed txn ----------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn t2_bit_flip_before_last_txn_never_drops_committed(
+        pos in 0.0f64..1.0,
+        bit in 0u8..8,
+    ) {
+        let (_d, path) = build();
+        let orig = std::fs::read(&path).unwrap();
+        let t = txns(&orig);
+        let last_start = t.last().unwrap()[0].0;
+        let off = HEADER_LEN + (pos * (last_start - HEADER_LEN) as f64) as usize;
+        prop_assume!(off < last_start);
+        let mut bytes = orig.clone();
+        bytes[off] ^= 1 << bit;
+        std::fs::write(&path, &bytes).unwrap();
+        match World::open(&path) {
+            Ok(w) => {
+                prop_assert_eq!(w.latest_tx(), TxId(3), "silently lost committed txns (offset {})", off);
+            }
+            Err(e) => {
+                prop_assert!(is_corrupt(&e), "expected Corrupt, got {:?} (offset {})", e, off);
+                prop_assert_eq!(std::fs::read(&path).unwrap(), bytes, "file modified (offset {})", off);
+            }
+        }
+        // Whatever open did, a refusal must not have cut anything.
+        if let Ok(w) = World::open(&path) { drop(w); }
+    }
+}
+
+// ---------- T3: torn tail is cut, and the cut bytes are quarantined ----------
+
+#[test]
+fn t3_damaged_last_txn_payload_cuts_to_previous_tx_and_quarantines() {
+    let (_d, path) = build();
+    let orig = std::fs::read(&path).unwrap();
+    let t = txns(&orig);
+    let last = t.last().unwrap();
+    let valid_len = last[0].0;
+    let mut bytes = orig.clone();
+    bytes[valid_len + 4 + 2] ^= 0xFF; // inside the first frame's payload
+    std::fs::write(&path, &bytes).unwrap();
+
+    let w = match World::open(&path) {
+        Ok(w) => w,
+        Err(e) => panic!("torn last txn must open: {e:?}"),
+    };
+    assert_eq!(w.latest_tx(), TxId(2));
+    drop(w);
+    assert_eq!(std::fs::read(&path).unwrap(), &bytes[..valid_len]);
+    let q = quarantine_files(&path);
+    assert_eq!(q, vec![qpath(&path, &format!(".torn-{valid_len}"))]);
+    assert_eq!(std::fs::read(&q[0]).unwrap(), &bytes[valid_len..]);
+}
+
+#[test]
+fn t3_damaged_last_commit_checksum_cuts_and_quarantines() {
+    let (_d, path) = build();
+    let orig = std::fs::read(&path).unwrap();
+    let last = txns(&orig).pop().unwrap();
+    let valid_len = last[0].0;
+    let mut bytes = orig.clone();
+    *bytes.last_mut().unwrap() ^= 0x01; // checksum byte of the final Commit
+    std::fs::write(&path, &bytes).unwrap();
+    let w = match World::open(&path) {
+        Ok(w) => w,
+        Err(e) => panic!("{e:?}"),
+    };
+    assert_eq!(w.latest_tx(), TxId(2));
+    drop(w);
+    assert_eq!(std::fs::read(&path).unwrap(), &bytes[..valid_len]);
+    let q = quarantine_files(&path);
+    assert_eq!(q, vec![qpath(&path, &format!(".torn-{valid_len}"))]);
+    assert_eq!(std::fs::read(&q[0]).unwrap(), &bytes[valid_len..]);
+}
+
+#[test]
+fn t3_plain_truncation_quarantines_exactly_the_cut_bytes() {
+    let (_d, path) = build();
+    let orig = std::fs::read(&path).unwrap();
+    let last = txns(&orig).pop().unwrap();
+    let valid_len = last[0].0;
+    let torn = &orig[..orig.len() - 7]; // mid-Commit
+    std::fs::write(&path, torn).unwrap();
+    let w = match World::open(&path) {
+        Ok(w) => w,
+        Err(e) => panic!("{e:?}"),
+    };
+    assert_eq!(w.latest_tx(), TxId(2));
+    drop(w);
+    assert_eq!(std::fs::read(&path).unwrap(), &orig[..valid_len]);
+    let q = quarantine_files(&path);
+    assert_eq!(q, vec![qpath(&path, &format!(".torn-{valid_len}"))]);
+    assert_eq!(std::fs::read(&q[0]).unwrap(), &torn[valid_len..]);
+}
+
+#[test]
+fn t3_clean_log_creates_no_quarantine_file() {
+    let (_d, path) = build();
+    let before = std::fs::read(&path).unwrap();
+    let w = match World::open(&path) {
+        Ok(w) => w,
+        Err(e) => panic!("{e:?}"),
+    };
+    drop(w);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(quarantine_files(&path).is_empty());
+}
+
+#[test]
+fn t3_two_recoveries_at_same_valid_len_keep_both_quarantines() {
+    let (_d, path) = build();
+    let orig = std::fs::read(&path).unwrap();
+    let valid_len = orig.len();
+
+    let first = vec![0xABu8; 9];
+    let mut b = orig.clone();
+    b.extend_from_slice(&first);
+    std::fs::write(&path, &b).unwrap();
+    drop(World::open(&path).map_err(|e| panic!("{e:?}")).ok());
+    assert_eq!(std::fs::read(&path).unwrap(), orig);
+
+    let second = vec![0xCDu8; 5];
+    let mut b = orig.clone();
+    b.extend_from_slice(&second);
+    std::fs::write(&path, &b).unwrap();
+    drop(World::open(&path).map_err(|e| panic!("{e:?}")).ok());
+    assert_eq!(std::fs::read(&path).unwrap(), orig);
+
+    assert_eq!(quarantine_files(&path).len(), 2);
+    let base = qpath(&path, &format!(".torn-{valid_len}"));
+    let suffixed = qpath(&path, &format!(".torn-{valid_len}-1"));
+    assert_eq!(
+        std::fs::read(&base).unwrap(),
+        first,
+        "first quarantine overwritten"
+    );
+    assert_eq!(std::fs::read(&suffixed).unwrap(), second);
+}
+
+// ---------- T4: zero padding after the last Commit ----------
+
+#[test]
+fn t4_zero_tail_is_cut_and_quarantined() {
+    let (_d, path) = build();
+    let orig = std::fs::read(&path).unwrap();
+    let mut bytes = orig.clone();
+    bytes.extend_from_slice(&[0u8; 4096]);
+    std::fs::write(&path, &bytes).unwrap();
+    let w = match World::open(&path) {
+        Ok(w) => w,
+        Err(e) => panic!("zeros must not look like committed data: {e:?}"),
+    };
+    assert_eq!(w.latest_tx(), TxId(3));
+    drop(w);
+    assert_eq!(std::fs::read(&path).unwrap(), orig);
+    let q = quarantine_files(&path);
+    assert_eq!(q, vec![qpath(&path, &format!(".torn-{}", orig.len()))]);
+    assert_eq!(std::fs::read(&q[0]).unwrap(), vec![0u8; 4096]);
+}
+
+#[test]
+fn t4_read_log_ignores_zero_tail() {
+    let (_d, path) = build();
+    let mut bytes = std::fs::read(&path).unwrap();
+    let n = read_log(&path).unwrap().len();
+    bytes.extend_from_slice(&[0u8; 4096]);
+    std::fs::write(&path, &bytes).unwrap();
+    assert_eq!(read_log(&path).unwrap().len(), n);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+// ---------- H2: exclusive lock ----------
+
+#[test]
+fn h2_second_open_while_created_world_alive_is_locked() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("world.kala");
+    let first = World::create(&path, schema()).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert_eq!(open_err(&path), Error::WorldLocked);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    drop(first);
+    assert!(World::open(&path).is_ok(), "open after drop must succeed");
+}
+
+#[test]
+fn h2_second_open_while_opened_world_alive_is_locked() {
+    let (_d, path) = build();
+    let first = World::open(&path)
+        .map_err(|e| panic!("{e:?}"))
+        .ok()
+        .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert_eq!(open_err(&path), Error::WorldLocked);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    drop(first);
+    let again = World::open(&path)
+        .map_err(|e| panic!("{e:?}"))
+        .ok()
+        .unwrap();
+    assert_eq!(again.latest_tx(), TxId(3));
+}
+
+#[test]
+fn h2_locked_open_does_not_cut_a_torn_tail() {
+    let (_d, path) = build();
+    let first = World::open(&path)
+        .map_err(|e| panic!("{e:?}"))
+        .ok()
+        .unwrap();
+    // A second handle must not truncate or quarantine behind the first's back.
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend_from_slice(&[0xEE; 6]);
+    std::fs::write(&path, &bytes).unwrap();
+    assert_eq!(open_err(&path), Error::WorldLocked);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert!(quarantine_files(&path).is_empty());
+    drop(first);
+}
+
+#[test]
+fn h2_read_log_works_while_world_holds_the_lock() {
+    let (_d, path) = build();
+    let w = World::open(&path)
+        .map_err(|e| panic!("{e:?}"))
+        .ok()
+        .unwrap();
+    assert!(!read_log(&path).unwrap().is_empty());
+    drop(w);
+    let dir = tempfile::tempdir().unwrap();
+    let p2 = dir.path().join("w2.kala");
+    let w2 = World::create(&p2, schema()).unwrap();
+    assert!(!read_log(&p2).unwrap().is_empty());
+    drop(w2);
+}
+
+// ---------- Edge cases (confirm step) ----------
+
+/// Last committed entry ID of the log at `path`.
+fn last_entry_id(path: &Path) -> u64 {
+    read_log(path).unwrap().last().unwrap().id.0
+}
+
+/// A well-formed Commit frame (length 21, kind 5) with the given entry ID,
+/// tx and a deliberately wrong checksum.
+fn commit_frame(entry: u64, tx: u64) -> Vec<u8> {
+    let mut f = Vec::new();
+    f.extend_from_slice(&21u32.to_le_bytes());
+    f.push(5);
+    f.extend_from_slice(&entry.to_le_bytes());
+    f.extend_from_slice(&tx.to_le_bytes());
+    f.extend_from_slice(&0x4141_4141u32.to_le_bytes());
+    f
+}
+
+#[cfg(unix)]
+#[test]
+fn quarantine_failure_fails_open_with_io_and_leaves_log_untouched() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, path) = build();
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend_from_slice(&[0xEE; 9]);
+    std::fs::write(&path, &bytes).unwrap();
+
+    struct Restore<'a>(&'a Path);
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    let _restore = Restore(dir.path());
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    // Root ignores permissions: skip if the directory is still writable.
+    let probe = dir.path().join("probe");
+    if std::fs::File::create(&probe).is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        eprintln!("skipped: running with permissions-ignoring privileges");
+        return;
+    }
+
+    let e = open_err(&path);
+    assert!(matches!(e, Error::Io { .. }), "expected Io, got {e:?}");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        bytes,
+        "log modified despite failed quarantine"
+    );
+    assert!(quarantine_files(&path).is_empty());
+}
+
+/// The documented false refusal, at byte level: a torn tail whose bytes
+/// happen to hold a Commit-shaped frame for tx torn_tx + 1 with an in-range
+/// entry ID is refused (fails safe), nothing cut. (A string value can't carry
+/// this shape: the value encoding escapes NUL bytes, and the shape needs
+/// `21 0 0 0`; so the pattern is planted directly in the tail.)
+#[test]
+fn torn_tail_with_commit_shaped_bytes_for_next_tx_is_refused_not_cut() {
+    for (junk_before, entry_delta, tx) in [(3usize, 1u64, 5u64), (10, 2, 5), (0, 1, 5)] {
+        let (_d, path) = build();
+        let l = last_entry_id(&path);
+        let mut tail = vec![0xEE; junk_before];
+        tail.extend(commit_frame(l + entry_delta, tx));
+        tail.extend([0xEE; 5]);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(&tail);
+        std::fs::write(&path, &bytes).unwrap();
+        let e = open_err(&path);
+        assert!(is_corrupt(&e), "expected Corrupt, got {e:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "file modified");
+        assert!(quarantine_files(&path).is_empty());
+    }
+}
+
+fn own_bad_commit_is_cut(entry_offset: u64, padding: usize) {
+    let (_d, path) = build();
+    let l = last_entry_id(&path);
+    // entry_offset 0 means the high edge: last entry + tail length.
+    let entry = if entry_offset == 0 {
+        l + (25 + padding) as u64
+    } else {
+        l + entry_offset
+    };
+    let mut tail = commit_frame(entry, 4);
+    tail.extend(std::iter::repeat_n(0u8, padding));
+    let orig = std::fs::read(&path).unwrap();
+    let mut bytes = orig.clone();
+    bytes.extend_from_slice(&tail);
+    std::fs::write(&path, &bytes).unwrap();
+
+    let w = match World::open(&path) {
+        Ok(w) => w,
+        Err(e) => panic!("own bad-checksum commit must be cut, got {e:?}"),
+    };
+    assert_eq!(w.latest_tx(), TxId(3));
+    drop(w);
+    assert_eq!(std::fs::read(&path).unwrap(), orig);
+    let q = quarantine_files(&path);
+    assert_eq!(q, vec![qpath(&path, &format!(".torn-{}", orig.len()))]);
+    assert_eq!(std::fs::read(&q[0]).unwrap(), tail);
+}
+
+#[test]
+fn own_bad_commit_at_low_entry_edge_is_cut() {
+    own_bad_commit_is_cut(1, 0);
+}
+
+#[test]
+fn own_bad_commit_at_high_entry_edge_is_cut() {
+    own_bad_commit_is_cut(0, 0); // entry = last + tail_len (25)
+}
+
+#[test]
+fn own_bad_commit_with_padding_at_both_entry_edges_is_cut() {
+    own_bad_commit_is_cut(1, 25);
+    own_bad_commit_is_cut(0, 25); // entry = last + tail_len (50)
+}
+
+#[test]
+fn damage_inside_genesis_with_later_commits_is_corrupt() {
+    let (_d, path) = build();
+    let g = txns(&std::fs::read(&path).unwrap())[0].clone();
+    // A payload byte of genesis's first frame.
+    assert_damage_refused(&path, |b| b[g[0].0 + 4 + 2] ^= 0xFF);
+}
+
+#[test]
+fn damage_to_genesis_commit_checksum_with_later_commits_is_corrupt() {
+    let (_d, path) = build();
+    let g = txns(&std::fs::read(&path).unwrap())[0].clone();
+    let end = g.last().unwrap().1;
+    assert_damage_refused(&path, |b| b[end - 1] ^= 0x01);
+}
+
+#[test]
+fn tail_shorter_than_a_commit_frame_is_cut_and_quarantined() {
+    for n in [1usize, 4, 12, 24] {
+        let (_d, path) = build();
+        let orig = std::fs::read(&path).unwrap();
+        let mut bytes = orig.clone();
+        let tail: Vec<u8> = (0..n).map(|i| 0xA0u8.wrapping_add(i as u8)).collect();
+        bytes.extend_from_slice(&tail);
+        std::fs::write(&path, &bytes).unwrap();
+        let w = match World::open(&path) {
+            Ok(w) => w,
+            Err(e) => panic!("tail of {n} bytes must be cut: {e:?}"),
+        };
+        assert_eq!(w.latest_tx(), TxId(3), "tail {n}");
+        drop(w);
+        assert_eq!(std::fs::read(&path).unwrap(), orig, "tail {n}");
+        let q = quarantine_files(&path);
+        assert_eq!(q, vec![qpath(&path, &format!(".torn-{}", orig.len()))]);
+        assert_eq!(std::fs::read(&q[0]).unwrap(), tail, "tail {n}");
+    }
+}
+
+#[test]
+fn second_open_after_a_cut_is_clean_and_makes_no_new_quarantine() {
+    let (_d, path) = build();
+    let orig = std::fs::read(&path).unwrap();
+    let mut bytes = orig.clone();
+    bytes.extend_from_slice(&[0x77; 40]);
+    std::fs::write(&path, &bytes).unwrap();
+    drop(World::open(&path).map_err(|e| panic!("{e:?}")).ok());
+    let q1 = quarantine_files(&path);
+    assert_eq!(q1.len(), 1);
+    let q1_bytes = std::fs::read(&q1[0]).unwrap();
+
+    let w = World::open(&path)
+        .map_err(|e| panic!("{e:?}"))
+        .ok()
+        .unwrap();
+    assert_eq!(w.latest_tx(), TxId(3));
+    drop(w);
+    assert_eq!(std::fs::read(&path).unwrap(), orig);
+    assert_eq!(quarantine_files(&path), q1, "second open added a file");
+    assert_eq!(std::fs::read(&q1[0]).unwrap(), q1_bytes);
+}
