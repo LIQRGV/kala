@@ -13,6 +13,16 @@
 //! for one tick, the newest tx) sorts first; a seek to `E|e|a|v|^T` therefore
 //! lands on the latest entry with tick `<= T`.
 //!
+//! The reverse index `R` mirrors every `ref` fact under its target:
+//!
+//! ```text
+//! b'R' | target (8, BE) | attr (4, BE) | source (8, BE) | ^tick (8) | ^tx (8)
+//! ```
+//!
+//! Every part is fixed-width, so an `R` key is always [`R_KEY_LEN`] bytes
+//! and `R|t|a|` and `R|t|a|s|` are exact prefixes. The tick and tx suffix
+//! is the same as in `E`, so one history sorts newest first in both.
+//!
 //! Keys are built from encoded bytes only (the value is already
 //! [`Value::encode`](crate::value::Value::encode)d), never from `Value`.
 
@@ -23,6 +33,12 @@ use crate::world::TxId;
 
 /// Tag byte of the forward index.
 const E_TAG: u8 = b'E';
+
+/// Tag byte of the reverse index.
+const R_TAG: u8 = b'R';
+
+/// Length of every `R` key: `R|target|attr|source|^tick|^tx`.
+pub(crate) const R_KEY_LEN: usize = 1 + 8 + 4 + 8 + SUFFIX_LEN;
 
 /// Length of `E|entity|attr|`, the part before the value.
 pub(crate) const E_ATTR_PREFIX_LEN: usize = 1 + 8 + 4;
@@ -114,6 +130,96 @@ pub(crate) fn e_value_and_tick(key: &[u8]) -> Result<(&[u8], Tick), ValueError> 
         .and_then(|b| b.try_into().ok())
         .ok_or(ValueError::Malformed("index key suffix is not ^tick|^tx"))?;
     Ok((value, Tick::decode_inverted(tick)))
+}
+
+/// The full `R` key of one ref fact `source attr target`.
+pub(crate) fn r_fact_key(
+    target: EntityId,
+    attr: AttrId,
+    source: EntityId,
+    tick: Tick,
+    tx: TxId,
+) -> Vec<u8> {
+    let mut k = Vec::with_capacity(R_KEY_LEN);
+    k.push(R_TAG);
+    k.extend_from_slice(&target.to_bytes());
+    k.extend_from_slice(&attr.0.to_be_bytes());
+    k.extend_from_slice(&source.to_bytes());
+    k.extend_from_slice(&tick.encode_inverted());
+    k.extend_from_slice(&(!tx.0).to_be_bytes());
+    k
+}
+
+/// Length of `R|target|attr|`, the part before the source.
+pub(crate) const R_ATTR_PREFIX_LEN: usize = 1 + 8 + 4;
+
+/// Length of `R|target|attr|source|`: one source's history prefix.
+pub(crate) const R_SOURCE_PREFIX_LEN: usize = R_ATTR_PREFIX_LEN + 8;
+
+/// `R|target|attr|`: the prefix of every source of one attribute into
+/// `target`.
+pub(crate) fn r_attr_prefix(target: EntityId, attr: AttrId) -> Vec<u8> {
+    let mut k = Vec::with_capacity(R_KEY_LEN);
+    k.push(R_TAG);
+    k.extend_from_slice(&target.to_bytes());
+    k.extend_from_slice(&attr.0.to_be_bytes());
+    k
+}
+
+/// The source of an `R` key, or of an `R|t|a|s|` prefix; `None` if the
+/// bytes are too short to hold one.
+pub(crate) fn r_source(key: &[u8]) -> Option<EntityId> {
+    bytes8(key, R_ATTR_PREFIX_LEN).map(EntityId::from_bytes)
+}
+
+/// Reads 8 bytes at `at`, if the key has them.
+fn bytes8(key: &[u8], at: usize) -> Option<[u8; 8]> {
+    key.get(at..at + 8)?.try_into().ok()
+}
+
+/// A decoded `E` key: `(entity, attr, value encoding, tick, tx)`.
+pub(crate) type EKeyParts<'k> = (EntityId, AttrId, &'k [u8], Tick, TxId);
+
+/// Splits a full `E` key into its parts. Fails if the key isn't a
+/// well-formed `E` key.
+pub(crate) fn decode_e_key(key: &[u8]) -> Result<EKeyParts<'_>, ValueError> {
+    if key.first() != Some(&E_TAG) {
+        return Err(ValueError::Malformed("not an E key"));
+    }
+    let (value, tick) = e_value_and_tick(key)?;
+    // `e_value_and_tick` checked the key holds the prefix, a value and the
+    // `^tick|^tx` suffix, so these reads are in bounds.
+    let short = || ValueError::Malformed("index key shorter than its prefix");
+    let entity = EntityId::from_bytes(bytes8(key, 1).ok_or_else(short)?);
+    let attr: [u8; 4] = key
+        .get(9..13)
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(short)?;
+    let tx = e_key_tx(key).ok_or_else(short)?;
+    Ok((entity, AttrId(u32::from_be_bytes(attr)), value, tick, tx))
+}
+
+/// A decoded `R` key: `(target, attr, source, tick, tx)`.
+pub(crate) type RKeyParts = (EntityId, AttrId, EntityId, Tick, TxId);
+
+/// Splits a full `R` key into its parts. Fails if the key isn't exactly
+/// [`R_KEY_LEN`] bytes with the `R` tag.
+pub(crate) fn decode_r_key(key: &[u8]) -> Result<RKeyParts, ValueError> {
+    if key.len() != R_KEY_LEN || key[0] != R_TAG {
+        return Err(ValueError::Malformed("not an R key"));
+    }
+    // Fixed width: every slice below is in bounds after the length check.
+    let get8 = |at| bytes8(key, at).ok_or(ValueError::Malformed("not an R key"));
+    let attr: [u8; 4] = key[9..13]
+        .try_into()
+        .map_err(|_| ValueError::Malformed("not an R key"))?;
+    Ok((
+        EntityId::from_bytes(get8(1)?),
+        AttrId(u32::from_be_bytes(attr)),
+        EntityId::from_bytes(get8(13)?),
+        Tick::decode_inverted(get8(21)?),
+        TxId(!u64::from_be_bytes(get8(29)?)),
+    ))
 }
 
 #[cfg(test)]
@@ -427,5 +533,193 @@ mod tests {
         assert!(e_value_and_tick(&half).is_err());
         push_seek_tick(&mut half, Tick(1));
         assert!(e_value_and_tick(&half).is_err());
+    }
+
+    // ---- R keys ----
+
+    fn edge_ent(seq: u64) -> EntityId {
+        crate::id::EdgeId::new(seq).expect("valid edge").into()
+    }
+
+    #[test]
+    fn r_key_layout_and_round_trip() {
+        let (t, a, src) = (ent(2, 5), AttrId(9), ent(1, 7));
+        let k = r_fact_key(t, a, src, Tick(-5), TxId(42));
+        assert_eq!(k.len(), R_KEY_LEN);
+        assert_eq!(k[0], b'R');
+        assert_eq!(&k[1..9], &t.to_bytes());
+        assert_eq!(&k[9..13], &9u32.to_be_bytes());
+        assert_eq!(&k[13..21], &src.to_bytes());
+        assert_eq!(decode_r_key(&k).unwrap(), (t, a, src, Tick(-5), TxId(42)));
+    }
+
+    #[test]
+    fn r_key_round_trips_extremes() {
+        let ids = [ent(0, 1), ent(1, MAX_SEQ), ent(32767, MAX_SEQ), edge_ent(1)];
+        for &t in &ids {
+            for &s in &ids {
+                for tick in [i64::MIN, -1, 0, 1, i64::MAX] {
+                    for (a, tx) in [(0u32, 0u64), (u32::MAX, u64::MAX), (7, 1)] {
+                        let k = r_fact_key(t, AttrId(a), s, Tick(tick), TxId(tx));
+                        assert_eq!(
+                            decode_r_key(&k).unwrap(),
+                            (t, AttrId(a), s, Tick(tick), TxId(tx))
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r_keys_do_not_run_into_neighbouring_targets_attrs_sources() {
+        let big = ent(32767, MAX_SEQ);
+        let edge = edge_ent(1);
+        assert!(big < edge, "edge-tagged ids sort after every entity id");
+        let ids = [
+            ent(1, 1),
+            ent(1, 2),
+            ent(1, MAX_SEQ),
+            ent(2, 1),
+            big,
+            edge,
+            edge_ent(2),
+        ];
+        let attrs = [
+            AttrId(0),
+            AttrId(1),
+            AttrId(255),
+            AttrId(256),
+            AttrId(u32::MAX),
+        ];
+        // (target, attr, source) triples; lexicographic order must equal key order
+        // of the (target, attr, source) prefix, and no prefix may contain another's keys.
+        let mut triples = Vec::new();
+        for &t in &ids {
+            for &a in &attrs {
+                for &s in &ids {
+                    triples.push((t, a, s));
+                }
+            }
+        }
+        let low = |x: &(EntityId, AttrId, EntityId)| {
+            r_fact_key(x.0, x.1, x.2, Tick(i64::MAX), TxId(u64::MAX))
+        };
+        let high =
+            |x: &(EntityId, AttrId, EntityId)| r_fact_key(x.0, x.1, x.2, Tick(i64::MIN), TxId(0));
+        for x in &triples {
+            for y in &triples {
+                if x == y {
+                    continue;
+                }
+                let (px, py) = (&low(x)[..21], &low(y)[..21]);
+                assert_ne!(px, py);
+                assert!(!low(y).starts_with(px) && !high(y).starts_with(px));
+                // Disjoint ranges ordered like the triples.
+                if x < y {
+                    assert!(high(x) < low(y), "{x:?} range reaches {y:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r_key_ticks_sort_newest_first_within_one_triple() {
+        let (t, a, s) = (ent(1, 1), AttrId(3), ent(2, 2));
+        let ticks = [i64::MIN, -1, 0, 1, i64::MAX];
+        let mut keys: Vec<Vec<u8>> = ticks
+            .iter()
+            .map(|&x| r_fact_key(t, a, s, Tick(x), TxId(1)))
+            .collect();
+        keys.sort();
+        let sorted: Vec<i64> = keys.iter().map(|k| decode_r_key(k).unwrap().3.0).collect();
+        assert_eq!(sorted, vec![i64::MAX, 1, 0, -1, i64::MIN]);
+    }
+
+    #[test]
+    fn r_key_same_tick_sorts_newest_tx_first() {
+        let (t, a, s) = (ent(1, 1), AttrId(3), ent(2, 2));
+        let k1 = r_fact_key(t, a, s, Tick(0), TxId(1));
+        let k9 = r_fact_key(t, a, s, Tick(0), TxId(9));
+        let kmax = r_fact_key(t, a, s, Tick(0), TxId(u64::MAX));
+        assert!(kmax < k9 && k9 < k1);
+    }
+
+    #[test]
+    fn decode_r_key_rejects_wrong_length_and_tag() {
+        let k = r_fact_key(ent(1, 1), AttrId(1), ent(1, 2), Tick(0), TxId(1));
+        assert!(decode_r_key(&k).is_ok());
+        assert!(decode_r_key(&[]).is_err());
+        assert!(decode_r_key(&k[..k.len() - 1]).is_err());
+        let mut long = k.clone();
+        long.push(0);
+        assert!(decode_r_key(&long).is_err());
+        for tag in [b'E', b'V', 0u8, 0xFF] {
+            let mut bad = k.clone();
+            bad[0] = tag;
+            assert!(decode_r_key(&bad).is_err(), "tag {tag}");
+        }
+    }
+
+    // ---- E key decoding ----
+
+    #[test]
+    fn e_key_round_trips() {
+        let values = [
+            Value::I64(i64::MIN),
+            Value::I64(0),
+            Value::Bool(true),
+            s(""),
+            s("Edwin"),
+            Value::Ref(ent(3, 4)),
+            Value::Ref(edge_ent(9)),
+        ];
+        for e in [ent(1, 1), ent(32767, MAX_SEQ), edge_ent(1)] {
+            for v in &values {
+                let enc = venc(v);
+                for tick in [i64::MIN, -1, 0, 1, i64::MAX] {
+                    for (a, tx) in [(0u32, 0u64), (u32::MAX, u64::MAX), (3, 5)] {
+                        let k = e_fact_key(e, AttrId(a), &enc, Tick(tick), TxId(tx));
+                        let (de, da, dv, dt, dx) = decode_e_key(&k).unwrap();
+                        assert_eq!(
+                            (de, da, dv, dt, dx),
+                            (e, AttrId(a), &enc[..], Tick(tick), TxId(tx))
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decode_e_key_rejects_wrong_tag_and_malformed_keys() {
+        let enc = venc(&Value::I64(5));
+        let k = e_fact_key(ent(1, 1), AttrId(1), &enc, Tick(0), TxId(1));
+        assert!(decode_e_key(&k).is_ok());
+        for tag in [b'R', b'V', 0u8, 0xFF] {
+            let mut bad = k.clone();
+            bad[0] = tag;
+            assert!(decode_e_key(&bad).is_err(), "tag {tag}");
+        }
+        assert!(decode_e_key(&[]).is_err());
+        assert!(decode_e_key(&k[..E_ATTR_PREFIX_LEN]).is_err());
+        assert!(decode_e_key(&k[..k.len() - 1]).is_err());
+        let mut long = k.clone();
+        long.push(0);
+        assert!(decode_e_key(&long).is_err());
+    }
+
+    #[test]
+    fn e_and_r_decoders_reject_each_others_keys() {
+        let r = r_fact_key(ent(1, 1), AttrId(1), ent(1, 2), Tick(0), TxId(1));
+        assert!(decode_e_key(&r).is_err());
+        let e = e_fact_key(
+            ent(1, 1),
+            AttrId(1),
+            &venc(&Value::Ref(ent(1, 2))),
+            Tick(0),
+            TxId(1),
+        );
+        assert!(decode_r_key(&e).is_err());
     }
 }

@@ -20,6 +20,20 @@
 //!   transaction began (max tick of committed facts, 0 if none);
 //! - any write error aborts the transaction: nothing applies, no tx is used;
 //! - a commit that stores nothing (all no-ops, no new entity) uses no tx.
+//!
+//! Slice 2 (item 9) extends the same harness:
+//!
+//! - ref attributes are directed, directed with an inverse name, or
+//!   bidirectional (random spellings; the model stores `(min, max)`);
+//! - the model interns an edge for the first *stored* assert of each
+//!   (normalised) triple, in write order, and a dropped/aborted txn consumes
+//!   none; edge IDs are compared after every check;
+//! - edge properties: writes whose subject is an edge ID obtained from
+//!   `edge_id` (or a never-defined edge, which must be `UnknownEntity`);
+//! - reads on a bidirectional attribute merge both sides (partner as
+//!   `Ref`), a self pair counting once;
+//! - `neighbors` Out / In / Both (and the inverse name) at every sampled
+//!   canon, against the model.
 
 use kala_core::*;
 use proptest::prelude::*;
@@ -36,15 +50,19 @@ struct A {
     event: bool,
     indexed: bool,
     many: bool,
+    bidi: bool,
+    inverse: Option<&'static str>,
 }
 
-const ATTRS: [A; 9] = [
+const ATTRS: [A; 12] = [
     A {
         name: "loc",
         ty: ValueType::Ref,
         event: false,
         indexed: true,
         many: false,
+        bidi: false,
+        inverse: None,
     },
     A {
         name: "allies",
@@ -52,6 +70,8 @@ const ATTRS: [A; 9] = [
         event: false,
         indexed: true,
         many: true,
+        bidi: false,
+        inverse: None,
     },
     A {
         name: "name",
@@ -59,6 +79,8 @@ const ATTRS: [A; 9] = [
         event: false,
         indexed: true,
         many: false,
+        bidi: false,
+        inverse: None,
     },
     A {
         name: "age",
@@ -66,6 +88,8 @@ const ATTRS: [A; 9] = [
         event: false,
         indexed: true,
         many: true,
+        bidi: false,
+        inverse: None,
     },
     A {
         name: "alive",
@@ -73,6 +97,8 @@ const ATTRS: [A; 9] = [
         event: false,
         indexed: true,
         many: false,
+        bidi: false,
+        inverse: None,
     },
     A {
         name: "height",
@@ -80,6 +106,8 @@ const ATTRS: [A; 9] = [
         event: false,
         indexed: true,
         many: false,
+        bidi: false,
+        inverse: None,
     },
     A {
         name: "bought",
@@ -87,6 +115,8 @@ const ATTRS: [A; 9] = [
         event: true,
         indexed: true,
         many: true,
+        bidi: false,
+        inverse: None,
     },
     A {
         name: "year",
@@ -94,6 +124,8 @@ const ATTRS: [A; 9] = [
         event: true,
         indexed: true,
         many: false,
+        bidi: false,
+        inverse: None,
     },
     A {
         name: "bio",
@@ -101,11 +133,46 @@ const ATTRS: [A; 9] = [
         event: false,
         indexed: false,
         many: false,
+        bidi: false,
+        inverse: None,
+    },
+    A {
+        name: "friend_of",
+        ty: ValueType::Ref,
+        event: false,
+        indexed: true,
+        many: true,
+        bidi: true,
+        inverse: None,
+    },
+    A {
+        name: "parent_of",
+        ty: ValueType::Ref,
+        event: false,
+        indexed: true,
+        many: true,
+        bidi: false,
+        inverse: Some("child_of"),
+    },
+    A {
+        name: "spouse",
+        ty: ValueType::Ref,
+        event: false,
+        indexed: true,
+        many: false,
+        bidi: true,
+        inverse: None,
     },
 ];
 const A_LOC: usize = 0;
 const A_NAME: usize = 2;
 const A_HEIGHT: usize = 5;
+const A_PARENT_OF: usize = 10;
+/// Attributes an edge can carry as properties in this model (non-ref only,
+/// so a property write never interns an edge of its own).
+const EDGE_PROPS: [usize; 6] = [2, 3, 4, 5, 7, 8];
+/// Pseudo node-type index for edges in the model's `Ent`.
+const EDGE_T: usize = 3;
 
 fn schema() -> Schema {
     let mut s = Schema::new();
@@ -125,6 +192,12 @@ fn schema() -> Schema {
         );
         if !a.indexed {
             d = d.unindexed();
+        }
+        if a.bidi {
+            d = d.bidirectional();
+        }
+        if let Some(inv) = a.inverse {
+            d = d.inverse(inv);
         }
         s = s.attribute(d);
     }
@@ -180,6 +253,15 @@ fn from_value(v: &Value) -> MV {
         }
         Value::Str(s) => MV::Str(s.clone()),
         Value::Ref(id) => MV::Ref((usize::from(id.node_type().0), id.seq())),
+    }
+}
+
+/// Bidirectional pairs are stored as (min, max); directed ones as written.
+fn norm(a: usize, x: Ent, y: Ent) -> (Ent, Ent) {
+    if ATTRS[a].bidi && y < x {
+        (y, x)
+    } else {
+        (x, y)
     }
 }
 
@@ -253,10 +335,21 @@ struct Model {
     ents: Vec<(Ent, u64)>, // entity and the tx that created it
     handles: HashSet<String>,
     facts: Vec<MFact>,
+    /// Interned edges in seq order (seq = index + 1), triple normalised for
+    /// bidirectional attributes, with the tx that interned it.
+    edges: Vec<(Ent, usize, Ent, u64)>,
     tx: u64,
 }
 
 impl Model {
+    fn edge_seq(&self, src: Ent, a: usize, tgt: Ent) -> Option<u64> {
+        let (src, tgt) = norm(a, src, tgt);
+        self.edges
+            .iter()
+            .position(|(s, x, t, _)| (*s, *x, *t) == (src, a, tgt))
+            .map(|i| i as u64 + 1)
+    }
+
     fn latest_tick(&self) -> i64 {
         self.facts.iter().map(|f| f.tick).max().unwrap_or(0)
     }
@@ -267,6 +360,7 @@ struct MTxn {
     base_tick: i64,
     default: Option<i64>,
     staged: Vec<MFact>,
+    staged_edges: Vec<(Ent, usize, Ent)>,
     staged_ents: Vec<Ent>,
     staged_handles: Vec<String>,
     poisoned: bool,
@@ -278,6 +372,7 @@ impl MTxn {
             base_tick: m.latest_tick(),
             default,
             staged: vec![],
+            staged_edges: vec![],
             staged_ents: vec![],
             staged_handles: vec![],
             poisoned: false,
@@ -285,7 +380,19 @@ impl MTxn {
     }
 
     fn defined(&self, m: &Model, e: Ent) -> bool {
+        if e.0 == EDGE_T {
+            return e.1 >= 1 && e.1 <= (m.edges.len() + self.staged_edges.len()) as u64;
+        }
         m.ents.iter().any(|(x, _)| *x == e) || self.staged_ents.contains(&e)
+    }
+
+    /// Edges visible to this txn, in seq order.
+    fn visible_edges(&self, m: &Model) -> Vec<(Ent, usize, Ent)> {
+        m.edges
+            .iter()
+            .map(|(s, a, t, _)| (*s, *a, *t))
+            .chain(self.staged_edges.iter().copied())
+            .collect()
     }
 
     fn create(&mut self, m: &Model, c: &MCreate) -> Result<Ent, EK> {
@@ -357,6 +464,14 @@ impl MTxn {
             return Err(EK::RetractEvent);
         }
         let tick = w.tick.or(self.default).unwrap_or(self.base_tick);
+        let (subj, mv) = match mv {
+            MV::Ref(t) if subj.0 != EDGE_T => {
+                let (x, y) = norm(a, subj, *t);
+                (x, MV::Ref(y))
+            }
+            _ => (subj, mv.clone()),
+        };
+        let mv = &mv;
         let same: Vec<&MFact> = m
             .facts
             .iter()
@@ -377,6 +492,16 @@ impl MTxn {
             .is_some_and(|f| f.assert);
         if w.assert == holds {
             return Ok((0, tick));
+        }
+        if let MV::Ref(t) = mv
+            && w.assert
+            && subj.0 != EDGE_T
+        {
+            let known =
+                m.edge_seq(subj, a, *t).is_some() || self.staged_edges.contains(&(subj, a, *t));
+            if !known {
+                self.staged_edges.push((subj, a, *t));
+            }
         }
         self.staged.push(MFact {
             e: subj,
@@ -404,6 +529,9 @@ impl MTxn {
             m.ents.push((*e, m.tx));
         }
         m.handles.extend(self.staged_handles);
+        for (s, a, t) in self.staged_edges {
+            m.edges.push((s, a, t, m.tx));
+        }
         for mut f in self.staged {
             f.tx = m.tx;
             m.facts.push(f);
@@ -412,18 +540,36 @@ impl MTxn {
     }
 }
 
+/// The facts a read of `(e, a)` at canon `c` is built from. For a
+/// bidirectional attribute that is both stored sides, re-keyed so the entity
+/// is the subject and the partner is the `Ref` value (a self pair once).
+fn m_view(m: &Model, c: u64, e: Ent, a: usize) -> Vec<MFact> {
+    let mut out = vec![];
+    for f in m.facts.iter().filter(|f| f.tx <= c && f.a == a) {
+        if f.e == e {
+            out.push(f.clone());
+        } else if ATTRS[a].bidi && f.v == MV::Ref(e) {
+            let mut g = f.clone();
+            g.e = e;
+            g.v = MV::Ref(f.e);
+            out.push(g);
+        }
+    }
+    out
+}
+
 /// Model answers (canon `c`).
 fn m_holds(m: &Model, c: u64, e: Ent, a: usize, v: &MV, t: i64) -> bool {
-    m.facts
+    m_view(m, c, e, a)
         .iter()
-        .filter(|f| f.tx <= c && f.e == e && f.a == a && f.v == *v && f.tick <= t)
+        .filter(|f| f.v == *v && f.tick <= t)
         .max_by_key(|f| f.tick)
         .is_some_and(|f| f.assert)
 }
 
 fn m_as_of(m: &Model, c: u64, e: Ent, a: usize, t: i64) -> Vec<MV> {
     let mut vals: Vec<MV> = vec![];
-    for f in m.facts.iter().filter(|f| f.tx <= c && f.e == e && f.a == a) {
+    for f in m_view(m, c, e, a) {
         if !vals.contains(&f.v) {
             vals.push(f.v.clone());
         }
@@ -437,15 +583,48 @@ fn m_as_of(m: &Model, c: u64, e: Ent, a: usize, t: i64) -> Vec<MV> {
 }
 
 fn m_history(m: &Model, c: u64, e: Ent, a: usize) -> Vec<(i64, bool, MV)> {
-    let mut fs: Vec<&MFact> = m
-        .facts
-        .iter()
-        .filter(|f| f.tx <= c && f.e == e && f.a == a)
-        .collect();
+    let mut fs = m_view(m, c, e, a);
     fs.sort_by(|x, y| x.tick.cmp(&y.tick).then_with(|| cmp_mv(&x.v, &y.v)));
     fs.into_iter()
         .map(|f| (f.tick, f.assert, f.v.clone()))
         .collect()
+}
+
+/// `neighbors(x, a, dir, t)` at canon `c`: (neighbor, edge seq), sorted.
+/// Directed: Out = x is the stored source, In = x is the stored target.
+/// Bidirectional: every direction reads both sides.
+fn m_neighbors(m: &Model, c: u64, x: Ent, a: usize, dir: Direction, t: i64) -> Vec<(Ent, u64)> {
+    let want_out = matches!(dir, Direction::Out | Direction::Both) || ATTRS[a].bidi;
+    let want_in = matches!(dir, Direction::In | Direction::Both) || ATTRS[a].bidi;
+    let mut keys: Vec<(Ent, Ent)> = vec![];
+    for f in m.facts.iter().filter(|f| f.tx <= c && f.a == a) {
+        let MV::Ref(tgt) = f.v else { continue };
+        if (want_out && f.e == x) || (want_in && tgt == x) {
+            keys.push((f.e, tgt));
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    let mut out = std::collections::BTreeSet::new();
+    for (src, tgt) in keys {
+        let held = m
+            .facts
+            .iter()
+            .filter(|f| f.tx <= c && f.a == a && f.e == src && f.v == MV::Ref(tgt) && f.tick <= t)
+            .max_by_key(|f| f.tick)
+            .is_some_and(|f| f.assert);
+        if !held {
+            continue;
+        }
+        let edge = m.edge_seq(src, a, tgt).expect("a stored fact has an edge");
+        if want_out && src == x {
+            out.insert((tgt, edge));
+        }
+        if want_in && tgt == x {
+            out.insert((src, edge));
+        }
+    }
+    out.into_iter().collect()
 }
 
 // ------------------------------------------------------------ test specs
@@ -463,6 +642,16 @@ enum OpSpec {
         val: usize,
         tick: Option<i64>,
         defect: u8,
+    },
+    /// A property write on an edge (`edge` picks among the edges visible
+    /// to the transaction; `bogus` uses a never-defined edge ID instead).
+    EdgeWrite {
+        assert: bool,
+        edge: usize,
+        attr: usize,
+        val: usize,
+        tick: Option<i64>,
+        bogus: bool,
     },
 }
 
@@ -505,6 +694,17 @@ fn op_strategy() -> impl Strategy<Value = OpSpec> {
             .prop_map(|(assert, ent, attr, val, tick, defect)| OpSpec::Write {
                 assert, ent, attr, val, tick, defect
             }),
+        4 => (
+            any::<bool>(),
+            0usize..64,
+            0usize..EDGE_PROPS.len(),
+            0usize..5,
+            tick_strategy(),
+            prop_oneof![92 => Just(false), 8 => Just(true)],
+        )
+            .prop_map(|(assert, edge, attr, val, tick, bogus)| OpSpec::EdgeWrite {
+                assert, edge, attr, val, tick, bogus
+            }),
     ]
 }
 
@@ -539,6 +739,13 @@ impl Target<'_> {
         }
     }
 
+    fn edge_id(&self, s: EntityId, a: &str, t: EntityId) -> Option<EdgeId> {
+        match self {
+            Target::T(x) => x.edge_id(s, a, t),
+            Target::W(x) => x.edge_id(s, a, t),
+        }
+    }
+
     fn write(
         &mut self,
         assert: bool,
@@ -561,6 +768,33 @@ struct Sys {
     world: Option<World>,
     m: Model,
     real: HashMap<Ent, EntityId>,
+}
+
+/// A non-ref value for an edge property, from a small pool.
+fn edge_prop_value(ty: ValueType, val: usize) -> (MV, Value) {
+    match ty {
+        ValueType::Bool => (MV::Bool(val % 2 == 1), Value::Bool(val % 2 == 1)),
+        ValueType::I64 => {
+            let i = [0, -1, 1, i64::MIN, i64::MAX][val % 5];
+            (MV::I64(i), Value::I64(i))
+        }
+        ValueType::F64 => {
+            let x = [0.0f64, 0.0, 1.5, -2.5, f64::INFINITY][val % 5];
+            let real = if val == 1 { -0.0 } else { x };
+            (MV::F64(x.to_bits()), Value::F64(real))
+        }
+        ValueType::Str => {
+            let s = match val % 5 {
+                0 => String::new(),
+                1 => "a".into(),
+                2 => "Edwin é".into(),
+                3 => "x".repeat(256),
+                _ => "y".repeat(257),
+            };
+            (MV::Str(s.clone()), Value::Str(s))
+        }
+        ValueType::Ref => unreachable!("edge properties are non-ref in this model"),
+    }
 }
 
 fn bogus_entity() -> EntityId {
@@ -749,6 +983,50 @@ impl Sys {
                             (e, g) => panic!("{ctx}: model {e:?} vs real {g:?}"),
                         }
                     }
+                    OpSpec::EdgeWrite {
+                        assert,
+                        edge,
+                        attr,
+                        val,
+                        tick,
+                        bogus,
+                    } => {
+                        let edges = mt.visible_edges(&self.m);
+                        if edges.is_empty() && !*bogus {
+                            continue; // nothing to write on; skipped on both sides
+                        }
+                        let ai = EDGE_PROPS[*attr % EDGE_PROPS.len()];
+                        let (mval, rval) = edge_prop_value(ATTRS[ai].ty, *val);
+                        let (subj, real_subj) = if *bogus {
+                            let seq = 9_999u64;
+                            ((EDGE_T, seq), EntityId::from(EdgeId::new(seq).unwrap()))
+                        } else {
+                            let k = *edge % edges.len();
+                            let (s, a, t) = edges[k];
+                            let id = tgt
+                                .edge_id(self.real[&s], ATTRS[a].name, self.real[&t])
+                                .unwrap_or_else(|| panic!("{ctx}: no edge id for {:?}", edges[k]));
+                            assert_eq!(id.seq(), k as u64 + 1, "{ctx}: edge seq");
+                            ((EDGE_T, id.seq()), EntityId::from(id))
+                        };
+                        let mw = MWrite {
+                            assert: *assert,
+                            subj: Some(subj),
+                            attr: Some(ai),
+                            val: Val::Mv(mval),
+                            tick: *tick,
+                        };
+                        let exp = mt.write(&self.m, &mw);
+                        let got =
+                            tgt.write(*assert, real_subj, ATTRS[ai].name, rval, tick.map(Tick));
+                        match (exp, got) {
+                            (Ok((c, t)), Ok(r)) => {
+                                assert_eq!((c, Tick(t)), (r.changed, r.tick), "{ctx}: write result")
+                            }
+                            (Err(k), Err(err)) => assert_eq!(k, ek(&err), "{ctx}: {err:?}"),
+                            (e, g) => panic!("{ctx}: model {e:?} vs real {g:?}"),
+                        }
+                    }
                     OpSpec::Write { .. } => {
                         let (mw, attr, subj, val) = self.resolve_write(&mt, op);
                         let exp = mt.write(&self.m, &mw);
@@ -815,6 +1093,7 @@ impl Sys {
             vec![0, 1, n / 3, n / 2, 2 * n / 3, n - 1, n]
         };
         canons.dedup();
+        self.compare_graph(label, &canons);
         for c in canons {
             let view = w.at_canon(TxId(c));
             for (e, created) in m.ents.iter() {
@@ -865,6 +1144,164 @@ impl Sys {
                             if c == n {
                                 let g = w.as_of_value(id, a.name, &real_v, Tick(t)).unwrap();
                                 assert_eq!(g, got, "{ctx}: world vs view @{t}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Edges, edge properties and `neighbors`, against the model.
+    fn compare_graph(&self, label: &str, canons: &[u64]) {
+        let w = self.world.as_ref().unwrap();
+        let m = &self.m;
+        let n = m.tx;
+        let ref_attrs: Vec<usize> = (0..ATTRS.len())
+            .filter(|&a| ATTRS[a].ty == ValueType::Ref)
+            .collect();
+
+        // the edge table: IDs, triples, and nothing extra
+        for (i, (s, a, t, _)) in m.edges.iter().enumerate() {
+            let (rs, rt, name) = (self.real[s], self.real[t], ATTRS[*a].name);
+            let id = w
+                .edge_id(rs, name, rt)
+                .unwrap_or_else(|| panic!("{label}: edge {i} {s:?} {name} {t:?} has no id"));
+            assert_eq!(id.seq(), i as u64 + 1, "{label}: edge seq");
+            assert_eq!(
+                w.edge(id),
+                Some((rs, name.to_string(), rt)),
+                "{label}: edge()"
+            );
+            if ATTRS[*a].bidi {
+                assert_eq!(w.edge_id(rt, name, rs), Some(id), "{label}: either order");
+            }
+        }
+        assert!(
+            w.edge(EdgeId::new(m.edges.len() as u64 + 1).unwrap())
+                .is_none(),
+            "{label}: no extra edge"
+        );
+        for (x, _) in m.ents.iter() {
+            for (y, _) in m.ents.iter() {
+                for &a in &ref_attrs {
+                    let got = w
+                        .edge_id(self.real[x], ATTRS[a].name, self.real[y])
+                        .map(|e| e.seq());
+                    assert_eq!(
+                        got,
+                        m.edge_seq(*x, a, *y),
+                        "{label}: edge_id({x:?}, {}, {y:?})",
+                        ATTRS[a].name
+                    );
+                }
+            }
+        }
+
+        for &c in canons {
+            let view = w.at_canon(TxId(c));
+
+            // edge properties
+            for (i, (_, _, _, etx)) in m.edges.iter().enumerate() {
+                if *etx > c {
+                    continue;
+                }
+                let ent: Ent = (EDGE_T, i as u64 + 1);
+                let id = EntityId::from(EdgeId::new(ent.1).unwrap());
+                for &pa in &EDGE_PROPS {
+                    let name = ATTRS[pa].name;
+                    let ctx = format!("{label} canon {c} edge#{} {name}", ent.1);
+                    let exp_h = m_history(m, c, ent, pa);
+                    let got_h: Vec<(i64, bool, MV)> = view
+                        .history(id, name)
+                        .unwrap()
+                        .iter()
+                        .map(|ch| (ch.tick.0, ch.op == Op::Assert, from_value(&ch.value)))
+                        .collect();
+                    assert_eq!(got_h, exp_h, "{ctx}: history");
+                    let mut ticks: Vec<i64> = vec![i64::MIN, i64::MAX, 0];
+                    for (t, _, _) in &exp_h {
+                        ticks.extend([t.saturating_sub(1), *t, t.saturating_add(1)]);
+                    }
+                    ticks.sort_unstable();
+                    ticks.dedup();
+                    for t in ticks {
+                        let got: Vec<MV> = view
+                            .as_of(id, name, Tick(t))
+                            .unwrap()
+                            .iter()
+                            .map(from_value)
+                            .collect();
+                        assert_eq!(got, m_as_of(m, c, ent, pa, t), "{ctx}: as_of @{t}");
+                        for (_, _, v) in &exp_h {
+                            assert_eq!(
+                                view.as_of_value(id, name, &to_value(v), Tick(t)).unwrap(),
+                                m_holds(m, c, ent, pa, v, t),
+                                "{ctx}: as_of_value {v:?} @{t}"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // neighbors
+            for (e, created) in m.ents.iter() {
+                if *created > c {
+                    continue;
+                }
+                let id = self.real[e];
+                for &a in &ref_attrs {
+                    let name = ATTRS[a].name;
+                    let mut ticks: Vec<i64> = vec![i64::MIN, i64::MAX, 0];
+                    for f in m
+                        .facts
+                        .iter()
+                        .filter(|f| f.tx <= c && f.a == a && (f.e == *e || f.v == MV::Ref(*e)))
+                    {
+                        ticks.extend([f.tick.saturating_sub(1), f.tick, f.tick.saturating_add(1)]);
+                    }
+                    ticks.sort_unstable();
+                    ticks.dedup();
+                    let to_ent = |(id, edge): (EntityId, EdgeId)| {
+                        ((usize::from(id.node_type().0), id.seq()), edge.seq())
+                    };
+                    for t in ticks {
+                        for dir in [Direction::Out, Direction::In, Direction::Both] {
+                            let ctx = format!("{label} canon {c} {e:?} {name} {dir:?} @{t}");
+                            let exp = m_neighbors(m, c, *e, a, dir, t);
+                            let got: Vec<(Ent, u64)> = view
+                                .neighbors(id, name, dir, Tick(t))
+                                .unwrap()
+                                .into_iter()
+                                .map(to_ent)
+                                .collect();
+                            assert_eq!(got, exp, "{ctx}: neighbors");
+                            if c == n {
+                                let g: Vec<(Ent, u64)> = w
+                                    .neighbors(id, name, dir, Tick(t))
+                                    .unwrap()
+                                    .into_iter()
+                                    .map(to_ent)
+                                    .collect();
+                                assert_eq!(g, exp, "{ctx}: world neighbors");
+                            }
+                            if let Some(inv) = ATTRS[a].inverse {
+                                let flipped = match dir {
+                                    Direction::Out => Direction::In,
+                                    Direction::In => Direction::Out,
+                                    Direction::Both => Direction::Both,
+                                };
+                                let g: Vec<(Ent, u64)> = view
+                                    .neighbors(id, inv, dir, Tick(t))
+                                    .unwrap()
+                                    .into_iter()
+                                    .map(to_ent)
+                                    .collect();
+                                assert_eq!(
+                                    g,
+                                    m_neighbors(m, c, *e, a, flipped, t),
+                                    "{ctx}: inverse {inv}"
+                                );
                             }
                         }
                     }
@@ -1007,4 +1444,111 @@ fn fixed_script_hits_noop_conflict_abort_default_and_reopen() {
             w(true, 40, 3, 1, None, 0),
         ])],
     );
+}
+
+/// Sanity for the slice-2 parts: a fixed script that interns edges through
+/// both spellings, hits a bidirectional no-op and same-tick conflict, a self
+/// pair, an inverse-named attribute, edge properties (including on an edge
+/// staged in the same txn, a retracted event property and a never-defined
+/// edge), and an aborted txn that must not consume an edge. The model is
+/// inspected so a broken generator can't make the property vacuous.
+#[test]
+fn fixed_graph_script_interns_edges_and_checks_neighbors_and_properties() {
+    const A_FRIEND: usize = 9;
+    let w = |assert, ent, attr, val, tick| OpSpec::Write {
+        assert,
+        ent,
+        attr,
+        val,
+        tick,
+        defect: 0,
+    };
+    let ew = |assert, edge, attr, val, tick, bogus| OpSpec::EdgeWrite {
+        assert,
+        edge,
+        attr,
+        val,
+        tick,
+        bogus,
+    };
+    let c = |ops: Vec<OpSpec>| TxnSpec {
+        mode: Mode::Commit,
+        default: None,
+        ops,
+        check: true,
+    };
+    // visible entities: 0 C1, 1 C2, 2 C3, 3 P1, 4 P2, 5 I1
+    let script = vec![
+        // C2 friend_of C1 (larger first) -> stored (C1, C2), edge#1
+        c(vec![w(true, 1, A_FRIEND, 0, Some(-5))]),
+        // other spelling at a later tick: already holds, no-op, no new edge
+        c(vec![w(true, 0, A_FRIEND, 1, Some(-3))]),
+        // retract with the other spelling, then the same-tick opposite aborts
+        c(vec![w(false, 0, A_FRIEND, 1, Some(-1))]),
+        c(vec![w(true, 1, A_FRIEND, 0, Some(-1))]),
+        // self pair and a cross-type pair (CHARACTER < PLACE)
+        c(vec![
+            w(true, 2, A_FRIEND, 2, Some(0)),
+            w(true, 3, A_FRIEND, 0, Some(4)),
+        ]),
+        // directed with an inverse name: C1 parent_of C2, and C2 parent_of C1
+        c(vec![
+            w(true, 0, A_PARENT_OF, 1, Some(2)),
+            w(true, 1, A_PARENT_OF, 0, Some(2)),
+        ]),
+        // edge properties: on edge#1, on an edge staged in this txn, and an
+        // event property retract (error), then a bogus edge (error)
+        c(vec![
+            ew(true, 0, 0, 1, Some(-4), false),
+            ew(true, 0, 0, 2, Some(-2), false),
+            ew(false, 0, 0, 1, Some(-3), false),
+        ]),
+        c(vec![
+            w(true, 4, A_LOC, 0, Some(1)),
+            ew(true, 63, 4, 1, Some(1), false), // `year` is an event
+            ew(false, 63, 4, 1, Some(1), false), // retract event: error, aborts
+        ]),
+        c(vec![ew(true, 0, 1, 0, Some(0), true)]),
+        // aborted txn staging a new edge: the edge ID must be reused later
+        c(vec![
+            w(true, 5, A_FRIEND, 4, Some(9)),
+            w(true, 5, 99, 0, Some(9)), // attr index wraps to a valid one: fine
+        ]),
+        TxnSpec {
+            mode: Mode::Drop,
+            default: None,
+            ops: vec![w(true, 4, A_FRIEND, 0, Some(11))],
+            check: true,
+        },
+        c(vec![w(true, 4, A_FRIEND, 1, Some(12))]),
+    ];
+    let mut sys = setup();
+    for (i, s) in script.iter().enumerate() {
+        let label = format!("graph script txn#{i}");
+        sys.step(s, &label);
+        if s.check {
+            sys.compare_all(&label);
+        }
+    }
+    sys.reopen();
+    sys.compare_all("graph script after reopen");
+    // generator sanity: edges exist, with edge-subject facts and both sides
+    assert!(sys.m.edges.len() >= 6, "edges: {:?}", sys.m.edges);
+    assert!(sys.m.facts.iter().any(|f| f.e.0 == EDGE_T));
+    assert!(
+        sys.m
+            .facts
+            .iter()
+            .any(|f| ATTRS[f.a].bidi && f.e == (0, 1) && f.v == MV::Ref((0, 2)))
+    );
+    // C2~C1 is one edge#1 with 3 stored changes? assert -5, retract -1 only
+    assert_eq!(sys.m.edge_seq((0, 2), A_FRIEND, (0, 1)), Some(1));
+    assert_eq!(sys.m.edge_seq((0, 1), A_FRIEND, (0, 2)), Some(1));
+    let stored = sys
+        .m
+        .facts
+        .iter()
+        .filter(|f| f.a == A_FRIEND && f.e == (0, 1) && f.v == MV::Ref((0, 2)))
+        .count();
+    assert_eq!(stored, 2, "assert -5 and retract -1; the rest were no-ops");
 }

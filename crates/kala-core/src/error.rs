@@ -19,8 +19,16 @@ pub enum Error {
     InvalidHandle(String),
     /// A node type or attribute name in the schema isn't valid (e.g. empty).
     InvalidName(String),
+    /// An attribute's direction or inverse doesn't fit its declaration: a
+    /// non-ref attribute with a direction or an inverse, a ref attribute
+    /// without a direction, or an inverse on a bidirectional attribute.
+    /// Holds the attribute's name.
+    InvalidDirection(String),
     /// The attribute name isn't declared in the schema.
     UnknownAttribute(String),
+    /// The attribute isn't a `ref` attribute, so it has no neighbors.
+    /// Holds the attribute name as given.
+    NotARef(String),
     /// The entity (a write's subject or a `ref` value) isn't defined in
     /// this world.
     UnknownEntity(EntityId),
@@ -90,7 +98,11 @@ impl fmt::Display for Error {
             }
             Error::InvalidHandle(h) => write!(f, "invalid handle {h:?}"),
             Error::InvalidName(name) => write!(f, "invalid schema name {name:?}"),
+            Error::InvalidDirection(a) => {
+                write!(f, "attribute {a:?} has an invalid direction or inverse")
+            }
             Error::UnknownAttribute(a) => write!(f, "unknown attribute {a:?}"),
+            Error::NotARef(a) => write!(f, "attribute {a:?} is not a ref attribute"),
             Error::UnknownEntity(e) => write!(f, "unknown entity {e:?}"),
             Error::WrongValueType {
                 attr,

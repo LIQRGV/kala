@@ -1,10 +1,12 @@
-//! Item 15: torn tail recovery. On `World::open`, a trailing transaction
-//! without a valid COMMIT (truncated anywhere, or a complete Commit frame
-//! with a bad checksum as the last thing in the file) is ignored AND cut off:
-//! the file is truncated to the end of the last committed transaction. All
-//! committed transactions survive; writing afterwards continues tx and entry
-//! IDs from the last committed ones. Damage in the middle of the log (valid
-//! transactions after it) is `Corrupt`, with the file untouched.
+//! Torn tail recovery under log format v2 (docs/slice-2-decisions.md, Item 1).
+//! On `World::open`, a last transaction that was cut short (fewer than 25
+//! bytes, or `body_len` running past EOF, or a zero-filled tail) is ignored AND
+//! cut off: the file is truncated to the end of the last committed transaction.
+//! All committed transactions survive; writing afterwards continues tx and
+//! entry IDs from the last committed ones. Damage to bytes that are all present
+//! (begin record or body, in ANY transaction, the last one included) is
+//! `Corrupt`, with the file untouched (slice-1 finding M1).
+mod common;
 
 use kala_core::log::{EntryBody, read_log};
 use kala_core::*;
@@ -266,9 +268,12 @@ fn cut_txns_tx_and_entry_numbers_are_reused() {
     entry_ids_contiguous(&p);
 }
 
+// Rewritten from slice 1 (`..._cuts_that_txn`): with all bytes of the last txn
+// present, a damaged Commit checksum is damage (body_crc mismatch), not a torn
+// write. It must never be cut.
 #[test]
-fn bad_checksum_field_on_the_last_commit_cuts_that_txn() {
-    let (f, before, _) = fixture();
+fn bad_checksum_field_on_the_last_commit_is_corrupt_and_untouched() {
+    let (f, _, _) = fixture();
     let scratch = tempfile::tempdir().unwrap();
     for off in 1..=4u64 {
         let p = scratch.path().join(format!("c{off}.kala"));
@@ -276,17 +281,15 @@ fn bad_checksum_field_on_the_last_commit_cuts_that_txn() {
         let n = d.len();
         d[n - off as usize] ^= 0x01;
         std::fs::write(&p, &d).unwrap();
-        let w = open_ok(&p);
-        assert_eq!(snapshot(&w, &f.ents), before, "off={off}");
-        drop(w);
-        assert_eq!(len(&p), l0(&f), "off={off}");
-        check_writes_continue(&p, &f.ents);
+        assert_corrupt_untouched(&p);
+        assert_read_log_corrupt_untouched(&p);
     }
 }
 
+// Rewritten from slice 1 (`..._cuts_that_txn`): same reason (M1).
 #[test]
-fn bad_byte_in_a_fact_payload_of_the_last_txn_cuts_that_txn() {
-    let (f, before, _) = fixture();
+fn bad_byte_in_a_fact_payload_of_the_last_txn_is_corrupt_and_untouched() {
+    let (f, _, _) = fixture();
     let scratch = tempfile::tempdir().unwrap();
     // bytes inside the last fact frame, just before the 25-byte Commit frame
     for back in [26u64, 27, 30, 33] {
@@ -295,16 +298,13 @@ fn bad_byte_in_a_fact_payload_of_the_last_txn_cuts_that_txn() {
         let at = d.len() - back as usize;
         d[at] ^= 0x40;
         std::fs::write(&p, &d).unwrap();
-        let w = open_ok(&p);
-        assert_eq!(snapshot(&w, &f.ents), before, "back={back}");
-        drop(w);
-        assert_eq!(len(&p), l0(&f), "back={back}");
-        check_writes_continue(&p, &f.ents);
+        assert_corrupt_untouched(&p);
+        assert_read_log_corrupt_untouched(&p);
     }
 }
 
 #[test]
-fn garbage_after_a_clean_log_is_cut_back() {
+fn short_or_zero_or_cut_short_tails_after_a_clean_log_are_cut_back_and_random_tail_is_corrupt() {
     let (f, _, after) = fixture();
     let clean = bytes(&f.path);
     let mut seed = 0x1234_5678_9abc_def0u64;
@@ -315,8 +315,10 @@ fn garbage_after_a_clean_log_is_cut_back() {
             .wrapping_add(1442695040888963407);
         random.push((seed >> 33) as u8);
     }
+    // Tails that v2 classifies as torn (cut + quarantined): shorter than a
+    // begin record, all-zero, or a VALID begin whose body runs past EOF.
+    let next_tx = common::spans(&clean).len() as u64;
     let cases: Vec<(&str, Vec<u8>)> = vec![
-        ("random", random),
         ("1 byte", vec![0x07]),
         ("2 bytes", vec![0x07, 0x00]),
         ("3 bytes", vec![0x07, 0x00, 0x00]),
@@ -327,7 +329,17 @@ fn garbage_after_a_clean_log_is_cut_back() {
             v
         }),
         ("zero length frame", vec![0, 0, 0, 0]),
+        ("24 bytes of junk", vec![0x5A; 24]),
         ("zeros", vec![0; 64]),
+        (
+            "valid begin, body missing",
+            common::begin_raw(common::BEGIN_TAG, next_tx, 1_000, 0),
+        ),
+        ("valid begin, huge body_len", {
+            let mut v = common::begin_raw(common::BEGIN_TAG, next_tx, u64::MAX, 0);
+            v.extend_from_slice(&[1, 2, 3]);
+            v
+        }),
     ];
     let scratch = tempfile::tempdir().unwrap();
     for (name, junk) in cases {
@@ -348,6 +360,13 @@ fn garbage_after_a_clean_log_is_cut_back() {
         );
         check_writes_continue(&p, &f.ents);
     }
+    // 300 random bytes: not a valid begin and not zeros -> damage, never cut.
+    let p = scratch.path().join("random.kala");
+    let mut d = clean.clone();
+    d.extend_from_slice(&random);
+    std::fs::write(&p, &d).unwrap();
+    assert_corrupt_untouched(&p);
+    assert_read_log_corrupt_untouched(&p);
 }
 
 #[test]
@@ -359,7 +378,11 @@ fn mid_log_corruption_followed_by_valid_txns_is_corrupt_and_untouched() {
     for i in 1..f.lens.len() - 1 {
         let start = f.lens[i - 1] as usize;
         let end = f.lens[i] as usize;
-        for (what, at) in [("payload", start + 8), ("checksum", end - 1)] {
+        for (what, at) in [
+            ("begin", start + 3),
+            ("body", start + common::BEGIN_LEN + 8),
+            ("checksum", end - 1),
+        ] {
             let p = scratch.path().join(format!("m{i}{what}.kala"));
             let mut d = bytes(&f.path);
             d[at] ^= 0x01;
@@ -447,14 +470,14 @@ fn read_log_on_a_torn_file_returns_only_committed_entries_and_does_not_modify_it
             "k={k}: read_log must not modify the file"
         );
     }
-    // bad checksum on the last commit: also only committed entries, file untouched
+    // bad checksum on the last commit: all bytes are present, so this is
+    // damage (v2), not a torn write: Corrupt, file untouched.
     let p = scratch.path().join("bad.kala");
     let mut d = full.clone();
     let n = d.len();
     d[n - 1] ^= 1;
     std::fs::write(&p, &d).unwrap();
-    assert_eq!(read_log(&p).unwrap(), clean_at_l0);
-    assert_eq!(bytes(&p), d);
+    assert_read_log_corrupt_untouched(&p);
 }
 
 #[test]
@@ -472,8 +495,7 @@ fn recovery_is_idempotent_a_second_open_changes_nothing() {
 
 // ---- item 15 hardening: damage that must never be a silent drop ----
 
-/// Length of a Commit frame: u32 len + kind + entry id + tx + checksum.
-const COMMIT_FRAME: usize = 4 + 1 + 8 + 8 + 4;
+use common::{COMMIT_FRAME, commit_frame};
 
 fn split_frames(d: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
@@ -484,21 +506,6 @@ fn split_frames(d: &[u8]) -> Vec<Vec<u8>> {
         i += 4 + n;
     }
     out
-}
-
-/// A Commit frame with a correct checksum over `prior` frames' bytes.
-fn commit_frame(prior: &[u8], entry_id: u64, tx: u64) -> Vec<u8> {
-    let mut f = Vec::new();
-    f.extend_from_slice(&21u32.to_le_bytes());
-    f.push(5);
-    f.extend_from_slice(&entry_id.to_le_bytes());
-    f.extend_from_slice(&tx.to_le_bytes());
-    let mut h = crc32fast::Hasher::new();
-    h.update(prior);
-    h.update(&f);
-    f.extend_from_slice(&h.finalize().to_le_bytes());
-    assert_eq!(f.len(), COMMIT_FRAME);
-    f
 }
 
 fn assert_read_log_corrupt_untouched(p: &Path) {
@@ -518,11 +525,19 @@ fn damaged_commit_kind_byte_of_the_second_to_last_txn_is_corrupt() {
     // kind byte of the previous txn's Commit frame
     let at = l0(&f) as usize - COMMIT_FRAME + 4;
     assert_eq!(bytes(&f.path)[at], 5, "test assumes this is the kind byte");
+    // The txn's begin record is re-sealed after each edit so that framing
+    // (body_crc, begin_crc) stays valid and only the body CONTENT is wrong:
+    // the damage must be caught by body validation, not by body_crc.
+    let span = *common::spans(&bytes(&f.path))
+        .iter()
+        .find(|s| s.end == l0(&f) as usize)
+        .unwrap();
     // other defined kinds, an unknown kind, and a single bit flip
     for (i, newk) in [1u8, 2, 3, 4, 0, 6, 0x85, 0xFF].into_iter().enumerate() {
         let p = scratch.path().join(format!("k{i}.kala"));
         let mut d = bytes(&f.path);
         d[at] = newk;
+        common::reseal(&mut d, span);
         std::fs::write(&p, &d).unwrap();
         let before = bytes(&p);
         match World::open(&p) {
@@ -546,7 +561,11 @@ fn read_log_on_mid_log_corruption_is_corrupt_and_untouched() {
     for i in 1..f.lens.len() - 1 {
         let start = f.lens[i - 1] as usize;
         let end = f.lens[i] as usize;
-        for (what, at) in [("payload", start + 8), ("checksum", end - 1)] {
+        for (what, at) in [
+            ("begin", start + 3),
+            ("body", start + common::BEGIN_LEN + 8),
+            ("checksum", end - 1),
+        ] {
             let p = scratch.path().join(format!("r{i}{what}.kala"));
             let mut d = bytes(&f.path);
             d[at] ^= 0x01;
@@ -564,7 +583,9 @@ fn torn_tail_after_a_checksum_valid_but_replay_invalid_txn_is_corrupt() {
     let (a, b) = (l0(&f) as usize, l1(&f) as usize);
     // Rebuild the last txn without its DefineEntity frame: its facts now use
     // an entity that was never defined. Renumber entry IDs, fix the checksum.
-    let frames = split_frames(&d[a..b]);
+    let sp = *common::spans(&d).last().unwrap();
+    assert_eq!((sp.start, sp.end), (a, b));
+    let frames = split_frames(&d[sp.body_start..b]);
     let first_id = u64::from_le_bytes(frames[0][5..13].try_into().unwrap());
     let tx = u64::from_le_bytes(frames.last().unwrap()[13..21].try_into().unwrap());
     let kept: Vec<Vec<u8>> = frames[..frames.len() - 1]
@@ -580,9 +601,10 @@ fn torn_tail_after_a_checksum_valid_but_replay_invalid_txn_is_corrupt() {
         body.extend_from_slice(&fr);
     }
     let commit = commit_frame(&body, first_id + kept.len() as u64, tx);
+    let mut full_body = body.clone();
+    full_body.extend_from_slice(&commit);
     let mut bad = d[..a].to_vec();
-    bad.extend_from_slice(&body);
-    bad.extend_from_slice(&commit);
+    bad.extend_from_slice(&common::txn(tx, &full_body));
 
     // sanity-check the construction: with no tail it is Corrupt too
     let p0 = scratch.path().join("notail.kala");
@@ -622,7 +644,7 @@ fn commit_only_txn_after_a_bad_checksum_txn_is_corrupt() {
     d[n - 1] ^= 0x01; // last txn now has a bad checksum
     // a valid commit-only txn follows it
     let extra = commit_frame(&[], last_entry + 1, last_tx + 1);
-    d.extend_from_slice(&extra);
+    d.extend_from_slice(&common::txn(last_tx + 1, &extra));
     let p = scratch.path().join("c.kala");
     std::fs::write(&p, &d).unwrap();
     assert_corrupt_untouched(&p);

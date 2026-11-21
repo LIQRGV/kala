@@ -47,7 +47,7 @@ fn seven_byte_magic_prefix_is_a_truncated_header() {
 #[test]
 fn magic_without_full_version_is_a_truncated_header() {
     let mut h = LOG_MAGIC.to_vec();
-    h.extend_from_slice(&[1, 0]);
+    h.extend_from_slice(&[2, 0]);
     let (_d, p) = write_file(&h);
     assert!(matches!(read_log(&p), Err(Error::Corrupt(_))));
 }
@@ -62,9 +62,17 @@ fn empty_file_is_not_a_valid_log() {
 }
 
 #[test]
-fn version_two_is_unsupported() {
-    let (_d, p) = write_file(&header(2));
-    assert_eq!(read_log(&p), Err(Error::UnsupportedVersion(2)));
+fn versions_other_than_the_current_one_are_unsupported() {
+    // v1 is the slice-1 format (no migration); 3 is from the future.
+    for v in [0u32, 1, 3, u32::MAX] {
+        let (_d, p) = write_file(&header(v));
+        assert_eq!(read_log(&p), Err(Error::UnsupportedVersion(v)), "v{v}");
+    }
+}
+
+#[test]
+fn current_format_version_is_two() {
+    assert_eq!(LOG_FORMAT_VERSION, 2);
 }
 
 #[test]

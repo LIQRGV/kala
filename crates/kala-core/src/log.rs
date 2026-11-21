@@ -3,42 +3,92 @@
 //! Everything else (ID tables, schema, indexes) is a copy rebuilt from it.
 //! Only committed transactions count; [`read_log`] returns exactly those.
 //!
-//! # Byte layout (format version 1)
+//! # Byte layout (format version 2)
 //!
 //! All integers are little-endian. A `str` is `u32 len | len bytes of UTF-8`.
 //!
 //! ```text
-//! file    = header frame*
+//! file    = header txn*
 //! header  = magic "KALALOG\0" (8 bytes) | version u32           (12 bytes)
+//! txn     = begin body
+//! begin   = tag u8 = 0x07 | tx u64 | body_len u64 | body_crc u32
+//!           | begin_crc u32                                      (25 bytes)
+//! body    = frame*                                               (body_len bytes)
 //! frame   = payload_len u32 | payload                            (payload_len bytes)
-//! payload = kind u8 | entry_id u64 | body
+//! payload = kind u8 | entry_id u64 | entry
 //!
 //! kind 1  DefineNodeType  id u16 | name str
 //! kind 2  DefineAttr      id u32 | name str | value_type u8 | kind u8
-//!                         | cardinality u8 | indexed u8
+//!                         | cardinality u8 | indexed u8 | direction u8
+//!                         | has_inverse u8 | [inverse str, if has_inverse = 1]
 //! kind 3  DefineEntity    id u64 | has_handle u8 | [handle str, if has_handle = 1]
 //! kind 4  Fact            entity u64 | attr u32 | tick i64 | op u8
 //!                         | value (Value encoding, the rest of the payload)
 //! kind 5  Commit          tx u64 | checksum u32
+//! kind 6  DefineEdge      id u64 | source u64 | attr u32 | target u64
 //!
 //! value_type: 1 bool, 2 i64, 3 f64, 4 str, 5 ref (the Value tags)
 //! kind:       0 state, 1 event
 //! cardinality 0 one,   1 many
 //! op:         0 assert, 1 retract
-//! has_handle, indexed: 0 no, 1 yes
+//! direction:  0 none (non-ref), 1 directed, 2 bidirectional
+//! has_handle, indexed, has_inverse: 0 no, 1 yes
 //! ```
 //!
 //! Every byte of a payload must be consumed and every enum byte must be one
-//! listed above; anything else makes the frame unparseable.
+//! listed above; anything else makes the entry unparseable. A `DefineEdge`
+//! id must have the edge tag (bit 63) set and a non-zero sequence.
 //!
-//! **Transactions.** A transaction is a run of consecutive frames ending in a
-//! `Commit`. Its checksum is CRC32 (IEEE, `crc32fast`) over every byte of the
-//! transaction's frames before the `Commit` frame, plus the `Commit` frame's
-//! bytes up to (not including) the checksum field, i.e. its length prefix,
-//! kind, entry ID and tx. Entry IDs start at 1 and grow by one per entry
-//! across the whole log; tx numbers start at 0 (the genesis transaction
-//! holding the schema) and grow by one per transaction. A fact's tx is the
-//! tx of the `Commit` that ends its transaction.
+//! **IDs are defined before use.** Inside a transaction the entries come in
+//! this order: `DefineEntity`s, then `DefineEdge`s, then `Fact`s, then the
+//! `Commit`. An edge `(source, attr, target)` is defined (with the next edge
+//! sequence, counted across the whole log) in the transaction that first
+//! stores an assert of that `ref` fact, so every `ref` fact and every fact on
+//! an edge (an edge property) follows its edge's `DefineEdge`.
+//!
+//! **Transactions.** Every transaction is a begin record followed by its
+//! body. The begin record is framing, not a log entry: it has no entry ID
+//! and [`read_log`] never returns it. `begin_crc` is CRC32 (IEEE,
+//! `crc32fast`) over the record's first 21 bytes, `body_len` the byte length
+//! of the body and `body_crc` CRC32 over all of it. The body is the
+//! transaction's entries, the last one being its only `Commit`. The `Commit`
+//! checksum is CRC32 over every byte of the body before the `Commit` frame,
+//! plus the `Commit` frame's bytes up to (not including) the checksum field,
+//! i.e. its length prefix, kind, entry ID and tx; it doesn't cover the begin
+//! record. Entry IDs start at 1 and grow by one per entry across the whole
+//! log; tx numbers start at 0 (the genesis transaction holding the schema)
+//! and grow by one per transaction, and a `Commit`'s tx is its begin
+//! record's. A fact's tx is the tx of its transaction.
+//!
+//! # Recovery: torn tail or corruption
+//!
+//! A log is scanned transaction by transaction from just past the header,
+//! expecting tx 0 first. Each one is judged by the first rule that applies:
+//!
+//! 1. No bytes left: a clean end.
+//! 2. Fewer than 25 bytes left: **torn**.
+//! 3. `begin_crc` doesn't match: **torn** if every byte from here to the end
+//!    of the file is `0x00` (a zero-filled tail, how some file systems expose
+//!    an append that never reached the disk), else [`Error::Corrupt`].
+//! 4. A tag other than `0x07`, or a tx other than the expected one:
+//!    [`Error::Corrupt`].
+//! 5. `body_len` is more than the bytes left after the begin record: **torn**
+//!    (the last append was cut short).
+//! 6. `body_crc` doesn't match: [`Error::Corrupt`]. Every byte is there, so
+//!    this is damage, not a torn write, and is never cut.
+//! 7. The body's content is invalid (frames not exactly filling `body_len`,
+//!    an unparseable entry, no `Commit`, more than one or not last, a
+//!    `Commit` tx other than the begin record's, a `Commit` checksum mismatch,
+//!    an entry ID out of sequence): [`Error::Corrupt`].
+//! 8. Otherwise the transaction is committed, and the scan moves on.
+//!
+//! **Torn** means the valid prefix ends where that transaction starts: only
+//! the last append can be torn, because each one is fsynced before the next
+//! starts. [`read_log`] ignores a torn tail; `World::open` saves it to a
+//! quarantine file and then cuts it. Corruption is reported with the file
+//! left untouched. Because a damaged length field is caught by `begin_crc`
+//! and damaged content by `body_crc`, damage never makes committed
+//! transactions look like a torn tail.
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions, TryLockError};
@@ -46,17 +96,17 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::Error;
-use crate::id::{AttrId, EntityId, NodeTypeId};
-use crate::schema::{AttrDef, Cardinality, Kind};
+use crate::id::{AttrId, EdgeId, EntityId, NodeTypeId};
+use crate::schema::{AttrDef, Cardinality, Kind, RefDirection};
 use crate::tick::Tick;
 use crate::value::{Value, ValueType};
-use crate::world::{Op, TxId};
+use crate::world::{Op, RecoveryReport, TxId};
 
 /// First 8 bytes of every log file.
 pub const LOG_MAGIC: [u8; 8] = *b"KALALOG\0";
 
 /// The log format version this build writes and reads (header bytes 8..12).
-pub const LOG_FORMAT_VERSION: u32 = 1;
+pub const LOG_FORMAT_VERSION: u32 = 2;
 
 /// Header length: magic plus version.
 const HEADER_LEN: usize = 12;
@@ -66,6 +116,7 @@ const KIND_DEFINE_ATTR: u8 = 2;
 const KIND_DEFINE_ENTITY: u8 = 3;
 const KIND_FACT: u8 = 4;
 const KIND_COMMIT: u8 = 5;
+const KIND_DEFINE_EDGE: u8 = 6;
 
 /// A log entry's position in the whole log: 1, 2, 3, ... in log order,
 /// never reused.
@@ -95,6 +146,19 @@ pub enum EntryBody {
         id: EntityId,
         /// Its handle, if any.
         handle: Option<String>,
+    },
+    /// Interns an edge: gives the triple `(source, attr, target)` its edge
+    /// ID. Written in the transaction that first asserts that `ref` fact,
+    /// before the fact.
+    DefineEdge {
+        /// Its ID (the next edge sequence number).
+        id: EdgeId,
+        /// The entity (or edge) the `ref` fact is on.
+        source: EntityId,
+        /// The `ref` attribute.
+        attr: AttrId,
+        /// The fact's value: the entity (or edge) referred to.
+        target: EntityId,
     },
     /// An assert or retract at a story tick. Its tx is the enclosing
     /// transaction's.
@@ -133,18 +197,14 @@ pub struct LogEntry {
 ///
 /// Fails with [`Error::Io`] if the file can't be read, [`Error::BadMagic`]
 /// if it isn't a Kala log, [`Error::UnsupportedVersion`] for another format
-/// version, or [`Error::Corrupt`] for a truncated header, a transaction
-/// whose checksum matches but whose content is invalid (an unparseable entry,
-/// an entry ID or tx out of sequence), a committed transaction found
-/// after a damaged one, or a tail holding a frame shaped like the `Commit`
-/// of a transaction newer than a torn one could be: that is damage or a
-/// bug, not a torn write.
+/// version (including version 1: there is no migration), or
+/// [`Error::Corrupt`] for a truncated header or any damage the recovery
+/// rules in the module docs don't classify as a torn tail.
 ///
-/// A torn tail (an incomplete last transaction, or a bad checksum on the
-/// last one) is not returned and not an error; it is left in the file
-/// (only [`World::open`](crate::World::open) cuts it). See `scan` in the
-/// source for the exact torn-versus-corrupt rule. Takes no lock, so it
-/// can read a log while a [`World`](crate::World) has it open.
+/// A torn tail (a last transaction cut short, or a zero-filled tail) is not
+/// returned and not an error; it is left in the file (only
+/// [`World::open`](crate::World::open) cuts it). Takes no lock, so it can
+/// read a log while a [`World`](crate::World) has it open.
 pub fn read_log(path: &Path) -> Result<Vec<LogEntry>, Error> {
     let bytes = std::fs::read(path)?;
     Ok(scan(&bytes)?.entries)
@@ -155,7 +215,7 @@ struct Scan {
     /// Entries of every committed transaction, in log order.
     entries: Vec<LogEntry>,
     /// Length of the valid prefix: the header plus every committed
-    /// transaction. Bytes past it are a torn or damaged tail.
+    /// transaction. Bytes past it are a torn tail.
     valid_len: usize,
 }
 
@@ -189,185 +249,162 @@ fn next_frame(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
 /// Scans a whole log file's bytes: see [`read_log`]. This is the one
 /// decoder of the log; reading and reopening both go through it.
 ///
-/// # Where the valid prefix ends: torn tail or corruption
-///
-/// The valid prefix is the header plus every transaction up to the first
-/// one that doesn't end in a checksum-valid `Commit` (an incomplete frame,
-/// a frame length running past the end of the file, no `Commit` before the
-/// end, or a `Commit` whose checksum doesn't match). What follows is judged
-/// by parsing on, frame by frame, to the end of the file:
-///
-/// - If a later `Commit` has a matching checksum, a committed transaction
-///   sits behind the damage: [`Error::Corrupt`]. Dropping it would silently
-///   lose committed data. The checksum is tried over two spans: from just
-///   past the previous `Commit` frame, and from just past the last frame
-///   that didn't parse (so a transaction is still found when the damage hit
-///   the `Commit` frame before it).
-/// - Otherwise it is a **torn tail**, the trace of an append cut short by a
-///   crash (only the last transaction can be torn: every append is fsynced
-///   before the next starts). [`Scan::valid_len`] says where to cut.
-///
-/// A transaction whose checksum matches but whose content is invalid (an
-/// unparseable entry, an entry ID or tx out of sequence) is
-/// [`Error::Corrupt`] wherever it is.
-///
-/// - Otherwise, before calling it torn, every byte offset of the tail is
-///   searched for a frame shaped like a **later** `Commit` (see
-///   [`find_later_commit`]): if a crash cut the last append, the tail holds
-///   at most that one transaction, so a `Commit` for a newer tx means
-///   damage mid-log broke frame lengths and threw parsing out of step with
-///   the real frames, with committed transactions behind it:
-///   [`Error::Corrupt`].
-///
-/// **Residual risk.** Without a resynchronisation marker in the format, two
-/// cases remain. Damage that also destroys every later `Commit` frame still
-/// looks like a torn tail, so those transactions are cut (the cut bytes are
-/// kept in a quarantine file by [`LogWriter::open`]). And user data in a
-/// genuinely torn transaction that happens to contain a `Commit`-shaped
-/// byte pattern makes a torn tail look like corruption: a false refusal,
-/// which fails safe (nothing is cut).
+/// Transactions are judged one at a time from just past the header, by the
+/// rules in the module docs ("Recovery"). The first one that is torn ends
+/// the valid prefix ([`Scan::valid_len`]); anything else that isn't a
+/// committed transaction is [`Error::Corrupt`].
 fn scan(bytes: &[u8]) -> Result<Scan, Error> {
-    let body = check_header(bytes)?;
-    let mut out = Vec::new();
+    let mut rest = check_header(bytes)?;
+    let mut entries = Vec::new();
     let mut next_entry = 1u64;
     let mut next_tx = 0u64;
-    // Just past the last committed transaction: the end of the valid prefix.
-    let mut committed = body;
-    // The current transaction: its bytes start at `txn`, its parsed entries
-    // are `pending`, and `bad` holds the first entry that didn't parse.
-    // Parse failures are only judged at the Commit: a bad checksum means a
-    // torn or damaged tail, a good one means corruption.
-    let mut txn = body;
-    let mut pending: Vec<LogEntry> = Vec::new();
-    let mut bad: Option<String> = None;
-    // Just past the last frame of the current transaction that didn't parse
-    // (`txn` if none did): where the next transaction starts if that frame
-    // was a damaged Commit.
-    let mut resync = body;
-    // Set at the first Commit whose checksum doesn't match. From then on
-    // nothing more is committed; a later valid Commit means corruption.
-    let mut damaged = false;
-    // `next_frame` checks each length against the bytes left, so nothing is
-    // allocated from an unchecked length.
-    let mut rest = body;
-    while let Some((payload, after)) = next_frame(rest) {
-        rest = after;
-        let entry = match parse_payload(payload) {
-            Ok(entry) => entry,
-            Err(why) => {
-                bad.get_or_insert(why);
-                resync = rest;
-                continue;
-            }
-        };
-        let EntryBody::Commit { tx, checksum } = entry.body else {
-            pending.push(entry);
-            continue;
-        };
-        // Covered: every byte from the start of the transaction up to the
-        // Commit frame's checksum field, its last 4 bytes. (A parsed Commit
-        // frame is 4 + 21 bytes, so every span here is `>= 25` bytes.)
-        let covers = |start: &[u8]| {
-            let len = start.len() - rest.len();
-            crc32fast::hash(&start[..len - 4]) == checksum
-        };
-        let valid = covers(txn);
-        if damaged || !valid {
-            if valid || (resync.len() != txn.len() && covers(resync)) {
-                return Err(Error::Corrupt(format!(
-                    "a committed transaction (tx#{}) follows a damaged one",
-                    tx.0
-                )));
-            }
-            damaged = true;
-            pending.clear();
-            bad = None;
-            txn = rest;
-            resync = rest;
-            continue;
+    loop {
+        let at = bytes.len() - rest.len();
+        // Rule 1: a clean end.
+        if rest.is_empty() {
+            break;
         }
-        if let Some(why) = bad.take() {
-            return Err(Error::Corrupt(format!("tx#{}: {why}", tx.0)));
-        }
-        pending.push(entry);
-        for e in &pending {
-            if e.id.0 != next_entry {
-                return Err(Error::Corrupt(format!(
-                    "entry#{} found where entry#{next_entry} was expected",
-                    e.id.0
-                )));
+        // Rule 2: not even a whole begin record: the last append was cut.
+        let Some((begin, after_begin)) = rest.split_first_chunk::<BEGIN_LEN>() else {
+            break;
+        };
+        let begin = Begin::parse(begin);
+        // Rule 3: a damaged begin record. Only a zero-filled tail (how some
+        // file systems expose an append that never reached the disk) is a
+        // torn write; anything else may hide committed data behind it.
+        if !begin.crc_ok {
+            if rest.iter().all(|&b| b == 0) {
+                break;
             }
-            next_entry += 1;
-        }
-        if tx.0 != next_tx {
             return Err(Error::Corrupt(format!(
-                "tx#{} found where tx#{next_tx} was expected",
-                tx.0
+                "damaged transaction header at offset {at}"
             )));
         }
+        // Rule 4: a sound begin record that isn't the next transaction's.
+        if begin.tag != BEGIN_TAG {
+            return Err(Error::Corrupt(format!(
+                "unknown record tag {:#04x} at offset {at}",
+                begin.tag
+            )));
+        }
+        if begin.tx != next_tx {
+            return Err(Error::Corrupt(format!(
+                "tx#{} found at offset {at} where tx#{next_tx} was expected",
+                begin.tx
+            )));
+        }
+        // Rule 5: the body runs past the end of the file: cut short. The
+        // length is checked against the bytes left before it is used.
+        let Some(body_len) = usize::try_from(begin.body_len)
+            .ok()
+            .filter(|&n| n <= after_begin.len())
+        else {
+            break;
+        };
+        let (body, after_body) = after_begin.split_at(body_len);
+        // Rule 6: every byte is there but they don't match: damage, never a
+        // torn write.
+        if crc32fast::hash(body) != begin.body_crc {
+            return Err(Error::Corrupt(format!(
+                "tx#{}: body checksum mismatch at offset {at}",
+                begin.tx
+            )));
+        }
+        // Rule 7: sound framing around content a writer can't produce.
+        let mut txn = parse_body(body, begin.tx, next_entry)
+            .map_err(|why| Error::Corrupt(format!("tx#{}: {why}", begin.tx)))?;
+        // Rule 8: committed.
+        next_entry += txn.len() as u64;
         next_tx += 1;
-        out.append(&mut pending);
-        committed = rest;
-        txn = rest;
-        resync = rest;
-    }
-    let valid_len = bytes.len() - committed.len();
-    // `next_entry - 1` is the last committed entry ID (0 if none) and
-    // `next_tx` the tx a torn transaction would have had.
-    if let Some((at, tx)) = find_later_commit(committed, next_entry - 1, next_tx) {
-        return Err(Error::Corrupt(format!(
-            "committed data may follow damage at offset {valid_len}: \
-             a frame shaped like the Commit of tx#{tx} is at offset {}",
-            valid_len + at
-        )));
+        entries.append(&mut txn);
+        rest = after_body;
     }
     Ok(Scan {
-        entries: out,
-        valid_len,
+        entries,
+        valid_len: bytes.len() - rest.len(),
     })
 }
 
-/// Length of a `Commit` frame: the length prefix plus its 21-byte payload.
-const COMMIT_FRAME_LEN: usize = 4 + COMMIT_PAYLOAD_LEN as usize;
+/// Length of a transaction's begin record.
+const BEGIN_LEN: usize = 25;
 
-/// Payload length of a `Commit`: kind, entry ID, tx, checksum.
-const COMMIT_PAYLOAD_LEN: u32 = 1 + 8 + 8 + 4;
+/// Tag byte of a begin record.
+const BEGIN_TAG: u8 = 0x07;
 
-/// Searches every byte offset of `tail` (the bytes past the valid prefix)
-/// for a frame shaped like the `Commit` of a transaction **newer** than the
-/// torn one: length 21, kind 5, an entry ID in
-/// `(last_entry, last_entry + tail.len()]` and a tx in
-/// `[torn_tx + 1, torn_tx + tail.len() / 25]`, where `torn_tx` is the tx the
-/// torn transaction would have had. Returns its offset in `tail` and its tx.
-///
-/// Why these bounds: a crash can tear only the last append, so a genuine
-/// torn tail holds at most one transaction, whose `Commit` (if it got
-/// written) has tx `torn_tx`. A commit for a later tx can only be there if
-/// damage hid committed transactions. Each entry is at least one byte of
-/// the tail, and each transaction at least one 25-byte `Commit` frame, so
-/// a real later `Commit` always falls in these ranges; random bytes
-/// (zero padding, garbage) almost never do. The checksum isn't checked: the
-/// damage may have hit the very bytes it covers.
-fn find_later_commit(tail: &[u8], last_entry: u64, torn_tx: u64) -> Option<(usize, u64)> {
-    // usize fits u64 on every supported target; saturate rather than wrap.
-    let tail_len = u64::try_from(tail.len()).unwrap_or(u64::MAX);
-    let entry_max = last_entry.saturating_add(tail_len);
-    let tx_min = torn_tx.saturating_add(1);
-    let tx_max = torn_tx.saturating_add(tail_len / COMMIT_FRAME_LEN as u64);
-    tail.windows(COMMIT_FRAME_LEN)
-        .enumerate()
-        .find_map(|(at, w)| {
-            let field = |r: std::ops::Range<usize>| {
-                let mut b = [0u8; 8];
-                b[..r.len()].copy_from_slice(&w[r]);
-                u64::from_le_bytes(b)
-            };
-            let shaped = field(0..4) == u64::from(COMMIT_PAYLOAD_LEN)
-                && w[4] == KIND_COMMIT
-                && (last_entry + 1..=entry_max).contains(&field(5..13));
-            let tx = field(13..21);
-            (shaped && (tx_min..=tx_max).contains(&tx)).then_some((at, tx))
-        })
+/// Bytes of a begin record covered by its own checksum.
+const BEGIN_COVERED: usize = 21;
+
+/// A decoded begin record (no field is trusted unless `crc_ok`).
+struct Begin {
+    tag: u8,
+    tx: u64,
+    body_len: u64,
+    body_crc: u32,
+    /// Whether the record's own checksum matches its first 21 bytes.
+    crc_ok: bool,
+}
+
+impl Begin {
+    fn parse(b: &[u8; BEGIN_LEN]) -> Begin {
+        let u64_at = |i: usize| {
+            let mut x = [0u8; 8];
+            x.copy_from_slice(&b[i..i + 8]);
+            u64::from_le_bytes(x)
+        };
+        let u32_at = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+        Begin {
+            tag: b[0],
+            tx: u64_at(1),
+            body_len: u64_at(9),
+            body_crc: u32_at(17),
+            crc_ok: crc32fast::hash(&b[..BEGIN_COVERED]) == u32_at(BEGIN_COVERED),
+        }
+    }
+}
+
+/// Parses a transaction body whose framing checked out: frames exactly
+/// filling it, entry IDs consecutive from `first_entry`, exactly one
+/// `Commit`, last, for `tx`, with a matching checksum. Returns its entries,
+/// the `Commit` included.
+fn parse_body(body: &[u8], tx: u64, first_entry: u64) -> Result<Vec<LogEntry>, String> {
+    let mut entries = Vec::new();
+    let mut rest = body;
+    let mut next_entry = first_entry;
+    loop {
+        let Some((payload, after)) = next_frame(rest) else {
+            return Err(if rest.is_empty() {
+                "no Commit".to_owned()
+            } else {
+                "a frame runs past the end of the transaction".to_owned()
+            });
+        };
+        rest = after;
+        let entry = parse_payload(payload)?;
+        if entry.id.0 != next_entry {
+            return Err(format!(
+                "entry#{} found where entry#{next_entry} was expected",
+                entry.id.0
+            ));
+        }
+        next_entry += 1;
+        if let EntryBody::Commit { tx: ctx, checksum } = entry.body {
+            if !rest.is_empty() {
+                return Err("bytes after the Commit".to_owned());
+            }
+            if ctx.0 != tx {
+                return Err(format!("its Commit says tx#{}", ctx.0));
+            }
+            // Covered: every byte of the body except the Commit's own
+            // checksum field, its last 4 bytes (a parsed Commit frame is
+            // 25 bytes, so the body is at least that long).
+            if crc32fast::hash(&body[..body.len() - 4]) != checksum {
+                return Err("Commit checksum mismatch".to_owned());
+            }
+            entries.push(entry);
+            return Ok(entries);
+        }
+        entries.push(entry);
+    }
 }
 
 /// A bounds-checked reader over one payload. Every read fails rather than
@@ -462,6 +499,13 @@ fn parse_payload(payload: &[u8]) -> Result<LogEntry, String> {
                 b => return Err(format!("unknown cardinality {b}")),
             };
             let indexed = c.flag()?;
+            let direction = match c.u8()? {
+                0 => None,
+                1 => Some(RefDirection::Directed),
+                2 => Some(RefDirection::Bidirectional),
+                b => return Err(format!("unknown direction {b}")),
+            };
+            let inverse = if c.flag()? { Some(c.string()?) } else { None };
             EntryBody::DefineAttr {
                 id,
                 def: AttrDef {
@@ -470,6 +514,8 @@ fn parse_payload(payload: &[u8]) -> Result<LogEntry, String> {
                     kind,
                     cardinality,
                     indexed,
+                    direction,
+                    inverse,
                 },
             }
         }
@@ -500,6 +546,18 @@ fn parse_payload(payload: &[u8]) -> Result<LogEntry, String> {
             tx: TxId(c.u64()?),
             checksum: c.u32()?,
         },
+        KIND_DEFINE_EDGE => {
+            let raw = c.u64()?;
+            let id = EntityId::from_bytes(raw.to_be_bytes())
+                .as_edge()
+                .ok_or_else(|| format!("edge id {raw:#018x} is not an edge ID"))?;
+            EntryBody::DefineEdge {
+                id,
+                source: EntityId::from_bytes(c.u64()?.to_be_bytes()),
+                attr: AttrId(c.u32()?),
+                target: EntityId::from_bytes(c.u64()?.to_be_bytes()),
+            }
+        }
         b => return Err(format!("unknown entry kind {b}")),
     };
     c.finish()?;
@@ -544,6 +602,12 @@ pub(crate) enum NewEntry<'a> {
         id: EntityId,
         handle: Option<&'a str>,
     },
+    Edge {
+        id: EdgeId,
+        source: EntityId,
+        attr: AttrId,
+        target: EntityId,
+    },
     Fact {
         entity: EntityId,
         attr: AttrId,
@@ -585,14 +649,17 @@ fn push_frame(
     Ok(())
 }
 
-/// Appends the frames of one transaction (its entries, then its `Commit`)
-/// to `buf`, numbering entries from `first_id`. Returns the next entry ID.
+/// Appends one transaction to `buf`: its begin record, then its body (its
+/// entries' frames, then its `Commit`), numbering entries from `first_id`.
+/// Returns the next entry ID.
 fn encode_txn<'a>(
     buf: &mut Vec<u8>,
     first_id: u64,
     tx: TxId,
     entries: impl IntoIterator<Item = NewEntry<'a>>,
 ) -> Result<u64, Error> {
+    let begin = buf.len();
+    buf.extend_from_slice(&[0; BEGIN_LEN]); // patched once the body is known
     let start = buf.len();
     let mut id = first_id;
     for entry in entries {
@@ -616,7 +683,21 @@ fn encode_txn<'a>(
                     Cardinality::Many => 1,
                 });
                 b.push(u8::from(def.indexed));
-                Ok(())
+                b.push(match def.direction {
+                    None => 0,
+                    Some(RefDirection::Directed) => 1,
+                    Some(RefDirection::Bidirectional) => 2,
+                });
+                match &def.inverse {
+                    Some(inverse) => {
+                        b.push(1);
+                        push_str(b, inverse)
+                    }
+                    None => {
+                        b.push(0);
+                        Ok(())
+                    }
+                }
             })?,
             NewEntry::Entity { id: e, handle } => push_frame(buf, KIND_DEFINE_ENTITY, id, |b| {
                 b.extend_from_slice(&e.raw().to_le_bytes());
@@ -630,6 +711,18 @@ fn encode_txn<'a>(
                         Ok(())
                     }
                 }
+            })?,
+            NewEntry::Edge {
+                id: e,
+                source,
+                attr,
+                target,
+            } => push_frame(buf, KIND_DEFINE_EDGE, id, |b| {
+                b.extend_from_slice(&e.raw().to_le_bytes());
+                b.extend_from_slice(&source.raw().to_le_bytes());
+                b.extend_from_slice(&attr.0.to_le_bytes());
+                b.extend_from_slice(&target.raw().to_le_bytes());
+                Ok(())
             })?,
             NewEntry::Fact {
                 entity,
@@ -659,6 +752,17 @@ fn encode_txn<'a>(
     let end = buf.len();
     let checksum = crc32fast::hash(&buf[start..end - 4]);
     buf[end - 4..].copy_from_slice(&checksum.to_le_bytes());
+
+    // `end - start` is the length of an in-memory buffer, so it fits a u64.
+    let body_len = (end - start) as u64;
+    let body_crc = crc32fast::hash(&buf[start..end]);
+    let rec = &mut buf[begin..start];
+    rec[0] = BEGIN_TAG;
+    rec[1..9].copy_from_slice(&tx.0.to_le_bytes());
+    rec[9..17].copy_from_slice(&body_len.to_le_bytes());
+    rec[17..21].copy_from_slice(&body_crc.to_le_bytes());
+    let begin_crc = crc32fast::hash(&rec[..BEGIN_COVERED]);
+    rec[BEGIN_COVERED..].copy_from_slice(&begin_crc.to_le_bytes());
     Ok(id + 1)
 }
 
@@ -720,15 +824,16 @@ impl LogWriter {
     ///
     /// Fails as [`read_log`] does, or with `replay`'s error. Only once both
     /// succeeded is a torn tail (bytes past the last committed transaction,
-    /// see `scan`) cut off, so the next append lands right after the last
-    /// commit. The cut bytes are first saved, durably, to a quarantine file
-    /// (see [`quarantine`]); if that fails, the open fails with
-    /// [`Error::Io`] and the log is not cut. On any error the log is
+    /// see the module docs) cut off, so the next append lands right after
+    /// the last commit. The cut bytes are first saved, durably, to a
+    /// quarantine file (see [`quarantine`]); if that fails, the open fails
+    /// with [`Error::Io`] and the log is not cut. On any error the log is
     /// untouched. A clean log is never modified, so opening is idempotent.
+    /// The returned [`RecoveryReport`] says what was cut and where it went.
     pub(crate) fn open<T>(
         path: &Path,
         replay: impl FnOnce(&[LogEntry]) -> Result<T, Error>,
-    ) -> Result<(T, LogWriter), Error> {
+    ) -> Result<(T, LogWriter, RecoveryReport), Error> {
         // One handle for reading, cutting and appending, so the bytes
         // replayed are the bytes appended after. `append` without `create`
         // never creates the file.
@@ -738,16 +843,19 @@ impl LogWriter {
         file.read_to_end(&mut bytes)?;
         let Scan { entries, valid_len } = scan(&bytes)?;
         let replayed = replay(&entries)?;
+        let mut report = RecoveryReport::default();
         if valid_len != bytes.len() {
             // Keep the cut bytes before cutting: if the tail was misjudged
             // torn, nothing committed is lost for good.
-            quarantine(path, valid_len, &bytes[valid_len..])?;
+            let tail = &bytes[valid_len..];
+            report.quarantine = Some(quarantine(path, valid_len, tail)?);
             // `valid_len <= bytes.len()`, a `usize` that came from an
             // in-memory buffer, so it fits a `u64`. The size change is
             // metadata: `sync_all` makes it durable. Appends (O_APPEND) then
             // start at the new end.
             file.set_len(valid_len as u64)?;
             file.sync_all()?;
+            report.bytes_cut = tail.len() as u64;
         }
         let next_entry = entries.last().map_or(1, |e| e.id.0 + 1);
         Ok((
@@ -757,6 +865,7 @@ impl LogWriter {
                 next_entry,
                 failed: None,
             },
+            report,
         ))
     }
 
@@ -768,8 +877,8 @@ impl LogWriter {
         }
     }
 
-    /// Appends one transaction (its entries, then a `Commit` for `tx`) with
-    /// a single write, then fsyncs. Returns only once the transaction is
+    /// Appends one transaction (its begin record, its entries, then a
+    /// `Commit` for `tx`) with a single write, then fsyncs. Returns only once the transaction is
     /// durable; on failure the writer is marked failed (the file may now
     /// end in a torn transaction).
     pub(crate) fn append<'a>(
@@ -818,8 +927,9 @@ fn lock(file: &File) -> Result<(), Error> {
 /// `<path>.torn-<valid_len>`, or `<path>.torn-<valid_len>-1`, `-2`, ... if
 /// that exists (an earlier quarantine is never overwritten). The file and
 /// its directory entry are fsynced before this returns, so the log may be
-/// cut afterwards. On failure the new file is removed (best effort).
-fn quarantine(path: &Path, valid_len: usize, tail: &[u8]) -> Result<(), Error> {
+/// cut afterwards. Returns the new file's path. On failure the new file is
+/// removed (best effort).
+fn quarantine(path: &Path, valid_len: usize, tail: &[u8]) -> Result<PathBuf, Error> {
     let base = {
         let mut s = OsString::from(path.as_os_str());
         s.push(format!(".torn-{valid_len}"));
@@ -857,7 +967,7 @@ fn quarantine(path: &Path, valid_len: usize, tail: &[u8]) -> Result<(), Error> {
         let _ = std::fs::remove_file(&qpath);
         return Err(e);
     }
-    Ok(())
+    Ok(qpath)
 }
 
 /// Fsyncs the directory holding `path`, so a newly created file's directory

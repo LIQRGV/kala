@@ -1,10 +1,11 @@
 //! Item 17: security regressions (H1 mid-log damage must never silently cut
-//! committed transactions; H2 exclusive lock on the log file).
+//! committed transactions; H2 exclusive lock on the log file), re-expressed
+//! for log format v2 (docs/slice-2-decisions.md, Item 1).
 //!
-//! Contract: "Security fixes (item 17)".
-//! - H1(a): when `open` finds bytes past the valid prefix, a Commit-shaped
-//!   frame NEWER than the torn txn's would-be tx anywhere in the tail ->
-//!   `Err(Error::Corrupt(_))`, file untouched; `read_log` -> `Err(Corrupt)`.
+//! - H1(a) is REMOVED in v2 (the Commit-shaped-tail heuristic): exact framing
+//!   replaces it. Damage to bytes that are all present (begin record or body of
+//!   ANY txn, the last included) -> `Err(Error::Corrupt(_))`, file untouched;
+//!   only a cut-short last txn (<25 bytes, body_len past EOF, zero tail) is cut.
 //! - H1(b): before cutting a torn tail, `open` writes the cut bytes to
 //!   `<path>.torn-<valid_len>` (`-1`, `-2`, ... if it exists), then cuts.
 //! - H2: `World::create` / `World::open` hold an exclusive lock for the
@@ -13,10 +14,12 @@
 
 use kala_core::log::read_log;
 use kala_core::*;
+mod common;
+
 use proptest::prelude::*;
 use std::path::{Path, PathBuf};
 
-const HEADER_LEN: usize = 12;
+use common::HEADER_LEN;
 
 fn schema() -> Schema {
     Schema::new().node_type("CHARACTER").attribute(AttrDef::new(
@@ -44,30 +47,23 @@ fn build() -> (tempfile::TempDir, PathBuf) {
     (dir, path)
 }
 
-/// Frame spans `(start, end, kind)` of a well-formed log.
-fn frames(bytes: &[u8]) -> Vec<(usize, usize, u8)> {
-    let mut out = Vec::new();
-    let mut at = HEADER_LEN;
-    while at < bytes.len() {
-        let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-        out.push((at, at + 4 + len, bytes[at + 4]));
-        at += 4 + len;
-    }
-    out
-}
-
-/// Frame spans grouped per committed transaction (index 0 = genesis).
+/// Spans grouped per committed transaction (index 0 = genesis). Element 0 of
+/// each group is the 25-byte begin record `(start, start + 25)`; the rest are
+/// the body's frames. So `group[0].0` is the txn's start offset and
+/// `group[1].0` the offset of its first frame.
 fn txns(bytes: &[u8]) -> Vec<Vec<(usize, usize)>> {
-    let mut out = Vec::new();
-    let mut cur = Vec::new();
-    for (s, e, kind) in frames(bytes) {
-        cur.push((s, e));
-        if kind == 5 {
-            out.push(std::mem::take(&mut cur));
-        }
-    }
-    assert!(cur.is_empty());
-    out
+    common::spans(bytes)
+        .into_iter()
+        .map(|s| {
+            let mut g = vec![(s.start, s.body_start)];
+            g.extend(
+                common::frame_spans(bytes, s)
+                    .into_iter()
+                    .map(|(a, b, _)| (a, b)),
+            );
+            g
+        })
+        .collect()
 }
 
 fn open_err(path: &Path) -> Error {
@@ -139,9 +135,15 @@ fn set_len(bytes: &mut [u8], at: usize, v: u32) {
 
 // ---------- T1: length-field damage in a non-last transaction ----------
 
+/// `target` 0 = the begin record (-> begin_crc mismatch), 1 = the length field
+/// of the txn's first frame (-> body_crc mismatch). Both are `Corrupt`.
 fn length_damage(tx_index: usize, mode: &str) {
+    length_damage_at(tx_index, mode, 1);
+}
+
+fn length_damage_at(tx_index: usize, mode: &str, target: usize) {
     let (_d, path) = build();
-    let start = txns(&std::fs::read(&path).unwrap())[tx_index][0].0;
+    let start = txns(&std::fs::read(&path).unwrap())[tx_index][target].0;
     assert_damage_refused(&path, |b| match mode {
         "plus256" => b[start + 1] ^= 1,
         "max" => set_len(b, start, u32::MAX),
@@ -183,6 +185,25 @@ fn t1_tx2_length_minus_1_is_corrupt() {
     length_damage(2, "minus1");
 }
 
+#[test]
+fn t1_begin_record_damage_in_a_non_last_txn_is_corrupt() {
+    for tx in [1usize, 2] {
+        for mode in ["plus256", "max", "minus1"] {
+            length_damage_at(tx, mode, 0);
+        }
+    }
+}
+
+#[test]
+fn t1_length_damage_in_the_last_txn_is_corrupt_too() {
+    // v2 (M1): the last txn is no different from the others when all of its
+    // bytes are present.
+    for mode in ["plus256", "minus1"] {
+        length_damage(3, mode);
+        length_damage_at(3, mode, 0);
+    }
+}
+
 // ---------- T2: random bit flip in any non-last committed txn ----------
 
 proptest! {
@@ -202,64 +223,56 @@ proptest! {
         let mut bytes = orig.clone();
         bytes[off] ^= 1 << bit;
         std::fs::write(&path, &bytes).unwrap();
+        // v2: every single-bit flip in a non-last txn is caught by begin_crc or
+        // body_crc, so open must refuse with Corrupt and leave the file alone.
         match World::open(&path) {
             Ok(w) => {
-                prop_assert_eq!(w.latest_tx(), TxId(3), "silently lost committed txns (offset {})", off);
+                prop_assert!(false, "open succeeded with damage at offset {} (latest_tx {:?})", off, w.latest_tx());
             }
             Err(e) => {
                 prop_assert!(is_corrupt(&e), "expected Corrupt, got {:?} (offset {})", e, off);
-                prop_assert_eq!(std::fs::read(&path).unwrap(), bytes, "file modified (offset {})", off);
             }
         }
-        // Whatever open did, a refusal must not have cut anything.
-        if let Ok(w) = World::open(&path) { drop(w); }
+        prop_assert_eq!(std::fs::read(&path).unwrap(), bytes, "file modified (offset {})", off);
+        prop_assert!(quarantine_files(&path).is_empty());
     }
 }
 
 // ---------- T3: torn tail is cut, and the cut bytes are quarantined ----------
 
+// Rewritten from slice 1 (`t3_damaged_last_txn_payload_cuts_to_previous_tx_and_quarantines`):
+// slice-1 finding M1. Damage inside the last committed txn, with every byte
+// present, is not a torn write: Corrupt, nothing cut, nothing quarantined.
 #[test]
-fn t3_damaged_last_txn_payload_cuts_to_previous_tx_and_quarantines() {
-    let (_d, path) = build();
-    let orig = std::fs::read(&path).unwrap();
-    let t = txns(&orig);
-    let last = t.last().unwrap();
-    let valid_len = last[0].0;
-    let mut bytes = orig.clone();
-    bytes[valid_len + 4 + 2] ^= 0xFF; // inside the first frame's payload
-    std::fs::write(&path, &bytes).unwrap();
-
-    let w = match World::open(&path) {
-        Ok(w) => w,
-        Err(e) => panic!("torn last txn must open: {e:?}"),
-    };
-    assert_eq!(w.latest_tx(), TxId(2));
-    drop(w);
-    assert_eq!(std::fs::read(&path).unwrap(), &bytes[..valid_len]);
-    let q = quarantine_files(&path);
-    assert_eq!(q, vec![qpath(&path, &format!(".torn-{valid_len}"))]);
-    assert_eq!(std::fs::read(&q[0]).unwrap(), &bytes[valid_len..]);
-}
-
-#[test]
-fn t3_damaged_last_commit_checksum_cuts_and_quarantines() {
+fn t3_damaged_last_txn_payload_is_corrupt_not_cut() {
     let (_d, path) = build();
     let orig = std::fs::read(&path).unwrap();
     let last = txns(&orig).pop().unwrap();
-    let valid_len = last[0].0;
+    for at in [last[1].0 + 4 + 2, last[1].0, last[0].0 + 3] {
+        let mut bytes = orig.clone();
+        bytes[at] ^= 0xFF; // payload byte, frame length byte, begin record byte
+        std::fs::write(&path, &bytes).unwrap();
+        let e = open_err(&path);
+        assert!(is_corrupt(&e), "offset {at}: expected Corrupt, got {e:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "offset {at}");
+        assert!(quarantine_files(&path).is_empty(), "offset {at}");
+    }
+}
+
+// Rewritten from slice 1 (`t3_damaged_last_commit_checksum_cuts_and_quarantines`): same reason (M1).
+#[test]
+fn t3_damaged_last_commit_checksum_is_corrupt_not_cut() {
+    let (_d, path) = build();
+    let orig = std::fs::read(&path).unwrap();
     let mut bytes = orig.clone();
     *bytes.last_mut().unwrap() ^= 0x01; // checksum byte of the final Commit
     std::fs::write(&path, &bytes).unwrap();
-    let w = match World::open(&path) {
-        Ok(w) => w,
-        Err(e) => panic!("{e:?}"),
-    };
-    assert_eq!(w.latest_tx(), TxId(2));
-    drop(w);
-    assert_eq!(std::fs::read(&path).unwrap(), &bytes[..valid_len]);
-    let q = quarantine_files(&path);
-    assert_eq!(q, vec![qpath(&path, &format!(".torn-{valid_len}"))]);
-    assert_eq!(std::fs::read(&q[0]).unwrap(), &bytes[valid_len..]);
+    let e = open_err(&path);
+    assert!(is_corrupt(&e), "expected Corrupt, got {e:?}");
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert!(quarantine_files(&path).is_empty());
+    let e = read_log(&path).expect_err("read_log must refuse too");
+    assert!(is_corrupt(&e), "{e:?}");
 }
 
 #[test]
@@ -477,13 +490,12 @@ fn quarantine_failure_fails_open_with_io_and_leaves_log_untouched() {
     assert!(quarantine_files(&path).is_empty());
 }
 
-/// The documented false refusal, at byte level: a torn tail whose bytes
-/// happen to hold a Commit-shaped frame for tx torn_tx + 1 with an in-range
-/// entry ID is refused (fails safe), nothing cut. (A string value can't carry
-/// this shape: the value encoding escapes NUL bytes, and the shape needs
-/// `21 0 0 0`; so the pattern is planted directly in the tail.)
+// Rewritten from slice 1 (`torn_tail_with_commit_shaped_bytes_for_next_tx_is_refused_not_cut`):
+// the H1(a) heuristic is gone. A tail of >= 25 bytes that is not a valid begin
+// record (begin_crc mismatch, not all zero) is refused as damage, whatever it
+// contains; nothing is cut.
 #[test]
-fn torn_tail_with_commit_shaped_bytes_for_next_tx_is_refused_not_cut() {
+fn tail_of_25_or_more_bytes_with_a_bad_begin_crc_is_corrupt_not_cut() {
     for (junk_before, entry_delta, tx) in [(3usize, 1u64, 5u64), (10, 2, 5), (0, 1, 5)] {
         let (_d, path) = build();
         let l = last_entry_id(&path);
@@ -497,30 +509,29 @@ fn torn_tail_with_commit_shaped_bytes_for_next_tx_is_refused_not_cut() {
         assert!(is_corrupt(&e), "expected Corrupt, got {e:?}");
         assert_eq!(std::fs::read(&path).unwrap(), bytes, "file modified");
         assert!(quarantine_files(&path).is_empty());
+        let e = read_log(&path).expect_err("read_log must refuse too");
+        assert!(is_corrupt(&e), "{e:?}");
     }
 }
 
-fn own_bad_commit_is_cut(entry_offset: u64, padding: usize) {
+// New in v2: the H1(a) false refusal is gone. A Commit-shaped frame that is
+// merely SHORT (< 25 bytes) is just a torn tail: cut and quarantined.
+#[test]
+fn commit_shaped_tail_shorter_than_a_begin_record_is_cut_not_refused() {
     let (_d, path) = build();
     let l = last_entry_id(&path);
-    // entry_offset 0 means the high edge: last entry + tail length.
-    let entry = if entry_offset == 0 {
-        l + (25 + padding) as u64
-    } else {
-        l + entry_offset
-    };
-    let mut tail = commit_frame(entry, 4);
-    tail.extend(std::iter::repeat_n(0u8, padding));
     let orig = std::fs::read(&path).unwrap();
+    let mut tail = commit_frame(l + 1, 4);
+    tail.truncate(common::BEGIN_LEN - 1);
     let mut bytes = orig.clone();
     bytes.extend_from_slice(&tail);
     std::fs::write(&path, &bytes).unwrap();
-
     let w = match World::open(&path) {
         Ok(w) => w,
-        Err(e) => panic!("own bad-checksum commit must be cut, got {e:?}"),
+        Err(e) => panic!("short tail must be cut, got {e:?}"),
     };
     assert_eq!(w.latest_tx(), TxId(3));
+    assert_eq!(w.recovery().bytes_cut, tail.len() as u64);
     drop(w);
     assert_eq!(std::fs::read(&path).unwrap(), orig);
     let q = quarantine_files(&path);
@@ -528,20 +539,35 @@ fn own_bad_commit_is_cut(entry_offset: u64, padding: usize) {
     assert_eq!(std::fs::read(&q[0]).unwrap(), tail);
 }
 
+// Replaces slice 1's `own_bad_commit_at_{low,high}_entry_edge_is_cut` and
+// `own_bad_commit_with_padding_at_both_entry_edges_is_cut` (they probed the
+// entry-ID window of the removed heuristic). v2 equivalent of "own torn txn is
+// cut": a VALID begin record (tx 4) whose body was cut short at every length.
 #[test]
-fn own_bad_commit_at_low_entry_edge_is_cut() {
-    own_bad_commit_is_cut(1, 0);
-}
-
-#[test]
-fn own_bad_commit_at_high_entry_edge_is_cut() {
-    own_bad_commit_is_cut(0, 0); // entry = last + tail_len (25)
-}
-
-#[test]
-fn own_bad_commit_with_padding_at_both_entry_edges_is_cut() {
-    own_bad_commit_is_cut(1, 25);
-    own_bad_commit_is_cut(0, 25); // entry = last + tail_len (50)
+fn own_txn_with_valid_begin_and_cut_short_body_is_cut_and_quarantined() {
+    let (_d, path) = build();
+    let l = last_entry_id(&path);
+    let orig = std::fs::read(&path).unwrap();
+    let body = common::commit_frame(&[], l + 1, 4);
+    let full = common::txn(4, &body);
+    for keep in 0..full.len() {
+        // keep == 0..25: begin itself cut; 25..: begin + partial body
+        let tail = &full[..keep];
+        let mut bytes = orig.clone();
+        bytes.extend_from_slice(tail);
+        std::fs::write(&path, &bytes).unwrap();
+        let w = match World::open(&path) {
+            Ok(w) => w,
+            Err(e) => panic!("keep={keep}: torn txn must be cut, got {e:?}"),
+        };
+        assert_eq!(w.latest_tx(), TxId(3), "keep={keep}");
+        assert_eq!(w.recovery().bytes_cut, keep as u64, "keep={keep}");
+        drop(w);
+        assert_eq!(std::fs::read(&path).unwrap(), orig, "keep={keep}");
+        for q in quarantine_files(&path) {
+            let _ = std::fs::remove_file(q);
+        }
+    }
 }
 
 #[test]
@@ -549,7 +575,8 @@ fn damage_inside_genesis_with_later_commits_is_corrupt() {
     let (_d, path) = build();
     let g = txns(&std::fs::read(&path).unwrap())[0].clone();
     // A payload byte of genesis's first frame.
-    assert_damage_refused(&path, |b| b[g[0].0 + 4 + 2] ^= 0xFF);
+    assert_damage_refused(&path, |b| b[g[1].0 + 4 + 2] ^= 0xFF);
+    assert_damage_refused(&path, |b| b[g[0].0 + 3] ^= 0xFF);
 }
 
 #[test]
@@ -561,12 +588,13 @@ fn damage_to_genesis_commit_checksum_with_later_commits_is_corrupt() {
 }
 
 #[test]
-fn tail_shorter_than_a_commit_frame_is_cut_and_quarantined() {
+fn tail_shorter_than_a_begin_record_is_cut_and_quarantined() {
     for n in [1usize, 4, 12, 24] {
         let (_d, path) = build();
         let orig = std::fs::read(&path).unwrap();
         let mut bytes = orig.clone();
         let tail: Vec<u8> = (0..n).map(|i| 0xA0u8.wrapping_add(i as u8)).collect();
+        assert!(n < common::BEGIN_LEN);
         bytes.extend_from_slice(&tail);
         std::fs::write(&path, &bytes).unwrap();
         let w = match World::open(&path) {
@@ -587,7 +615,7 @@ fn second_open_after_a_cut_is_clean_and_makes_no_new_quarantine() {
     let (_d, path) = build();
     let orig = std::fs::read(&path).unwrap();
     let mut bytes = orig.clone();
-    bytes.extend_from_slice(&[0x77; 40]);
+    bytes.extend_from_slice(&[0x77; 24]); // < 25 bytes: torn, not damage
     std::fs::write(&path, &bytes).unwrap();
     drop(World::open(&path).map_err(|e| panic!("{e:?}")).ok());
     let q1 = quarantine_files(&path);

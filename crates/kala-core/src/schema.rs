@@ -26,6 +26,16 @@ pub enum Cardinality {
     Many,
 }
 
+/// Which way a `ref` attribute reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RefDirection {
+    /// One-sided: `Mara trusts Edwin` says nothing about `Edwin trusts Mara`.
+    Directed,
+    /// Genuinely mutual (`ally_of`, `married_to`): `Edwin ally_of Mara`
+    /// means `Mara ally_of Edwin`. Declared, never inferred from writes.
+    Bidirectional,
+}
+
 /// One attribute declaration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttrDef {
@@ -40,10 +50,20 @@ pub struct AttrDef {
     /// Whether values get `V` index entries. Indexed strings are limited to
     /// [`MAX_INDEXED_STRING_BYTES`](crate::value::MAX_INDEXED_STRING_BYTES).
     pub indexed: bool,
+    /// Direction of a `ref` attribute; `None` for every other value type.
+    /// A `ref` attribute must have one and a non-ref attribute must not
+    /// (checked when the schema is given to a world).
+    pub direction: Option<RefDirection>,
+    /// Name the reverse side of a directed `ref` attribute reads under
+    /// (`parent_of` -> `child_of`). It shares the attribute namespace for
+    /// duplicate checks but isn't an attribute: only `neighbors` accepts it.
+    pub inverse: Option<String>,
 }
 
 impl AttrDef {
-    /// An indexed attribute declaration.
+    /// An indexed attribute declaration. A `ref` attribute starts
+    /// [`Directed`](RefDirection::Directed), any other has no direction;
+    /// neither has an inverse.
     pub fn new(name: &str, value_type: ValueType, kind: Kind, cardinality: Cardinality) -> AttrDef {
         AttrDef {
             name: name.to_owned(),
@@ -51,7 +71,28 @@ impl AttrDef {
             kind,
             cardinality,
             indexed: true,
+            direction: (value_type == ValueType::Ref).then_some(RefDirection::Directed),
+            inverse: None,
         }
+    }
+
+    /// Marks a `ref` attribute as directed (the default for `ref`).
+    pub fn directed(mut self) -> AttrDef {
+        self.direction = Some(RefDirection::Directed);
+        self
+    }
+
+    /// Marks a `ref` attribute as bidirectional (mutual).
+    pub fn bidirectional(mut self) -> AttrDef {
+        self.direction = Some(RefDirection::Bidirectional);
+        self
+    }
+
+    /// Names the reverse side of a directed `ref` attribute
+    /// (`parent_of` with inverse `child_of`).
+    pub fn inverse(mut self, name: &str) -> AttrDef {
+        self.inverse = Some(name.to_owned());
+        self
     }
 
     /// Marks the attribute as not indexed: its values have no length limit

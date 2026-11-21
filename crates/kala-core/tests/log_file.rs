@@ -8,7 +8,7 @@
 //! - `Error::Io { kind: std::io::ErrorKind, message: String }`.
 //! - `kala_core::log::{read_log, LogEntry, EntryBody, EntryId, LOG_MAGIC,
 //!   LOG_FORMAT_VERSION}`; `read_log(path: &Path) -> Result<Vec<LogEntry>, Error>`;
-//!   `LOG_MAGIC: [u8; 8] = *b"KALALOG\0"`, `LOG_FORMAT_VERSION: u32 = 1`;
+//!   `LOG_MAGIC: [u8; 8] = *b"KALALOG\0"`, `LOG_FORMAT_VERSION: u32 = 2`;
 //!   `EntryId(pub u64)`; `LogEntry { pub id: EntryId, pub body: EntryBody }`
 //!   (Debug, Clone, PartialEq); `EntryBody::{DefineNodeType{id: NodeTypeId, name: String},
 //!   DefineAttr{id: AttrId, def: AttrDef}, DefineEntity{id: EntityId, handle: Option<String>},
@@ -126,8 +126,8 @@ fn header_is_magic_then_version_little_endian() {
     assert!(b.len() >= 12);
     assert_eq!(&b[..8], b"KALALOG\0");
     assert_eq!(LOG_MAGIC, *b"KALALOG\0");
-    assert_eq!(LOG_FORMAT_VERSION, 1);
-    assert_eq!(&b[8..12], &1u32.to_le_bytes());
+    assert_eq!(LOG_FORMAT_VERSION, 2);
+    assert_eq!(&b[8..12], &2u32.to_le_bytes());
 }
 
 #[test]
@@ -293,12 +293,17 @@ fn txn_defines_come_before_facts_and_end_in_one_commit_with_the_txns_tx() {
 
     let entries = log(&f.path);
     let new = &entries[before..];
-    assert_eq!(new.len(), 5, "{new:?}");
+    // the ref assert also interns an edge (slice 2, item 3)
+    assert_eq!(new.len(), 6, "{new:?}");
     assert!(matches!(new[0].body, EntryBody::DefineEntity { id, .. } if id == greg));
     assert!(matches!(new[1].body, EntryBody::DefineEntity { id, .. } if id == varrow));
-    assert!(matches!(new[2].body, EntryBody::Fact { .. }));
+    assert!(
+        matches!(new[2].body, EntryBody::DefineEdge { source, target, .. }
+        if source == greg && target == varrow)
+    );
     assert!(matches!(new[3].body, EntryBody::Fact { .. }));
-    assert!(matches!(new[4].body, EntryBody::Commit { tx, .. } if tx == res.tx));
+    assert!(matches!(new[4].body, EntryBody::Fact { .. }));
+    assert!(matches!(new[5].body, EntryBody::Commit { tx, .. } if tx == res.tx));
     let n_commits = new
         .iter()
         .filter(|e| matches!(e.body, EntryBody::Commit { .. }))

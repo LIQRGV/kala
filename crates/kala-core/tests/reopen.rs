@@ -4,6 +4,8 @@
 //!
 //! Torn-tail recovery (item 15) is not tested here.
 
+mod common;
+
 use kala_core::log::{EntryBody, LOG_FORMAT_VERSION, LOG_MAGIC, read_log};
 use kala_core::*;
 use std::path::{Path, PathBuf};
@@ -438,9 +440,9 @@ fn wrong_magic_is_bad_magic() {
 fn unknown_version_is_unsupported_version() {
     let b = built();
     let mut d = bytes(&b.path);
-    d[8..12].copy_from_slice(&2u32.to_le_bytes());
+    d[8..12].copy_from_slice(&3u32.to_le_bytes());
     std::fs::write(&b.path, &d).unwrap();
-    assert_eq!(open_err(&b.path), Error::UnsupportedVersion(2));
+    assert_eq!(open_err(&b.path), Error::UnsupportedVersion(3));
     assert_eq!(bytes(&b.path), d);
 }
 
@@ -503,10 +505,12 @@ fn append_fact_txn(path: &Path, entity: u64, attr: u32, value: &Value) {
     h.update(&commit);
     commit.extend_from_slice(&h.finalize().to_le_bytes());
 
+    // v2: the txn is framed by a begin record (not part of the Commit checksum).
+    let mut body = fact;
+    body.extend_from_slice(&commit);
     let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
     use std::io::Write;
-    f.write_all(&fact).unwrap();
-    f.write_all(&commit).unwrap();
+    f.write_all(&common::txn(last_tx + 1, &body)).unwrap();
 }
 
 fn attr_id(path: &Path, name: &str) -> u32 {
@@ -617,7 +621,8 @@ fn body_define_attr(id: u32, name: &str) -> (u8, Vec<u8>) {
     let mut b = id.to_le_bytes().to_vec();
     b.extend_from_slice(&(name.len() as u32).to_le_bytes());
     b.extend_from_slice(name.as_bytes());
-    b.extend_from_slice(&[2, 0, 1, 1]); // i64, state, many, indexed
+    // i64, state, many, indexed, then v2: direction none, no inverse
+    b.extend_from_slice(&[2, 0, 1, 1, 0, 0]);
     (2, b)
 }
 
@@ -646,7 +651,7 @@ fn append_txn(path: &Path, entries: &[(u8, Vec<u8>)]) {
     out.extend(commit);
     let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
     use std::io::Write;
-    f.write_all(&out).unwrap();
+    f.write_all(&common::txn(tx, &out)).unwrap();
 }
 
 fn assert_corrupt_untouched(b: &Built, entries: &[(u8, Vec<u8>)]) {
@@ -742,7 +747,8 @@ fn define_entity_with_edge_tag_bit_is_corrupt() {
 fn fact_on_edge_tagged_subject_is_corrupt() {
     let b = built();
     let age = attr_id(&b.path, "age");
-    let edge = b.ents.greg.raw() | (1 << 63);
+    // edge#1 is defined by the fixture; edge#999 is not
+    let edge = 999u64 | (1 << 63);
     let v = Value::I64(1).encode().unwrap();
     assert_corrupt_untouched(&b, &[body_fact(edge, age, 999, false, &v)]);
 }

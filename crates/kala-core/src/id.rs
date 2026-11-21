@@ -11,6 +11,12 @@
 //!
 //! Stored big-endian, so all IDs of one type share a two-byte key prefix and
 //! "all characters" is a prefix scan.
+//!
+//! An [`EdgeId`] shares the same `u64` space with bit 63 set and bits 0..=62
+//! holding its own sequence number (from 1), so edge and entity IDs never
+//! collide and an edge can stand wherever an entity ID can (the subject of
+//! an edge property, a `ref` value): [`EntityId::from`] converts it with the
+//! same bits, [`EntityId::as_edge`] converts back.
 
 use std::fmt;
 
@@ -20,11 +26,17 @@ const SEQ_BITS: u32 = 48;
 const TYPE_BITS: u32 = 15;
 const SEQ_MASK: u64 = (1 << SEQ_BITS) - 1;
 const TYPE_MASK: u64 = (1 << TYPE_BITS) - 1;
+/// Bit 63: set for edge IDs, clear for entity IDs.
+const EDGE_TAG: u64 = 1 << 63;
+/// The edge sequence bits (0..=62).
+const EDGE_SEQ_MASK: u64 = EDGE_TAG - 1;
 
 /// Largest valid node type ID (`2^15 - 1`).
 pub const MAX_NODE_TYPE: u16 = (1 << TYPE_BITS) - 1;
 /// Largest valid per-type sequence number (`2^48 - 1`).
 pub const MAX_SEQ: u64 = SEQ_MASK;
+/// Largest valid edge sequence number (`2^63 - 1`).
+pub const MAX_EDGE_SEQ: u64 = EDGE_SEQ_MASK;
 
 /// A node type ID (`CHARACTER`, `PLACE`, ...), assigned by the schema.
 ///
@@ -42,7 +54,8 @@ pub struct AttrId(pub u32);
 pub enum IdError {
     /// The node type ID doesn't fit in 15 bits.
     NodeTypeOutOfRange(u16),
-    /// The sequence number is `0` (sequences start at 1) or doesn't fit in 48 bits.
+    /// The sequence number is `0` (sequences start at 1) or doesn't fit in
+    /// its bits (48 for an entity, 63 for an edge).
     SeqOutOfRange(u64),
 }
 
@@ -53,7 +66,11 @@ impl fmt::Display for IdError {
                 write!(f, "node type ID {t} is out of range (max {MAX_NODE_TYPE})")
             }
             IdError::SeqOutOfRange(s) => {
-                write!(f, "sequence number {s} is out of range (1..={MAX_SEQ})")
+                write!(
+                    f,
+                    "sequence number {s} is out of range \
+                     (entities 1..={MAX_SEQ}, edges 1..={MAX_EDGE_SEQ})"
+                )
             }
         }
     }
@@ -116,6 +133,73 @@ impl EntityId {
     #[inline]
     pub fn to_bytes(self) -> [u8; 8] {
         self.0.to_be_bytes()
+    }
+
+    /// Whether the edge tag (bit 63) is set. A tagged ID with sequence `0`
+    /// is tagged but not a valid edge ([`EntityId::as_edge`] is `None`).
+    #[inline]
+    pub fn is_edge(self) -> bool {
+        self.0 & EDGE_TAG != 0
+    }
+
+    /// The edge this ID names: `Some` iff the edge tag is set and the edge
+    /// sequence (bits 0..=62) isn't `0`. Says nothing about whether the
+    /// edge is defined in a world.
+    #[inline]
+    pub fn as_edge(self) -> Option<EdgeId> {
+        (self.is_edge() && self.0 & EDGE_SEQ_MASK != 0).then_some(EdgeId(self.0))
+    }
+}
+
+/// An edge ID: the identity of one `(source, attribute, target)` triple,
+/// interned when the triple is first asserted. Bit 63 is set and bits
+/// 0..=62 are the edge's sequence number, starting at 1, counted across the
+/// whole world (not per attribute).
+///
+/// Ordering (and byte order) follows the sequence. Every edge ID sorts after
+/// every entity ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EdgeId(u64);
+
+impl EdgeId {
+    /// Builds the edge ID with sequence number `seq`.
+    ///
+    /// Fails with [`IdError::SeqOutOfRange`] if `seq` is `0` or above
+    /// [`MAX_EDGE_SEQ`].
+    #[inline]
+    pub fn new(seq: u64) -> Result<EdgeId, IdError> {
+        if seq == 0 || seq > MAX_EDGE_SEQ {
+            return Err(IdError::SeqOutOfRange(seq));
+        }
+        Ok(EdgeId(EDGE_TAG | seq))
+    }
+
+    /// The edge's sequence number (`edge#9` has seq 9).
+    #[inline]
+    pub fn seq(self) -> u64 {
+        self.0 & EDGE_SEQ_MASK
+    }
+
+    /// The raw `u64`, bit 63 set.
+    #[inline]
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// The 8-byte big-endian key form (the same bytes as the [`EntityId`]
+    /// it converts to).
+    #[inline]
+    pub fn to_bytes(self) -> [u8; 8] {
+        self.0.to_be_bytes()
+    }
+}
+
+impl From<EdgeId> for EntityId {
+    /// The same bits as an [`EntityId`], so an edge can be a fact's subject
+    /// or a `ref` value.
+    #[inline]
+    fn from(e: EdgeId) -> EntityId {
+        EntityId(e.0)
     }
 }
 
