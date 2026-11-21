@@ -1,0 +1,12 @@
+# Rust build output
+/target/
+
+# Claude: local agents, skills and state stay out of the repo
+/.claude/
+/.mcp.json
+
+# Codex: local agents, memory and joint-run logs stay out, like .claude/
+/.codex/
+/.agents/
+
+CLAUDE.md
