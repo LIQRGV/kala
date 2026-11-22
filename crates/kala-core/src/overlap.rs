@@ -172,30 +172,87 @@ pub fn value_intervals(changes: &[Change]) -> Vec<(Value, Vec<Interval>)> {
 /// ones merged, as [`value_intervals`] returns them. Rows come sorted by
 /// `(a, b, during.from)`.
 pub fn find_overlaps(per_value: &[(Value, Vec<Interval>)]) -> Vec<(Value, Value, Interval)> {
-    // Sort key as in `value_intervals`: the encoding, NaN (unencodable) first.
+    let sorted = by_encoding(per_value);
+    let mut out = Vec::new();
+    for (i, (_, a)) in sorted.iter().enumerate() {
+        for (_, b) in &sorted[i + 1..] {
+            sweep(a, b, &mut out);
+        }
+    }
+    out
+}
+
+/// The rows of [`find_overlaps`] in which `a` or `b` is one of the
+/// `touched` values (their encodings, ascending and deduplicated), in the
+/// same order. Write warnings use it: a commit only changes the intervals
+/// of the values it touched, so every other row is the same before and
+/// after it. Cost: one sweep per pair with a touched value, i.e.
+/// proportional to `values × touched`, not `values²`.
+pub(crate) fn find_overlaps_touching(
+    per_value: &[(Value, Vec<Interval>)],
+    touched: &[Vec<u8>],
+) -> Vec<(Value, Value, Interval)> {
+    let sorted = by_encoding(per_value);
+    let is_touched: Vec<bool> = sorted
+        .iter()
+        .map(|(key, _)| {
+            key.as_ref()
+                .is_some_and(|k| touched.binary_search(k).is_ok())
+        })
+        .collect();
+    // Positions (ascending) of the touched values among `sorted`.
+    let positions: Vec<usize> = (0..sorted.len()).filter(|&i| is_touched[i]).collect();
+    let mut out = Vec::new();
+    for (i, (_, a)) in sorted.iter().enumerate() {
+        if is_touched[i] {
+            // A touched `a`: against every later value.
+            for (_, b) in &sorted[i + 1..] {
+                sweep(a, b, &mut out);
+            }
+        } else {
+            // An untouched `a`: only against the touched values after it.
+            let from = positions.partition_point(|&j| j <= i);
+            for &j in &positions[from..] {
+                sweep(a, sorted[j].1, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// One value's intervals, as [`value_intervals`] lists them.
+type ValueIntervals = (Value, Vec<Interval>);
+
+/// `per_value` sorted by value encoding as in [`value_intervals`] (NaN, which
+/// doesn't encode, first), each with its encoding.
+fn by_encoding(per_value: &[ValueIntervals]) -> Vec<(Option<Vec<u8>>, &ValueIntervals)> {
     let mut sorted: Vec<_> = per_value
         .iter()
         .map(|pv| (pv.0.encode().ok(), pv))
         .collect();
     sorted.sort_by(|x, y| x.0.cmp(&y.0));
-    let mut out = Vec::new();
-    for (i, (_, (a, a_iv))) in sorted.iter().enumerate() {
-        for (_, (b, b_iv)) in &sorted[i + 1..] {
-            // A sweep over both ascending lists: advance whichever ends first.
-            let (mut x, mut y) = (0, 0);
-            while x < a_iv.len() && y < b_iv.len() {
-                if let Some(during) = a_iv[x].intersect(&b_iv[y]) {
-                    out.push((a.clone(), b.clone(), during));
-                }
-                if a_iv[x].ends_before(&b_iv[y]) {
-                    x += 1;
-                } else {
-                    y += 1;
-                }
-            }
+    sorted
+}
+
+/// Appends the overlaps of two values' interval lists as `(a, b, during)`,
+/// ascending by `during.from`: a sweep over both ascending lists that
+/// advances whichever interval ends first.
+fn sweep(
+    (a, a_iv): &(Value, Vec<Interval>),
+    (b, b_iv): &(Value, Vec<Interval>),
+    out: &mut Vec<(Value, Value, Interval)>,
+) {
+    let (mut x, mut y) = (0, 0);
+    while x < a_iv.len() && y < b_iv.len() {
+        if let Some(during) = a_iv[x].intersect(&b_iv[y]) {
+            out.push((a.clone(), b.clone(), during));
+        }
+        if a_iv[x].ends_before(&b_iv[y]) {
+            x += 1;
+        } else {
+            y += 1;
         }
     }
-    out
 }
 
 /// The overlap warnings a commit introduced and resolved, reported next to

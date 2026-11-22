@@ -772,6 +772,7 @@ fn fact(entity: u64, attr: u32, tick: i64, retract: bool, value: &Value) -> (u8,
     b.extend_from_slice(&attr.to_le_bytes());
     b.extend_from_slice(&tick.to_le_bytes());
     b.push(retract as u8);
+    b.push(0); // precision byte (v4): Exact
     b.extend_from_slice(&value.encode().unwrap());
     (4, b)
 }

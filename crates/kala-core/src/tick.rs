@@ -46,6 +46,58 @@ impl Tick {
     }
 }
 
+/// How precisely an author knows a fact's tick: vague time, v1 (CLAUDE.md
+/// "Vague time"). The store keeps exact ticks only; the precision is a
+/// payload next to the tick (`tick = start of -208, precision = year`) for
+/// display layers ("sometime in -208"). It is never part of an index key:
+/// queries treat the tick as exact, and the no-op and same-tick rules ignore
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum Precision {
+    /// The tick is exact (the default).
+    #[default]
+    Exact,
+    /// Known to the day.
+    Day,
+    /// Known to the month.
+    Month,
+    /// Known to the year.
+    Year,
+    /// Known to the decade.
+    Decade,
+    /// Known to the century.
+    Century,
+}
+
+impl Precision {
+    /// The log byte of the precision (0 exact .. 5 century; see
+    /// [`crate::log`]).
+    pub(crate) fn to_byte(self) -> u8 {
+        match self {
+            Precision::Exact => 0,
+            Precision::Day => 1,
+            Precision::Month => 2,
+            Precision::Year => 3,
+            Precision::Decade => 4,
+            Precision::Century => 5,
+        }
+    }
+
+    /// The precision of log byte `b`, or `None` for a byte no writer
+    /// produces (above 5).
+    pub(crate) fn from_byte(b: u8) -> Option<Precision> {
+        Some(match b {
+            0 => Precision::Exact,
+            1 => Precision::Day,
+            2 => Precision::Month,
+            3 => Precision::Year,
+            4 => Precision::Decade,
+            5 => Precision::Century,
+            _ => return None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::Tick;

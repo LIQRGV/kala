@@ -28,6 +28,9 @@ pub enum Error {
     InvalidDirection(String),
     /// The attribute name isn't declared in the schema.
     UnknownAttribute(String),
+    /// The attribute is declared `indexed: false`, so it has no `V`
+    /// entries and can't be looked up by value. Holds the attribute name.
+    NotIndexed(String),
     /// The attribute isn't a `ref` attribute, so it has no neighbors.
     /// Holds the attribute name as given.
     NotARef(String),
@@ -46,6 +49,20 @@ pub enum Error {
     /// The value can't be stored: NaN, or a string too long for an indexed
     /// attribute.
     Value(ValueError),
+    /// The value is too large for the log: an entry carrying it would be
+    /// longer than [`MAX_ENTRY_BYTES`](crate::log::MAX_ENTRY_BYTES), one
+    /// log frame. It is judged against the largest entry the value could
+    /// ever need, a `Revised` correction carrying it, so every accepted value
+    /// can later be deleted or replaced in place. Refused before anything is
+    /// written.
+    EntryTooLarge {
+        /// The attribute written.
+        attr: String,
+        /// The payload length of a `Revised` entry carrying the value.
+        len: usize,
+        /// The limit, [`MAX_ENTRY_BYTES`](crate::log::MAX_ENTRY_BYTES).
+        max: usize,
+    },
     /// A retract of an event attribute. Events are never retracted in
     /// story time; un-canon one with a correction instead.
     RetractEvent(String),
@@ -113,6 +130,13 @@ pub enum Error {
     /// lock. The lock is advisory, so it only keeps out other Kala worlds,
     /// not other programs writing the file.
     WorldLocked,
+    /// [`World::open`](crate::World::open) cut a *damaged* tail off the log
+    /// (a committed-looking last transaction whose checksum fails; see
+    /// [`CutCause::Damaged`](crate::CutCause::Damaged)), and nobody has
+    /// looked at it yet: the world reads normally but refuses every write
+    /// until [`World::acknowledge_recovery`](crate::World::acknowledge_recovery)
+    /// is called, so new writes don't silently land on top of lost canon.
+    RecoveryUnacknowledged,
 }
 
 impl fmt::Display for Error {
@@ -129,6 +153,12 @@ impl fmt::Display for Error {
                 write!(f, "attribute {a:?} has an invalid direction or inverse")
             }
             Error::UnknownAttribute(a) => write!(f, "unknown attribute {a:?}"),
+            Error::NotIndexed(a) => {
+                write!(
+                    f,
+                    "attribute {a:?} is not indexed, so it can't be looked up by value"
+                )
+            }
             Error::NotARef(a) => write!(f, "attribute {a:?} is not a ref attribute"),
             Error::UnknownEntity(e) => write!(f, "unknown entity {e:?}"),
             Error::WrongValueType {
@@ -140,6 +170,11 @@ impl fmt::Display for Error {
                 "attribute {attr:?} holds {expected:?} values, got a {got:?} value"
             ),
             Error::Value(e) => write!(f, "invalid value: {e}"),
+            Error::EntryTooLarge { attr, len, max } => write!(
+                f,
+                "a value of attribute {attr:?} needs a {len}-byte log entry, over the \
+                 {max}-byte limit"
+            ),
             Error::RetractEvent(a) => write!(
                 f,
                 "attribute {a:?} is an event and can't be retracted (use a correction)"
@@ -174,6 +209,10 @@ impl fmt::Display for Error {
             Error::UnsupportedVersion(v) => write!(f, "unsupported log format version {v}"),
             Error::Corrupt(why) => write!(f, "corrupt log: {why}"),
             Error::WorldLocked => f.write_str("world is open elsewhere (its log file is locked)"),
+            Error::RecoveryUnacknowledged => f.write_str(
+                "opening the log cut off a damaged transaction; acknowledge the recovery \
+                 (World::acknowledge_recovery) before writing",
+            ),
         }
     }
 }

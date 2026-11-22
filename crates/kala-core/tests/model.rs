@@ -79,7 +79,7 @@ use std::rc::Rc;
 /// broken generator can't make the property vacuous.
 mod stats {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-    pub const NAMES: [&str; 17] = [
+    pub const NAMES: [&str; 22] = [
         "correct delete",
         "correct op flip (same key)",
         "correct move (delete + revised)",
@@ -97,6 +97,11 @@ mod stats {
         "doctor/overlap forward bidirectional seen",
         "doctor edge-property finding seen",
         "read at an older canon with a deleted key",
+        "lookup found a non-ref value holder",
+        "lookup found a ref holder",
+        "lookup found an edge property holder",
+        "lookup_ci found a holder with a different spelling",
+        "lookup_ci/lookup found nothing for a stored value at another tick",
     ];
     pub const DELETE: usize = 0;
     pub const FLIP: usize = 1;
@@ -115,7 +120,12 @@ mod stats {
     pub const BIDI_OV: usize = 14;
     pub const EDGE_FINDING: usize = 15;
     pub const OLD_CANON_DELETED: usize = 16;
-    static COUNTS: [AtomicUsize; 17] = [const { AtomicUsize::new(0) }; 17];
+    pub const LOOKUP_VALUE: usize = 17;
+    pub const LOOKUP_REF: usize = 18;
+    pub const LOOKUP_EDGE: usize = 19;
+    pub const CI_SPELLING: usize = 20;
+    pub const LOOKUP_ABSENT: usize = 21;
+    static COUNTS: [AtomicUsize; 22] = [const { AtomicUsize::new(0) }; 22];
     pub fn bump(i: usize) {
         COUNTS[i].fetch_add(1, Relaxed);
     }
@@ -1619,6 +1629,7 @@ impl Sys {
         self.compare_graph(label, &canons);
         self.compare_overlaps(label, &canons);
         self.check_entries(label);
+        self.compare_lookups(label, &canons);
         if canons
             .iter()
             .any(|&c| m.facts.iter().any(|f| f.kind == FK::Deleted && f.tx > c))
@@ -2189,6 +2200,7 @@ impl Sys {
                 value: real_value,
                 tick: new_tick.map(Tick),
                 op: new_op.map(|b| if b { Op::Assert } else { Op::Retract }),
+                precision: None,
             }
         };
         let got = self.w().correct(entry, correction);
@@ -2323,6 +2335,251 @@ impl Sys {
                         .map(Self::conv_ov)
                         .collect();
                     assert_eq!(got, exp, "{label}: World::overlaps({})", a.name);
+                }
+            }
+        }
+    }
+
+    /// The real ID of a model entity or edge (edges are `(EDGE_T, seq)`).
+    fn real_any(&self, e: Ent) -> EntityId {
+        if e.0 == EDGE_T {
+            EntityId::from(EdgeId::new(e.1).unwrap())
+        } else {
+            self.real[&e]
+        }
+    }
+
+    /// Slice 4 (item 9): `lookup`, `lookup_ci` and `entities_of_type` against a naive
+    /// scan of the model's current entries, at every sampled canon, through the normal
+    /// view and (at the latest canon) the main-index view. The model never touches an
+    /// index: it groups the current entries of an attribute by (holder, value) and asks
+    /// "is the latest op with tick <= t an assert". `lookup_ci` is compared with a naive
+    /// scan: every holder with ANY holding value `u` where `fold_for_search(u) ==
+    /// fold_for_search(query)` (the fold itself is the one public function, so this part
+    /// is not independent of it; the holding logic and the grouping are).
+    fn compare_lookups(&self, label: &str, canons: &[u64]) {
+        let w = self.world.as_ref().unwrap();
+        let m = &self.m;
+        let n = m.tx;
+        for &c in canons {
+            let live = m.live(c);
+            for view in views(w, c, n) {
+                for (ai, a) in ATTRS.iter().enumerate() {
+                    let ctx = format!("{label} canon {c} lookup({})", a.name);
+                    // (holder, value) -> its change points at this canon
+                    let mut groups: HashMap<(Ent, MV), Vec<(i64, bool)>> = HashMap::new();
+                    for f in live.iter().filter(|f| f.a == ai) {
+                        groups
+                            .entry((f.e, f.v.clone()))
+                            .or_default()
+                            .push((f.tick, f.assert));
+                        if a.bidi
+                            && let MV::Ref(y) = f.v
+                        {
+                            groups
+                                .entry((y, MV::Ref(f.e)))
+                                .or_default()
+                                .push((f.tick, f.assert));
+                        }
+                    }
+                    for g in groups.values_mut() {
+                        g.sort();
+                        g.dedup();
+                    }
+                    let holds = |g: &Vec<(i64, bool)>, t: i64| {
+                        g.iter()
+                            .rev()
+                            .find(|(tk, _)| *tk <= t)
+                            .is_some_and(|(_, up)| *up)
+                    };
+                    // every value ever stored for the attribute (any canon), plus a few
+                    // never stored; every tick of any entry of the attribute, +-1
+                    let mut values: Vec<MV> = vec![];
+                    let mut ticks: Vec<i64> = vec![i64::MIN, i64::MAX, 0, -1, 1];
+                    for f in m.facts.iter().filter(|f| f.a == ai) {
+                        if !values.contains(&f.v) {
+                            values.push(f.v.clone());
+                        }
+                        ticks.extend([f.tick.saturating_sub(1), f.tick, f.tick.saturating_add(1)]);
+                    }
+                    match a.ty {
+                        ValueType::Bool => values.extend([MV::Bool(false), MV::Bool(true)]),
+                        ValueType::I64 => values.extend([MV::I64(0), MV::I64(7)]),
+                        ValueType::F64 => {
+                            values.extend([MV::F64(0.0f64.to_bits()), MV::F64(9.5f64.to_bits())])
+                        }
+                        ValueType::Str => values
+                            .extend([MV::Str("never stored".into()), MV::Str("y".repeat(257))]),
+                        ValueType::Ref => values.extend(m.ents.iter().map(|(e, _)| MV::Ref(*e))),
+                    }
+                    let mut dedup: Vec<MV> = vec![];
+                    for v in values {
+                        if !dedup.contains(&v) {
+                            dedup.push(v);
+                        }
+                    }
+                    ticks.sort_unstable();
+                    ticks.dedup();
+                    // thin the tick sample when the attribute is busy
+                    if ticks.len() > 40 {
+                        let step = ticks.len() / 40 + 1;
+                        let keep: Vec<i64> = ticks.iter().copied().step_by(step).collect();
+                        ticks = keep;
+                        ticks.extend([i64::MIN, i64::MAX]);
+                        ticks.sort_unstable();
+                        ticks.dedup();
+                    }
+                    // the unindexed non-ref attribute has no V entries
+                    if a.ty != ValueType::Ref && !a.indexed {
+                        let e = view.lookup(a.name, &to_value(&dedup[0]), Tick(0));
+                        assert!(matches!(e, Err(Error::NotIndexed(_))), "{ctx}: {e:?}");
+                        if a.ty == ValueType::Str {
+                            let e = view.lookup_ci(a.name, "x", Tick(0));
+                            assert!(matches!(e, Err(Error::NotIndexed(_))), "{ctx}: ci {e:?}");
+                        }
+                        continue;
+                    }
+                    // wrong value type
+                    let wrong = match a.ty {
+                        ValueType::Str => Value::I64(1),
+                        _ => Value::Str("x".into()),
+                    };
+                    let e = view.lookup(a.name, &wrong, Tick(0));
+                    assert!(
+                        matches!(e, Err(Error::WrongValueType { .. })),
+                        "{ctx}: wrong type {e:?}"
+                    );
+                    for v in &dedup {
+                        let real_v = to_value(v);
+                        // a ref to an entity never defined finds nothing; only defined ones here
+                        for &t in &ticks {
+                            let mut exp: Vec<EntityId> = groups
+                                .iter()
+                                .filter(|((_, gv), g)| gv == v && holds(g, t))
+                                .map(|((h, _), _)| self.real_any(*h))
+                                .collect();
+                            exp.sort();
+                            exp.dedup();
+                            let got = view.lookup(a.name, &real_v, Tick(t)).unwrap();
+                            assert_eq!(got, exp, "{ctx}: {v:?} @{t}");
+                            if !exp.is_empty() {
+                                let any_edge = exp.iter().any(|e| e.is_edge());
+                                stats::bump(if any_edge {
+                                    stats::LOOKUP_EDGE
+                                } else if a.ty == ValueType::Ref {
+                                    stats::LOOKUP_REF
+                                } else {
+                                    stats::LOOKUP_VALUE
+                                });
+                            } else if groups.keys().any(|(_, gv)| gv == v) {
+                                stats::bump(stats::LOOKUP_ABSENT);
+                            }
+                            if c == n {
+                                assert_eq!(
+                                    w.lookup(a.name, &real_v, Tick(t)).unwrap(),
+                                    exp,
+                                    "{ctx}: world {v:?} @{t}"
+                                );
+                            }
+                        }
+                        // -0.0 is normalised like a write: finds 0.0
+                        if *v == MV::F64(0.0f64.to_bits()) {
+                            for &t in &ticks {
+                                assert_eq!(
+                                    view.lookup(a.name, &Value::F64(-0.0), Tick(t)).unwrap(),
+                                    view.lookup(a.name, &Value::F64(0.0), Tick(t)).unwrap(),
+                                    "{ctx}: -0.0 @{t}"
+                                );
+                            }
+                        }
+                    }
+                    // case-insensitive search on indexed string attributes
+                    if a.ty == ValueType::Str {
+                        let mut queries: Vec<String> =
+                            vec!["nobody".into(), String::new(), "y".repeat(300)];
+                        for v in &dedup {
+                            if let MV::Str(x) = v {
+                                queries.push(x.clone());
+                                queries.push(x.to_uppercase());
+                                queries.push(x.to_lowercase());
+                                queries.push(x.replace('\u{e9}', "e\u{301}"));
+                                queries.push(x.replace('\u{e9}', "\u{c9}"));
+                            }
+                        }
+                        queries.sort();
+                        queries.dedup();
+                        for q in &queries {
+                            let fq = fold_for_search(q);
+                            for &t in &ticks {
+                                let mut exp: Vec<EntityId> = groups
+                                    .iter()
+                                    .filter(|((_, gv), g)| {
+                                        matches!(gv, MV::Str(u) if fold_for_search(u) == fq)
+                                            && holds(g, t)
+                                    })
+                                    .map(|((h, _), _)| self.real_any(*h))
+                                    .collect();
+                                exp.sort();
+                                exp.dedup();
+                                let got = view.lookup_ci(a.name, q, Tick(t)).unwrap();
+                                assert_eq!(got, exp, "{ctx}: ci {q:?} @{t}");
+                                if !exp.is_empty()
+                                    && q.contains(['E', 'D', 'W', 'I', 'N', '\u{301}', '\u{c9}'])
+                                {
+                                    stats::bump(stats::CI_SPELLING);
+                                }
+                                if c == n {
+                                    assert_eq!(
+                                        w.lookup_ci(a.name, q, Tick(t)).unwrap(),
+                                        exp,
+                                        "{ctx}: world ci {q:?} @{t}"
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        let e = view.lookup_ci(a.name, "x", Tick(0));
+                        assert!(
+                            matches!(e, Err(Error::WrongValueType { .. })),
+                            "{ctx}: ci on a non-string {e:?}"
+                        );
+                    }
+                }
+                let e = view.lookup("nope", &Value::Bool(true), Tick(0));
+                assert!(
+                    matches!(e, Err(Error::UnknownAttribute(_))),
+                    "{label}: {e:?}"
+                );
+                let e = view.lookup_ci("nope", "x", Tick(0));
+                assert!(
+                    matches!(e, Err(Error::UnknownAttribute(_))),
+                    "{label}: {e:?}"
+                );
+
+                // entities_of_type: the entities created by canon `c`, ascending by sequence
+                for (ti, ty) in TYPES.iter().enumerate() {
+                    let exp: Vec<EntityId> = m
+                        .ents
+                        .iter()
+                        .filter(|(e, created)| e.0 == ti && *created <= c)
+                        .map(|(e, _)| self.real[e])
+                        .collect();
+                    let mut sorted = exp.clone();
+                    sorted.sort();
+                    assert_eq!(
+                        exp, sorted,
+                        "{label}: the model lists entities in creation order"
+                    );
+                    let got: Vec<EntityId> = view.entities_of_type(ty).unwrap().collect();
+                    assert_eq!(got, exp, "{label} canon {c} entities_of_type({ty})");
+                    if c == n {
+                        let got: Vec<EntityId> = w.entities_of_type(ty).unwrap().collect();
+                        assert_eq!(got, exp, "{label}: world entities_of_type({ty})");
+                    }
+                }
+                match view.entities_of_type("NOPE") {
+                    Err(Error::UnknownNodeType(t)) => assert_eq!(t, "NOPE"),
+                    other => panic!("{label}: {:?}", other.map(|i| i.count())),
                 }
             }
         }
@@ -2772,4 +3029,1112 @@ fn the_generator_exercises_corrections_overlaps_and_doctor_findings() {
         }
     }
     assert!(missing.is_empty(), "never reached: {missing:?}");
+}
+
+// =====================================================================
+// Slice 4, item 0 (e): `Txn::correct` inside multi-op transactions,
+// `TxnKeyConflict` prediction, and mixed transactions (create + assert +
+// retract + correct in one txn).
+//
+// A second, self-contained harness (own tiny schema: one string attribute
+// `tag`, cardinality many, so there are no edges and no overlaps), driven
+// against its own naive model written from docs/slice-3-decisions.md "Core
+// model of corrections" and `Txn::correct`'s documented contract:
+//
+// - the current entry of a key `(entity, value, tick)` at canon N is the
+//   entry at that key with the highest tx <= N; a DELETED marker empties
+//   the whole key; staged entries count as the newest tx;
+// - a transaction stores at most one entry per key; a correction whose
+//   corrected key, or whose replacement's new key, already holds a staged
+//   entry is `TxnKeyConflict`, even if it would otherwise be a no-op;
+// - `Txn::correct` acts on COMMITTED chains (entry IDs exist only after
+//   commit): the chain's current fact is the committed one, never a staged one;
+// - the first error poisons the txn: later writes and the commit return
+//   `TransactionAborted` and nothing (not even created entities) is left;
+// - a commit that stores nothing and creates nothing uses no tx.
+//
+// Cases the contract leaves open are NOT guessed: a plain write whose key
+// holds a staged correction entry is skipped on both sides, and a move onto
+// a key staged with the opposite op accepts either conflict error (flagged
+// in the report).
+// =====================================================================
+mod txn_corrections {
+    use kala_core::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    const VALS: [&str; 3] = ["a", "b", "c"];
+    const TICKS: [i64; 9] = [i64::MIN, -3, -2, -1, 0, 1, 2, 3, i64::MAX];
+
+    // (entity index, value index, tick)
+    type Key = (usize, usize, i64);
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Mk {
+        Assert,
+        Retract,
+        Deleted,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum EKind {
+        SameTick,
+        TxnKey,
+        AlreadyDeleted,
+        Aborted,
+        DupHandle,
+    }
+
+    fn kind_of(e: &Error) -> EKind {
+        match e {
+            Error::SameTickConflict { .. } => EKind::SameTick,
+            Error::TxnKeyConflict { .. } => EKind::TxnKey,
+            Error::AlreadyDeleted(_) => EKind::AlreadyDeleted,
+            Error::TransactionAborted => EKind::Aborted,
+            Error::DuplicateHandle(_) => EKind::DupHandle,
+            other => panic!("unexpected error {other:?}"),
+        }
+    }
+
+    // stats, so a broken generator can't make the property vacuous
+    const STAT_NAMES: [&str; 7] = [
+        "TxnKeyConflict seen",
+        "correct delete committed in a multi-op txn",
+        "correct move (2 entries) committed in a multi-op txn",
+        "correct same-key flip committed in a multi-op txn",
+        "two corrections committed in one txn",
+        "mixed txn committed (create+assert+retract+correct)",
+        "poisoned txn left nothing (after staging entries)",
+    ];
+    static STATS: [AtomicUsize; 7] = [const { AtomicUsize::new(0) }; 7];
+    fn bump(i: usize) {
+        STATS[i].fetch_add(1, Relaxed);
+    }
+
+    // ------------------------------------------------------------- model
+
+    #[derive(Clone, Debug)]
+    struct Stored {
+        key: Key,
+        mk: Mk,
+        tx: u64,
+        id: EntryId,
+    }
+
+    #[derive(Clone, Debug)]
+    struct Chain {
+        base: EntryId,
+        ids: Vec<EntryId>,
+        /// the chain's current fact; `None` = deleted
+        cur: Option<(Key, bool)>,
+    }
+
+    #[derive(Default)]
+    struct Model {
+        tx: u64,
+        /// creation tx of each committed entity
+        ent_tx: Vec<u64>,
+        handles: HashSet<String>,
+        stored: Vec<Stored>,
+        chains: Vec<Chain>,
+    }
+
+    /// One entry a txn staged, in write order.
+    #[derive(Clone, Debug)]
+    struct SE {
+        key: Key,
+        mk: Mk,
+        /// `None`: a new base fact; `Some(chain)`: a correction of it
+        chain: Option<usize>,
+        /// the first entry of a correction bumps the chain's revision
+        /// (informational; the model's chains don't need the number)
+        cur_after: Option<(Key, bool)>,
+    }
+
+    impl Model {
+        /// key -> current mark at `canon`, committed entries only.
+        fn map(&self, canon: u64) -> HashMap<Key, Mk> {
+            let mut m = HashMap::new();
+            for s in self.stored.iter().filter(|s| s.tx <= canon) {
+                m.insert(s.key, s.mk); // ascending tx: later overrides
+            }
+            m
+        }
+    }
+
+    fn holds(map: &HashMap<Key, Mk>, e: usize, v: usize, t: i64) -> bool {
+        map.iter()
+            .filter(|((ke, kv, kt), mk)| *ke == e && *kv == v && *kt <= t && **mk != Mk::Deleted)
+            .max_by_key(|((_, _, kt), _)| *kt)
+            .is_some_and(|(_, mk)| *mk == Mk::Assert)
+    }
+
+    fn as_of(map: &HashMap<Key, Mk>, e: usize, t: i64) -> Vec<usize> {
+        (0..VALS.len()).filter(|v| holds(map, e, *v, t)).collect()
+    }
+
+    #[derive(Debug)]
+    enum Out {
+        Ok {
+            changed: usize,
+            tick: i64,
+        },
+        Err(Vec<EKind>),
+        /// open contract: not run on either side
+        Skip,
+        /// open contract: a move onto a key this txn staged with the SAME
+        /// op is either `TxnKeyConflict` or "the new key already says this,
+        /// only the old key goes" (`changed: 1`, a marker). The harness
+        /// follows whichever the world does (see `MTxn::resolve_marker`).
+        MarkerOrConflict {
+            tick: i64,
+        },
+    }
+
+    struct MTxn {
+        /// committed view at the txn's start
+        base: HashMap<Key, Mk>,
+        staged: Vec<SE>,
+        new_ents: usize,
+        new_handles: Vec<String>,
+        poisoned: bool,
+        /// the chain and key a `MarkerOrConflict` correction would delete
+        pending_marker: Option<(usize, Key)>,
+    }
+
+    impl MTxn {
+        fn begin(m: &Model) -> MTxn {
+            MTxn {
+                base: m.map(m.tx),
+                staged: vec![],
+                new_ents: 0,
+                new_handles: vec![],
+                poisoned: false,
+                pending_marker: None,
+            }
+        }
+
+        /// The world's answer to a `MarkerOrConflict`: it stored the marker
+        /// (`stored`) or refused with `TxnKeyConflict`.
+        fn resolve_marker(&mut self, stored: bool) {
+            let (ci, k) = self.pending_marker.take().expect("pending marker");
+            if stored {
+                self.staged.push(SE {
+                    key: k,
+                    mk: Mk::Deleted,
+                    chain: Some(ci),
+                    cur_after: None,
+                });
+            } else {
+                self.poisoned = true;
+            }
+        }
+
+        fn fail(&mut self, kinds: &[EKind]) -> Out {
+            self.poisoned = true;
+            Out::Err(kinds.to_vec())
+        }
+
+        /// base + staged: the view writes are judged against.
+        fn view(&self) -> HashMap<Key, Mk> {
+            let mut v = self.base.clone();
+            for s in &self.staged {
+                v.insert(s.key, s.mk);
+            }
+            v
+        }
+
+        fn staged_at(&self, k: Key) -> Option<&SE> {
+            self.staged.iter().find(|s| s.key == k)
+        }
+
+        fn create(&mut self, m: &Model, handle: Option<&str>) -> Out {
+            if self.poisoned {
+                return Out::Err(vec![EKind::Aborted]);
+            }
+            if let Some(h) = handle
+                && (m.handles.contains(h) || self.new_handles.iter().any(|x| x == h))
+            {
+                return self.fail(&[EKind::DupHandle]);
+            }
+            self.new_ents += 1;
+            if let Some(h) = handle {
+                self.new_handles.push(h.to_owned());
+            }
+            Out::Ok {
+                changed: 0,
+                tick: 0,
+            }
+        }
+
+        fn write(&mut self, assert: bool, ent: usize, val: usize, tick: i64) -> Out {
+            if self.poisoned {
+                return Out::Err(vec![EKind::Aborted]);
+            }
+            let key = (ent, val, tick);
+            if let Some(s) = self.staged_at(key)
+                && s.chain.is_some()
+            {
+                return Out::Skip; // open: a plain write onto a staged correction's key
+            }
+            let view = self.view();
+            if let Some(mk) = view.get(&key).filter(|mk| **mk != Mk::Deleted) {
+                return if (*mk == Mk::Assert) == assert {
+                    Out::Ok { changed: 0, tick }
+                } else {
+                    self.fail(&[EKind::SameTick])
+                };
+            }
+            if holds(&view, ent, val, tick) == assert {
+                return Out::Ok { changed: 0, tick };
+            }
+            self.staged.push(SE {
+                key,
+                mk: if assert { Mk::Assert } else { Mk::Retract },
+                chain: None,
+                cur_after: None,
+            });
+            Out::Ok { changed: 1, tick }
+        }
+
+        fn correct(
+            &mut self,
+            m: &Model,
+            ci: usize,
+            delete: bool,
+            val: Option<usize>,
+            tick: Option<i64>,
+            op: Option<bool>,
+        ) -> Out {
+            if self.poisoned {
+                return Out::Err(vec![EKind::Aborted]);
+            }
+            let Some((k, cur_assert)) = m.chains[ci].cur else {
+                return self.fail(&[EKind::AlreadyDeleted]);
+            };
+            if self.staged_at(k).is_some() {
+                // also when the correction would be a no-op
+                return self.fail(&[EKind::TxnKey]);
+            }
+            let del = |chain| SE {
+                key: k,
+                mk: Mk::Deleted,
+                chain: Some(chain),
+                cur_after: None,
+            };
+            if delete {
+                self.staged.push(del(ci));
+                return Out::Ok {
+                    changed: 1,
+                    tick: k.2,
+                };
+            }
+            let k2 = (k.0, val.unwrap_or(k.1), tick.unwrap_or(k.2));
+            let op2 = op.unwrap_or(cur_assert);
+            let mk2 = if op2 { Mk::Assert } else { Mk::Retract };
+            if k2 == k {
+                if op2 == cur_assert {
+                    return Out::Ok {
+                        changed: 0,
+                        tick: k.2,
+                    };
+                }
+                self.staged.push(SE {
+                    key: k,
+                    mk: mk2,
+                    chain: Some(ci),
+                    cur_after: Some((k, op2)),
+                });
+                return Out::Ok {
+                    changed: 1,
+                    tick: k.2,
+                };
+            }
+            if let Some(s) = self.staged_at(k2) {
+                // The contract doesn't say which error (or none) a move onto a
+                // key staged by this txn gives, except that a staged DELETED
+                // marker there can only be a TxnKeyConflict.
+                return match (s.mk, mk2) {
+                    (Mk::Deleted, _) => self.fail(&[EKind::TxnKey]),
+                    (staged, new) if staged != new => self.fail(&[EKind::TxnKey, EKind::SameTick]),
+                    _ => {
+                        self.pending_marker = Some((ci, k));
+                        Out::MarkerOrConflict { tick: k2.2 }
+                    }
+                };
+            }
+            match self.base.get(&k2).filter(|mk| **mk != Mk::Deleted) {
+                Some(mk) if *mk != mk2 => self.fail(&[EKind::SameTick]),
+                Some(_) => {
+                    self.staged.push(del(ci));
+                    Out::Ok {
+                        changed: 1,
+                        tick: k2.2,
+                    }
+                }
+                None => {
+                    self.staged.push(del(ci));
+                    self.staged.push(SE {
+                        key: k2,
+                        mk: mk2,
+                        chain: Some(ci),
+                        cur_after: Some((k2, op2)),
+                    });
+                    Out::Ok {
+                        changed: 2,
+                        tick: k2.2,
+                    }
+                }
+            }
+        }
+    }
+
+    impl Model {
+        /// Stores a committed txn's entries with the IDs the world gave them.
+        fn apply(&mut self, t: MTxn, ids: &[EntryId]) {
+            assert_eq!(ids.len(), t.staged.len(), "entries accounting");
+            if t.staged.is_empty() && t.new_ents == 0 {
+                return;
+            }
+            self.tx += 1;
+            for _ in 0..t.new_ents {
+                self.ent_tx.push(self.tx);
+            }
+            self.handles.extend(t.new_handles);
+            for (s, id) in t.staged.into_iter().zip(ids) {
+                self.stored.push(Stored {
+                    key: s.key,
+                    mk: s.mk,
+                    tx: self.tx,
+                    id: *id,
+                });
+                match s.chain {
+                    None => self.chains.push(Chain {
+                        base: *id,
+                        ids: vec![*id],
+                        cur: Some((s.key, s.mk == Mk::Assert)),
+                    }),
+                    Some(ci) => {
+                        let c = &mut self.chains[ci];
+                        c.cur = s.cur_after; // None for a DELETED marker
+                        if s.mk != Mk::Deleted {
+                            c.ids.push(*id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------- specs
+
+    #[derive(Clone, Debug)]
+    enum OpS {
+        Create {
+            handle: Option<u8>,
+        },
+        Write {
+            assert: bool,
+            ent: usize,
+            val: usize,
+            tick: i64,
+        },
+        Correct {
+            pick: usize,
+            /// pass the chain's newest entry ID instead of its base
+            last: bool,
+            delete: bool,
+            val: Option<usize>,
+            tick: Option<i64>,
+            op: Option<bool>,
+        },
+    }
+
+    #[derive(Clone, Debug)]
+    struct Spec {
+        commit: bool,
+        ops: Vec<OpS>,
+    }
+
+    fn tick() -> impl Strategy<Value = i64> {
+        prop_oneof![
+            90 => -2i64..=2,
+            4 => Just(i64::MIN),
+            4 => Just(i64::MAX),
+        ]
+    }
+
+    fn op_s() -> impl Strategy<Value = OpS> {
+        prop_oneof![
+            8 => prop::option::of(0u8..3).prop_map(|handle| OpS::Create { handle }),
+            45 => (any::<bool>(), 0usize..16, 0usize..VALS.len(), tick())
+                .prop_map(|(assert, ent, val, tick)| OpS::Write { assert, ent, val, tick }),
+            47 => (
+                0usize..1000,
+                any::<bool>(),
+                prop_oneof![25 => Just(true), 75 => Just(false)],
+                prop::option::of(0usize..VALS.len()),
+                prop::option::of(tick()),
+                prop::option::of(any::<bool>()),
+            )
+                .prop_map(|(pick, last, delete, val, tick, op)| OpS::Correct {
+                    pick, last, delete, val, tick, op
+                }),
+        ]
+    }
+
+    fn spec() -> impl Strategy<Value = Spec> {
+        (
+            prop_oneof![75 => Just(true), 25 => Just(false)],
+            prop::collection::vec(op_s(), 1..=7),
+        )
+            .prop_map(|(commit, ops)| Spec { commit, ops })
+    }
+
+    // ------------------------------------------------------------ harness
+
+    fn schema() -> Schema {
+        Schema::new().node_type("CHARACTER").attribute(AttrDef::new(
+            "tag",
+            ValueType::Str,
+            Kind::State,
+            Cardinality::Many,
+        ))
+    }
+
+    struct Sys {
+        _dir: tempfile::TempDir,
+        path: std::path::PathBuf,
+        world: World,
+        m: Model,
+        real: Vec<EntityId>,
+    }
+
+    fn setup() -> Sys {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.kala");
+        let mut world = World::create(&path, schema()).unwrap();
+        let mut m = Model::default();
+        let mut real = vec![];
+        for h in ["g0", "g1"] {
+            real.push(world.create_entity("CHARACTER", Some(h)).unwrap());
+            m.tx += 1;
+            m.ent_tx.push(m.tx);
+            m.handles.insert(h.to_owned());
+        }
+        assert_eq!(world.latest_tx(), TxId(m.tx));
+        Sys {
+            _dir: dir,
+            path,
+            world,
+            m,
+            real,
+        }
+    }
+
+    fn judge(ctx: &str, want: &Out, got: &Result<WriteResult, Error>) {
+        match (want, got) {
+            (Out::Ok { changed, tick }, Ok(r)) => {
+                assert_eq!((*changed, Tick(*tick)), (r.changed, r.tick), "{ctx}");
+            }
+            (Out::Err(kinds), Err(e)) => {
+                let k = kind_of(e);
+                if k == EKind::TxnKey {
+                    bump(0);
+                }
+                assert!(
+                    kinds.contains(&k),
+                    "{ctx}: expected one of {kinds:?}, got {e:?}"
+                );
+            }
+            (w, g) => panic!("{ctx}: model {w:?} vs real {g:?}"),
+        }
+    }
+
+    impl Sys {
+        fn step(&mut self, s: &Spec, label: &str) {
+            let before_bytes = std::fs::read(&self.path).unwrap();
+            let before_tx = self.world.latest_tx();
+            let n_real = self.real.len();
+            let mut mt = MTxn::begin(&self.m);
+            let mut staged_real: Vec<EntityId> = vec![];
+            let mut had_create = false;
+            let mut kinds_seen = (false, false, false, false); // create, assert, retract, correct
+            let commit_res;
+            {
+                let mut txn = self.world.begin();
+                for (i, op) in s.ops.iter().enumerate() {
+                    let ctx = format!("{label} op#{i} {op:?}");
+                    match op {
+                        OpS::Create { handle } => {
+                            let h = handle.map(|h| format!("h{h}"));
+                            let want = mt.create(&self.m, h.as_deref());
+                            let got = txn.create_entity("CHARACTER", h.as_deref());
+                            match (&want, got) {
+                                (Out::Ok { .. }, Ok(id)) => {
+                                    staged_real.push(id);
+                                    had_create = true;
+                                    kinds_seen.0 = true;
+                                }
+                                (Out::Err(k), Err(e)) => {
+                                    assert!(k.contains(&kind_of(&e)), "{ctx}: {k:?} vs {e:?}")
+                                }
+                                (w, g) => panic!("{ctx}: model {w:?} vs real {g:?}"),
+                            }
+                        }
+                        OpS::Write {
+                            assert,
+                            ent,
+                            val,
+                            tick,
+                        } => {
+                            let total = n_real + mt.new_ents;
+                            let e = ent % total;
+                            let id = if e < n_real {
+                                self.real[e]
+                            } else {
+                                staged_real[e - n_real]
+                            };
+                            let was_staged = mt.staged.len();
+                            let want = mt.write(*assert, e, *val, *tick);
+                            if matches!(want, Out::Skip) {
+                                continue;
+                            }
+                            let v = Value::Str(VALS[*val].into());
+                            let got = if *assert {
+                                txn.assert(id, "tag", v, Some(Tick(*tick)))
+                            } else {
+                                txn.retract(id, "tag", v, Some(Tick(*tick)))
+                            };
+                            judge(&ctx, &want, &got);
+                            if mt.staged.len() > was_staged {
+                                if *assert {
+                                    kinds_seen.1 = true;
+                                } else {
+                                    kinds_seen.2 = true;
+                                }
+                            }
+                        }
+                        OpS::Correct {
+                            pick,
+                            last,
+                            delete,
+                            val,
+                            tick,
+                            op,
+                        } => {
+                            if self.m.chains.is_empty() {
+                                continue;
+                            }
+                            let ci = pick % self.m.chains.len();
+                            let chain = &self.m.chains[ci];
+                            let entry = if *last {
+                                *chain.ids.last().unwrap()
+                            } else {
+                                chain.base
+                            };
+                            let was_staged = mt.staged.len();
+                            let want = mt.correct(&self.m, ci, *delete, *val, *tick, *op);
+                            let c = if *delete {
+                                Correction::Delete
+                            } else {
+                                Correction::Replace {
+                                    value: val.map(|v| Value::Str(VALS[v].into())),
+                                    tick: tick.map(Tick),
+                                    op: op.map(|b| if b { Op::Assert } else { Op::Retract }),
+                                    precision: None,
+                                }
+                            };
+                            let got = txn.correct(entry, c);
+                            if let Out::MarkerOrConflict { tick } = want {
+                                match &got {
+                                    Ok(r) => {
+                                        assert_eq!((r.changed, r.tick), (1, Tick(tick)), "{ctx}");
+                                        mt.resolve_marker(true);
+                                    }
+                                    Err(Error::TxnKeyConflict { .. }) => {
+                                        bump(0);
+                                        mt.resolve_marker(false);
+                                    }
+                                    Err(e) => panic!("{ctx}: unexpected {e:?}"),
+                                }
+                            } else {
+                                judge(&ctx, &want, &got);
+                            }
+                            if mt.staged.len() > was_staged {
+                                kinds_seen.3 = true;
+                            }
+                        }
+                    }
+                }
+                if s.commit {
+                    commit_res = Some(txn.commit());
+                } else {
+                    drop(txn);
+                    commit_res = None;
+                }
+            }
+            let staged_n = mt.staged.len();
+            let nothing_left = |sys: &Sys| {
+                assert_eq!(sys.world.latest_tx(), before_tx, "{label}: tx unchanged");
+                assert_eq!(
+                    std::fs::read(&sys.path).unwrap(),
+                    before_bytes,
+                    "{label}: the log is untouched"
+                );
+                for h in ["h0", "h1", "h2"] {
+                    assert_eq!(
+                        sys.world.entity_by_handle(h).is_some(),
+                        sys.m.handles.contains(h),
+                        "{label}: handle {h}"
+                    );
+                }
+            };
+            match commit_res {
+                None => nothing_left(self),
+                Some(res) if mt.poisoned => {
+                    assert_eq!(
+                        res,
+                        Err(Error::TransactionAborted),
+                        "{label}: commit of a poisoned txn"
+                    );
+                    if staged_n > 0 {
+                        bump(6);
+                    }
+                    nothing_left(self);
+                }
+                Some(res) => {
+                    let r = res.unwrap_or_else(|e| panic!("{label}: commit failed: {e:?}"));
+                    assert_eq!(r.entries.len(), staged_n, "{label}: entries");
+                    assert_eq!(r.changed, staged_n, "{label}: changed");
+                    let corrections: Vec<&SE> =
+                        mt.staged.iter().filter(|s| s.chain.is_some()).collect();
+                    // classify committed corrections
+                    let mut i = 0;
+                    while i < mt.staged.len() {
+                        let e = &mt.staged[i];
+                        if e.chain.is_some() {
+                            let next_rev = mt
+                                .staged
+                                .get(i + 1)
+                                .is_some_and(|n| n.chain == e.chain && e.mk == Mk::Deleted);
+                            match (e.mk, next_rev) {
+                                (Mk::Deleted, true) => {
+                                    bump(2);
+                                    i += 1;
+                                }
+                                (Mk::Deleted, false) => bump(1), // delete, or a marker-only move
+                                _ => bump(3),
+                            }
+                        }
+                        i += 1;
+                    }
+                    if corrections.len() >= 2 && s.ops.len() > 1 {
+                        bump(4);
+                    }
+                    if kinds_seen == (true, true, true, true) {
+                        bump(5);
+                    }
+                    let want_tx = if staged_n == 0 && !had_create {
+                        before_tx
+                    } else {
+                        TxId(self.m.tx + 1)
+                    };
+                    assert_eq!(r.tx, want_tx, "{label}: commit tx");
+                    if staged_n == 0 && !had_create {
+                        assert_eq!(
+                            std::fs::read(&self.path).unwrap(),
+                            before_bytes,
+                            "{label}: a commit of nothing appends nothing"
+                        );
+                    }
+                    self.m.apply(mt, &r.entries);
+                    self.real.extend(staged_real);
+                    assert_eq!(
+                        self.world.latest_tx(),
+                        TxId(self.m.tx),
+                        "{label}: latest_tx"
+                    );
+                }
+            }
+        }
+
+        fn compare(&self, label: &str) {
+            let w = &self.world;
+            assert_eq!(w.latest_tx(), TxId(self.m.tx), "{label}: latest_tx");
+            assert_eq!(self.real.len(), self.m.ent_tx.len(), "{label}: entities");
+            for c in 0..=self.m.tx {
+                let map = self.m.map(c);
+                let view = w.at_canon(TxId(c));
+                for (e, id) in self.real.iter().enumerate() {
+                    if self.m.ent_tx[e] > c {
+                        continue;
+                    }
+                    for t in TICKS {
+                        let want: Vec<Value> = as_of(&map, e, t)
+                            .into_iter()
+                            .map(|v| Value::Str(VALS[v].into()))
+                            .collect();
+                        let got = view.as_of(*id, "tag", Tick(t)).unwrap();
+                        assert_eq!(got, want, "{label}: canon {c} entity#{e} tick {t}");
+                        if c == self.m.tx {
+                            assert_eq!(
+                                w.as_of(*id, "tag", Tick(t)).unwrap(),
+                                want,
+                                "{label}: World::as_of"
+                            );
+                            assert_eq!(
+                                w.at_canon_main(TxId(c)).as_of(*id, "tag", Tick(t)).unwrap(),
+                                want,
+                                "{label}: main index"
+                            );
+                        }
+                    }
+                }
+            }
+            for s in &self.m.stored {
+                let info = w
+                    .entry(s.id)
+                    .unwrap_or_else(|| panic!("{label}: entry {:?}", s.id));
+                assert_eq!(info.tx, TxId(s.tx), "{label}: entry tx");
+            }
+        }
+
+        fn doctor_clean(&self, label: &str) {
+            let rep = doctor(&self.world, &DoctorOptions::default());
+            assert!(rep.is_clean(), "{label}: {:#?}", rep.findings);
+        }
+
+        fn reopen(&mut self) {
+            let dummy = World::in_memory(schema()).unwrap();
+            drop(std::mem::replace(&mut self.world, dummy));
+            self.world = World::open(&self.path).unwrap();
+        }
+    }
+
+    fn run(batch1: Vec<Spec>, batch2: Vec<Spec>) {
+        let mut sys = setup();
+        for (i, s) in batch1.iter().enumerate() {
+            let label = format!("b1 txn#{i} commit={}", s.commit);
+            sys.step(s, &label);
+            sys.compare(&label);
+        }
+        sys.doctor_clean("end of batch 1");
+        sys.reopen();
+        sys.compare("after reopen 1");
+        sys.doctor_clean("after reopen 1");
+        for (i, s) in batch2.iter().enumerate() {
+            let label = format!("b2 txn#{i} commit={}", s.commit);
+            sys.step(s, &label);
+            sys.compare(&label);
+        }
+        sys.doctor_clean("end of batch 2");
+        sys.reopen();
+        sys.compare("after reopen 2");
+        sys.doctor_clean("after reopen 2");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 96,
+            rng_seed: RngSeed::Fixed(0x4b41_4c41_0004),
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn txn_corrections_match_the_naive_model(
+            batch1 in prop::collection::vec(spec(), 0..=24),
+            batch2 in prop::collection::vec(spec(), 0..=10),
+        ) {
+            run(batch1, batch2);
+        }
+    }
+
+    /// The generator reaches every interesting path (so the property isn't vacuous).
+    #[test]
+    fn txn_corrections_generator_reaches_every_path() {
+        use proptest::strategy::ValueTree;
+        use proptest::test_runner::{Config, TestRunner};
+        let mut runner = TestRunner::new(Config {
+            rng_seed: RngSeed::Fixed(0x6b61_6c61_0004),
+            ..Config::default()
+        });
+        let strat = (
+            prop::collection::vec(spec(), 0..=24),
+            prop::collection::vec(spec(), 0..=10),
+        );
+        for _ in 0..96 {
+            let (a, b) = strat.new_tree(&mut runner).unwrap().current();
+            run(a, b);
+        }
+        let mut missing = vec![];
+        for (i, n) in STAT_NAMES.iter().enumerate() {
+            eprintln!("stat {n}: {}", STATS[i].load(Relaxed));
+            if STATS[i].load(Relaxed) == 0 {
+                missing.push(*n);
+            }
+        }
+        assert!(missing.is_empty(), "never reached: {missing:?}");
+    }
+
+    // --------------------------------------------------- fixed scripts
+
+    fn tag(s: &str) -> Value {
+        Value::Str(s.into())
+    }
+
+    fn world() -> (tempfile::TempDir, std::path::PathBuf, World, EntityId) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.kala");
+        let mut w = World::create(&path, schema()).unwrap();
+        let g = w.create_entity("CHARACTER", Some("g")).unwrap();
+        (dir, path, w, g)
+    }
+
+    #[test]
+    fn two_corrections_in_one_txn_commit_together_and_older_canon_is_unchanged() {
+        let (_d, _p, mut w, g) = world();
+        let e1 = w.assert(g, "tag", tag("a"), Some(Tick(1))).unwrap().entries[0];
+        let e2 = w.assert(g, "tag", tag("b"), Some(Tick(2))).unwrap().entries[0];
+        let old = w.latest_tx();
+        let mut t = w.begin();
+        assert_eq!(t.correct(e1, Correction::Delete).unwrap().changed, 1);
+        let r = t
+            .correct(
+                e2,
+                Correction::Replace {
+                    value: None,
+                    tick: Some(Tick(5)),
+                    op: None,
+                    precision: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(r.changed, 2);
+        let res = t.commit().unwrap();
+        assert_eq!(res.tx, TxId(old.0 + 1));
+        assert_eq!(res.entries.len(), 3, "marker, marker, revised");
+        assert_eq!(w.as_of(g, "tag", Tick(3)).unwrap(), Vec::<Value>::new());
+        assert_eq!(w.as_of(g, "tag", Tick(5)).unwrap(), vec![tag("b")]);
+        assert_eq!(
+            w.at_canon(old).as_of(g, "tag", Tick(3)).unwrap(),
+            vec![tag("a"), tag("b")]
+        );
+        assert!(doctor(&w, &DoctorOptions::default()).is_clean());
+    }
+
+    #[test]
+    fn a_second_correction_of_the_same_chain_is_txn_key_conflict_and_the_txn_leaves_nothing() {
+        let (_d, path, mut w, g) = world();
+        let e1 = w.assert(g, "tag", tag("a"), Some(Tick(1))).unwrap().entries[0];
+        let before = std::fs::read(&path).unwrap();
+        let tx = w.latest_tx();
+        let mut t = w.begin();
+        t.assert(g, "tag", tag("z"), Some(Tick(9))).unwrap();
+        t.correct(e1, Correction::Delete).unwrap();
+        let err = t
+            .correct(
+                e1,
+                Correction::Replace {
+                    value: None,
+                    tick: Some(Tick(3)),
+                    op: None,
+                    precision: None,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::TxnKeyConflict { .. }), "{err:?}");
+        // even a correction that would be a no-op conflicts once the key is staged
+        assert!(matches!(
+            t.correct(e1, Correction::Delete),
+            Err(Error::TransactionAborted)
+        ));
+        assert_eq!(t.commit(), Err(Error::TransactionAborted));
+        assert_eq!(w.latest_tx(), tx);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(w.as_of(g, "tag", Tick(10)).unwrap(), vec![tag("a")]);
+        // the same entry can be corrected afterwards
+        w.correct(e1, Correction::Delete).unwrap();
+    }
+
+    #[test]
+    fn a_noop_second_correction_conflicts_but_a_noop_first_one_stages_nothing() {
+        let (_d, _p, mut w, g) = world();
+        let e1 = w.assert(g, "tag", tag("a"), Some(Tick(1))).unwrap().entries[0];
+        // first correction is a no-op (same tick, same op): nothing staged, so a second is fine
+        let mut t = w.begin();
+        let r = t
+            .correct(
+                e1,
+                Correction::Replace {
+                    value: None,
+                    tick: Some(Tick(1)),
+                    op: None,
+                    precision: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(r.changed, 0);
+        t.correct(e1, Correction::Delete).unwrap();
+        // now the key is staged: even a no-op replace conflicts
+        let err = t
+            .correct(
+                e1,
+                Correction::Replace {
+                    value: None,
+                    tick: Some(Tick(1)),
+                    op: None,
+                    precision: None,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::TxnKeyConflict { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn moving_a_fact_onto_a_key_this_txn_deleted_is_txn_key_conflict() {
+        let (_d, path, mut w, g) = world();
+        let e1 = w.assert(g, "tag", tag("a"), Some(Tick(1))).unwrap().entries[0];
+        let e2 = w.assert(g, "tag", tag("b"), Some(Tick(2))).unwrap().entries[0];
+        let before = std::fs::read(&path).unwrap();
+        let mut t = w.begin();
+        t.correct(e1, Correction::Delete).unwrap(); // a DELETED marker at (a, 1)
+        // b@2 -> a@1: a Revised would be a second entry at the staged key (a, 1)
+        let err = t
+            .correct(
+                e2,
+                Correction::Replace {
+                    value: Some(tag("a")),
+                    tick: Some(Tick(1)),
+                    op: None,
+                    precision: None,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::TxnKeyConflict { .. }), "{err:?}");
+        drop(t);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// OPEN in the contract (reported, not guessed): moving a fact onto a key
+    /// this txn staged a live entry at, with the SAME op. Either refusal
+    /// (TxnKeyConflict) or "the new key already says this: only the old key
+    /// goes" (changed 1) keeps the store consistent; both are accepted here.
+    #[test]
+    fn moving_onto_a_key_staged_with_the_same_op_is_consistent_either_way() {
+        let (_d, path, mut w, g) = world();
+        let e1 = w.assert(g, "tag", tag("a"), Some(Tick(1))).unwrap().entries[0];
+        let before = std::fs::read(&path).unwrap();
+        let mut t = w.begin();
+        t.assert(g, "tag", tag("b"), Some(Tick(4))).unwrap();
+        let r = t.correct(
+            e1,
+            Correction::Replace {
+                value: Some(tag("b")),
+                tick: Some(Tick(4)),
+                op: None,
+                precision: None,
+            },
+        );
+        match r {
+            Err(Error::TxnKeyConflict { .. }) => {
+                assert_eq!(t.commit(), Err(Error::TransactionAborted));
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+            }
+            Ok(r) => {
+                assert_eq!(r.changed, 1);
+                t.commit().unwrap();
+                assert_eq!(w.as_of(g, "tag", Tick(5)).unwrap(), vec![tag("b")]);
+                assert!(doctor(&w, &DoctorOptions::default()).is_clean());
+            }
+            Err(e) => panic!("unexpected {e:?}"),
+        }
+    }
+
+    #[test]
+    fn a_mixed_txn_creates_asserts_retracts_and_corrects_in_one_tx() {
+        let (_d, path, mut w, g) = world();
+        let old = w.assert(g, "tag", tag("a"), Some(Tick(1))).unwrap().entries[0];
+        let tx0 = w.latest_tx();
+        let mut t = w.begin();
+        let h = t.create_entity("CHARACTER", Some("h")).unwrap();
+        assert_eq!(
+            t.assert(h, "tag", tag("x"), Some(Tick(2))).unwrap().changed,
+            1
+        );
+        assert_eq!(
+            t.assert(g, "tag", tag("b"), Some(Tick(3))).unwrap().changed,
+            1
+        );
+        assert_eq!(
+            t.retract(g, "tag", tag("a"), Some(Tick(4)))
+                .unwrap()
+                .changed,
+            1
+        );
+        assert_eq!(
+            t.correct(
+                old,
+                Correction::Replace {
+                    value: None,
+                    tick: Some(Tick(0)),
+                    op: None,
+                    precision: None
+                }
+            )
+            .unwrap()
+            .changed,
+            2
+        );
+        let res = t.commit().unwrap();
+        assert_eq!(res.tx, TxId(tx0.0 + 1));
+        assert_eq!(w.latest_tx(), res.tx, "one tx for everything");
+        assert_eq!(res.entries.len(), 5);
+        assert_eq!(w.entity_by_handle("h"), Some(h));
+        // a was moved from tick 1 to tick 0 and retracted at 4: holds on [0, 4)
+        assert_eq!(w.as_of(g, "tag", Tick(0)).unwrap(), vec![tag("a")]);
+        assert_eq!(
+            w.as_of(g, "tag", Tick(3)).unwrap(),
+            vec![tag("a"), tag("b")]
+        );
+        assert_eq!(w.as_of(g, "tag", Tick(4)).unwrap(), vec![tag("b")]);
+        assert_eq!(w.as_of(h, "tag", Tick(2)).unwrap(), vec![tag("x")]);
+        // the older canon has neither the new entity's facts nor the move
+        assert_eq!(
+            w.at_canon(tx0).as_of(g, "tag", Tick(0)).unwrap(),
+            Vec::<Value>::new()
+        );
+        assert!(doctor(&w, &DoctorOptions::default()).is_clean());
+        drop(w);
+        let w = World::open(&path).unwrap();
+        assert_eq!(
+            w.as_of(g, "tag", Tick(3)).unwrap(),
+            vec![tag("a"), tag("b")]
+        );
+    }
+
+    #[test]
+    fn a_poisoned_mixed_txn_leaves_no_entity_no_handle_and_no_log_bytes() {
+        let (_d, path, mut w, g) = world();
+        let e1 = w.assert(g, "tag", tag("a"), Some(Tick(1))).unwrap().entries[0];
+        let before = std::fs::read(&path).unwrap();
+        let tx = w.latest_tx();
+        let mut t = w.begin();
+        t.create_entity("CHARACTER", Some("ghost")).unwrap();
+        t.assert(g, "tag", tag("q"), Some(Tick(7))).unwrap();
+        t.correct(e1, Correction::Delete).unwrap();
+        assert!(matches!(
+            t.correct(e1, Correction::Delete),
+            Err(Error::TxnKeyConflict { .. })
+        ));
+        assert_eq!(t.commit(), Err(Error::TransactionAborted));
+        assert_eq!(w.latest_tx(), tx);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(w.entity_by_handle("ghost"), None);
+        // the handle and the entity number are free again
+        let again = w.create_entity("CHARACTER", Some("ghost")).unwrap();
+        assert_eq!(again.seq(), g.seq() + 1);
+    }
 }

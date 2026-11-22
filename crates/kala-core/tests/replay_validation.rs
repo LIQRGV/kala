@@ -99,6 +99,7 @@ fn fact(entity: u64, attr: u32, tick: i64, retract: bool, v: &Value) -> Vec<u8> 
     b.extend_from_slice(&attr.to_le_bytes());
     b.extend_from_slice(&tick.to_le_bytes());
     b.push(u8::from(retract));
+    b.push(0); // precision byte (v4): Exact
     b.extend_from_slice(&v.encode().unwrap());
     b
 }

@@ -198,7 +198,12 @@ fn only(r: WriteResult) -> EntryId {
 }
 
 fn rep(value: Option<Value>, tick: Option<Tick>, op: Option<Op>) -> Correction {
-    Correction::Replace { value, tick, op }
+    Correction::Replace {
+        value,
+        tick,
+        op,
+        precision: None,
+    }
 }
 
 /// Every overlap of every attribute at the latest canon.

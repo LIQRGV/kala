@@ -6,7 +6,7 @@
 //! the source of truth: a committed [`Txn`] is appended as its `DEFINE`
 //! entries, its facts and a `COMMIT`, and fsynced, before the in-memory
 //! tables change. Every operation first validates into a definition
-//! ([`EntityDef`], [`FactDef`], [`EdgeDef`]) without touching the world, then
+//! (`EntityDef`, `FactDef`, `EdgeDef`) without touching the world, then
 //! applies it, so a failed operation changes nothing.
 //!
 //! **Edges.** The first stored assert of a `ref` fact `(source, attr,
@@ -40,21 +40,26 @@
 //! the world's own reads are the view at its latest tx.
 
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "test-hooks")]
 use crate::doctor::{IndexName, Tamper};
 use crate::error::Error;
 use crate::id::{AttrId, EdgeId, EntityId, IdError, MAX_NODE_TYPE, NodeTypeId};
-use crate::key;
+use crate::key::{self, ValueRef};
 use crate::log::{
-    self, EncodedTxn, EntryBody, EntryId, LogEntry, LogFault, LogWriter, NewEntry, SurveyedTxn,
+    self, EncodedTxn, EntryBody, EntryId, LogEntry, LogWriter, NewEntry, SurveyedTxn,
 };
-use crate::overlap::{Overlap, Side, Warnings, find_overlaps, value_intervals};
+use crate::overlap::{
+    Overlap, Side, Warnings, find_overlaps, find_overlaps_touching, value_intervals,
+};
 use crate::schema::{AttrDef, Cardinality, Kind, RefDirection, Schema};
-use crate::tick::Tick;
-use crate::value::{Value, ValueType};
+use crate::tick::{Precision, Tick};
+use crate::value::{Value, ValueType, fold_for_search};
+use crate::value_table::{ContentHash, ValueTable, fnv1a64};
 
 /// A position on the author timeline: the number of the transaction that
 /// wrote a fact. Each committed transaction advances it by one.
@@ -158,6 +163,10 @@ pub enum Correction {
         tick: Option<Tick>,
         /// The new op.
         op: Option<Op>,
+        /// The new tick precision. A replace that changes only this is a
+        /// `Revised` entry at the same key with the op unchanged; a moved
+        /// fact keeps the current precision unless one is given.
+        precision: Option<Precision>,
     },
 }
 
@@ -192,8 +201,9 @@ impl Direction {
 }
 
 /// One change point of an `(entity, attribute)`'s history, as returned by
-/// [`View::history`]: at story tick `tick`, `value` was asserted or
-/// retracted (`op`).
+/// [`View::history`] and [`View::as_of_detail`]: at story tick `tick`,
+/// `value` was asserted or retracted (`op`), with the tick known to
+/// `precision`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Change {
     /// Story tick of the change.
@@ -202,6 +212,9 @@ pub struct Change {
     pub op: Op,
     /// The value asserted or retracted.
     pub value: Value,
+    /// How precisely the tick is known, as the entry stored it (a payload:
+    /// reads treat the tick as exact).
+    pub precision: Precision,
 }
 
 /// A validated fact, ready to apply. Later this is the payload of the log's
@@ -210,13 +223,42 @@ pub struct Change {
 pub(crate) struct FactDef {
     pub(crate) entity: EntityId,
     pub(crate) attr: AttrId,
-    /// Order-preserving encoding of the value (index key bytes).
+    /// Order-preserving encoding of the full value: what the log stores,
+    /// and what every rule and public order compares.
     pub(crate) value: Vec<u8>,
     pub(crate) tick: Tick,
     pub(crate) op: Op,
+    /// The precision of the tick: carried by the entry, never part of a
+    /// key, and ignored by every judgement except a correction's "nothing
+    /// changed".
+    pub(crate) precision: Precision,
     /// The target of a `ref` fact (its `R` key), `None` for other values.
     pub(crate) target: Option<EntityId>,
+    /// For an unindexed string value, the value reference its `E` keys
+    /// carry instead of `value` (see [`World::value_ref`]); `None` for
+    /// every other value, whose `E` keys carry `value` itself.
+    pub(crate) vref: Option<[u8; key::VALUE_REF_LEN]>,
 }
+
+impl FactDef {
+    /// The value part of the fact's `E` keys: its value reference, or its
+    /// value encoding.
+    pub(crate) fn key_value(&self) -> &[u8] {
+        match &self.vref {
+            Some(r) => r,
+            None => &self.value,
+        }
+    }
+
+    /// The fact's value reference, for an unindexed string value.
+    fn value_ref(&self) -> Option<ValueRef> {
+        self.vref.as_ref().and_then(|r| ValueRef::from_key_bytes(r))
+    }
+}
+
+/// An `E`-layout index with its value references resolved, and the stored
+/// keys that couldn't be (see [`World::resolved_e_index`]).
+pub(crate) type ResolvedIndex<'i, V> = (Cow<'i, BTreeMap<Vec<u8>, V>>, Vec<Vec<u8>>);
 
 /// An `E`- or `R`-layout index: full key -> what the entry says. Used for
 /// the committed indexes and for a transaction's staged entries, so one seek
@@ -229,6 +271,14 @@ pub(crate) type Index = BTreeMap<Vec<u8>, Mark>;
 /// is a `DELETED` marker is absent, so the first key at or after `^T` in a
 /// history is the answer at `T`: one seek, nothing to skip.
 pub(crate) type LatestIndex = BTreeMap<Vec<u8>, Op>;
+
+/// The tick precisions of an `E`-layout index (main keys with `^tx`, or
+/// latest-revision keys without), by the same key as the entry they belong
+/// to. Sparse: only facts whose precision isn't [`Precision::Exact`] have a
+/// row, so a world that never writes a vague tick holds none. Precision is
+/// a payload, never part of a key: the indexes themselves are the same
+/// whatever the precisions are.
+pub(crate) type Precisions = BTreeMap<Vec<u8>, Precision>;
 
 /// One entry a transaction staged, in write order: the order of its log
 /// entries.
@@ -309,8 +359,20 @@ enum Verdict {
 #[derive(Debug)]
 struct NodeType {
     name: String,
+    /// The tx that defined each entity of this type: entry `i` is the
+    /// entity with sequence `i + 1` (sequences are assigned without gaps,
+    /// so the length is the last sequence, 0 = none). Non-decreasing,
+    /// because entities are defined in tx order: the entities visible at a
+    /// canon are a prefix.
+    defined_in: Vec<TxId>,
+}
+
+impl NodeType {
     /// Sequence number of the last entity created with this type (0 = none).
-    last_seq: u64,
+    fn last_seq(&self) -> u64 {
+        // A Vec's length always fits a u64.
+        self.defined_in.len() as u64
+    }
 }
 
 /// A validated entity definition, ready to apply. Later this is the payload
@@ -354,6 +416,11 @@ struct StagedIds {
     /// sequences continue the world's without gaps.
     edges: Vec<EdgeDef>,
     edge_by_triple: HashMap<Triple, EdgeId>,
+    /// Unindexed string values this transaction's staged entries use that
+    /// the world's value table doesn't hold yet, with the references they
+    /// will get: they enter the world's table only when the transaction
+    /// commits, so a dropped or poisoned one leaves nothing behind.
+    values: ValueTable,
 }
 
 impl StagedIds {
@@ -436,6 +503,10 @@ pub struct IndexDump {
     pub e: Vec<(EntityId, AttrId, Value, Tick, TxId, Mark)>,
     /// `R` rows: `(target, attr, source, tick, tx, mark)`.
     pub r: Vec<(EntityId, AttrId, EntityId, Tick, TxId, Mark)>,
+    /// `V` rows: `(attr, value, entity, tick, tx, mark)`.
+    pub v: Vec<(AttrId, Value, EntityId, Tick, TxId, Mark)>,
+    /// `VFold` rows: `(attr, folded, original, entity, tick, tx, mark)`.
+    pub v_fold: Vec<(AttrId, String, Value, EntityId, Tick, TxId, Mark)>,
 }
 
 /// A world: schema, entities and (later) their facts over story time.
@@ -476,6 +547,40 @@ pub struct World {
     pub(crate) e_latest: LatestIndex,
     /// `R_latest`: the same for `r_index`.
     pub(crate) r_latest: LatestIndex,
+    /// The precision of every `E` entry that is a fact with a vague tick,
+    /// by its `E` key (see [`Precisions`]): the payload half of an `E` row.
+    /// Written only by [`World::index_entry`], derived and rebuilt with `E`;
+    /// doctor compares it as part of `E`.
+    e_precision: Precisions,
+    /// The same for `E_latest`: the precision of each key's current fact at
+    /// the latest canon, if vague. Compared by doctor as part of `E_latest`.
+    e_latest_precision: Precisions,
+    /// Value index `V|attr|value|entity|^tick|^tx -> mark`: a copy of every
+    /// `E` entry of an indexed, non-ref attribute (see
+    /// [`World::value_indexed`]), keyed by value so "every entity with
+    /// `attr = v`" is a prefix walk. Written only by [`World::index_entry`]
+    /// next to its `E` entry, so it is derived and rebuilt with `E`.
+    v_index: Index,
+    /// `V_latest`: the same for `v_index` as `E_latest` is for `e_index`.
+    /// Serves [`View::lookup`] at the latest canon.
+    pub(crate) v_latest: LatestIndex,
+    /// Folded value index `F|attr|fold|original|entity|^tick|^tx -> mark`
+    /// (layout in [`crate::key`]): a copy of every `V` entry of a string
+    /// attribute, keyed by the value's [`fold_for_search`] form, so "every
+    /// entity named edwin, in any case" is a prefix walk. Written only by
+    /// [`World::index_entry`] next to its `V` entry; derived and rebuilt
+    /// with `E`.
+    vfold_index: Index,
+    /// `VFold_latest`: the same for `vfold_index` as `E_latest` is for
+    /// `e_index`. Serves [`View::lookup_ci`] at the latest canon.
+    pub(crate) vfold_latest: LatestIndex,
+    /// Every unindexed string value an `E` key refers to, by reference and
+    /// by content (see [`crate::value_table`]). Derived like the indexes:
+    /// filled only by [`World::index_entry`] on commit and replay.
+    values: ValueTable,
+    /// The content hash of the value references ([`fnv1a64`]; a test hook
+    /// may replace it, see `World::set_content_hash`).
+    content_hash: ContentHash,
     /// How many keys hold a fact (assert or retract) at the latest canon,
     /// per tick: a key whose current entry is a `DELETED` marker isn't
     /// counted. The last tick is the world's latest tick. Derived from the
@@ -494,6 +599,10 @@ pub struct World {
     /// What opening the log cut off (default unless [`World::open`] cut a
     /// torn tail).
     recovery: RecoveryReport,
+    /// Writes are refused with [`Error::RecoveryUnacknowledged`]: the open
+    /// cut a damaged tail and [`World::acknowledge_recovery`] hasn't been
+    /// called yet. Never set for a torn cut, a clean open or a new world.
+    recovery_unacknowledged: bool,
 }
 
 impl World {
@@ -510,8 +619,9 @@ impl World {
     /// The world holds the genesis transaction tx#0 (the schema's `DEFINE`s
     /// and its `Commit`) as entries, numbered as [`World::create`] writes
     /// them, so the same writes get the same entry IDs in both kinds of world.
-    /// A name too long for a log entry (over 4 GiB) fails with
-    /// [`Error::Io`] of kind `InvalidInput`, as it would for a file.
+    /// A name too long for a log entry (one over
+    /// [`MAX_ENTRY_BYTES`](log::MAX_ENTRY_BYTES)) fails with [`Error::Io`]
+    /// of kind `InvalidInput`, as it would for a file.
     pub fn in_memory(schema: Schema) -> Result<World, Error> {
         World::with_genesis(schema).map(|(world, _)| world)
     }
@@ -538,7 +648,7 @@ impl World {
             }
             node_types.push(NodeType {
                 name: name.clone(),
-                last_seq: 0,
+                defined_in: Vec::new(),
             });
         }
         let defs = schema.attributes();
@@ -584,11 +694,20 @@ impl World {
             r_index: BTreeMap::new(),
             e_latest: BTreeMap::new(),
             r_latest: BTreeMap::new(),
+            e_precision: BTreeMap::new(),
+            e_latest_precision: BTreeMap::new(),
+            v_index: BTreeMap::new(),
+            v_latest: BTreeMap::new(),
+            vfold_index: BTreeMap::new(),
+            vfold_latest: BTreeMap::new(),
+            values: ValueTable::default(),
+            content_hash: fnv1a64,
             tick_counts: BTreeMap::new(),
             chains: HashMap::new(),
             entries: Vec::new(),
             log: None,
             recovery: RecoveryReport::default(),
+            recovery_unacknowledged: false,
         };
         let node_types = world
             .node_types
@@ -737,12 +856,18 @@ impl World {
     pub fn open(path: &Path) -> Result<World, Error> {
         let (mut world, writer, recovery) = LogWriter::open(path, World::replay)?;
         world.log = Some(writer);
+        world.recovery_unacknowledged = recovery.cause == Some(CutCause::Damaged);
         world.recovery = recovery;
         Ok(world)
     }
 
     /// Rebuilds a world from the entries of a log's committed transactions.
     fn replay(entries: &[LogEntry]) -> Result<World, Error> {
+        World::replay_with_hash(entries, fnv1a64)
+    }
+
+    /// [`World::replay`] with value references hashed by `hash`.
+    fn replay_with_hash(entries: &[LogEntry], hash: ContentHash) -> Result<World, Error> {
         // Split off the genesis transaction: everything up to the first
         // Commit. `read_log`'s scan guarantees the first Commit is tx#0.
         let genesis_end = entries
@@ -750,6 +875,7 @@ impl World {
             .position(|e| matches!(e.body, EntryBody::Commit { .. }))
             .ok_or_else(|| Error::Corrupt("no committed genesis transaction".to_owned()))?;
         let mut world = World::from_genesis(&entries[..=genesis_end])?;
+        world.set_rebuild_hash(hash);
         let mut txn = ReplayTxn::default();
         for entry in &entries[genesis_end + 1..] {
             world.replay_entry(entry, &mut txn)?;
@@ -765,10 +891,66 @@ impl World {
         let mut world = World::in_memory(genesis_schema(defines)?)
             .map_err(|e| Error::Corrupt(format!("genesis schema: {e}")))?;
         // Keep the genesis entries as the file has them, not as this build
-        // would re-encode them: `entry` reports what the log says.
+        // would re-encode them: `entry` reports what the log says. Pushed
+        // as given, not through `record_one`: `World::open`'s scan has
+        // already refused entry IDs that don't start at 1, but doctor's
+        // survey reports them (`EntryIdGap`) and rebuilds anyway, and a
+        // rebuild copes with ascending IDs that have gaps (see
+        // `World::kept_entry`).
         world.entries.clear();
-        world.record(genesis.iter().cloned(), TxId(0));
+        world.entries.extend(genesis.iter().map(|e| EntryInfo {
+            id: e.id,
+            tx: TxId(0),
+            body: e.body.clone(),
+        }));
         Ok(world)
+    }
+
+    /// The content hash this world's value references use: doctor rebuilds
+    /// a world with the same one, so the two assign the same references.
+    pub(crate) fn content_hash(&self) -> ContentHash {
+        self.content_hash
+    }
+
+    /// Sets the content hash of a world being rebuilt, before any fact is
+    /// applied (a world holding just its genesis).
+    pub(crate) fn set_rebuild_hash(&mut self, hash: ContentHash) {
+        debug_assert!(
+            self.values.is_empty(),
+            "invariant: the content hash is set before any value is referenced"
+        );
+        self.content_hash = hash;
+    }
+
+    /// Replaces the content hash of this world's value references with `f`
+    /// and rebuilds its indexes and value table from its kept entries, as a
+    /// replay with that hash would: a test hook, so a forced-collision world
+    /// (`|_| 0`) can be checked to answer exactly like a normal one.
+    /// [`crate::doctor`] rebuilds this world with `f` too. Only this World
+    /// object changes: nothing is logged, and a reopen uses the real hash.
+    /// Not part of the supported API.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn set_content_hash(&mut self, f: fn(&[u8]) -> u64) {
+        let entries: Vec<LogEntry> = self
+            .entries
+            .iter()
+            .map(|e| LogEntry {
+                id: e.id,
+                body: e.body.clone(),
+            })
+            .collect();
+        let rebuilt = World::replay_with_hash(&entries, f)
+            .expect("invariant: a world's kept entries replay cleanly");
+        // The rebuild holds the same schema, IDs and entries; what is kept
+        // from this World is what isn't derived from the log.
+        let log = self.log.take();
+        let recovery = std::mem::take(&mut self.recovery);
+        let unacknowledged = self.recovery_unacknowledged;
+        *self = rebuilt;
+        self.log = log;
+        self.recovery = recovery;
+        self.recovery_unacknowledged = unacknowledged;
     }
 
     /// Applies one entry of a transaction after the genesis. Facts are
@@ -853,13 +1035,19 @@ impl World {
         self.log.as_ref().map(LogWriter::path)
     }
 
-    /// The four stored indexes, for doctor to compare against a rebuild.
+    /// The stored indexes, for doctor to compare against a rebuild.
     pub(crate) fn indexes(&self) -> StoredIndexes<'_> {
         StoredIndexes {
             e: &self.e_index,
             r: &self.r_index,
+            v: &self.v_index,
             e_latest: &self.e_latest,
             r_latest: &self.r_latest,
+            e_precision: &self.e_precision,
+            e_latest_precision: &self.e_latest_precision,
+            v_latest: &self.v_latest,
+            vfold: &self.vfold_index,
+            vfold_latest: &self.vfold_latest,
         }
     }
 
@@ -897,7 +1085,9 @@ impl World {
                         def.id
                     )));
                 }
-                self.apply_entity(def);
+                // Both replay paths key the transaction at `next_tx`.
+                let tx = self.next_tx();
+                self.apply_entity(def, tx);
                 Ok(())
             }
             EntryBody::DefineEdge {
@@ -950,6 +1140,7 @@ impl World {
                 value,
                 tick,
                 op,
+                precision,
             } => {
                 let def = self
                     .attributes
@@ -963,9 +1154,10 @@ impl World {
                 {
                     return Err(corrupt(&"bidirectional fact with entity > value"));
                 }
-                let fact = self
+                let mut fact = self
                     .prepare_fact(&StagedIds::default(), *entity, &def.name, value, *tick, *op)
                     .map_err(ReplayFault::from_write)?;
+                fact.precision = *precision;
                 // A live write logs a ref fact's DefineEdge ahead of its
                 // first stored assert, and a stored retract needs a stored
                 // assert, so every stored ref fact's triple has an edge
@@ -983,7 +1175,7 @@ impl World {
                 // entry is a DELETED marker holds nothing. Judged at the
                 // latest canon; the current transaction's entries are
                 // already in.
-                let mut prefix = key::e_value_prefix(fact.entity, fact.attr, &fact.value);
+                let mut prefix = key::e_value_prefix(fact.entity, fact.attr, fact.key_value());
                 let all = TxId(u64::MAX);
                 if let Some(stored) = op_at_tick(&[&self.e_index], &mut prefix, fact.tick, all)
                     && stored != fact.op
@@ -1043,7 +1235,8 @@ impl World {
                 check_next_rev(chain, *of, *rev)?;
                 // The marker sits at the key of the chain's current fact.
                 // (Its op is unused: the marker is indexed as Deleted.)
-                let fact = fact_def(*entity, *attr, value, *tick, Op::Assert)
+                let fact = self
+                    .stored_fact_def(*entity, *attr, value, *tick, Op::Assert)
                     .map_err(ReplayFault::Refused)?;
                 if self.op_if_at_key(current, &fact).is_none() {
                     return Err(bad_correction(&format!(
@@ -1071,6 +1264,7 @@ impl World {
                 value,
                 tick,
                 op,
+                precision,
             } => {
                 let def = self
                     .attributes
@@ -1087,23 +1281,21 @@ impl World {
                 // Validated like a live write (type, defined IDs, string
                 // length, RetractEvent); not judged by the hold-based no-op
                 // rules, which don't apply to corrections.
-                let fact = self
+                let mut fact = self
                     .prepare_fact(&StagedIds::default(), *entity, &def.name, value, *tick, *op)
                     .map_err(ReplayFault::from_write)?;
+                fact.precision = *precision;
                 // A live correction interns the edge of a revised assert's
                 // triple before it, as for a fact; a revised retract may be
                 // the triple's only entry (no edge).
-                if let (Some(target), Op::Assert) = (fact.target, fact.op) {
-                    if self
+                if let (Some(target), Op::Assert) = (fact.target, fact.op)
+                    && self
                         .edge_of(&StagedIds::default(), fact.entity, fact.attr, target)
                         .is_none()
-                    {
-                        return Err(corrupt(
-                            &"revised ref assert with no edge defined before it",
-                        ));
-                    }
-                    txn.unasserted_edges
-                        .remove(&(fact.entity, fact.attr, target));
+                {
+                    return Err(corrupt(
+                        &"revised ref assert with no edge defined before it",
+                    ));
                 }
                 let chain = self.replay_chain(*of).map_err(|why| bad_correction(&why))?;
                 if prev_deleted == Some((*of, *rev)) {
@@ -1112,7 +1304,7 @@ impl World {
                     // at the new key: a live writer errs on the opposite op
                     // and writes no Revised for the same one, so any current
                     // entry there means no live writer wrote this.
-                    let mut prefix = key::e_value_prefix(fact.entity, fact.attr, &fact.value);
+                    let mut prefix = key::e_value_prefix(fact.entity, fact.attr, fact.key_value());
                     let all = TxId(u64::MAX);
                     if let Some(stored) = op_at_tick(&[&self.e_index], &mut prefix, fact.tick, all)
                     {
@@ -1123,7 +1315,7 @@ impl World {
                     }
                 } else {
                     // Otherwise it revises the current fact in place: same
-                    // key, its own next rev, another op.
+                    // key, its own next rev, another op or precision.
                     let current = chain.current.ok_or_else(|| {
                         bad_correction(&format!(
                             "a revision of the deleted chain of entry#{} not right after its \
@@ -1132,14 +1324,14 @@ impl World {
                         ))
                     })?;
                     check_next_rev(chain, *of, *rev)?;
-                    let Some(c_op) = self.op_if_at_key(current, &fact) else {
+                    let Some((c_op, c_precision)) = self.op_if_at_key(current, &fact) else {
                         return Err(bad_correction(&format!(
                             "a revision of entry#{} at another key not right after its \
                              DELETED marker",
                             of.0
                         )));
                     };
-                    if fact.op == c_op {
+                    if (fact.op, fact.precision) == (c_op, c_precision) {
                         return Err(corrupt(&format!(
                             "a revision of entry#{} that changes nothing",
                             of.0
@@ -1147,6 +1339,14 @@ impl World {
                     }
                 }
                 txn.claim_key(&fact).map_err(|why| corrupt(&why))?;
+                // Only an accepted revised assert asserts its edge's triple
+                // (as for a Fact): a refused one must leave the edge
+                // unasserted, so doctor's collecting replay judges the
+                // Commit like a fresh rebuild.
+                if let (Some(target), Op::Assert) = (fact.target, fact.op) {
+                    txn.unasserted_edges
+                        .remove(&(fact.entity, fact.attr, target));
+                }
                 self.index_entry(&fact, Mark::from(fact.op), self.next_tx());
                 self.chains.insert(
                     *of,
@@ -1182,17 +1382,40 @@ impl World {
     /// Stores one entry of transaction `tx` at the key of `fact` in the
     /// indexes: `mark` (the fact's op, or [`Mark::Deleted`] for a `DELETED`
     /// marker at that key) under its `E` key and, for a `ref` key, its `R`
-    /// mirror. Commit and replay both write the indexes only through here,
-    /// so the two always hold the same entries, and the latest-revision
-    /// indexes and the latest tick follow the keys' current entries.
+    /// mirror, for an indexed non-ref attribute its `V` mirror (and for a
+    /// string attribute its `VFold` mirror). Commit and
+    /// replay both write the indexes only through here, so the two always
+    /// hold the same entries, and the latest-revision indexes and the
+    /// latest tick follow the keys' current entries.
     fn index_entry(&mut self, fact: &FactDef, mark: Mark, tx: TxId) {
-        let k = key::e_fact_key(fact.entity, fact.attr, &fact.value, fact.tick, tx);
+        // A new unindexed value enters the table with the reference its
+        // keys were built with (see `World::value_ref`).
+        if let Some(r) = fact.value_ref() {
+            self.values.insert(&fact.value, r);
+        }
+        let k = key::e_fact_key(fact.entity, fact.attr, fact.key_value(), fact.tick, tx);
         // `tx` is newer than every stored entry, so this entry becomes the
         // key's current one at the latest canon: `E_latest` holds the
         // previous current entry, if it was a fact.
         let at_key = key::without_tx(&k);
         let was_fact = self.e_latest.contains_key(at_key);
         set_latest(&mut self.e_latest, at_key, mark);
+        // The precision rides along with the entry (sparse: vague ticks
+        // only). The key's current entry replaces the previous one's at
+        // the latest canon, so a DELETED marker or an exact fact clears it.
+        let vague = mark.op().is_some() && fact.precision != Precision::Exact;
+        if vague {
+            self.e_precision.insert(k.clone(), fact.precision);
+            match self.e_latest_precision.get_mut(at_key) {
+                Some(p) => *p = fact.precision,
+                None => {
+                    self.e_latest_precision
+                        .insert(at_key.to_vec(), fact.precision);
+                }
+            }
+        } else {
+            self.e_latest_precision.remove(at_key);
+        }
         match (was_fact, mark.op().is_some()) {
             (false, true) => *self.tick_counts.entry(fact.tick).or_insert(0) += 1,
             (true, false) => {
@@ -1211,6 +1434,153 @@ impl World {
             set_latest(&mut self.r_latest, key::without_tx(&k), mark);
             self.r_index.insert(k, mark);
         }
+        if self.value_indexed(fact.attr) {
+            let k = key::v_fact_key(fact.attr, &fact.value, fact.entity, fact.tick, tx);
+            set_latest(&mut self.v_latest, key::without_tx(&k), mark);
+            self.v_index.insert(k, mark);
+            // A string attribute's entry is mirrored once more under its
+            // fold. `fact.value` comes from `Value::encode`, so it decodes;
+            // anything but a string (never stored for a string attribute)
+            // has no fold.
+            if let Ok(Value::Str(text)) = Value::decode(&fact.value) {
+                let fold = Value::Str(fold_for_search(&text))
+                    .encode()
+                    .expect("invariant: encoding a string never fails");
+                let k =
+                    key::vfold_fact_key(fact.attr, &fold, &fact.value, fact.entity, fact.tick, tx);
+                set_latest(&mut self.vfold_latest, key::without_tx(&k), mark);
+                self.vfold_index.insert(k, mark);
+            }
+        }
+    }
+
+    /// Whether `attr`'s entries are mirrored in `V`: it is declared
+    /// indexed and isn't a `ref` attribute (`R` is the value index of a
+    /// `ref` attribute).
+    fn value_indexed(&self, attr: AttrId) -> bool {
+        let def = &self.attributes[attr.0 as usize];
+        def.indexed && def.value_type != ValueType::Ref
+    }
+
+    /// Whether `attr`'s `E` keys carry value references: it is an
+    /// unindexed string attribute.
+    fn keys_by_ref(&self, attr: AttrId) -> bool {
+        self.attributes
+            .get(attr.0 as usize)
+            .is_some_and(|def| !def.indexed && def.value_type == ValueType::Str)
+    }
+
+    /// The full value encoding an `E`-key value part of attribute `attr`
+    /// stands for: the part itself, or for an unindexed string the value
+    /// its reference names in the table. `None` if the part doesn't fit the
+    /// attribute's layout (a reference on an attribute not keyed by
+    /// reference, a plain encoding on one that is) or names a reference the
+    /// table lacks: only reachable by tampering, so readers skip such keys
+    /// (doctor reports them).
+    fn e_part_encoding<'a>(&'a self, attr: AttrId, part: &'a [u8]) -> Option<&'a [u8]> {
+        match (self.keys_by_ref(attr), ValueRef::from_key_bytes(part)) {
+            (true, Some(r)) => self.values.resolve(r),
+            (false, None) => Some(part),
+            _ => None,
+        }
+    }
+
+    /// The value an `E`-key value part of attribute `attr` stands for, or
+    /// `None` if it can't be resolved or decoded (see
+    /// [`World::e_part_encoding`]); readers skip such keys.
+    fn decode_e_part(&self, attr: AttrId, part: &[u8]) -> Option<Value> {
+        self.decode_e_value(attr, part).map(|(_, v)| v)
+    }
+
+    /// The full value encoding and the value an `E`-key value part of
+    /// attribute `attr` stands for, or `None` if it can't be resolved or
+    /// decoded, or decodes to a value of another type than the attribute's
+    /// (a plain value on a `ref` attribute, say). Every write and replay
+    /// checks the type, so such a key is only reachable by tampering:
+    /// readers skip it (doctor reports it).
+    fn decode_e_value<'a>(&'a self, attr: AttrId, part: &'a [u8]) -> Option<(&'a [u8], Value)> {
+        let bytes = self.e_part_encoding(attr, part)?;
+        let value = Value::decode(bytes).ok()?;
+        let def = self.attributes.get(attr.0 as usize)?;
+        (value.value_type() == def.value_type).then_some((bytes, value))
+    }
+
+    /// The `E`-key value part of the committed value `v` (encoded as
+    /// `encoding`) of `attr`: the encoding, or for an unindexed string its
+    /// reference; `None` if no committed entry ever stored that unindexed
+    /// value (so it has no history).
+    fn committed_key_part<'a>(&self, attr: AttrId, encoding: &'a [u8]) -> Option<Cow<'a, [u8]>> {
+        if !self.keys_by_ref(attr) {
+            return Some(Cow::Borrowed(encoding));
+        }
+        let r = self.values.get(encoding)?;
+        Some(Cow::Owned(r.to_key_bytes().to_vec()))
+    }
+
+    /// Decodes a stored `E` key with its value resolved through this
+    /// world's value table: `(entity, attr, value, tick, tx)`, or `None` if
+    /// the bytes aren't a well-formed `E` key or refer to no value. Never
+    /// panics, whatever the bytes.
+    fn decode_e_row_resolved(&self, k: &[u8]) -> Option<(EntityId, AttrId, Value, Tick, TxId)> {
+        let (entity, attr, part, tick, tx) = key::decode_e_key(k).ok()?;
+        let (_, value) = self.decode_e_value(attr, part)?;
+        Some((entity, attr, value, tick, tx))
+    }
+
+    /// A copy of an `E`-layout index (`main`: full keys, else
+    /// latest-revision keys) with every value reference replaced by the
+    /// full value encoding it names, for doctor to compare rows with values
+    /// resolved: two worlds that agree on every row agree on these keys,
+    /// whatever references they assigned. The second list holds the stored
+    /// keys that can't be resolved: a reference on an attribute that isn't
+    /// an unindexed string, an unindexed string not keyed by reference, or a
+    /// reference the table lacks. Keys that don't parse as `E` keys at all
+    /// are kept as they are (doctor reports them as it always has). Borrows
+    /// the index when nothing needs resolving.
+    pub(crate) fn resolved_e_index<'i, V: Clone>(
+        &self,
+        index: &'i BTreeMap<Vec<u8>, V>,
+        main: bool,
+    ) -> ResolvedIndex<'i, V> {
+        let unindexed_strings = self
+            .attributes
+            .iter()
+            .any(|d| !d.indexed && d.value_type == ValueType::Str);
+        if self.values.is_empty() && !unindexed_strings {
+            return (Cow::Borrowed(index), Vec::new());
+        }
+        let mut out = BTreeMap::new();
+        let mut bad = Vec::new();
+        for (k, v) in index {
+            let split = if main {
+                key::decode_e_key(k).map(|(e, a, part, ..)| (e, a, part))
+            } else {
+                key::decode_latest_e_key(k).map(|(e, a, part, _)| (e, a, part))
+            };
+            let Ok((_, attr, part)) = split else {
+                out.insert(k.clone(), v.clone());
+                continue;
+            };
+            let is_ref = ValueRef::from_key_bytes(part).is_some();
+            if self.attributes.get(attr.0 as usize).is_none() && !is_ref {
+                // An unknown attribute: no layout to check against.
+                out.insert(k.clone(), v.clone());
+                continue;
+            }
+            let resolved = self.e_part_encoding(attr, part);
+            let Some(full) = resolved else {
+                bad.push(k.clone());
+                continue;
+            };
+            // The part sits right after `E|e|a|`; the suffix follows it.
+            let start = key::E_ATTR_PREFIX_LEN;
+            let mut canonical = Vec::with_capacity(k.len() - part.len() + full.len());
+            canonical.extend_from_slice(&k[..start]);
+            canonical.extend_from_slice(full);
+            canonical.extend_from_slice(&k[start + part.len()..]);
+            out.insert(canonical, v.clone());
+        }
+        (Cow::Owned(out), bad)
     }
 
     /// Every stored `E` and `R` entry, decoded, in key order: an inspection
@@ -1224,7 +1594,7 @@ impl World {
             .e_index
             .iter()
             .filter_map(|(k, mark)| {
-                let (entity, attr, value, tick, tx) = decode_e_row(k)?;
+                let (entity, attr, value, tick, tx) = self.decode_e_row_resolved(k)?;
                 Some((entity, attr, value, tick, tx, *mark))
             })
             .collect();
@@ -1236,7 +1606,23 @@ impl World {
                 Some((target, attr, source, tick, tx, *mark))
             })
             .collect();
-        IndexDump { e, r }
+        let v = self
+            .v_index
+            .iter()
+            .filter_map(|(k, mark)| {
+                let (attr, value, entity, tick, tx) = decode_v_row(k)?;
+                Some((attr, value, entity, tick, tx, *mark))
+            })
+            .collect();
+        let v_fold = self
+            .vfold_index
+            .iter()
+            .filter_map(|(k, mark)| {
+                let (attr, folded, original, entity, tick, tx) = decode_vfold_row(k)?;
+                Some((attr, folded, original, entity, tick, tx, *mark))
+            })
+            .collect();
+        IndexDump { e, r, v, v_fold }
     }
 
     /// Damages one stored index in memory, for doctor's tests: the
@@ -1244,6 +1630,7 @@ impl World {
     /// without the log changing. Only that index changes (nothing else is
     /// kept in step), and nothing is logged. A row number past the end does
     /// nothing. Not part of the supported API.
+    #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub fn tamper_index(&mut self, t: Tamper) {
         fn remove_nth<V>(index: &mut BTreeMap<Vec<u8>, V>, nth: usize) {
@@ -1278,12 +1665,28 @@ impl World {
                 IndexName::RLatest => {
                     self.r_latest.insert(key, Op::Assert);
                 }
+                IndexName::V => {
+                    self.v_index.insert(key, Mark::Assert);
+                }
+                IndexName::VLatest => {
+                    self.v_latest.insert(key, Op::Assert);
+                }
+                IndexName::VFold => {
+                    self.vfold_index.insert(key, Mark::Assert);
+                }
+                IndexName::VFoldLatest => {
+                    self.vfold_latest.insert(key, Op::Assert);
+                }
             },
             Tamper::RemoveRow { index, nth } => match index {
                 IndexName::E => remove_nth(&mut self.e_index, nth),
                 IndexName::R => remove_nth(&mut self.r_index, nth),
                 IndexName::ELatest => remove_nth(&mut self.e_latest, nth),
                 IndexName::RLatest => remove_nth(&mut self.r_latest, nth),
+                IndexName::V => remove_nth(&mut self.v_index, nth),
+                IndexName::VLatest => remove_nth(&mut self.v_latest, nth),
+                IndexName::VFold => remove_nth(&mut self.vfold_index, nth),
+                IndexName::VFoldLatest => remove_nth(&mut self.vfold_latest, nth),
             },
             Tamper::FlipOp { index, nth } => match index {
                 IndexName::E => self
@@ -1310,6 +1713,30 @@ impl World {
                     .nth(nth)
                     .into_iter()
                     .for_each(flip_op),
+                IndexName::V => self
+                    .v_index
+                    .values_mut()
+                    .nth(nth)
+                    .into_iter()
+                    .for_each(flip_mark),
+                IndexName::VLatest => self
+                    .v_latest
+                    .values_mut()
+                    .nth(nth)
+                    .into_iter()
+                    .for_each(flip_op),
+                IndexName::VFold => self
+                    .vfold_index
+                    .values_mut()
+                    .nth(nth)
+                    .into_iter()
+                    .for_each(flip_mark),
+                IndexName::VFoldLatest => self
+                    .vfold_latest
+                    .values_mut()
+                    .nth(nth)
+                    .into_iter()
+                    .for_each(flip_op),
             },
         }
     }
@@ -1317,16 +1744,43 @@ impl World {
     /// Makes the next log append fail as `fault` says, to test failure
     /// handling. An in-memory world has no log and ignores it. Not part of
     /// the supported API.
+    #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
-    pub fn inject_log_fault(&mut self, fault: LogFault) {
+    pub fn inject_log_fault(&mut self, fault: log::LogFault) {
         if let Some(log) = self.log.as_mut() {
             log.inject_fault(fault);
         }
     }
 
-    /// `Err` if the world refuses writes: its log append failed earlier.
+    /// `Err` if the world refuses writes: an unacknowledged damaged-tail
+    /// recovery (checked first), or a log append that failed earlier.
     fn writable(&self) -> Result<(), Error> {
+        self.acknowledged()?;
         self.log.as_ref().map_or(Ok(()), LogWriter::check)
+    }
+
+    /// `Err(RecoveryUnacknowledged)` until a damaged-tail cut is
+    /// acknowledged (see [`World::acknowledge_recovery`]).
+    fn acknowledged(&self) -> Result<(), Error> {
+        if self.recovery_unacknowledged {
+            return Err(Error::RecoveryUnacknowledged);
+        }
+        Ok(())
+    }
+
+    /// Acknowledges what [`World::open`] cut off the log, allowing writes
+    /// again.
+    ///
+    /// After an open that cut a damaged tail ([`CutCause::Damaged`]: bytes
+    /// that look committed but fail their checksum, saved to the quarantine
+    /// file), every write fails with [`Error::RecoveryUnacknowledged`]
+    /// until this is called, so the author decides what the lost canon
+    /// means before writing on top of it. [`World::recovery`] keeps
+    /// reporting the cut afterwards. On any other world (torn cut, clean
+    /// open, [`World::create`], [`World::in_memory`]) and when called again
+    /// this does nothing.
+    pub fn acknowledge_recovery(&mut self) {
+        self.recovery_unacknowledged = false;
     }
 
     /// What opening the log did to recover it (see [`RecoveryReport`]).
@@ -1385,7 +1839,9 @@ impl World {
     /// the entity or a `ref` value isn't defined ([`Error::UnknownEntity`]),
     /// the value has the wrong type ([`Error::WrongValueType`]), or the
     /// value can't be stored ([`Error::Value`]: NaN, indexed string over
-    /// 256 bytes), or the opposite op (a retract) is already stored for
+    /// 256 bytes; [`Error::EntryTooLarge`]: a value whose `Revised` entry
+    /// would exceed [`MAX_ENTRY_BYTES`](log::MAX_ENTRY_BYTES), which only an
+    /// unindexed string can reach), or the opposite op (a retract) is already stored for
     /// this value at exactly this tick ([`Error::SameTickConflict`]; a
     /// repeated assert at that tick is a no-op instead).
     pub fn assert(
@@ -1395,7 +1851,37 @@ impl World {
         v: Value,
         tick: Option<Tick>,
     ) -> Result<WriteResult, Error> {
-        self.write(entity, attr, &v, tick, Op::Assert)
+        self.write(entity, attr, &v, tick, Op::Assert, Precision::Exact)
+    }
+
+    /// [`World::assert`] with the tick's precision (vague time): the stored
+    /// fact carries `p`, which [`View::history`] and [`View::as_of_detail`]
+    /// report. Precision is never part of a key: the write is validated and
+    /// judged exactly like [`World::assert`] (asserting a value that holds
+    /// at the write's tick is "0 changed" whatever its precision, and
+    /// records nothing).
+    pub fn assert_with_precision(
+        &mut self,
+        entity: EntityId,
+        attr: &str,
+        v: Value,
+        tick: Option<Tick>,
+        p: Precision,
+    ) -> Result<WriteResult, Error> {
+        self.write(entity, attr, &v, tick, Op::Assert, p)
+    }
+
+    /// [`World::retract`] with the tick's precision; judged exactly like
+    /// [`World::retract`] (see [`World::assert_with_precision`]).
+    pub fn retract_with_precision(
+        &mut self,
+        entity: EntityId,
+        attr: &str,
+        v: Value,
+        tick: Option<Tick>,
+        p: Precision,
+    ) -> Result<WriteResult, Error> {
+        self.write(entity, attr, &v, tick, Op::Retract, p)
     }
 
     /// Retracts value `v` of `entity.attr` from `tick` on.
@@ -1416,7 +1902,7 @@ impl World {
         v: Value,
         tick: Option<Tick>,
     ) -> Result<WriteResult, Error> {
-        self.write(entity, attr, &v, tick, Op::Retract)
+        self.write(entity, attr, &v, tick, Op::Retract, Precision::Exact)
     }
 
     /// Corrects the committed fact entry `entry` (author time): see
@@ -1437,10 +1923,11 @@ impl World {
     /// [`Correction::Replace`] builds the new fact from the current one with
     /// the given fields replaced, validated like a write (a bidirectional
     /// pair renormalised, which may swap entity and value), and `tick` is its
-    /// tick. Same key, only the op changed: one `Revised` entry (`changed:
-    /// 1`). A moved key (tick or value): a `DELETED` marker at the old key,
-    /// then the `Revised` at the new one, sharing one revision (`changed:
-    /// 2`); if the same op is already current at the new key only the marker
+    /// tick. Same key, only the op and/or the precision changed: one
+    /// `Revised` entry (`changed: 1`). A moved key (tick or value): a
+    /// `DELETED` marker at the old key, then the `Revised` at the new one,
+    /// sharing one revision and keeping the precision unless one is given
+    /// (`changed: 2`); if the same op is already current at the new key only the marker
     /// is written (`changed: 1`, and the chain counts as deleted). Nothing
     /// changed: a no-op (`changed: 0`, nothing appended). A new `Revised`
     /// assert of a `ref` triple with no edge interns one (listed in
@@ -1451,8 +1938,12 @@ impl World {
     /// `DELETED` entry), [`Error::AlreadyDeleted`] (the chain is currently
     /// deleted), [`Error::TooManyRevisions`], for a replace any error of
     /// [`World::assert`]'s validation (including [`Error::RetractEvent`] for
-    /// a new retract of an event), or [`Error::SameTickConflict`] if the
-    /// opposite op is current at a moved fact's new key.
+    /// a new retract of an event), [`Error::SameTickConflict`] if the
+    /// opposite op is current at a moved fact's new key, or
+    /// [`Error::EntryTooLarge`] if a correction entry carrying the current
+    /// or the new value would exceed [`MAX_ENTRY_BYTES`](log::MAX_ENTRY_BYTES)
+    /// (judged as for a write; for the current value only reachable
+    /// through a crafted log).
     pub fn correct(&mut self, entry: EntryId, c: Correction) -> Result<WriteResult, Error> {
         let mut txn = self.begin();
         let mut res = txn.correct(entry, c)?;
@@ -1476,15 +1967,17 @@ impl World {
         };
         let chain = self.chain(base);
         let current = chain.current.ok_or(Error::AlreadyDeleted(entry))?;
-        let (entity, attr, value, tick, op) = self
+        let (entity, attr, value, tick, op, precision) = self
             .kept_entry(current)
             .and_then(|info| as_fact(&info.body))
             .expect("invariant: a chain's current entry is a committed Fact or Revised entry");
+        // A committed fact's value was encoded once before; it encodes.
+        let mut fact = self.stored_fact_def(entity, attr, value, tick, op)?;
+        fact.precision = precision;
         Ok(Target {
             base,
             chain,
-            // A committed fact's value was encoded once before; it encodes.
-            fact: fact_def(entity, attr, value, tick, op)?,
+            fact,
             value: value.clone(),
         })
     }
@@ -1497,18 +1990,18 @@ impl World {
             .unwrap_or(Chain::untouched(base))
     }
 
-    /// Replay: the op of the committed fact entry `current` (a chain's
-    /// current fact) if `fact` is at its key, else `None`. Values compare
-    /// by encoding: exact bytes.
-    fn op_if_at_key(&self, current: EntryId, fact: &FactDef) -> Option<Op> {
-        let (entity, attr, value, tick, op) = self
+    /// Replay: the op and precision of the committed fact entry `current`
+    /// (a chain's current fact) if `fact` is at its key, else `None`.
+    /// Values compare by encoding: exact bytes.
+    fn op_if_at_key(&self, current: EntryId, fact: &FactDef) -> Option<(Op, Precision)> {
+        let (entity, attr, value, tick, op, precision) = self
             .kept_entry(current)
             .and_then(|info| as_fact(&info.body))
             .expect("invariant: a chain's current entry is a committed Fact or Revised entry");
         // Committed values were encoded once before, so they encode.
         let same = (entity, attr, tick) == (fact.entity, fact.attr, fact.tick)
             && value.encode().is_ok_and(|v| v == fact.value);
-        same.then_some(op)
+        same.then_some((op, precision))
     }
 
     /// Replay: the state of the chain a correction names as `of`, which
@@ -1534,9 +2027,10 @@ impl World {
         v: &Value,
         tick: Option<Tick>,
         op: Op,
+        precision: Precision,
     ) -> Result<WriteResult, Error> {
         let mut txn = self.begin();
-        let mut res = txn.write(entity, attr, v, tick, op)?;
+        let mut res = txn.write(entity, attr, v, tick, op, precision)?;
         let commit = txn.commit()?;
         res.entries = commit.entries;
         res.edges = commit.edges;
@@ -1551,6 +2045,7 @@ impl World {
     /// defined, both as the subject and as a `ref` value. A fact on a
     /// bidirectional attribute comes back normalised (see
     /// [`World::stored_pair`]), so both spellings judge and store as one.
+    ///
     fn prepare_fact(
         &self,
         staged: &StagedIds,
@@ -1589,13 +2084,88 @@ impl World {
             }
             _ => (entity, None),
         };
+        let vref = self.value_ref(staged, def, v, &value)?;
         Ok(FactDef {
             entity,
             attr: attr_id,
             value,
             tick,
             op,
+            precision: Precision::Exact,
             target,
+            vref,
+        })
+    }
+
+    /// The value reference the `E` keys of value `v` (encoded as
+    /// `encoding`) of attribute `def` carry: `None` unless `def` is an
+    /// unindexed string attribute. A value the world's table (or the
+    /// writing transaction, `staged`) already holds keeps its reference; a
+    /// new one gets the next ordinal of its content hash, counting the
+    /// values `staged` adds, which is exactly what it gets when its entry
+    /// is applied (commit and replay assign in log order). A new value has
+    /// no stored history, so judging it under that reference finds nothing,
+    /// as it should.
+    ///
+    /// Fails with [`Error::Id`] only if every ordinal of the hash is spent
+    /// (`u32::MAX + 1` distinct values sharing one content hash).
+    fn value_ref(
+        &self,
+        staged: &StagedIds,
+        def: &AttrDef,
+        v: &Value,
+        encoding: &[u8],
+    ) -> Result<Option<[u8; key::VALUE_REF_LEN]>, Error> {
+        let Value::Str(text) = v else {
+            return Ok(None);
+        };
+        if def.indexed || def.value_type != ValueType::Str {
+            return Ok(None);
+        }
+        if let Some(r) = self
+            .values
+            .get(encoding)
+            .or_else(|| staged.values.get(encoding))
+        {
+            return Ok(Some(r.to_key_bytes()));
+        }
+        let hash = (self.content_hash)(text.as_bytes());
+        // Staged values of a hash continue the committed ordinals.
+        let next = self
+            .values
+            .next_ordinal(hash)
+            .max(staged.values.next_ordinal(hash));
+        let ordinal = u32::try_from(next).map_err(|_| IdError::SeqOutOfRange(next))?;
+        Ok(Some(ValueRef { hash, ordinal }.to_key_bytes()))
+    }
+
+    /// The [`FactDef`] (keys and op) of a stored entry, from its decoded
+    /// fields: its value reference is the one the world's table holds.
+    fn stored_fact_def(
+        &self,
+        entity: EntityId,
+        attr: AttrId,
+        value: &Value,
+        tick: Tick,
+        op: Op,
+    ) -> Result<FactDef, Error> {
+        let encoded = value.encode()?;
+        let vref = match self.attributes.get(attr.0 as usize) {
+            Some(def) => self.value_ref(&StagedIds::default(), def, value, &encoded)?,
+            None => None,
+        };
+        Ok(FactDef {
+            entity,
+            attr,
+            value: encoded,
+            tick,
+            op,
+            precision: Precision::Exact,
+            target: match value {
+                Value::Ref(target) => Some(*target),
+                _ => None,
+            },
+            vref,
         })
     }
 
@@ -1644,6 +2214,7 @@ impl World {
     /// the canon skip, even at the latest canon: the reference path the
     /// latest-revision indexes must agree with. Not part of the supported
     /// API.
+    #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub fn at_canon_main(&self, tx: TxId) -> View<'_> {
         View {
@@ -1666,10 +2237,45 @@ impl World {
             .as_of_value(entity, attr, v, t)
     }
 
+    /// Every entity (or edge) for which `attr = v` holds at tick `t`
+    /// (latest canon). Same as [`View::lookup`] on `at_canon(latest_tx())`.
+    pub fn lookup(&self, attr: &str, v: &Value, t: Tick) -> Result<Vec<EntityId>, Error> {
+        self.at_canon(self.latest_tx).lookup(attr, v, t)
+    }
+
+    /// Every entity of node type `node_type` (latest canon). Same as
+    /// [`View::entities_of_type`] on `at_canon(latest_tx())`.
+    pub fn entities_of_type<'w>(
+        &'w self,
+        node_type: &str,
+    ) -> Result<impl Iterator<Item = EntityId> + use<'w>, Error> {
+        self.at_canon(self.latest_tx).entities_of_type(node_type)
+    }
+
+    /// Every entity (or edge) with a value of the string attribute `attr`
+    /// holding at tick `t` whose [`fold_for_search`] equals `text`'s
+    /// (latest canon). Same as [`View::lookup_ci`] on
+    /// `at_canon(latest_tx())`.
+    pub fn lookup_ci(&self, attr: &str, text: &str, t: Tick) -> Result<Vec<EntityId>, Error> {
+        self.at_canon(self.latest_tx).lookup_ci(attr, text, t)
+    }
+
     /// Every value of `entity.attr` that holds at tick `t` (latest canon).
     /// Same as [`View::as_of`] on `at_canon(latest_tx())`.
     pub fn as_of(&self, entity: EntityId, attr: &str, t: Tick) -> Result<Vec<Value>, Error> {
         self.at_canon(self.latest_tx).as_of(entity, attr, t)
+    }
+
+    /// Every value of `entity.attr` holding at tick `t` (latest canon) with
+    /// the change that makes it hold, its tick and precision. Same as
+    /// [`View::as_of_detail`] on `at_canon(latest_tx())`.
+    pub fn as_of_detail(
+        &self,
+        entity: EntityId,
+        attr: &str,
+        t: Tick,
+    ) -> Result<Vec<Change>, Error> {
+        self.at_canon(self.latest_tx).as_of_detail(entity, attr, t)
     }
 
     /// The change points of `entity.attr` (latest canon).
@@ -1691,7 +2297,7 @@ impl World {
         let entities = self.node_types.iter().enumerate().flat_map(|(t, nt)| {
             // In range: at most MAX_NODE_TYPE + 1 types are declared.
             let t = NodeTypeId(t as u16);
-            (1..=nt.last_seq).map(move |seq| {
+            (1..=nt.last_seq()).map(move |seq| {
                 EntityId::new(t, seq).expect("invariant: assigned entity sequences fit an ID")
             })
         });
@@ -1832,33 +2438,86 @@ impl World {
     ) -> Vec<(EntityId, AttrId, Side)> {
         let mut touched = Vec::new();
         for f in facts {
-            touched.push((f.entity, f.attr, Side::Forward));
-            if let Some(target) = f.target {
-                touched.push((target, f.attr, Side::Reverse));
-                if self.is_bidirectional(f.attr) {
-                    touched.push((target, f.attr, Side::Forward));
-                }
-            }
+            self.sides_of(f, |side, _| touched.push(side));
         }
-        let rank = |s: Side| match s {
-            Side::Forward => 0u8,
-            Side::Reverse => 1,
-        };
-        touched.sort_by(|x, y| {
-            let name = |a: AttrId| self.attributes[a.0 as usize].name.as_str();
-            (x.0.raw(), name(x.1), rank(x.2)).cmp(&(y.0.raw(), name(y.1), rank(y.2)))
-        });
+        self.sort_sides(&mut touched, |s| *s);
         touched.dedup();
         touched
     }
 
-    /// The overlaps at the latest canon of each `(entity, attr, side)` in
-    /// `sides`, one list per entry (see [`View::overlaps_of`]).
-    fn overlaps_of_sides(&self, sides: &[(EntityId, AttrId, Side)]) -> Vec<Vec<Overlap>> {
+    /// [`World::touched_sides`], each side with the values the entries
+    /// change on it (their encodings, ascending and deduplicated): on the
+    /// entity's Forward side the fact's value, on the target's Reverse (and
+    /// bidirectional Forward) side `Ref(entity)`. Only those values'
+    /// intervals can differ before and after the commit.
+    fn touched_side_values<'f>(
+        &self,
+        facts: impl Iterator<Item = &'f FactDef>,
+    ) -> Vec<TouchedSide> {
+        let mut pairs: Vec<((EntityId, AttrId, Side), Vec<u8>)> = Vec::new();
+        for f in facts {
+            self.sides_of(f, |side, value| pairs.push((side, value)));
+        }
+        self.sort_sides(&mut pairs, |p| p.0);
+        let mut out: Vec<TouchedSide> = Vec::new();
+        for (side, value) in pairs {
+            match out.last_mut() {
+                Some(last) if last.side == side => last.values.push(value),
+                _ => out.push(TouchedSide {
+                    side,
+                    values: vec![value],
+                }),
+            }
+        }
+        for t in &mut out {
+            t.values.sort_unstable();
+            t.values.dedup();
+        }
+        out
+    }
+
+    /// Calls `push` with each `(entity, attr, side)` check the stored entry
+    /// at `f`'s key can change and the value (encoded) it changes there.
+    fn sides_of(&self, f: &FactDef, mut push: impl FnMut((EntityId, AttrId, Side), Vec<u8>)) {
+        push((f.entity, f.attr, Side::Forward), f.value.clone());
+        if let Some(target) = f.target {
+            let source = || {
+                Value::Ref(f.entity)
+                    .encode()
+                    .expect("invariant: a ref value always encodes")
+            };
+            push((target, f.attr, Side::Reverse), source());
+            if self.is_bidirectional(f.attr) {
+                push((target, f.attr, Side::Forward), source());
+            }
+        }
+    }
+
+    /// Sorts by `(entity, attr name, side)` with Forward first (stable, so
+    /// equal sides keep their order): the order warnings are reported in.
+    fn sort_sides<T>(&self, items: &mut [T], side: impl Fn(&T) -> (EntityId, AttrId, Side)) {
+        let rank = |s: Side| match s {
+            Side::Forward => 0u8,
+            Side::Reverse => 1,
+        };
+        let name = |a: AttrId| self.attributes[a.0 as usize].name.as_str();
+        items.sort_by(|x, y| {
+            let (x, y) = (side(x), side(y));
+            (x.0.raw(), name(x.1), rank(x.2)).cmp(&(y.0.raw(), name(y.1), rank(y.2)))
+        });
+    }
+
+    /// The overlaps at the latest canon of each touched side in `sides`
+    /// that involve one of its touched values, one list per entry (see
+    /// [`View::overlaps_of_touching`]).
+    fn overlaps_of_sides(&self, sides: &[TouchedSide]) -> Vec<Vec<Overlap>> {
         let view = self.at_canon(self.latest_tx);
         sides
             .iter()
-            .map(|&(entity, attr, side)| view.overlaps_of(entity, attr, side))
+            .map(|t| {
+                let (entity, attr, side) = t.side;
+                view.overlaps_of_touching(entity, attr, side, Some(&t.values))
+            })
             .collect()
     }
 
@@ -1897,7 +2556,7 @@ impl World {
     /// The last sequence number assigned to node type `t`, counting staged
     /// entities; `None` if the type isn't declared.
     fn last_seq(&self, staged: &StagedIds, t: NodeTypeId) -> Option<u64> {
-        let committed = self.node_types.get(usize::from(t.0))?.last_seq;
+        let committed = self.node_types.get(usize::from(t.0))?.last_seq();
         Some(staged.last_seq.get(&t).copied().unwrap_or(committed))
     }
 
@@ -1951,10 +2610,16 @@ impl World {
         })
     }
 
-    /// Applies a definition produced by [`World::prepare_entity`] (later:
-    /// its `DEFINE` entry), as part of a commit. Infallible.
-    fn apply_entity(&mut self, def: EntityDef) {
-        self.node_types[usize::from(def.id.node_type().0)].last_seq = def.id.seq();
+    /// Applies a definition produced by [`World::prepare_entity`], as part
+    /// of the commit (or replay) of transaction `tx`. Infallible.
+    fn apply_entity(&mut self, def: EntityDef, tx: TxId) {
+        let nt = &mut self.node_types[usize::from(def.id.node_type().0)];
+        debug_assert_eq!(
+            def.id.seq(),
+            nt.last_seq() + 1,
+            "invariant: entity sequences are applied in order, without gaps"
+        );
+        nt.defined_in.push(tx);
         if let Some(h) = def.handle {
             self.entity_by_handle.insert(h, def.id);
         }
@@ -1984,6 +2649,14 @@ impl World {
     }
 }
 
+/// One `(entity, attr, side)` check a commit touches, with the values
+/// (encoded, ascending, deduplicated) whose intervals it may change there.
+#[derive(Debug)]
+struct TouchedSide {
+    side: (EntityId, AttrId, Side),
+    values: Vec<Vec<u8>>,
+}
+
 /// Replay state spanning one transaction after the genesis, for the rules a
 /// single entry can't check on its own.
 #[derive(Debug, Default)]
@@ -2005,7 +2678,7 @@ impl ReplayTxn {
     /// if it already wrote one there (a live transaction stores at most one
     /// entry per key).
     fn claim_key(&mut self, fact: &FactDef) -> Result<(), String> {
-        let mut k = key::e_value_prefix(fact.entity, fact.attr, &fact.value);
+        let mut k = key::e_value_prefix(fact.entity, fact.attr, fact.key_value());
         key::push_seek_tick(&mut k, fact.tick);
         if self.keys.insert(k) {
             Ok(())
@@ -2092,12 +2765,18 @@ impl std::fmt::Display for ReplayFault {
     }
 }
 
-/// Borrowed views of a world's four stored indexes (see [`World::indexes`]).
+/// Borrowed views of a world's stored indexes (see [`World::indexes`]).
 pub(crate) struct StoredIndexes<'w> {
     pub(crate) e: &'w Index,
     pub(crate) r: &'w Index,
+    pub(crate) v: &'w Index,
     pub(crate) e_latest: &'w LatestIndex,
     pub(crate) r_latest: &'w LatestIndex,
+    pub(crate) e_precision: &'w Precisions,
+    pub(crate) e_latest_precision: &'w Precisions,
+    pub(crate) v_latest: &'w LatestIndex,
+    pub(crate) vfold: &'w Index,
+    pub(crate) vfold_latest: &'w LatestIndex,
 }
 
 /// The schema declared by the genesis transaction's entries (without its
@@ -2165,9 +2844,12 @@ fn check_type(attr: &str, def: &AttrDef, v: &Value) -> Result<(), Error> {
     Ok(())
 }
 
-/// The fact a `Fact` or `Revised` entry says: `(entity, attr, value, tick,
-/// op)`; `None` for any other entry.
-fn as_fact(body: &EntryBody) -> Option<(EntityId, AttrId, &Value, Tick, Op)> {
+/// A fact as a `Fact` or `Revised` entry says it: `(entity, attr, value,
+/// tick, op, precision)`.
+type FactFields<'b> = (EntityId, AttrId, &'b Value, Tick, Op, Precision);
+
+/// The fact a `Fact` or `Revised` entry says; `None` for any other entry.
+fn as_fact(body: &EntryBody) -> Option<FactFields<'_>> {
     match body {
         EntryBody::Fact {
             entity,
@@ -2175,6 +2857,7 @@ fn as_fact(body: &EntryBody) -> Option<(EntityId, AttrId, &Value, Tick, Op)> {
             value,
             tick,
             op,
+            precision,
         }
         | EntryBody::Revised {
             entity,
@@ -2182,31 +2865,11 @@ fn as_fact(body: &EntryBody) -> Option<(EntityId, AttrId, &Value, Tick, Op)> {
             value,
             tick,
             op,
+            precision,
             ..
-        } => Some((*entity, *attr, value, *tick, *op)),
+        } => Some((*entity, *attr, value, *tick, *op, *precision)),
         _ => None,
     }
-}
-
-/// A stored fact's [`FactDef`] (its key and op), from its decoded fields.
-fn fact_def(
-    entity: EntityId,
-    attr: AttrId,
-    value: &Value,
-    tick: Tick,
-    op: Op,
-) -> Result<FactDef, Error> {
-    Ok(FactDef {
-        entity,
-        attr,
-        value: value.encode()?,
-        tick,
-        op,
-        target: match value {
-            Value::Ref(target) => Some(*target),
-            _ => None,
-        },
-    })
 }
 
 /// Borrows an owned key bound as a slice bound, for `BTreeMap::range`.
@@ -2336,7 +2999,33 @@ impl Txn<'_> {
         v: Value,
         tick: Option<Tick>,
     ) -> Result<WriteResult, Error> {
-        self.write(entity, attr, &v, tick, Op::Assert)
+        self.write(entity, attr, &v, tick, Op::Assert, Precision::Exact)
+    }
+
+    /// [`Txn::assert`] with the tick's precision: staged with `p`, judged
+    /// exactly like [`Txn::assert`] (see [`World::assert_with_precision`]).
+    pub fn assert_with_precision(
+        &mut self,
+        entity: EntityId,
+        attr: &str,
+        v: Value,
+        tick: Option<Tick>,
+        p: Precision,
+    ) -> Result<WriteResult, Error> {
+        self.write(entity, attr, &v, tick, Op::Assert, p)
+    }
+
+    /// [`Txn::retract`] with the tick's precision: staged with `p`, judged
+    /// exactly like [`Txn::retract`].
+    pub fn retract_with_precision(
+        &mut self,
+        entity: EntityId,
+        attr: &str,
+        v: Value,
+        tick: Option<Tick>,
+        p: Precision,
+    ) -> Result<WriteResult, Error> {
+        self.write(entity, attr, &v, tick, Op::Retract, p)
     }
 
     /// Stages a retract of `v` for `entity.attr` from `tick` on.
@@ -2351,7 +3040,7 @@ impl Txn<'_> {
         v: Value,
         tick: Option<Tick>,
     ) -> Result<WriteResult, Error> {
-        self.write(entity, attr, &v, tick, Op::Retract)
+        self.write(entity, attr, &v, tick, Op::Retract, Precision::Exact)
     }
 
     /// The edge interned for `(source, attr, target)`, as
@@ -2371,12 +3060,16 @@ impl Txn<'_> {
         v: &Value,
         tick: Option<Tick>,
         op: Op,
+        precision: Precision,
     ) -> Result<WriteResult, Error> {
         self.guard(|txn| {
             let tick = tick.or(txn.default_tick).unwrap_or(txn.base_tick);
-            let fact = txn
+            let mut fact = txn
                 .world
                 .prepare_fact(&txn.ids, entity, attr, v, tick, op)?;
+            // A payload only: judged below exactly as an exact fact.
+            fact.precision = precision;
+            check_entry_size(attr, &fact)?;
             if judge(&txn.world.e_index, &txn.staged, &fact, entity, attr)? == Verdict::Noop {
                 // Find-then-act: nothing to change, so nothing is staged.
                 return Ok(WriteResult {
@@ -2431,8 +3124,14 @@ impl Txn<'_> {
                     tick: current.tick,
                 });
             }
+            // Every correction entry carries the current value (a `DELETED`
+            // marker) or a value derived from it, so the current value must
+            // fit a correction entry before anything is staged. A value that
+            // fit only as a plain fact (a crafted log) is refused here with
+            // the typed error, not later by the log writer.
+            check_entry_size(&attr, &current)?;
             let rev = || chain.rev.checked_add(1).ok_or(Error::TooManyRevisions(of));
-            let (value, tick, op) = match c {
+            let (value, tick, op, precision) = match c {
                 Correction::Delete => {
                     let tick = current.tick;
                     txn.stage(Staged::Deleted {
@@ -2442,13 +3141,18 @@ impl Txn<'_> {
                     });
                     return Ok(written(1, tick));
                 }
-                Correction::Replace { value, tick, op } => (value, tick, op),
+                Correction::Replace {
+                    value,
+                    tick,
+                    op,
+                    precision,
+                } => (value, tick, op, precision),
             };
             // The new fact is the current one with the given fields
             // replaced, validated like a write. The subject is the current
             // fact's (stored) entity; a bidirectional pair is renormalised,
             // which may swap it with the value.
-            let new = txn.world.prepare_fact(
+            let mut new = txn.world.prepare_fact(
                 &txn.ids,
                 current.entity,
                 &attr,
@@ -2456,16 +3160,20 @@ impl Txn<'_> {
                 tick.unwrap_or(current.tick),
                 op.unwrap_or(current.op),
             )?;
+            // Kept unless given, also when the key moves.
+            new.precision = precision.unwrap_or(current.precision);
+            check_entry_size(&attr, &new)?;
             let tick = new.tick;
             let same_key = (new.entity, &new.value, new.tick)
                 == (current.entity, &current.value, current.tick);
             if same_key {
-                if new.op == current.op {
+                if (new.op, new.precision) == (current.op, current.precision) {
                     // Nothing changed: find-then-act, nothing staged.
                     return Ok(written(0, tick));
                 }
                 // The chain's own entry is the current one at its key, so
-                // changing the op there can't conflict with anything else.
+                // changing the op or the precision there can't conflict
+                // with anything else.
                 txn.intern_edge(&new)?;
                 txn.stage(Staged::Revised {
                     of,
@@ -2478,7 +3186,7 @@ impl Txn<'_> {
             // latest canon plus the staged entries. The hold-based no-op
             // rules don't apply: this changes what canon says, not the story.
             let layers = [&txn.world.e_index, &txn.staged];
-            let mut prefix = key::e_value_prefix(new.entity, new.attr, &new.value);
+            let mut prefix = key::e_value_prefix(new.entity, new.attr, new.key_value());
             let there = op_at_tick(&layers, &mut prefix, new.tick, TxId(u64::MAX));
             match there {
                 Some(stored) if stored != new.op => Err(Error::SameTickConflict {
@@ -2536,7 +3244,13 @@ impl Txn<'_> {
     /// write order.
     fn stage(&mut self, entry: Staged) {
         let (fact, mark) = entry.key_and_mark();
-        let k = key::e_fact_key(fact.entity, fact.attr, &fact.value, fact.tick, self.tx);
+        // A value new to the world is held here until the commit applies it.
+        if let Some(r) = fact.value_ref()
+            && self.world.values.get(&fact.value).is_none()
+        {
+            self.ids.values.insert(&fact.value, r);
+        }
+        let k = key::e_fact_key(fact.entity, fact.attr, fact.key_value(), fact.tick, self.tx);
         self.staged.insert(k, mark);
         self.entries.push(entry);
     }
@@ -2556,10 +3270,31 @@ impl Txn<'_> {
     /// returns [`Error::Io`], nothing is applied, and the world refuses
     /// further writes.
     pub fn commit(self) -> Result<CommitResult, Error> {
+        self.commit_with(true)
+    }
+
+    /// [`Txn::commit`] without the write warnings: the returned
+    /// [`CommitResult::warnings`] is always empty. Everything stored (log
+    /// bytes, entry and edge IDs, tx numbering) is identical to `commit`.
+    ///
+    /// For the fixture loader, which discards warnings: computing them
+    /// rescans each touched cardinality-one side's whole history and is
+    /// quadratic in the overlapping values one transaction touches
+    /// (security review H1/H2).
+    pub(crate) fn commit_quiet(self) -> Result<CommitResult, Error> {
+        self.commit_with(false)
+    }
+
+    /// The body of [`Txn::commit`]; `warn` selects whether the overlap
+    /// warnings diff is computed. Nothing else depends on it.
+    fn commit_with(self, warn: bool) -> Result<CommitResult, Error> {
         if self.poisoned {
             return Err(Error::TransactionAborted);
         }
         let world = self.world;
+        // Before anything else, an empty transaction included: an
+        // unacknowledged recovery refuses every write.
+        world.acknowledged()?;
         let changed = self.entries.len();
         if changed == 0 && self.ids.is_empty() {
             return Ok(CommitResult {
@@ -2573,8 +3308,14 @@ impl Txn<'_> {
         // The overlaps of everything the transaction touches, before it
         // lands: half of the warnings diff. Read before the append, so a
         // failed append has nothing to undo.
-        let touched = world.touched_sides(self.entries.iter().map(|e| e.key_and_mark().0));
-        let before = world.overlaps_of_sides(&touched);
+        let (touched, before) = if warn {
+            let touched =
+                world.touched_side_values(self.entries.iter().map(|e| e.key_and_mark().0));
+            let before = world.overlaps_of_sides(&touched);
+            (touched, before)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         // Entity DEFINEs, then edge DEFINEs (whose endpoints may be new
         // entities), precede every fact, so no fact uses an ID before the
         // log defines it. Both kinds of world encode the transaction, so
@@ -2598,6 +3339,7 @@ impl Txn<'_> {
                 value: &f.value,
                 tick: f.tick,
                 op: f.op,
+                precision: f.precision,
             },
             Staged::Fact(f) => NewEntry::Fact {
                 entity: f.entity,
@@ -2605,6 +3347,7 @@ impl Txn<'_> {
                 value: &f.value,
                 tick: f.tick,
                 op: f.op,
+                precision: f.precision,
             },
             Staged::Deleted { of, rev, fact: f } => NewEntry::Deleted {
                 of: *of,
@@ -2626,7 +3369,7 @@ impl Txn<'_> {
             log.append(&encoded)?;
         }
         for def in self.ids.defs {
-            world.apply_entity(def);
+            world.apply_entity(def, self.tx);
         }
         let edges = self.ids.edges.iter().map(|d| d.id).collect();
         for def in self.ids.edges {
@@ -2671,8 +3414,12 @@ impl Txn<'_> {
         }
         world.latest_tx = self.tx;
         world.record(encoded.entries, self.tx);
-        let after = world.overlaps_of_sides(&touched);
-        let warnings = overlap_diff(before, after);
+        let warnings = if warn {
+            let after = world.overlaps_of_sides(&touched);
+            overlap_diff(before, after)
+        } else {
+            Warnings::default()
+        };
         Ok(CommitResult {
             tx: self.tx,
             changed,
@@ -2699,6 +3446,37 @@ pub struct View<'w> {
     /// Read the latest-revision indexes (`canon` is the latest tx) instead
     /// of the main ones with the canon skip.
     latest: bool,
+}
+
+impl<'w> View<'w> {
+    /// Every entity of node type `node_type` defined in this canon (its
+    /// `DEFINE` in a transaction `<=` the view's canon), ascending by
+    /// sequence number (so by [`EntityId`]): `NodeScan` by type. Never an
+    /// entity of another type, never an edge; an entity with no facts is
+    /// listed. Node type names are exact (case-sensitive).
+    ///
+    /// Answered from the ID tables, not the facts: finding the canon's
+    /// entities is one binary search, then the iterator yields each ID
+    /// lazily. Fails with [`Error::UnknownNodeType`] for a type the schema
+    /// doesn't declare; a declared type with no entities is empty.
+    pub fn entities_of_type(
+        &self,
+        node_type: &str,
+    ) -> Result<impl Iterator<Item = EntityId> + use<'w>, Error> {
+        let world = self.world;
+        let type_id = *world
+            .node_type_by_name
+            .get(node_type)
+            .ok_or_else(|| Error::UnknownNodeType(node_type.to_owned()))?;
+        let canon = self.canon;
+        let defined_in = &world.node_types[usize::from(type_id.0)].defined_in;
+        // Entities are defined in tx order, so those visible at the canon
+        // are a prefix of the type's sequences.
+        let visible = defined_in.partition_point(|&tx| tx <= canon) as u64;
+        Ok((1..=visible).map(move |seq| {
+            EntityId::new(type_id, seq).expect("invariant: assigned entity sequences fit an ID")
+        }))
+    }
 }
 
 impl View<'_> {
@@ -2732,7 +3510,14 @@ impl View<'_> {
                 let (source, target) = world.stored_pair(attr_id, entity, *target);
                 key::e_value_prefix(source, attr_id, &Value::Ref(target).encode()?)
             }
-            _ => key::e_value_prefix(entity, attr_id, &v.encode()?),
+            _ => {
+                let encoded = v.encode()?;
+                // An unindexed value never stored has no history.
+                let Some(part) = world.committed_key_part(attr_id, &encoded) else {
+                    return Ok(false);
+                };
+                key::e_value_prefix(entity, attr_id, &part)
+            }
         };
         Ok(self.holds_e(&mut prefix, t))
     }
@@ -2775,9 +3560,274 @@ impl View<'_> {
         }
         let mut out = Vec::new();
         self.for_each_e_value_holding(entity, attr_id, t, |value| {
-            out.push(decode_e_value(value));
+            // An unresolvable key (only by tampering) is skipped.
+            if let Some(v) = world.decode_e_part(attr_id, value) {
+                out.push(v);
+            }
         });
+        if world.keys_by_ref(attr_id) {
+            // Value references sort by hash, not by value: restore the
+            // value-encoding order every other attribute has by key order.
+            out.sort_by_cached_key(|v| v.encode().ok());
+        }
         Ok(out)
+    }
+
+    /// [`View::as_of`] with detail: for every value of `entity.attr` that
+    /// holds at tick `t` in this canon, the [`Change`] that makes it hold,
+    /// i.e. its latest op with tick `<= t` (an assert), with that op's tick
+    /// and [`Precision`]. Sorted by value encoding, so the values are
+    /// exactly [`View::as_of`]'s, in the same order; for a bidirectional
+    /// attribute each partner once, from either side.
+    ///
+    /// Same cost as [`View::as_of`]: one seek per value the attribute has
+    /// ever had. Fails with [`Error::UnknownAttribute`] or
+    /// [`Error::UnknownEntity`].
+    pub fn as_of_detail(
+        &self,
+        entity: EntityId,
+        attr: &str,
+        t: Tick,
+    ) -> Result<Vec<Change>, Error> {
+        let world = self.world;
+        let (attr_id, _) = world.resolve(&StagedIds::default(), entity, attr)?;
+        // (value encoding, change), sorted by the encoding at the end.
+        let mut out: Vec<(Vec<u8>, Change)> = Vec::new();
+        self.for_each_e_history(entity, attr_id, |p| {
+            let Some((k, Op::Assert)) = self.entry_at(&world.e_index, &world.e_latest, p, t) else {
+                return;
+            };
+            // An unresolvable or mistyped key (only by tampering) is skipped.
+            let Some((bytes, value)) = world.decode_e_value(attr_id, &p[key::E_ATTR_PREFIX_LEN..])
+            else {
+                return;
+            };
+            let change = Change {
+                tick: tick_after(k, p.len()),
+                op: Op::Assert,
+                value,
+                precision: self.precision_at(k),
+            };
+            out.push((bytes.to_vec(), change));
+        });
+        if world.is_bidirectional(attr_id) {
+            // The pairs stored under a smaller partner, through their R
+            // mirrors; a self pair was found on the E side.
+            let prefix = key::r_attr_prefix(entity, attr_id);
+            let source_end = |_: &[u8]| key::R_SOURCE_PREFIX_LEN;
+            let mut on_history = |p: &mut Vec<u8>| {
+                let Some((k, Op::Assert)) = self.entry_at(&world.r_index, &world.r_latest, p, t)
+                else {
+                    return;
+                };
+                let Some(source) = key::r_source(p).filter(|s| *s != entity) else {
+                    return;
+                };
+                let tick = tick_after(k, p.len());
+                // A latest-revision key has no tx (and the latest path
+                // ignores it); a main R key ends in its entry's.
+                let tx = key::e_key_tx(k).filter(|_| !self.latest);
+                let value = Value::Ref(source);
+                let bytes = value
+                    .encode()
+                    .expect("invariant: a ref value always encodes");
+                let change = Change {
+                    tick,
+                    op: Op::Assert,
+                    value,
+                    precision: self.r_precision(
+                        source,
+                        attr_id,
+                        entity,
+                        tick,
+                        tx.unwrap_or(TxId(0)),
+                    ),
+                };
+                out.push((bytes, change));
+            };
+            if self.latest {
+                for_each_history(&world.r_latest, &prefix, source_end, &mut on_history);
+            } else {
+                for_each_history(&world.r_index, &prefix, source_end, &mut on_history);
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.dedup_by(|a, b| a.0 == b.0);
+        Ok(out.into_iter().map(|(_, c)| c).collect())
+    }
+
+    /// The key and op of the current entry of the latest tick `<= t` in
+    /// the history `value_prefix` (`E|e|a|v|` or `R|t|a|s|`) of the index
+    /// this view reads: `latest` at the latest canon, else `main` with the
+    /// canon skip (`DELETED` ticks skipped). Reuses `value_prefix` as the
+    /// seek key buffer; it is restored before returning.
+    fn entry_at<'i>(
+        &self,
+        main: &'i Index,
+        latest: &'i LatestIndex,
+        value_prefix: &mut Vec<u8>,
+        t: Tick,
+    ) -> Option<(&'i [u8], Op)> {
+        if self.latest {
+            return latest_seek(latest, value_prefix, t);
+        }
+        let len = value_prefix.len();
+        key::push_seek_tick(value_prefix, t);
+        let found = seek_entry(&[main], value_prefix, &value_prefix[..len], self.canon);
+        value_prefix.truncate(len);
+        found
+    }
+
+    /// Every entity for which `attr = v` holds at tick `t` in this canon,
+    /// ascending by [`EntityId`], each once: "the entity named Edwin".
+    ///
+    /// Holding is judged as in [`View::as_of_value`]: the latest op with
+    /// tick `<= t` for `(e, attr, v)` among the visible transactions
+    /// (`DELETED` ticks skipped) is an assert, so an event holds from its
+    /// tick on. An edge property finds the edge's entity ID.
+    ///
+    /// A non-ref attribute is answered from the `V` index (`V_latest` at
+    /// the latest canon, the main `V` with the canon skip at an older one):
+    /// one seek per entity that ever had `attr = v`. A `ref` attribute is
+    /// answered from `R`, whatever its `indexed` flag: for `Ref(x)`, every
+    /// source `s` of `(s, attr, x)`, and for a bidirectional attribute the
+    /// partners of `x` on either side.
+    ///
+    /// Fails with [`Error::UnknownAttribute`] (an inverse name included),
+    /// [`Error::NotIndexed`] for a non-ref attribute declared unindexed,
+    /// [`Error::WrongValueType`], or [`Error::Value`] for NaN. `-0.0` finds
+    /// `0.0`, as it is stored. A string too long to be indexed, or a `Ref`
+    /// to an undefined entity, can't have been written, so it finds nothing.
+    pub fn lookup(&self, attr: &str, v: &Value, t: Tick) -> Result<Vec<EntityId>, Error> {
+        let world = self.world;
+        let attr_id = *world
+            .attr_by_name
+            .get(attr)
+            .ok_or_else(|| Error::UnknownAttribute(attr.to_owned()))?;
+        let def = &world.attributes[attr_id.0 as usize];
+        if def.value_type != ValueType::Ref && !def.indexed {
+            return Err(Error::NotIndexed(attr.to_owned()));
+        }
+        check_type(attr, def, v)?;
+        // Encoding rejects NaN and normalises -0.0, exactly as a write does.
+        let encoded = v.encode()?;
+        let mut out = Vec::new();
+        match v {
+            Value::Ref(x) => {
+                if !world.is_defined(&StagedIds::default(), *x) {
+                    return Ok(out);
+                }
+                let both = world.is_bidirectional(attr_id);
+                self.for_each_partner_holding(*x, attr_id, both, true, t, |s| out.push(s));
+                // Two sides (and a self pair, stored under both) may repeat.
+                out.sort_unstable();
+                out.dedup();
+            }
+            _ => {
+                if v.check_indexed().is_err() {
+                    return Ok(out);
+                }
+                let prefix = key::v_value_prefix(attr_id, &encoded);
+                // V keys are fixed-width from the value on: `V|a|v|e|` is
+                // the history of one entity, in entity order.
+                let entity_end = |k: &[u8]| (prefix.len() + key::V_ENTITY_LEN).min(k.len());
+                self.for_each_value_holder(
+                    &world.v_index,
+                    &world.v_latest,
+                    &prefix,
+                    entity_end,
+                    t,
+                    |e| out.push(e),
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every entity (or edge) with ANY value of the string attribute `attr`
+    /// holding at tick `t` in this canon whose [`fold_for_search`] equals
+    /// `fold_for_search(text)`: a case- and normalisation-insensitive
+    /// [`View::lookup`] ("edwin" finds "Edwin" and "EDWIN"). Ascending by
+    /// [`EntityId`], each once.
+    ///
+    /// Each original value keeps its own history, judged latest-wins as in
+    /// [`View::lookup`]: an entity is found if at least one of its values
+    /// that fold equal holds at `t`. Answered from `VFold_latest` at the
+    /// latest canon and from the main `VFold` with the canon skip at an
+    /// older one: one seek per `(original value, entity)` that ever folded
+    /// to the text.
+    ///
+    /// Fails with [`Error::UnknownAttribute`] (an inverse name included),
+    /// then [`Error::NotIndexed`] for an attribute declared unindexed (of
+    /// any type), then [`Error::WrongValueType`] for a non-string
+    /// attribute. The text has no length limit: a fold no stored value has
+    /// finds nothing.
+    pub fn lookup_ci(&self, attr: &str, text: &str, t: Tick) -> Result<Vec<EntityId>, Error> {
+        let world = self.world;
+        let attr_id = *world
+            .attr_by_name
+            .get(attr)
+            .ok_or_else(|| Error::UnknownAttribute(attr.to_owned()))?;
+        let def = &world.attributes[attr_id.0 as usize];
+        if !def.indexed {
+            return Err(Error::NotIndexed(attr.to_owned()));
+        }
+        if def.value_type != ValueType::Str {
+            return Err(Error::WrongValueType {
+                attr: attr.to_owned(),
+                expected: def.value_type,
+                got: ValueType::Str,
+            });
+        }
+        let fold = Value::Str(fold_for_search(text))
+            .encode()
+            .expect("invariant: encoding a string never fails");
+        // The fold's encoding is self-delimiting, so `F|a|fold|` never
+        // matches a longer fold it is a byte prefix of.
+        let prefix = key::vfold_prefix(attr_id, &fold);
+        let fold_prefix_len = prefix.len();
+        let history_end = |k: &[u8]| key::vfold_history_end(fold_prefix_len, k);
+        let mut out = Vec::new();
+        self.for_each_value_holder(
+            &world.vfold_index,
+            &world.vfold_latest,
+            &prefix,
+            history_end,
+            t,
+            |e| out.push(e),
+        );
+        // Keys run by original value first, so one entity may hold several
+        // values that fold equal, and entities aren't in order across them.
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// Calls `f`, in key order, with the entity of every history under
+    /// `value_prefix` in a value index (`main` and its latest-revision copy
+    /// `latest`) that holds at `t` in this canon. `history_end(key)` is the
+    /// length of a key's `…|entity|` history prefix, whose last 8 bytes are
+    /// the entity. Shared by every value index layout.
+    fn for_each_value_holder(
+        &self,
+        main: &Index,
+        latest: &LatestIndex,
+        value_prefix: &[u8],
+        history_end: impl Fn(&[u8]) -> usize,
+        t: Tick,
+        mut f: impl FnMut(EntityId),
+    ) {
+        let f = |p: &[u8]| {
+            f(key::v_prefix_entity(p)
+                .expect("invariant: a value index history prefix ends in its entity"))
+        };
+        if self.latest {
+            let holds_at = |p: &mut Vec<u8>| holds_latest(latest, p, t);
+            for_each_holding(latest, value_prefix, history_end, holds_at, f);
+        } else {
+            let holds_at = |p: &mut Vec<u8>| holds(&[main], p, t, self.canon);
+            for_each_holding(main, value_prefix, history_end, holds_at, f);
+        }
     }
 
     /// Calls `f` with every neighbor `x` of `entity` through the `ref`
@@ -2795,9 +3845,13 @@ impl View<'_> {
         mut f: impl FnMut(EntityId),
     ) {
         if out {
-            self.for_each_e_value_holding(entity, attr, t, |value| match decode_e_value(value) {
-                Value::Ref(target) => f(target),
-                other => panic!("invariant: a ref attribute stores only refs, got {other:?}"),
+            let world = self.world;
+            self.for_each_e_value_holding(entity, attr, t, |value| {
+                // An unresolvable key, or one holding a plain value on this
+                // ref attribute (only by tampering), is skipped.
+                if let Some(Value::Ref(target)) = world.decode_e_part(attr, value) {
+                    f(target);
+                }
             });
         }
         if inn {
@@ -2829,14 +3883,23 @@ impl View<'_> {
         t: Tick,
         mut f: impl FnMut(&[u8]),
     ) {
+        self.for_each_e_history(entity, attr, |p| {
+            if self.holds_e(p, t) {
+                f(&p[key::E_ATTR_PREFIX_LEN..]);
+            }
+        });
+    }
+
+    /// Calls `f` with the history prefix `E|entity|attr|value` of every
+    /// value `entity.attr` has ever had in the index this view reads, in
+    /// key order (value-encoding order, value references aside).
+    fn for_each_e_history(&self, entity: EntityId, attr: AttrId, f: impl FnMut(&mut Vec<u8>)) {
         let prefix = key::e_attr_prefix(entity, attr);
-        let f = |p: &[u8]| f(&p[key::E_ATTR_PREFIX_LEN..]);
         let world = self.world;
         // Keys in both E indexes are only ever built by `key::e_fact_key`
         // (the latest one without its `^tx`) from a successful
         // `Value::encode`, so they always parse.
         if self.latest {
-            let index = &world.e_latest;
             let value_end = |k: &[u8]| {
                 key::E_ATTR_PREFIX_LEN
                     + key::latest_e_value_and_tick(k)
@@ -2844,32 +3907,29 @@ impl View<'_> {
                         .0
                         .len()
             };
-            let holds_at = |p: &mut Vec<u8>| holds_latest(index, p, t);
-            for_each_holding(index, &prefix, value_end, holds_at, f);
+            for_each_history(&world.e_latest, &prefix, value_end, f);
         } else {
-            let index = &world.e_index;
             let value_end = |k: &[u8]| {
                 key::E_ATTR_PREFIX_LEN
                     + key::e_value_bytes(k)
                         .expect("invariant: E index keys are built only by key::e_fact_key")
                         .len()
             };
-            let holds_at = |p: &mut Vec<u8>| holds(&[index], p, t, self.canon);
-            for_each_holding(index, &prefix, value_end, holds_at, f);
+            for_each_history(&world.e_index, &prefix, value_end, f);
         }
     }
 
     /// The current entry of every `E` key under `attr_prefix` (`E|e|a|`) in
-    /// this canon, `DELETED` ones left out, as `(tick, value encoding, op)`
-    /// in key order.
-    fn e_current<'v>(&'v self, attr_prefix: &'v [u8]) -> Vec<(Tick, &'v [u8], Op)> {
+    /// this canon, `DELETED` ones left out, as `(tick, value encoding, op,
+    /// precision)` in key order.
+    fn e_current<'v>(&'v self, attr_prefix: &'v [u8]) -> Vec<(Tick, &'v [u8], Op, Precision)> {
         let world = self.world;
         if self.latest {
             under(&world.e_latest, attr_prefix)
                 .map(|(k, op)| {
                     let (value, tick) = key::latest_e_value_and_tick(k)
                         .expect("invariant: E_latest keys are E keys without their ^tx");
-                    (tick, value, *op)
+                    (tick, value, *op, self.precision_at(k))
                 })
                 .collect()
         } else {
@@ -2877,31 +3937,73 @@ impl View<'_> {
                 .map(|(k, op)| {
                     let (value, tick) = key::e_value_and_tick(k)
                         .expect("invariant: E index keys are built only by key::e_fact_key");
-                    (tick, value, op)
+                    (tick, value, op, self.precision_at(k))
                 })
                 .collect()
         }
     }
 
-    /// The current entry of every `R` key under `attr_prefix` (`R|t|a|`) in
-    /// this canon, `DELETED` ones left out, as `(source, tick, op)` in key
-    /// order.
-    fn r_current(&self, attr_prefix: &[u8]) -> Vec<(EntityId, Tick, Op)> {
+    /// The precision of the fact stored at `E` key `k` of the index this
+    /// view reads (`E_latest` keys at the latest canon, main `E` keys
+    /// otherwise): [`Precision::Exact`] unless a vague one is recorded.
+    fn precision_at(&self, k: &[u8]) -> Precision {
+        let precisions = if self.latest {
+            &self.world.e_latest_precision
+        } else {
+            &self.world.e_precision
+        };
+        precisions.get(k).copied().unwrap_or_default()
+    }
+
+    /// The precision of the fact an `R` entry mirrors: the `E` entry of
+    /// `(source, attr, Ref(target))` at `tick` (and `tx`, for a main-index
+    /// read). Builds that `E` key only if the world holds any vague tick.
+    fn r_precision(
+        &self,
+        source: EntityId,
+        attr: AttrId,
+        target: EntityId,
+        tick: Tick,
+        tx: TxId,
+    ) -> Precision {
         let world = self.world;
+        if world.e_precision.is_empty() {
+            return Precision::Exact;
+        }
+        let value = Value::Ref(target)
+            .encode()
+            .expect("invariant: a ref value always encodes");
+        let k = key::e_fact_key(source, attr, &value, tick, tx);
         if self.latest {
-            under(&world.r_latest, attr_prefix)
+            self.precision_at(key::without_tx(&k))
+        } else {
+            self.precision_at(&k)
+        }
+    }
+
+    /// The current entry of every `R` key under `R|target|attr|` in this
+    /// canon, `DELETED` ones left out, as `(source, tick, op, precision)` in
+    /// key order.
+    fn r_current(&self, target: EntityId, attr: AttrId) -> Vec<(EntityId, Tick, Op, Precision)> {
+        let world = self.world;
+        let attr_prefix = key::r_attr_prefix(target, attr);
+        if self.latest {
+            under(&world.r_latest, &attr_prefix)
                 .map(|(k, op)| {
                     let (source, tick) = key::latest_r_source_and_tick(k)
                         .expect("invariant: R_latest keys are R keys without their ^tx");
-                    (source, tick, *op)
+                    // The latest path ignores the tx.
+                    let precision = self.r_precision(source, attr, target, tick, TxId(0));
+                    (source, tick, *op, precision)
                 })
                 .collect()
         } else {
-            current_entries(&world.r_index, attr_prefix, self.canon)
+            current_entries(&world.r_index, &attr_prefix, self.canon)
                 .map(|(k, op)| {
-                    let (_, _, source, tick, _) =
+                    let (_, _, source, tick, tx) =
                         key::decode_r_key(k).expect("invariant: R index keys are fixed-width");
-                    (source, tick, op)
+                    let precision = self.r_precision(source, attr, target, tick, tx);
+                    (source, tick, op, precision)
                 })
                 .collect()
         }
@@ -2998,39 +4100,49 @@ impl View<'_> {
         // The scan yields value-ascending, then newest tick first; collect
         // the value bytes (borrowed from E keys) and reorder by
         // (tick, value bytes).
-        let mut points: Vec<(Tick, Cow<'_, [u8]>, Op)> = self
+        // Value references are resolved to the full encodings they name, so
+        // the order below is by value, whatever the references are.
+        // A key whose value part can't be resolved or decoded (only by
+        // tampering) is skipped; doctor reports it.
+        // (value encoding, change): sorted by (tick, encoding) at the end.
+        let mut points: Vec<(Cow<'_, [u8]>, Change)> = self
             .e_current(&attr_prefix)
             .into_iter()
-            .map(|(tick, value, op)| (tick, Cow::Borrowed(value), op))
+            .filter_map(|(tick, part, op, precision)| {
+                let (bytes, value) = world.decode_e_value(attr_id, part)?;
+                let change = Change {
+                    tick,
+                    op,
+                    value,
+                    precision,
+                };
+                Some((Cow::Borrowed(bytes), change))
+            })
             .collect();
         if world.is_bidirectional(attr_id) {
             // The pairs stored under a smaller partner: their R mirrors.
             // A self pair's R mirror is the E entry already collected.
-            let r_prefix = key::r_attr_prefix(entity, attr_id);
-            for (source, tick, op) in self.r_current(&r_prefix) {
+            for (source, tick, op, precision) in self.r_current(entity, attr_id) {
                 if source != entity {
-                    let value = Value::Ref(source)
+                    let value = Value::Ref(source);
+                    let bytes = value
                         .encode()
                         .expect("invariant: a ref value always encodes");
-                    points.push((tick, Cow::Owned(value), op));
+                    let change = Change {
+                        tick,
+                        op,
+                        value,
+                        precision,
+                    };
+                    points.push((Cow::Owned(bytes), change));
                 }
             }
         }
         // (tick, value) is unique among the points: only each key's
         // current entry is listed, and a bidirectional pair is stored under
         // one side only (the self pair's R side is skipped).
-        points.sort_unstable_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
-        points
-            .into_iter()
-            .map(|(tick, value, op)| Change {
-                tick,
-                op,
-                value: Value::decode(&value).expect(
-                    "invariant: E index keys are built only by key::e_fact_key \
-                     from a successful Value::encode",
-                ),
-            })
-            .collect()
+        points.sort_unstable_by(|a, b| (a.1.tick, &a.0).cmp(&(b.1.tick, &b.0)));
+        points.into_iter().map(|(_, change)| change).collect()
     }
 
     /// The change points of the sources pointing at `target` through the
@@ -3038,14 +4150,15 @@ impl View<'_> {
     /// `Ref(source)` as value, ordered like [`View::history`]: by tick, then
     /// source ID (= value encoding).
     fn reverse_changes(&self, target: EntityId, attr: AttrId) -> Vec<Change> {
-        let mut points = self.r_current(&key::r_attr_prefix(target, attr));
-        points.sort_unstable_by_key(|&(source, tick, _)| (tick, source));
+        let mut points = self.r_current(target, attr);
+        points.sort_unstable_by_key(|&(source, tick, ..)| (tick, source));
         points
             .into_iter()
-            .map(|(source, tick, op)| Change {
+            .map(|(source, tick, op, precision)| Change {
                 tick,
                 op,
                 value: Value::Ref(source),
+                precision,
             })
             .collect()
     }
@@ -3102,6 +4215,19 @@ impl View<'_> {
     /// [`View::overlaps`]). The per-entity step of [`View::overlaps`], for
     /// callers that only need the entities a write touched.
     pub(crate) fn overlaps_of(&self, entity: EntityId, attr: AttrId, side: Side) -> Vec<Overlap> {
+        self.overlaps_of_touching(entity, attr, side, None)
+    }
+
+    /// [`View::overlaps_of`] restricted, when `touched` is given, to the
+    /// overlaps in which one value is among `touched` (value encodings,
+    /// ascending and deduplicated), in the same order.
+    fn overlaps_of_touching(
+        &self,
+        entity: EntityId,
+        attr: AttrId,
+        side: Side,
+        touched: Option<&[Vec<u8>]>,
+    ) -> Vec<Overlap> {
         if !self.is_checked(attr, side) {
             return Vec::new();
         }
@@ -3113,8 +4239,12 @@ impl View<'_> {
             return Vec::new();
         }
         let name = &self.world.attributes[attr.0 as usize].name;
-        find_overlaps(&value_intervals(&changes))
-            .into_iter()
+        let per_value = value_intervals(&changes);
+        let rows = match touched {
+            None => find_overlaps(&per_value),
+            Some(values) => find_overlaps_touching(&per_value, values),
+        };
+        rows.into_iter()
             .map(|(a, b, during)| Overlap {
                 entity,
                 attr: name.clone(),
@@ -3131,7 +4261,8 @@ impl View<'_> {
     /// their tx and key.
     fn visible_keyed_entries(&self) -> impl Iterator<Item = (&EntryInfo, FactDef)> + '_ {
         let canon = self.canon;
-        self.world
+        let world = self.world;
+        world
             .entries
             .iter()
             .take_while(move |e| e.tx <= canon)
@@ -3144,10 +4275,16 @@ impl View<'_> {
                         tick,
                         ..
                     } => (*entity, *attr, value, *tick, Op::Assert),
-                    body => as_fact(body)?,
+                    body => {
+                        let (entity, attr, value, tick, op, _) = as_fact(body)?;
+                        (entity, attr, value, tick, op)
+                    }
                 };
                 // Kept entries were applied, so their values encode.
-                Some((e, fact_def(entity, attr, value, tick, op).ok()?))
+                Some((
+                    e,
+                    world.stored_fact_def(entity, attr, value, tick, op).ok()?,
+                ))
             })
     }
 
@@ -3253,6 +4390,22 @@ fn for_each_holding<V>(
     mut holds_at: impl FnMut(&mut Vec<u8>) -> bool,
     mut f: impl FnMut(&[u8]),
 ) {
+    for_each_history(index, attr_prefix, history_end, |prefix| {
+        if holds_at(prefix) {
+            f(prefix);
+        }
+    });
+}
+
+/// The walk of [`for_each_holding`] without the seek: calls `f` with the
+/// history prefix of every distinct history under `attr_prefix`, in key
+/// order (`f` may use it as a seek buffer, restoring it before returning).
+fn for_each_history<V>(
+    index: &BTreeMap<Vec<u8>, V>,
+    attr_prefix: &[u8],
+    history_end: impl Fn(&[u8]) -> usize,
+    mut f: impl FnMut(&mut Vec<u8>),
+) {
     let mut from = Bound::Included(attr_prefix.to_vec());
     let mut prefix = Vec::new();
     while let Some((k, _)) = index
@@ -3265,10 +4418,18 @@ fn for_each_holding<V>(
         prefix.clear();
         prefix.extend_from_slice(&k[..history_end(k)]);
         from = Bound::Excluded(key::past_value(&prefix));
-        if holds_at(&mut prefix) {
-            f(&prefix);
-        }
+        f(&mut prefix);
     }
+}
+
+/// The tick of index key `k` whose history prefix is `prefix_len` bytes
+/// long: the `^tick` right after it (main and latest-revision keys alike).
+fn tick_after(k: &[u8], prefix_len: usize) -> Tick {
+    let bytes = k
+        .get(prefix_len..prefix_len + 8)
+        .and_then(|b| <[u8; 8]>::try_from(b).ok())
+        .expect("invariant: a history's keys carry a ^tick after its prefix");
+    Tick::decode_inverted(bytes)
 }
 
 /// Every `(key, op)` of a latest-revision index under `prefix`, in key
@@ -3307,15 +4468,25 @@ fn set_latest(index: &mut LatestIndex, at_key: &[u8], mark: Mark) {
 /// so there is nothing to skip. Reuses `value_prefix` as the seek key
 /// buffer; it is restored before returning.
 fn holds_latest(index: &LatestIndex, value_prefix: &mut Vec<u8>, t: Tick) -> bool {
+    latest_seek(index, value_prefix, t).map(|(_, op)| op) == Some(Op::Assert)
+}
+
+/// The seek of [`holds_latest`]: the key and op of the current entry of the
+/// latest tick `<= t` under `value_prefix`, if any.
+fn latest_seek<'i>(
+    index: &'i LatestIndex,
+    value_prefix: &mut Vec<u8>,
+    t: Tick,
+) -> Option<(&'i [u8], Op)> {
     let len = value_prefix.len();
     key::push_seek_tick(value_prefix, t);
     let found = index
         .range::<[u8], _>((Bound::Included(&value_prefix[..]), Bound::Unbounded))
         .next()
         .filter(|(k, _)| k.starts_with(&value_prefix[..len]))
-        .map(|(_, op)| *op);
+        .map(|(k, op)| (&k[..], *op));
     value_prefix.truncate(len);
-    found == Some(Op::Assert)
+    found
 }
 
 /// The current entry (newest tx `<= canon`) of every key under `prefix` in
@@ -3358,11 +4529,31 @@ pub(crate) fn decode_e_row(k: &[u8]) -> Option<(EntityId, AttrId, Value, Tick, T
     Some((entity, attr, Value::decode(value).ok()?, tick, tx))
 }
 
-/// Decodes the value bytes of a stored `E` key.
-fn decode_e_value(value: &[u8]) -> Value {
-    Value::decode(value).expect(
-        "invariant: E index keys are built only by key::e_fact_key from a successful Value::encode",
-    )
+/// Decodes a stored `V` key, value included: `(attr, value, entity, tick,
+/// tx)`, or `None` if the bytes aren't a well-formed `V` key holding a
+/// canonical value encoding. Never panics, whatever the bytes.
+pub(crate) fn decode_v_row(k: &[u8]) -> Option<(AttrId, Value, EntityId, Tick, TxId)> {
+    let (attr, value, entity, tick, tx) = key::decode_v_key(k).ok()?;
+    Some((attr, Value::decode(value).ok()?, entity, tick, tx))
+}
+
+/// Decodes a stored `VFold` key, values included: `(attr, folded,
+/// original, entity, tick, tx)`, or `None` if the bytes aren't a
+/// well-formed `VFold` key holding a canonical string fold and a canonical
+/// original value. Never panics, whatever the bytes.
+pub(crate) fn decode_vfold_row(k: &[u8]) -> Option<(AttrId, String, Value, EntityId, Tick, TxId)> {
+    let (attr, fold, original, entity, tick, tx) = key::decode_vfold_key(k).ok()?;
+    let Value::Str(folded) = Value::decode(fold).ok()? else {
+        return None;
+    };
+    Some((
+        attr,
+        folded,
+        Value::decode(original).ok()?,
+        entity,
+        tick,
+        tx,
+    ))
 }
 
 /// The result of a [`Txn`] write that stored `changed` entries at `tick`
@@ -3370,19 +4561,65 @@ fn decode_e_value(value: &[u8]) -> Value {
 /// The write warnings from the overlaps of the same checks before and after
 /// a commit (lists in the same order, as [`World::overlaps_of_sides`]
 /// returns them): `introduced` = after − before, `resolved` = before −
-/// after, by exact equality. Each check's list is short (pairs of one
-/// entity's values), so the per-check comparison is quadratic in that, not
-/// in the world; the order of the checks and of each list is kept, which
-/// gives the reported sort order.
+/// after, by exact equality. The order of the checks and of each list is
+/// kept, which gives the reported sort order.
+///
+/// Each list is sorted by `(a, b, during.from)` (value encodings), and that
+/// key is unique within a list (one pair's maximal stretches are
+/// disjoint), so the two lists are compared in one sort-merge: an overlap
+/// at the same key with another `until` is the old one resolved and the
+/// new one introduced.
 fn overlap_diff(before: Vec<Vec<Overlap>>, after: Vec<Vec<Overlap>>) -> Warnings {
+    fn sort_key(o: &Overlap) -> (Option<Vec<u8>>, Option<Vec<u8>>, Tick) {
+        (o.a.encode().ok(), o.b.encode().ok(), o.during.from)
+    }
     let mut w = Warnings::default();
-    for (old, new) in before.iter().zip(&after) {
-        w.introduced
-            .extend(new.iter().filter(|o| !old.contains(o)).cloned());
-        w.resolved
-            .extend(old.iter().filter(|o| !new.contains(o)).cloned());
+    for (old, new) in before.into_iter().zip(after) {
+        let mut old = old.into_iter().map(|o| (sort_key(&o), o)).peekable();
+        let mut new = new.into_iter().map(|o| (sort_key(&o), o)).peekable();
+        loop {
+            let order = match (old.peek(), new.peek()) {
+                (None, None) => break,
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (Some((ko, _)), Some((kn, _))) => ko.cmp(kn),
+            };
+            match order {
+                Ordering::Less => w.resolved.extend(old.next().map(|(_, o)| o)),
+                Ordering::Greater => w.introduced.extend(new.next().map(|(_, o)| o)),
+                Ordering::Equal => {
+                    let (o, n) = match (old.next(), new.next()) {
+                        (Some((_, o)), Some((_, n))) => (o, n),
+                        _ => unreachable!("invariant: both lists were peeked non-empty"),
+                    };
+                    if o != n {
+                        w.resolved.push(o);
+                        w.introduced.push(n);
+                    }
+                }
+            }
+        }
     }
     w
+}
+
+/// Refuses a live write of `fact` with [`Error::EntryTooLarge`] if a
+/// `Revised` entry carrying its value would exceed
+/// [`MAX_ENTRY_BYTES`](log::MAX_ENTRY_BYTES): every value is judged by the
+/// largest entry it may ever need, so any accepted value can later be
+/// deleted or replaced in place. Checked before anything is staged, so the
+/// log never gets a frame a reader refuses. Replay doesn't check: its
+/// entries already fit their frames.
+fn check_entry_size(attr: &str, fact: &FactDef) -> Result<(), Error> {
+    let len = log::revised_payload_len(fact.value.len());
+    if len > log::MAX_ENTRY_BYTES {
+        return Err(Error::EntryTooLarge {
+            attr: attr.to_owned(),
+            len,
+            max: log::MAX_ENTRY_BYTES,
+        });
+    }
+    Ok(())
 }
 
 fn written(changed: usize, tick: Tick) -> WriteResult {
@@ -3420,7 +4657,7 @@ fn judge(
 ) -> Result<Verdict, Error> {
     let layers = [committed, staged];
     let layers = &layers[..];
-    let mut prefix = key::e_value_prefix(fact.entity, fact.attr, &fact.value);
+    let mut prefix = key::e_value_prefix(fact.entity, fact.attr, fact.key_value());
     // Writes are judged at the latest canon plus the transaction's own
     // staged facts, so every entry is visible.
     let all = TxId(u64::MAX);
@@ -3454,7 +4691,7 @@ fn judge(
 /// Whether the `E`-layout `index` holds any entry (any tx) at `fact`'s key
 /// `E|e|a|v|^tick`.
 fn has_key(index: &Index, fact: &FactDef) -> bool {
-    let mut at_key = key::e_value_prefix(fact.entity, fact.attr, &fact.value);
+    let mut at_key = key::e_value_prefix(fact.entity, fact.attr, fact.key_value());
     key::push_seek_tick(&mut at_key, fact.tick);
     index
         .range::<[u8], _>((Bound::Included(&at_key[..]), Bound::Unbounded))
@@ -3503,6 +4740,16 @@ fn holds(layers: &[&Index], value_prefix: &mut Vec<u8>, t: Tick, canon: TxId) ->
 /// falling through to them. At the latest canon with no corrections nothing
 /// is skipped: still one seek.
 fn seek(layers: &[&Index], from: &[u8], prefix: &[u8], canon: TxId) -> Option<Op> {
+    seek_entry(layers, from, prefix, canon).map(|(_, op)| op)
+}
+
+/// [`seek`], also returning the key of the entry found.
+fn seek_entry<'i>(
+    layers: &[&'i Index],
+    from: &[u8],
+    prefix: &[u8],
+    canon: TxId,
+) -> Option<(&'i [u8], Op)> {
     // Set once a deleted tick was skipped: seek exclusively past it.
     let mut past: Option<Vec<u8>> = None;
     loop {
@@ -3520,7 +4767,7 @@ fn seek(layers: &[&Index], from: &[u8], prefix: &[u8], canon: TxId) -> Option<Op
             })
             .min_by(|(a, _), (b, _)| a.cmp(b))?;
         match mark.op() {
-            Some(op) => return Some(op),
+            Some(op) => return Some((&k[..], op)),
             None => past = Some(key::past_tick(k)),
         }
     }
@@ -3578,6 +4825,7 @@ mod tests {
                 value: None,
                 tick: Some(Tick(-280)),
                 op: None,
+                precision: None,
             },
         )
         .unwrap();
@@ -3657,5 +4905,41 @@ mod tests {
                 .unwrap()
         );
         assert!(!w.as_of_value(greg, "located_in", &v, Tick(1)).unwrap());
+    }
+    /// The precisions are the payload half of `E` / `E_latest` rows, kept
+    /// beside them: doctor's rebuild-and-compare must catch a wrong one in
+    /// either map, as an `IndexMismatch` of that index.
+    #[test]
+    fn doctor_reports_a_tampered_precision_as_an_index_mismatch() {
+        use crate::doctor::{DoctorOptions, Finding, IndexName, doctor};
+        let (mut w, greg, _, varrow) = world();
+        w.assert_with_precision(
+            greg,
+            "located_in",
+            Value::Ref(varrow),
+            Some(Tick(1)),
+            Precision::Year,
+        )
+        .unwrap();
+        assert!(doctor(&w, &DoctorOptions::default()).is_clean());
+        let mismatch_in = |w: &World, want: IndexName| {
+            doctor(w, &DoctorOptions::default())
+                .findings
+                .iter()
+                .any(|f| matches!(f, Finding::IndexMismatch { index, .. } if *index == want))
+        };
+        let mut main = w.e_precision.clone();
+        for p in w.e_precision.values_mut() {
+            *p = Precision::Day;
+        }
+        assert!(mismatch_in(&w, IndexName::E));
+        w.e_precision.clear();
+        assert!(mismatch_in(&w, IndexName::E));
+        std::mem::swap(&mut w.e_precision, &mut main);
+        for p in w.e_latest_precision.values_mut() {
+            *p = Precision::Century;
+        }
+        assert!(mismatch_in(&w, IndexName::ELatest));
+        assert!(!mismatch_in(&w, IndexName::E));
     }
 }

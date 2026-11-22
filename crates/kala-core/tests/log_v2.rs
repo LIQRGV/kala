@@ -263,8 +263,8 @@ fn every_txn_starts_with_a_documented_begin_record() {
     let (_d, path) = build();
     let b = bytes(&path);
     assert_eq!(&b[..8], b"KALALOG\0");
-    assert_eq!(&b[8..12], &3u32.to_le_bytes());
-    assert_eq!(LOG_FORMAT_VERSION, 3);
+    assert_eq!(&b[8..12], &4u32.to_le_bytes());
+    assert_eq!(LOG_FORMAT_VERSION, 4);
     let spans = common::spans(&b);
     assert_eq!(spans.len(), 5, "genesis + 4 txns");
     assert_eq!(
@@ -362,6 +362,33 @@ fn a_real_world_with_its_version_rewritten_to_2_is_unsupported() {
     std::fs::write(&path, &b).unwrap();
     assert_eq!(open_err(&path), Error::UnsupportedVersion(2));
     assert_eq!(read_log(&path), Err(Error::UnsupportedVersion(2)));
+    assert_eq!(bytes(&path), b);
+}
+
+#[test]
+fn v3_header_is_unsupported_version_3_for_open_and_read_log() {
+    // v3 (no precision byte in Fact/Revised bodies) is an older format: no migration
+    let dir = tempfile::tempdir().unwrap();
+    let mut with_txn = common::header(3);
+    with_txn.extend_from_slice(&common::txn(0, &[]));
+    for (i, file) in [common::header(3), with_txn].into_iter().enumerate() {
+        let p = dir.path().join(format!("v3-{i}.kala"));
+        std::fs::write(&p, &file).unwrap();
+        assert_eq!(open_err(&p), Error::UnsupportedVersion(3), "case {i}");
+        assert_eq!(read_log(&p), Err(Error::UnsupportedVersion(3)), "case {i}");
+        assert_eq!(bytes(&p), file, "case {i}: file untouched");
+        assert!(quarantine_files(&p).is_empty());
+    }
+}
+
+#[test]
+fn a_real_world_with_its_version_rewritten_to_3_is_unsupported() {
+    let (_d, path) = build();
+    let mut b = bytes(&path);
+    b[8..12].copy_from_slice(&3u32.to_le_bytes());
+    std::fs::write(&path, &b).unwrap();
+    assert_eq!(open_err(&path), Error::UnsupportedVersion(3));
+    assert_eq!(read_log(&path), Err(Error::UnsupportedVersion(3)));
     assert_eq!(bytes(&path), b);
 }
 

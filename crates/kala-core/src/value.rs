@@ -19,6 +19,9 @@
 
 use std::fmt;
 
+use caseless::Caseless;
+use unicode_normalization::UnicodeNormalization;
+
 use crate::id::EntityId;
 
 /// Longest string (in UTF-8 bytes, as written) an indexed attribute accepts.
@@ -324,6 +327,24 @@ impl Value {
             _ => Err(ValueError::Malformed("unknown type tag")),
         }
     }
+}
+
+/// The case-insensitive search form of `s`: `NFC(full_case_fold(NFD(s)))`.
+///
+/// Uses the Unicode default full case folding (status C + F; not
+/// locale-specific, so no Turkic `T` mappings: `"I"` folds to `"i"`). Two
+/// strings that differ only in case or in canonically equivalent forms fold
+/// equal: `"Edwin"`, `"EDWIN"` and `"edwin"` all fold to `"edwin"`, `"É"`
+/// (U+00C9) and `"E\u{0301}"` both fold to `"é"` (U+00E9), and `"Straße"`
+/// folds to `"strasse"`. The fold can be longer than `s`.
+///
+/// This is the derived key of the folded value index: it is never stored in
+/// the log, so a change of Unicode data only needs an index rebuild.
+pub fn fold_for_search(s: &str) -> String {
+    // NFD first so a precomposed letter folds like its decomposed form
+    // (case folding is defined per code point); NFC last so the result has
+    // one canonical byte form.
+    s.nfd().default_case_fold().nfc().collect()
 }
 
 #[cfg(test)]

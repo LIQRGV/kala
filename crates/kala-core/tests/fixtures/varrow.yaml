@@ -1,0 +1,408 @@
+# The Varrow chronicle: a fixture world for Kala's acceptance tests.
+#
+# One tick is one YEAR of the world's own calendar (negative years are normal).
+# The story, in the order the AUTHOR wrote it (each `transactions` entry below is one
+# author edit, so its position is its `tx`); story time is the `tick:` on each op.
+#
+#  1. places get their names and rulers          5. Greg in Varrow @200 (tx#50 of CLAUDE.md)
+#  2. the old guard                              6. Lisa's war
+#  3. 24 villagers, each with a home and a move  7. Greg in Ashford @601 -> an OVERLAP (a draft)
+#  4. Edwin's story                              8. a PREQUEL (written late, earlier ticks)
+#                                                9. Greg left Varrow @250 -> overlap resolved
+#                                               10. a new character, 11. the RETCON
+#
+# Moves are always explicit: retract the old place and assert the new one at one tick.
+schema:
+  node_types: [CHARACTER, PLACE, ITEM, EVENT]
+  attributes:
+    - { name: name,       type: string }
+    - { name: alias,      type: string, cardinality: many }
+    - { name: label,      type: string, cardinality: many }       # extra labels (Cypher :Character:Deity)
+    - { name: biography,  type: string, indexed: false }          # long text, no V entries
+    - { name: located_in, type: ref }                             # cardinality one is a LABEL
+    - { name: ally_of,    type: ref, cardinality: many, direction: bidirectional }
+    - { name: ruled_by,   type: ref, reverse: one }               # a place has one ruler, a ruler rules one place
+    - { name: present,    type: ref, cardinality: many }          # edge with properties
+    - { name: disguised,  type: bool }                            # property of a `present` edge
+    - { name: bought,     type: ref, kind: event, cardinality: many }
+    - { name: born_in,    type: ref, kind: event, cardinality: many }
+
+entities:
+  CHARACTER: [edwin, greg, mara, lisa, tomas, hild, osric, wren, v01, v02, v03, v04, v05, v06, v07, v08, v09, v10, v11, v12, v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23, v24]
+  PLACE: [varrow, ashford, carnath, eldoria, dunmere, highkeep, saltmarsh, oakhollow, redcliff, stonebridge, thornwick, whitefall, mistral, graymoor]
+  ITEM: [sword, crown]
+  EVENT: [battle_of_ashford]
+
+transactions:
+  # ---- tx 1: places and their rulers --------------------------------------------------
+  - ops:
+      - { assert: [varrow, name, "Varrow"], tick: -400 }
+      - { assert: [ashford, name, "Ashford"], tick: -400 }
+      - { assert: [carnath, name, "Carnath"], tick: -400 }
+      - { assert: [eldoria, name, "Eldoria"], tick: -400 }
+      - { assert: [dunmere, name, "Dunmere"], tick: -400 }
+      - { assert: [highkeep, name, "Highkeep"], tick: -400 }
+      - { assert: [saltmarsh, name, "Saltmarsh"], tick: -400 }
+      - { assert: [oakhollow, name, "Oakhollow"], tick: -400 }
+      - { assert: [redcliff, name, "Redcliff"], tick: -400 }
+      - { assert: [stonebridge, name, "Stonebridge"], tick: -400 }
+      - { assert: [thornwick, name, "Thornwick"], tick: -400 }
+      - { assert: [whitefall, name, "Whitefall"], tick: -400 }
+      - { assert: [mistral, name, "Mistral"], tick: -400 }
+      - { assert: [graymoor, name, "Graymoor"], tick: -400 }
+      # what kind of place each is (extra labels; a village can grow into a city later)
+      - { assert: [varrow, label, "City"], tick: -400 }
+      - { assert: [ashford, label, "City"], tick: -400 }
+      - { assert: [carnath, label, "Fortress"], tick: -400 }
+      - { assert: [eldoria, label, "Capital"], tick: -400 }
+      - { assert: [dunmere, label, "Port"], tick: -400 }
+      - { assert: [highkeep, label, "Fortress"], tick: -400 }
+      - { assert: [saltmarsh, label, "Marsh"], tick: -400 }
+      - { assert: [oakhollow, label, "Village"], tick: -400 }
+      - { assert: [redcliff, label, "Village"], tick: -400 }
+      - { assert: [stonebridge, label, "Village"], tick: -400 }
+      - { assert: [thornwick, label, "Village"], tick: -400 }
+      - { assert: [whitefall, label, "Village"], tick: -400 }
+      - { assert: [mistral, label, "Port"], tick: -400 }
+      - { assert: [graymoor, label, "Village"], tick: -400 }
+      - { assert: [crown, name, "Crown of Eldoria"], tick: -400 }
+      - { assert: [sword, name, "Sword of Ash"], tick: -400 }
+      - { assert: [battle_of_ashford, name, "Battle of Ashford"], tick: 600, precision: year }
+      # Tomas rules Varrow until Hild takes over; Edwin rules Eldoria from his coronation.
+      - { assert: [varrow, ruled_by, tomas], tick: -350 }
+      - { retract: [varrow, ruled_by, tomas], tick: -190 }
+      - { assert: [varrow, ruled_by, hild], tick: -190 }
+      - { assert: [eldoria, ruled_by, edwin], tick: -180, precision: year }
+
+  # ---- tx 2: the old guard ------------------------------------------------------------
+  - ops:
+      - { assert: [osric, name, "Osric"], tick: -400 }
+      - { assert: [osric, alias, "Old Osric"], tick: -400 }
+      - { assert: [osric, alias, "the Innkeeper"], tick: -390 }
+      - { assert: [osric, located_in, varrow], tick: -400 }
+      - { assert: [tomas, name, "Tomas"], tick: -400 }
+      - { assert: [tomas, label, "Steward"], tick: -350 }
+      - { assert: [tomas, located_in, varrow], tick: -350 }
+      - { assert: [hild, name, "Hild"], tick: -400 }
+      - { assert: [hild, alias, "Hilde"], tick: -300 }
+      - { assert: [hild, label, "Healer"], tick: -300 }
+      - { assert: [hild, located_in, varrow], tick: -270 }
+      - { retract: [hild, located_in, varrow], tick: -230 }
+      - { assert: [hild, located_in, redcliff], tick: -230 }
+      - { assert: [mara, name, "Mara"], tick: -400 }
+      - { assert: [mara, alias, "Mara the Wise"], tick: -250 }
+      - { assert: [mara, label, "Scholar"], tick: -300 }
+      - { assert: [mara, located_in, varrow], tick: -220 }
+      - { retract: [mara, located_in, varrow], tick: -190 }
+      - { assert: [mara, located_in, graymoor], tick: -190 }
+      # Mara takes her husband's name, "sometime in the decade" of -100.
+      - { retract: [mara, name, "Mara"], tick: -100, precision: decade }
+      - { assert: [mara, name, "Mara Voss"], tick: -100, precision: decade }
+      - { assert: [wren, name, "Wren Åberg"], tick: -400 }
+      - { assert: [wren, label, "Scout"], tick: -200 }
+      - { assert: [wren, located_in, saltmarsh], tick: -170 }
+      - { retract: [wren, located_in, saltmarsh], tick: -100 }
+      - { assert: [wren, located_in, thornwick], tick: -100 }
+      - { assert: [wren, alias, "Wren the Quiet"], tick: -200 }
+      - { assert: [tomas, alias, "Steward Tomas"], tick: -350 }
+      - { assert: [greg, alias, "Greg the Younger"], tick: -400 }
+
+  # ---- tx 3: the villagers (generated pattern, one line per fact) ---------------------
+  # Villager N (1..24): arrives in home place (N-1) mod 14 of the place list at -400+5N,
+  # moves at -100+5N to place (N+4) mod 14 (retract + assert at the same tick).
+  # Odd/even pairs (2k-1, 2k) are allies: formed at -300+k, and for odd k broken at -150+k.
+  - ops:
+      - { assert: [v01, name, "Villager 01"], tick: -400 }
+      - { assert: [v01, alias, "V01"], tick: -400 }
+      - { assert: [v01, label, "Villager"], tick: -400 }
+      - { assert: [v01, born_in, varrow], tick: -415, precision: decade }
+      - { assert: [v01, located_in, varrow], tick: -395 }
+      - { retract: [v01, located_in, varrow], tick: -95 }
+      - { assert: [v01, located_in, highkeep], tick: -95 }
+      - { assert: [v02, name, "Villager 02"], tick: -400 }
+      - { assert: [v02, alias, "V02"], tick: -400 }
+      - { assert: [v02, label, "Villager"], tick: -400 }
+      - { assert: [v02, born_in, ashford], tick: -410, precision: decade }
+      - { assert: [v02, located_in, ashford], tick: -390 }
+      - { retract: [v02, located_in, ashford], tick: -90 }
+      - { assert: [v02, located_in, saltmarsh], tick: -90 }
+      - { assert: [v03, name, "Villager 03"], tick: -400 }
+      - { assert: [v03, alias, "V03"], tick: -400 }
+      - { assert: [v03, label, "Villager"], tick: -400 }
+      - { assert: [v03, born_in, carnath], tick: -405, precision: decade }
+      - { assert: [v03, located_in, carnath], tick: -385 }
+      - { retract: [v03, located_in, carnath], tick: -85 }
+      - { assert: [v03, located_in, oakhollow], tick: -85 }
+      - { assert: [v04, name, "Villager 04"], tick: -400 }
+      - { assert: [v04, alias, "V04"], tick: -400 }
+      - { assert: [v04, label, "Villager"], tick: -400 }
+      - { assert: [v04, born_in, eldoria], tick: -400, precision: decade }
+      - { assert: [v04, located_in, eldoria], tick: -380 }
+      - { retract: [v04, located_in, eldoria], tick: -80 }
+      - { assert: [v04, located_in, redcliff], tick: -80 }
+      - { assert: [v05, name, "Villager 05"], tick: -400 }
+      - { assert: [v05, alias, "V05"], tick: -400 }
+      - { assert: [v05, label, "Villager"], tick: -400 }
+      - { assert: [v05, born_in, dunmere], tick: -395, precision: decade }
+      - { assert: [v05, located_in, dunmere], tick: -375 }
+      - { retract: [v05, located_in, dunmere], tick: -75 }
+      - { assert: [v05, located_in, stonebridge], tick: -75 }
+      - { assert: [v06, name, "Villager 06"], tick: -400 }
+      - { assert: [v06, alias, "V06"], tick: -400 }
+      - { assert: [v06, label, "Villager"], tick: -400 }
+      - { assert: [v06, born_in, highkeep], tick: -390, precision: decade }
+      - { assert: [v06, located_in, highkeep], tick: -370 }
+      - { retract: [v06, located_in, highkeep], tick: -70 }
+      - { assert: [v06, located_in, thornwick], tick: -70 }
+      - { assert: [v07, name, "Villager 07"], tick: -400 }
+      - { assert: [v07, alias, "V07"], tick: -400 }
+      - { assert: [v07, label, "Villager"], tick: -400 }
+      - { assert: [v07, born_in, saltmarsh], tick: -385, precision: decade }
+      - { assert: [v07, located_in, saltmarsh], tick: -365 }
+      - { retract: [v07, located_in, saltmarsh], tick: -65 }
+      - { assert: [v07, located_in, whitefall], tick: -65 }
+      - { assert: [v08, name, "Villager 08"], tick: -400 }
+      - { assert: [v08, alias, "V08"], tick: -400 }
+      - { assert: [v08, label, "Villager"], tick: -400 }
+      - { assert: [v08, born_in, oakhollow], tick: -380, precision: decade }
+      - { assert: [v08, located_in, oakhollow], tick: -360 }
+      - { retract: [v08, located_in, oakhollow], tick: -60 }
+      - { assert: [v08, located_in, mistral], tick: -60 }
+      - { assert: [v09, name, "Villager 09"], tick: -400 }
+      - { assert: [v09, alias, "V09"], tick: -400 }
+      - { assert: [v09, label, "Villager"], tick: -400 }
+      - { assert: [v09, born_in, redcliff], tick: -375, precision: decade }
+      - { assert: [v09, located_in, redcliff], tick: -355 }
+      - { retract: [v09, located_in, redcliff], tick: -55 }
+      - { assert: [v09, located_in, graymoor], tick: -55 }
+      - { assert: [v10, name, "Villager 10"], tick: -400 }
+      - { assert: [v10, alias, "V10"], tick: -400 }
+      - { assert: [v10, label, "Villager"], tick: -400 }
+      - { assert: [v10, born_in, stonebridge], tick: -370, precision: decade }
+      - { assert: [v10, located_in, stonebridge], tick: -350 }
+      - { retract: [v10, located_in, stonebridge], tick: -50 }
+      - { assert: [v10, located_in, varrow], tick: -50 }
+      - { assert: [v11, name, "Villager 11"], tick: -400 }
+      - { assert: [v11, alias, "V11"], tick: -400 }
+      - { assert: [v11, label, "Villager"], tick: -400 }
+      - { assert: [v11, born_in, thornwick], tick: -365, precision: decade }
+      - { assert: [v11, located_in, thornwick], tick: -345 }
+      - { retract: [v11, located_in, thornwick], tick: -45 }
+      - { assert: [v11, located_in, ashford], tick: -45 }
+      - { assert: [v12, name, "Villager 12"], tick: -400 }
+      - { assert: [v12, alias, "V12"], tick: -400 }
+      - { assert: [v12, label, "Villager"], tick: -400 }
+      - { assert: [v12, born_in, whitefall], tick: -360, precision: decade }
+      - { assert: [v12, located_in, whitefall], tick: -340 }
+      - { retract: [v12, located_in, whitefall], tick: -40 }
+      - { assert: [v12, located_in, carnath], tick: -40 }
+      - { assert: [v13, name, "Villager 13"], tick: -400 }
+      - { assert: [v13, alias, "V13"], tick: -400 }
+      - { assert: [v13, label, "Villager"], tick: -400 }
+      - { assert: [v13, born_in, mistral], tick: -355, precision: decade }
+      - { assert: [v13, located_in, mistral], tick: -335 }
+      - { retract: [v13, located_in, mistral], tick: -35 }
+      - { assert: [v13, located_in, eldoria], tick: -35 }
+      - { assert: [v14, name, "Villager 14"], tick: -400 }
+      - { assert: [v14, alias, "V14"], tick: -400 }
+      - { assert: [v14, label, "Villager"], tick: -400 }
+      - { assert: [v14, born_in, graymoor], tick: -350, precision: decade }
+      - { assert: [v14, located_in, graymoor], tick: -330 }
+      - { retract: [v14, located_in, graymoor], tick: -30 }
+      - { assert: [v14, located_in, dunmere], tick: -30 }
+      - { assert: [v15, name, "Villager 15"], tick: -400 }
+      - { assert: [v15, alias, "V15"], tick: -400 }
+      - { assert: [v15, label, "Villager"], tick: -400 }
+      - { assert: [v15, born_in, varrow], tick: -345, precision: decade }
+      - { assert: [v15, located_in, varrow], tick: -325 }
+      - { retract: [v15, located_in, varrow], tick: -25 }
+      - { assert: [v15, located_in, highkeep], tick: -25 }
+      - { assert: [v16, name, "Villager 16"], tick: -400 }
+      - { assert: [v16, alias, "V16"], tick: -400 }
+      - { assert: [v16, label, "Villager"], tick: -400 }
+      - { assert: [v16, born_in, ashford], tick: -340, precision: decade }
+      - { assert: [v16, located_in, ashford], tick: -320 }
+      - { retract: [v16, located_in, ashford], tick: -20 }
+      - { assert: [v16, located_in, saltmarsh], tick: -20 }
+      - { assert: [v17, name, "Villager 17"], tick: -400 }
+      - { assert: [v17, alias, "V17"], tick: -400 }
+      - { assert: [v17, label, "Villager"], tick: -400 }
+      - { assert: [v17, born_in, carnath], tick: -335, precision: decade }
+      - { assert: [v17, located_in, carnath], tick: -315 }
+      - { retract: [v17, located_in, carnath], tick: -15 }
+      - { assert: [v17, located_in, oakhollow], tick: -15 }
+      - { assert: [v18, name, "Villager 18"], tick: -400 }
+      - { assert: [v18, alias, "V18"], tick: -400 }
+      - { assert: [v18, label, "Villager"], tick: -400 }
+      - { assert: [v18, born_in, eldoria], tick: -330, precision: decade }
+      - { assert: [v18, located_in, eldoria], tick: -310 }
+      - { retract: [v18, located_in, eldoria], tick: -10 }
+      - { assert: [v18, located_in, redcliff], tick: -10 }
+      - { assert: [v19, name, "Villager 19"], tick: -400 }
+      - { assert: [v19, alias, "V19"], tick: -400 }
+      - { assert: [v19, label, "Villager"], tick: -400 }
+      - { assert: [v19, born_in, dunmere], tick: -325, precision: decade }
+      - { assert: [v19, located_in, dunmere], tick: -305 }
+      - { retract: [v19, located_in, dunmere], tick: -5 }
+      - { assert: [v19, located_in, stonebridge], tick: -5 }
+      - { assert: [v20, name, "Villager 20"], tick: -400 }
+      - { assert: [v20, alias, "V20"], tick: -400 }
+      - { assert: [v20, label, "Villager"], tick: -400 }
+      - { assert: [v20, born_in, highkeep], tick: -320, precision: decade }
+      - { assert: [v20, located_in, highkeep], tick: -300 }
+      - { retract: [v20, located_in, highkeep], tick: 0 }
+      - { assert: [v20, located_in, thornwick], tick: 0 }
+      - { assert: [v21, name, "Villager 21"], tick: -400 }
+      - { assert: [v21, alias, "V21"], tick: -400 }
+      - { assert: [v21, label, "Villager"], tick: -400 }
+      - { assert: [v21, born_in, saltmarsh], tick: -315, precision: decade }
+      - { assert: [v21, located_in, saltmarsh], tick: -295 }
+      - { retract: [v21, located_in, saltmarsh], tick: 5 }
+      - { assert: [v21, located_in, whitefall], tick: 5 }
+      - { assert: [v22, name, "Villager 22"], tick: -400 }
+      - { assert: [v22, alias, "V22"], tick: -400 }
+      - { assert: [v22, label, "Villager"], tick: -400 }
+      - { assert: [v22, born_in, oakhollow], tick: -310, precision: decade }
+      - { assert: [v22, located_in, oakhollow], tick: -290 }
+      - { retract: [v22, located_in, oakhollow], tick: 10 }
+      - { assert: [v22, located_in, mistral], tick: 10 }
+      - { assert: [v23, name, "Villager 23"], tick: -400 }
+      - { assert: [v23, alias, "V23"], tick: -400 }
+      - { assert: [v23, label, "Villager"], tick: -400 }
+      - { assert: [v23, born_in, redcliff], tick: -305, precision: decade }
+      - { assert: [v23, located_in, redcliff], tick: -285 }
+      - { retract: [v23, located_in, redcliff], tick: 15 }
+      - { assert: [v23, located_in, graymoor], tick: 15 }
+      - { assert: [v24, name, "Villager 24"], tick: -400 }
+      - { assert: [v24, alias, "V24"], tick: -400 }
+      - { assert: [v24, label, "Villager"], tick: -400 }
+      - { assert: [v24, born_in, stonebridge], tick: -300, precision: decade }
+      - { assert: [v24, located_in, stonebridge], tick: -280 }
+      - { retract: [v24, located_in, stonebridge], tick: 20 }
+      - { assert: [v24, located_in, varrow], tick: 20 }
+      - { assert: [v01, ally_of, v02], tick: -299 }
+      - { retract: [v02, ally_of, v01], tick: -149 }
+      - { assert: [v04, ally_of, v03], tick: -298 }
+      - { assert: [v05, ally_of, v06], tick: -297 }
+      - { retract: [v06, ally_of, v05], tick: -147 }
+      - { assert: [v08, ally_of, v07], tick: -296 }
+      - { assert: [v09, ally_of, v10], tick: -295 }
+      - { retract: [v10, ally_of, v09], tick: -145 }
+      - { assert: [v12, ally_of, v11], tick: -294 }
+      - { assert: [v13, ally_of, v14], tick: -293 }
+      - { retract: [v14, ally_of, v13], tick: -143 }
+      - { assert: [v16, ally_of, v15], tick: -292 }
+      - { assert: [v17, ally_of, v18], tick: -291 }
+      - { retract: [v18, ally_of, v17], tick: -141 }
+      - { assert: [v20, ally_of, v19], tick: -290 }
+      - { assert: [v21, ally_of, v22], tick: -289 }
+      - { retract: [v22, ally_of, v21], tick: -139 }
+      - { assert: [v24, ally_of, v23], tick: -288 }
+
+  # ---- tx 4: Edwin's story ------------------------------------------------------------
+  - ops:
+      - { assert: [edwin, name, "Edwin"], tick: -300 }
+      - { assert: [edwin, alias, "Ed"], tick: -300 }
+      - { assert: [edwin, alias, "Eddy"], tick: -290, label: typo }     # a typo, retconned in tx 11
+      - { assert: [edwin, alias, "the Lost Knight"], tick: -250, precision: year }
+      - { retract: [edwin, alias, "the Lost Knight"], tick: -180, precision: year }
+      - { assert: [edwin, label, "Knight"], tick: -300 }
+      - { assert: [edwin, label, "King"], tick: -180, precision: year }
+      - assert:
+          - edwin
+          - biography
+          - >-
+            Edwin was the second son of a Varrow cooper and learned the sword from a
+            retired mercenary who drank at Osric's inn. He left Varrow for the Carnath
+            marches under a false banner, came home a hero nobody could name, and was
+            crowned in Eldoria after the winter that took three kings. He never spoke of
+            the years between, and the chroniclers who tried to reconstruct them found
+            only contradictions, a borrowed horse, and one very large unpaid tab.
+        tick: -300
+      # his path: Varrow -> Carnath (in disguise, then not) -> Eldoria
+      - { assert: [edwin, located_in, varrow], tick: -300 }
+      - { retract: [edwin, located_in, varrow], tick: -250 }
+      - { assert: [edwin, located_in, carnath], tick: -250 }
+      - { assert: [edwin, present, carnath], tick: -250 }
+      - { assert: [[edwin, present, carnath], disguised, true], tick: -250 }
+      # disguise dropped and replaced
+      - { retract: [[edwin, present, carnath], disguised, true], tick: -220 }
+      - { assert: [[edwin, present, carnath], disguised, false], tick: -220 }
+      - { retract: [edwin, present, carnath], tick: -180 }
+      - { retract: [edwin, located_in, carnath], tick: -180 }
+      - { assert: [edwin, located_in, eldoria], tick: -180 }
+      # a name with history: "Edwin" until -180, then "the Grey King" (the year is vague)
+      - { retract: [edwin, name, "Edwin"], tick: -180, precision: year }
+      - { assert: [edwin, name, "the Grey King"], tick: -180, precision: year }
+      # events: never retracted
+      - { assert: [edwin, bought, sword], tick: -208 }
+      - { assert: [tomas, bought, crown], tick: -190 }
+      # alliances, written from either side (a bidirectional edge is one edge)
+      - { assert: [tomas, ally_of, edwin], tick: -300 }
+      - { assert: [edwin, ally_of, greg], tick: -280 }
+      - { assert: [hild, ally_of, edwin], tick: -260 }
+      - { retract: [edwin, ally_of, hild], tick: -240 }
+      - { assert: [edwin, ally_of, mara], tick: -208, precision: year }
+      - { retract: [edwin, ally_of, greg], tick: -190, label: greg-ally-end }   # retconned in tx 11
+      - { assert: [edwin, ally_of, wren], tick: -170, label: wren-ally }        # retconned in tx 11
+      - { retract: [edwin, ally_of, mara], tick: -150 }
+      - { assert: [mara, ally_of, edwin], tick: -60 }
+      # Mara's own lodging at Graymoor, with a property on the edge
+      - { assert: [mara, present, graymoor], tick: -190 }
+      - { assert: [[mara, present, graymoor], disguised, false], tick: -190 }
+
+  # ---- tx 5: Greg in Varrow (tx#50 in CLAUDE.md) --------------------------------------
+  - ops:
+      - { assert: [greg, name, "Greg"], tick: -400 }
+      - { assert: [greg, label, "Soldier"], tick: 200 }
+      - { assert: [greg, located_in, varrow], tick: 200 }
+
+  # ---- tx 6: Lisa's war ----------------------------------------------------------------
+  - ops:
+      - { assert: [lisa, name, "Lisa"], tick: 450 }
+      - { assert: [lisa, label, "Warlord"], tick: 480 }
+      - { assert: [lisa, located_in, dunmere], tick: 500 }
+      - { assert: [tomas, ally_of, lisa], tick: 590 }                 # the steward turns traitor
+      - { retract: [lisa, located_in, dunmere], tick: 600 }
+      - { assert: [lisa, located_in, ashford], tick: 600 }
+      - { assert: [lisa, label, "Deity"], tick: 700 }
+      - { assert: [lisa, alias, "the Ashen Queen"], tick: 480 }
+      - { retract: [lisa, alias, "the Ashen Queen"], tick: 700, precision: decade }   # a goddess needs no title
+      - { assert: [ashford, ruled_by, lisa], tick: 650 }
+
+  # ---- tx 7: Greg defends Ashford @601: he is in Varrow AND Ashford (a warning) -------
+  - ops:
+      - { assert: [greg, located_in, ashford], tick: 601 }
+
+  # ---- tx 8: a PREQUEL, written late with earlier ticks --------------------------------
+  - ops:
+      - { assert: [edwin, born_in, varrow], tick: -240, precision: decade }    # born before he first appears
+      - { assert: [edwin, located_in, oakhollow], tick: -340 }                 # his childhood...
+      - { retract: [edwin, located_in, oakhollow], tick: -300 }                # ...touches [-300, -250)
+      - { assert: [edwin, ally_of, greg], tick: -320 }                         # an early alliance
+      - { retract: [edwin, ally_of, greg], tick: -300 }
+      - { assert: [greg, located_in, carnath], tick: -100 }                    # Greg's earlier life
+      - { retract: [greg, located_in, carnath], tick: 150 }
+
+  # ---- tx 9: the author decides when Greg left Varrow: the overlap is gone -------------
+  - ops:
+      - { retract: [greg, located_in, varrow], tick: 250 }
+
+  # ---- tx 10: a second Edwin (names are not IDs), created late --------------------------
+  - ops:
+      - create: [CHARACTER, kael]
+      - { assert: [kael, name, "Edwin"], tick: 300 }
+      - { assert: [kael, located_in, ashford], tick: 300 }
+
+  # ---- tx 11: the RETCON ----------------------------------------------------------------
+  - ops:
+      # "he stopped being Greg's ally in -200, not -190": a moved tick
+      - correct: greg-ally-end
+        replace: { tick: -200 }
+      # "Wren never was an ally of Edwin": a delete
+      - correct: wren-ally
+        delete: true
+      # a typo in a value
+      - correct: typo
+        replace: { value: "Eddie" }
+

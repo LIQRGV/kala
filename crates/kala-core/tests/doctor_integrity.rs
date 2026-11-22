@@ -352,6 +352,7 @@ fn script(w: &mut World) {
                 value: None,
                 tick: t(-120),
                 op: None,
+                precision: None,
             },
         ),
         2,
@@ -370,6 +371,7 @@ fn script(w: &mut World) {
                 value: Some(s("Mara Voss")),
                 tick: None,
                 op: None,
+                precision: None,
             },
         ),
         2,
@@ -383,6 +385,7 @@ fn script(w: &mut World) {
                 value: Some(r(lisa)),
                 tick: None,
                 op: None,
+                precision: None,
             },
         ),
         2,
@@ -714,6 +717,7 @@ fn fact(entity: u64, attr: u32, tick: i64, retract: bool, v: &Value) -> Vec<u8> 
     b.extend_from_slice(&attr.to_le_bytes());
     b.extend_from_slice(&tick.to_le_bytes());
     b.push(u8::from(retract));
+    b.push(0); // precision byte (v4): Exact
     b.extend_from_slice(&v.encode().unwrap());
     b
 }
@@ -744,6 +748,7 @@ fn revised(
     b.extend_from_slice(&attr.to_le_bytes());
     b.extend_from_slice(&tick.to_le_bytes());
     b.push(u8::from(retract));
+    b.push(0); // precision byte (v4): Exact
     b.extend_from_slice(&v.encode().unwrap());
     b
 }
@@ -1155,22 +1160,29 @@ fn doctor_log_errs_on_other_files_it_cannot_scan() {
     ));
     // a truncated header
     let short = dir.path().join("short");
-    let full = common::header(3);
+    let full = common::header(4);
     std::fs::write(&short, &full[..5]).unwrap();
     assert!(doctor_log(&short, &opts()).is_err());
     // an old format version
     let old = dir.path().join("old");
     std::fs::write(&old, common::header(2)).unwrap();
     assert_eq!(doctor_log(&old, &opts()), Err(Error::UnsupportedVersion(2)));
+    let v3 = dir.path().join("v3");
+    std::fs::write(&v3, common::header(3)).unwrap();
+    assert_eq!(doctor_log(&v3, &opts()), Err(Error::UnsupportedVersion(3)));
 }
 
 // ================================================================ index tampering
 
-const INDEXES: [IndexName; 4] = [
+const INDEXES: [IndexName; 8] = [
     IndexName::E,
     IndexName::R,
     IndexName::ELatest,
     IndexName::RLatest,
+    IndexName::V,
+    IndexName::VLatest,
+    IndexName::VFold,
+    IndexName::VFoldLatest,
 ];
 
 fn mismatch_on(rep: &Report, which: IndexName) -> bool {
@@ -1204,6 +1216,34 @@ fn phantom_e_key(greg: EntityId, attr: AttrId, with_tx: bool) -> Vec<u8> {
     k.extend_from_slice(&greg.to_bytes());
     k.extend_from_slice(&attr.0.to_be_bytes());
     k.extend_from_slice(&s("Phantom").encode().unwrap());
+    k.extend_from_slice(&Tick(99).encode_inverted());
+    if with_tx {
+        k.extend_from_slice(&(!2u64).to_be_bytes());
+    }
+    k
+}
+
+/// a well-formed V key (value Str) the log never produced
+fn phantom_v_key(attr: AttrId, entity: EntityId, with_tx: bool) -> Vec<u8> {
+    let mut k = vec![b'V'];
+    k.extend_from_slice(&attr.0.to_be_bytes());
+    k.extend_from_slice(&s("Phantom").encode().unwrap());
+    k.extend_from_slice(&entity.to_bytes());
+    k.extend_from_slice(&Tick(99).encode_inverted());
+    if with_tx {
+        k.extend_from_slice(&(!2u64).to_be_bytes());
+    }
+    k
+}
+
+/// a well-formed VFold key (folded text, then the original Str encoding)
+/// the log never produced
+fn phantom_vfold_key(attr: AttrId, entity: EntityId, with_tx: bool) -> Vec<u8> {
+    let mut k = vec![b'F'];
+    k.extend_from_slice(&attr.0.to_be_bytes());
+    k.extend_from_slice(&s("phantom").encode().unwrap());
+    k.extend_from_slice(&s("Phantom").encode().unwrap());
+    k.extend_from_slice(&entity.to_bytes());
     k.extend_from_slice(&Tick(99).encode_inverted());
     if with_tx {
         k.extend_from_slice(&(!2u64).to_be_bytes());
@@ -1264,7 +1304,16 @@ fn the_tiny_worlds_are_clean_before_any_tampering() {
 #[test]
 fn removing_a_row_from_each_index_is_an_index_mismatch_for_that_index() {
     for which in INDEXES {
-        for nth in [0usize, 1] {
+        // the tiny world has one string fact: one V / V_latest row
+        let nths: &[usize] = if matches!(
+            which,
+            IndexName::V | IndexName::VLatest | IndexName::VFold | IndexName::VFoldLatest
+        ) {
+            &[0]
+        } else {
+            &[0, 1]
+        };
+        for &nth in nths {
             let mut w = tiny_mem();
             w.tamper_index(Tamper::RemoveRow { index: which, nth });
             let rep = doctor(&w, &opts());
@@ -1276,7 +1325,16 @@ fn removing_a_row_from_each_index_is_an_index_mismatch_for_that_index() {
 #[test]
 fn flipping_the_op_of_a_row_in_each_index_is_an_index_mismatch_for_that_index() {
     for which in INDEXES {
-        for nth in [0usize, 1] {
+        // the tiny world has one string fact: one V / V_latest row
+        let nths: &[usize] = if matches!(
+            which,
+            IndexName::V | IndexName::VLatest | IndexName::VFold | IndexName::VFoldLatest
+        ) {
+            &[0]
+        } else {
+            &[0, 1]
+        };
+        for &nth in nths {
             let mut w = tiny_mem();
             w.tamper_index(Tamper::FlipOp { index: which, nth });
             let rep = doctor(&w, &opts());
@@ -1295,6 +1353,10 @@ fn inserting_a_row_the_log_never_produced_is_an_index_mismatch_for_that_index() 
             IndexName::ELatest => phantom_e_key(ids.greg, ids.name, false),
             IndexName::R => phantom_r_key(ids.varrow, ids.located_in, ids.greg, true),
             IndexName::RLatest => phantom_r_key(ids.varrow, ids.located_in, ids.greg, false),
+            IndexName::V => phantom_v_key(ids.name, ids.greg, true),
+            IndexName::VLatest => phantom_v_key(ids.name, ids.greg, false),
+            IndexName::VFold => phantom_vfold_key(ids.name, ids.greg, true),
+            IndexName::VFoldLatest => phantom_vfold_key(ids.name, ids.greg, false),
         };
         w.tamper_index(Tamper::InsertRawKey { index: which, key });
         let rep = doctor(&w, &opts());
@@ -1974,6 +2036,7 @@ mod random_sequences {
                             value: val.map(|v| value(0, v)),
                             tick: tick.map(|x| Tick(i64::from(x))),
                             op: op.map(|b| if b { Op::Retract } else { Op::Assert }),
+                            precision: None,
                         },
                     )
                 }

@@ -61,6 +61,7 @@ fn ch(tick: i64, op: Op, value: Value) -> Change {
         tick: Tick(tick),
         op,
         value,
+        precision: Precision::Exact,
     }
 }
 
@@ -208,7 +209,12 @@ fn revised(r: WriteResult) -> EntryId {
 }
 
 fn rep(value: Option<Value>, tick: Option<Tick>, op: Option<Op>) -> Correction {
-    Correction::Replace { value, tick, op }
+    Correction::Replace {
+        value,
+        tick,
+        op,
+        precision: None,
+    }
 }
 
 fn r(e: EntityId) -> Value {
@@ -1651,6 +1657,7 @@ fn changes_strategy() -> impl Strategy<Value = Vec<Change>> {
                 tick: Tick(tick),
                 op: if assert { Op::Assert } else { Op::Retract },
                 value: Value::I64(vi as i64),
+                precision: Precision::Exact,
             })
             .collect()
     })

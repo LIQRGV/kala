@@ -18,7 +18,7 @@
 //! IndexDump rows end in `Mark` (item 8): `pub enum Mark { Assert, Retract, Deleted }`,
 //!     `PartialEq<Op> for Mark`, re-exported at the root. Used here only to see the
 //!     DELETED row in `index_dump` (the one place this file leans on item 8).
-//! LOG_FORMAT_VERSION == 3
+//! LOG_FORMAT_VERSION == 4
 //! ```
 //!
 //! Assumptions that follow the contract's wording and are flagged in the
@@ -1270,11 +1270,11 @@ fn script(w: &mut World, e: &Ents) -> Vec<EntryId> {
 }
 
 #[test]
-fn log_format_version_is_three_and_the_header_says_so() {
-    assert_eq!(LOG_FORMAT_VERSION, 3);
+fn log_format_version_is_four_and_the_header_says_so() {
+    assert_eq!(LOG_FORMAT_VERSION, 4);
     let (_d, path, _w, _e) = file();
     let b = std::fs::read(&path).unwrap();
-    assert_eq!(&b[8..12], &3u32.to_le_bytes());
+    assert_eq!(&b[8..12], &4u32.to_le_bytes());
 }
 
 #[test]

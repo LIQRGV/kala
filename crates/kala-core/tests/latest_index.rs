@@ -236,6 +236,7 @@ fn correction(
         value: v.map(|v| value_for(ents, attr, v)),
         tick: t.map(|t| Tick(TICKS[t])),
         op: op.map(|r| if r { Op::Retract } else { Op::Assert }),
+        precision: None,
     }
 }
 
@@ -418,7 +419,12 @@ fn mem() -> (World, Vec<EntityId>) {
 }
 
 fn rep(value: Option<Value>, tick: Option<Tick>, op: Option<Op>) -> Correction {
-    Correction::Replace { value, tick, op }
+    Correction::Replace {
+        value,
+        tick,
+        op,
+        precision: None,
+    }
 }
 
 fn only(r: WriteResult) -> EntryId {

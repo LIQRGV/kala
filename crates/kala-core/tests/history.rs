@@ -98,6 +98,7 @@ fn a(tick: i64, v: Value) -> Change {
         tick: Tick(tick),
         op: Op::Assert,
         value: v,
+        precision: Precision::Exact,
     }
 }
 
@@ -106,6 +107,7 @@ fn x(tick: i64, v: Value) -> Change {
         tick: Tick(tick),
         op: Op::Retract,
         value: v,
+        precision: Precision::Exact,
     }
 }
 

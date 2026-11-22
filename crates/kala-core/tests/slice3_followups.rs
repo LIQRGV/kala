@@ -188,6 +188,7 @@ fn damaged_last_txn_then_writing_continues_from_the_last_committed() {
     damage_body(&mut file, last);
     std::fs::write(&path, &file).unwrap();
     let mut w = open_ok(&path);
+    w.acknowledge_recovery(); // slice 4 item 0b: Damaged cut refuses writes until acknowledged
     let greg = w.entity_by_handle("greg").unwrap();
     w.assert(greg, "name", Value::Str("Z".into()), t(9))
         .unwrap();

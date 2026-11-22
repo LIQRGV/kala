@@ -23,9 +23,57 @@
 //! and `R|t|a|` and `R|t|a|s|` are exact prefixes. The tick and tx suffix
 //! is the same as in `E`, so one history sorts newest first in both.
 //!
-//! The latest-revision indexes (`E_latest`, `R_latest`) use the same keys
-//! without the trailing `^tx` ([`without_tx`]): one key per `(…, tick)`,
-//! holding its current entry at the latest canon.
+//! The value index `V` mirrors every entry of an *indexed, non-ref*
+//! attribute under its value ("the entity named Edwin"; `ref` attributes
+//! use `R` as their value index):
+//!
+//! ```text
+//! b'V' | attr (4, BE) | value encoding | entity (8, BE) | ^tick (8) | ^tx (8)
+//! ```
+//!
+//! The value encoding is self-delimiting and everything around it is
+//! fixed-width, so `V|a|v|` (every entity that ever had `a = v`) and
+//! `V|a|v|e|` (one entity's history of that value) are exact prefixes, and
+//! the same `^tick|^tx` suffix orders one history newest first, as in `E`.
+//!
+//! The folded value index `VFold` serves case-insensitive search. It
+//! mirrors every entry of an *indexed string* attribute (the same entries as
+//! `V`) under the value's search form
+//! ([`fold_for_search`](crate::value::fold_for_search)), encoded as a
+//! string value, followed by the original value's encoding:
+//!
+//! ```text
+//! b'F' | attr (4, BE) | fold encoding (as Str) | original value encoding | entity (8, BE) | ^tick (8) | ^tx (8)
+//! ```
+//!
+//! Both encodings are self-delimiting (a string ends in `0x00 0x00`, and a
+//! content `0x00` is escaped), so `F|a|fold|` is an exact prefix: the
+//! prefix for the fold `"ed"` never matches a key whose fold is `"edwin"`.
+//! The original value comes before the entity so two values that fold
+//! equal (`"Edwin"`, `"EDWIN"`) keep separate histories, each judged
+//! latest-wins on its own: `F|a|fold|orig|e|` is one history. Folds may be
+//! longer than the 256-byte indexed limit (a fold can grow), so the fold is
+//! encoded without that check.
+//!
+//! **Unindexed strings in `E`.** The value part of an `E` (and `E_latest`)
+//! key of an `indexed: false` string attribute is not the value encoding but
+//! a fixed-width **value reference** into the world's in-memory value table
+//! (derived, rebuilt from the log with the indexes), so a biography of any
+//! length costs [`VALUE_REF_LEN`] bytes per key:
+//!
+//! ```text
+//! value ref = tag 0x06 | content hash (8, BE) | collision ordinal (4, BE)
+//! ```
+//!
+//! `0x06` is no value type tag, so a reference never parses as a value and
+//! the part stays self-delimiting. Key order between references is hash
+//! order, which means nothing: every public answer re-sorts by the full
+//! value encoding.
+//!
+//! The latest-revision indexes (`E_latest`, `R_latest`, `V_latest`,
+//! `VFold_latest`) use the
+//! same keys without the trailing `^tx` ([`without_tx`]): one key per
+//! `(…, tick)`, holding its current entry at the latest canon.
 //!
 //! Keys are built from encoded bytes only (the value is already
 //! [`Value::encode`](crate::value::Value::encode)d), never from `Value`.
@@ -40,6 +88,70 @@ const E_TAG: u8 = b'E';
 
 /// Tag byte of the reverse index.
 const R_TAG: u8 = b'R';
+
+/// Tag byte of the value index.
+const V_TAG: u8 = b'V';
+
+/// Length of `V|attr|`, the part before the value.
+const V_ATTR_PREFIX_LEN: usize = 1 + 4;
+
+/// Tag byte of the folded value index.
+const VFOLD_TAG: u8 = b'F';
+
+/// Length of `F|attr|`, the part before the fold (same as `V|attr|`).
+const VFOLD_ATTR_PREFIX_LEN: usize = 1 + 4;
+
+/// Tag byte of a value reference in an `E` key (see the module docs). Not a
+/// value type tag, so a reference never decodes as a value.
+pub(crate) const VALUE_REF_TAG: u8 = 0x06;
+
+/// Length of a value reference: tag, content hash (8), ordinal (4).
+pub(crate) const VALUE_REF_LEN: usize = 1 + 8 + 4;
+
+/// The `E`-key part standing for an unindexed string value: its content
+/// hash and its collision ordinal among the values sharing that hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ValueRef {
+    pub(crate) hash: u64,
+    pub(crate) ordinal: u32,
+}
+
+impl ValueRef {
+    /// The reference's key bytes: `0x06 | hash BE | ordinal BE`.
+    pub(crate) fn to_key_bytes(self) -> [u8; VALUE_REF_LEN] {
+        let mut k = [0u8; VALUE_REF_LEN];
+        k[0] = VALUE_REF_TAG;
+        k[1..9].copy_from_slice(&self.hash.to_be_bytes());
+        k[9..].copy_from_slice(&self.ordinal.to_be_bytes());
+        k
+    }
+
+    /// The reference an `E`-key value part holds, or `None` if the part is
+    /// not exactly a value reference (e.g. a value encoding).
+    pub(crate) fn from_key_bytes(part: &[u8]) -> Option<ValueRef> {
+        let k: &[u8; VALUE_REF_LEN] = part.try_into().ok()?;
+        if k[0] != VALUE_REF_TAG {
+            return None;
+        }
+        Some(ValueRef {
+            hash: u64::from_be_bytes(k[1..9].try_into().ok()?),
+            ordinal: u32::from_be_bytes(k[9..].try_into().ok()?),
+        })
+    }
+}
+
+/// The length of the value part at the start of `rest` (an `E` key after
+/// `E|e|a|`): a value reference or a value encoding. Never panics.
+fn e_value_part_len(rest: &[u8]) -> Result<usize, ValueError> {
+    if rest.first() == Some(&VALUE_REF_TAG) {
+        return if rest.len() >= VALUE_REF_LEN {
+            Ok(VALUE_REF_LEN)
+        } else {
+            Err(ValueError::Malformed("truncated value reference"))
+        };
+    }
+    encoded_len(rest)
+}
 
 /// Length of every `R` key: `R|target|attr|source|^tick|^tx`.
 pub(crate) const R_KEY_LEN: usize = 1 + 8 + 4 + 8 + SUFFIX_LEN;
@@ -129,20 +241,20 @@ pub(crate) fn without_tx(key: &[u8]) -> &[u8] {
     &key[..key.len().saturating_sub(8)]
 }
 
-/// Splits the value encoding out of a full `E` key under `E|e|a|`: returns
-/// the value bytes. Fails if the key is too short or its value part isn't a
-/// well-formed encoding.
+/// Splits the value part (a value encoding or a value reference) out of a
+/// full `E` key under `E|e|a|`. Fails if the key is too short or its value
+/// part isn't well-formed.
 pub(crate) fn e_value_bytes(key: &[u8]) -> Result<&[u8], ValueError> {
     value_bytes_before(key, SUFFIX_LEN)
 }
 
-/// The value encoding of an `E`-layout key under `E|e|a|` that ends in a
-/// suffix of exactly `suffix_len` bytes after the value.
+/// The value part (encoding or reference) of an `E`-layout key under
+/// `E|e|a|` that ends in a suffix of exactly `suffix_len` bytes after it.
 fn value_bytes_before(key: &[u8], suffix_len: usize) -> Result<&[u8], ValueError> {
     let rest = key
         .get(E_ATTR_PREFIX_LEN..)
         .ok_or(ValueError::Malformed("index key shorter than its prefix"))?;
-    let len = encoded_len(rest)?;
+    let len = e_value_part_len(rest)?;
     if rest.len() != len + suffix_len {
         return Err(ValueError::Malformed(
             "index key suffix has the wrong length",
@@ -314,6 +426,199 @@ pub(crate) fn decode_r_key(key: &[u8]) -> Result<RKeyParts, ValueError> {
         Tick::decode_inverted(get8(21)?),
         TxId(!u64::from_be_bytes(get8(29)?)),
     ))
+}
+
+/// Length of the entity part after the value in a `V` key.
+pub(crate) const V_ENTITY_LEN: usize = 8;
+
+/// `V|attr|value|`: the prefix of every entity's history of one value.
+pub(crate) fn v_value_prefix(attr: AttrId, value: &[u8]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(V_ATTR_PREFIX_LEN + value.len() + V_ENTITY_LEN + SUFFIX_LEN);
+    k.push(V_TAG);
+    k.extend_from_slice(&attr.0.to_be_bytes());
+    k.extend_from_slice(value);
+    k
+}
+
+/// The full `V` key of one entry of `entity attr value` at `tick`, written
+/// by `tx`.
+pub(crate) fn v_fact_key(
+    attr: AttrId,
+    value: &[u8],
+    entity: EntityId,
+    tick: Tick,
+    tx: TxId,
+) -> Vec<u8> {
+    let mut k = v_value_prefix(attr, value);
+    k.extend_from_slice(&entity.to_bytes());
+    push_seek_tick(&mut k, tick);
+    k.extend_from_slice(&(!tx.0).to_be_bytes());
+    k
+}
+
+/// The entity of a `V|a|v|e|` history prefix (its last 8 bytes), or `None`
+/// if it is too short to hold one.
+pub(crate) fn v_prefix_entity(history_prefix: &[u8]) -> Option<EntityId> {
+    let start = history_prefix.len().checked_sub(V_ENTITY_LEN)?;
+    bytes8(history_prefix, start).map(EntityId::from_bytes)
+}
+
+/// A `V`-layout key split at its entity: `(attr, value encoding, entity,
+/// the bytes after the entity)`.
+type VKeySplit<'k> = (AttrId, &'k [u8], EntityId, &'k [u8]);
+
+/// Splits a `V`-layout key ending in exactly `suffix_len` bytes after the
+/// entity into its [`VKeySplit`]. Never panics.
+fn split_v_key(key: &[u8], suffix_len: usize) -> Result<VKeySplit<'_>, ValueError> {
+    if key.first() != Some(&V_TAG) {
+        return Err(ValueError::Malformed("not a V key"));
+    }
+    let short = || ValueError::Malformed("index key shorter than its prefix");
+    let attr: [u8; 4] = key
+        .get(1..V_ATTR_PREFIX_LEN)
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(short)?;
+    let rest = key.get(V_ATTR_PREFIX_LEN..).ok_or_else(short)?;
+    let len = encoded_len(rest)?;
+    if rest.len() != len + V_ENTITY_LEN + suffix_len {
+        return Err(ValueError::Malformed(
+            "index key suffix has the wrong length",
+        ));
+    }
+    let entity = EntityId::from_bytes(bytes8(rest, len).ok_or_else(short)?);
+    Ok((
+        AttrId(u32::from_be_bytes(attr)),
+        &rest[..len],
+        entity,
+        &rest[len + V_ENTITY_LEN..],
+    ))
+}
+
+/// A decoded `V` key: `(attr, value encoding, entity, tick, tx)`.
+pub(crate) type VKeyParts<'k> = (AttrId, &'k [u8], EntityId, Tick, TxId);
+
+/// Splits a full `V` key into its parts. Fails if it isn't a well-formed
+/// `V` key; never panics, whatever the bytes.
+pub(crate) fn decode_v_key(key: &[u8]) -> Result<VKeyParts<'_>, ValueError> {
+    let (attr, value, entity, suffix) = split_v_key(key, SUFFIX_LEN)?;
+    let bad = || ValueError::Malformed("index key suffix is not ^tick|^tx");
+    let tick = Tick::decode_inverted(bytes8(suffix, 0).ok_or_else(bad)?);
+    let tx = TxId(!u64::from_be_bytes(bytes8(suffix, 8).ok_or_else(bad)?));
+    Ok((attr, value, entity, tick, tx))
+}
+
+/// A decoded latest-index `V` key: `(attr, value encoding, entity, tick)`.
+pub(crate) type LatestVKeyParts<'k> = (AttrId, &'k [u8], EntityId, Tick);
+
+/// Splits a latest-index `V` key (`V|a|v|e|^tick`, a full key
+/// [`without_tx`]) into its parts. Fails if it isn't one; never panics.
+pub(crate) fn decode_latest_v_key(key: &[u8]) -> Result<LatestVKeyParts<'_>, ValueError> {
+    let (attr, value, entity, suffix) = split_v_key(key, 8)?;
+    let bad = || ValueError::Malformed("index key suffix is not ^tick");
+    let tick = Tick::decode_inverted(bytes8(suffix, 0).ok_or_else(bad)?);
+    Ok((attr, value, entity, tick))
+}
+
+/// `F|attr|fold|`: the prefix of every history whose value folds to
+/// `fold` (`fold` is the fold's string value encoding).
+pub(crate) fn vfold_prefix(attr: AttrId, fold: &[u8]) -> Vec<u8> {
+    let mut k =
+        Vec::with_capacity(VFOLD_ATTR_PREFIX_LEN + 2 * fold.len() + V_ENTITY_LEN + SUFFIX_LEN);
+    k.push(VFOLD_TAG);
+    k.extend_from_slice(&attr.0.to_be_bytes());
+    k.extend_from_slice(fold);
+    k
+}
+
+/// The full `VFold` key of one entry of `entity attr original` at `tick`,
+/// written by `tx`; `fold` is the encoding of the original's fold.
+pub(crate) fn vfold_fact_key(
+    attr: AttrId,
+    fold: &[u8],
+    original: &[u8],
+    entity: EntityId,
+    tick: Tick,
+    tx: TxId,
+) -> Vec<u8> {
+    let mut k = vfold_prefix(attr, fold);
+    k.extend_from_slice(original);
+    k.extend_from_slice(&entity.to_bytes());
+    push_seek_tick(&mut k, tick);
+    k.extend_from_slice(&(!tx.0).to_be_bytes());
+    k
+}
+
+/// The length of the `F|a|fold|orig|e|` history prefix of a `VFold` key
+/// (either layout) under the `F|a|fold|` prefix of length `fold_prefix_len`.
+/// Never panics and never exceeds `key.len()`: a key whose original part
+/// doesn't parse (only reachable by tampering) is taken whole.
+pub(crate) fn vfold_history_end(fold_prefix_len: usize, key: &[u8]) -> usize {
+    key.get(fold_prefix_len..)
+        .and_then(|rest| encoded_len(rest).ok())
+        .map_or(key.len(), |len| {
+            (fold_prefix_len + len + V_ENTITY_LEN).min(key.len())
+        })
+}
+
+/// A `VFold`-layout key split at its entity: `(attr, fold encoding,
+/// original encoding, entity, the bytes after the entity)`.
+type VFoldKeySplit<'k> = (AttrId, &'k [u8], &'k [u8], EntityId, &'k [u8]);
+
+/// Splits a `VFold`-layout key ending in exactly `suffix_len` bytes after
+/// the entity into its [`VFoldKeySplit`]. Never panics.
+fn split_vfold_key(key: &[u8], suffix_len: usize) -> Result<VFoldKeySplit<'_>, ValueError> {
+    if key.first() != Some(&VFOLD_TAG) {
+        return Err(ValueError::Malformed("not a VFold key"));
+    }
+    let short = || ValueError::Malformed("index key shorter than its prefix");
+    let attr: [u8; 4] = key
+        .get(1..VFOLD_ATTR_PREFIX_LEN)
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(short)?;
+    let rest = key.get(VFOLD_ATTR_PREFIX_LEN..).ok_or_else(short)?;
+    let fold_len = encoded_len(rest)?;
+    let after_fold = rest.get(fold_len..).ok_or_else(short)?;
+    let orig_len = encoded_len(after_fold)?;
+    if after_fold.len() != orig_len + V_ENTITY_LEN + suffix_len {
+        return Err(ValueError::Malformed(
+            "index key suffix has the wrong length",
+        ));
+    }
+    let entity = EntityId::from_bytes(bytes8(after_fold, orig_len).ok_or_else(short)?);
+    Ok((
+        AttrId(u32::from_be_bytes(attr)),
+        &rest[..fold_len],
+        &after_fold[..orig_len],
+        entity,
+        &after_fold[orig_len + V_ENTITY_LEN..],
+    ))
+}
+
+/// A decoded `VFold` key: `(attr, fold encoding, original encoding, entity,
+/// tick, tx)`.
+pub(crate) type VFoldKeyParts<'k> = (AttrId, &'k [u8], &'k [u8], EntityId, Tick, TxId);
+
+/// Splits a full `VFold` key into its parts. Fails if it isn't a
+/// well-formed `VFold` key; never panics, whatever the bytes.
+pub(crate) fn decode_vfold_key(key: &[u8]) -> Result<VFoldKeyParts<'_>, ValueError> {
+    let (attr, fold, original, entity, suffix) = split_vfold_key(key, SUFFIX_LEN)?;
+    let bad = || ValueError::Malformed("index key suffix is not ^tick|^tx");
+    let tick = Tick::decode_inverted(bytes8(suffix, 0).ok_or_else(bad)?);
+    let tx = TxId(!u64::from_be_bytes(bytes8(suffix, 8).ok_or_else(bad)?));
+    Ok((attr, fold, original, entity, tick, tx))
+}
+
+/// A decoded latest-index `VFold` key: `(attr, fold encoding, original
+/// encoding, entity, tick)`.
+pub(crate) type LatestVFoldKeyParts<'k> = (AttrId, &'k [u8], &'k [u8], EntityId, Tick);
+
+/// Splits a latest-index `VFold` key (`F|a|fold|orig|e|^tick`, a full key
+/// [`without_tx`]) into its parts. Fails if it isn't one; never panics.
+pub(crate) fn decode_latest_vfold_key(key: &[u8]) -> Result<LatestVFoldKeyParts<'_>, ValueError> {
+    let (attr, fold, original, entity, suffix) = split_vfold_key(key, 8)?;
+    let bad = || ValueError::Malformed("index key suffix is not ^tick");
+    let tick = Tick::decode_inverted(bytes8(suffix, 0).ok_or_else(bad)?);
+    Ok((attr, fold, original, entity, tick))
 }
 
 #[cfg(test)]

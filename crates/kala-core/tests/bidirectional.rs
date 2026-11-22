@@ -241,16 +241,19 @@ fn reads_agree_on_both_sides_whatever_spelling_was_written() {
                     tick: Tick(-300),
                     op: Op::Assert,
                     value: Value::Ref(p),
+                    precision: Precision::Exact,
                 },
                 Change {
                     tick: Tick(-250),
                     op: Op::Retract,
                     value: Value::Ref(p),
+                    precision: Precision::Exact,
                 },
                 Change {
                     tick: Tick(-200),
                     op: Op::Assert,
                     value: Value::Ref(p),
+                    precision: Precision::Exact,
                 },
             ];
             assert_eq!(h, want, "history of {x:?}");
@@ -774,16 +777,19 @@ fn self_pair_history_lists_each_stored_change_once_and_old_canon_agrees() {
             tick: Tick(5),
             op: Op::Assert,
             value: me.clone(),
+            precision: Precision::Exact,
         },
         Change {
             tick: Tick(9),
             op: Op::Retract,
             value: me.clone(),
+            precision: Precision::Exact,
         },
         Change {
             tick: Tick(20),
             op: Op::Assert,
             value: me.clone(),
+            precision: Precision::Exact,
         },
     ];
     assert_eq!(w.history(c.edwin, "ally_of").unwrap(), want);
@@ -994,6 +1000,7 @@ fn fact(entity: u64, attr: u32, tick: i64, retract: bool, value: &Value) -> (u8,
     b.extend_from_slice(&attr.to_le_bytes());
     b.extend_from_slice(&tick.to_le_bytes());
     b.push(retract as u8);
+    b.push(0); // precision byte (v4): Exact
     b.extend_from_slice(&value.encode().unwrap());
     (4, b)
 }
@@ -1353,7 +1360,7 @@ proptest! {
                     .collect();
                 want.sort_by_key(|(t, p, _)| (*t, *p));
                 let want: Vec<Change> = want.into_iter()
-                    .map(|(t, p, op)| Change { tick: Tick(t), op, value: Value::Ref(ents[p]) })
+                    .map(|(t, p, op)| Change { tick: Tick(t), op, value: Value::Ref(ents[p]), precision: Precision::Exact })
                     .collect();
                 prop_assert_eq!(view.history(ents[x], "ally_of").unwrap(), want, "history canon {} x {}", canon, x);
             }

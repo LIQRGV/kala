@@ -6,10 +6,26 @@ edition.workspace = true
 [lib]
 name = "kala_core"
 
+[features]
+# Test-only hooks (`World::inject_log_fault`, `World::tamper_index`,
+# `World::at_canon_main`, `LogFault`, `Tamper`). Off by default: not part of
+# the supported API.
+test-hooks = []
+
 [dependencies]
+# Case-insensitive search (`value::fold_for_search`): Unicode default full
+# case folding and NFC/NFD (security-consultant approved, slice 4).
+caseless = "0.2.2"
 crc32fast = "1.5.5"
+unicode-normalization = "0.1.26"
+# YAML fixture loader (`fixture`): pure Rust, forbid(unsafe_code); only the
+# `deserialize` feature (security-consultant approved, slice 4 items 6/7).
+serde = { version = "1", features = ["derive"] }
+serde-saphyr = { version = "2.2.0", default-features = false, features = ["deserialize"] }
 
 [dev-dependencies]
+# The crate's own tests use the test hooks.
+kala-core = { path = ".", features = ["test-hooks"] }
 proptest = "1.12.0"
 tempfile = "3.27.0"
 crc32fast = "1.5.5"

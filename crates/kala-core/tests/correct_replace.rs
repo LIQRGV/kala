@@ -133,7 +133,12 @@ fn file() -> (tempfile::TempDir, PathBuf, World, Ents) {
 }
 
 fn rep(value: Option<Value>, tick: Option<Tick>, op: Option<Op>) -> Correction {
-    Correction::Replace { value, tick, op }
+    Correction::Replace {
+        value,
+        tick,
+        op,
+        precision: None,
+    }
 }
 
 fn only_entry(r: &WriteResult) -> EntryId {
@@ -180,6 +185,7 @@ fn revised(w: &World, id: EntryId) -> Rev {
             value,
             tick,
             op,
+            precision: _,
         } => {
             assert_eq!(revision, Some((of, rev)));
             Rev {

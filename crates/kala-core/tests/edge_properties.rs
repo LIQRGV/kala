@@ -128,7 +128,8 @@ fn history_of_an_edge_property_lists_its_change_points_in_tick_order() {
         Change {
             tick: Tick(-300),
             op: Op::Assert,
-            value: b(true)
+            value: b(true),
+            precision: Precision::Exact
         }
     );
     let at280: Vec<(Op, Value)> = h[1..].iter().map(|c| (c.op, c.value.clone())).collect();

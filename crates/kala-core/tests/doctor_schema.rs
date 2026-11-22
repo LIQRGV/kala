@@ -563,6 +563,7 @@ fn a_correction_that_moves_the_edges_interval_makes_a_finding_appear_and_disappe
             value: None,
             tick: t(-320),
             op: None,
+            precision: None,
         },
     )
     .unwrap();
@@ -574,6 +575,7 @@ fn a_correction_that_moves_the_edges_interval_makes_a_finding_appear_and_disappe
             value: None,
             tick: t(-290),
             op: None,
+            precision: None,
         },
     )
     .unwrap();
@@ -608,6 +610,7 @@ fn an_older_canon_uses_the_edges_interval_at_that_canon() {
             value: None,
             tick: t(-200),
             op: None,
+            precision: None,
         },
     )
     .unwrap();
@@ -632,6 +635,7 @@ fn an_older_canon_sees_a_property_that_a_later_edge_correction_made_fine() {
             value: None,
             tick: t(-270),
             op: None,
+            precision: None,
         },
     )
     .unwrap(); // the edge began at -270: -280 is before it
@@ -691,6 +695,7 @@ fn fact(entity: u64, attr: u32, tick: i64, retract: bool, v: &Value) -> (u8, Vec
     b.extend_from_slice(&attr.to_le_bytes());
     b.extend_from_slice(&tick.to_le_bytes());
     b.push(u8::from(retract));
+    b.push(0); // precision byte (v4): Exact
     b.extend_from_slice(&v.encode().unwrap());
     (K_FACT, b)
 }
@@ -1070,6 +1075,7 @@ fn a_moved_property_assert_is_flagged_by_its_revised_entry_not_the_base() {
                 value: None,
                 tick: Some(Tick(-310)),
                 op: None,
+                precision: None,
             },
         )
         .unwrap();
@@ -1087,6 +1093,7 @@ fn a_moved_property_assert_is_flagged_by_its_revised_entry_not_the_base() {
                 value: None,
                 tick: Some(Tick(-320)),
                 op: None,
+                precision: None,
             },
         )
         .unwrap();
@@ -1118,6 +1125,7 @@ fn a_wrong_typed_crafted_revised_entry_is_a_wrong_value_type_warning() {
     rev.extend_from_slice(&c.attr_name.to_le_bytes());
     rev.extend_from_slice(&1i64.to_le_bytes());
     rev.push(0); // assert
+    rev.push(0); // precision byte (v4): Exact
     rev.extend_from_slice(&Value::I64(7).encode().unwrap());
     let first = c.push(&[(K_DELETED, del), (K_REVISED, rev)]);
     let rep = c.report(&opts());

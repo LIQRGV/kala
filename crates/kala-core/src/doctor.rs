@@ -55,6 +55,7 @@ use crate::log::{self, EntryId, SurveyedTxn, TaggedFinding};
 use crate::overlap::Overlap;
 use crate::tick::Tick;
 use crate::value::{Value, ValueType};
+use crate::value_table::{ContentHash, fnv1a64};
 use crate::world::{self, Index, ReplayFault, TxId, World};
 
 /// What doctor checks.
@@ -85,7 +86,7 @@ pub enum Severity {
     Warning,
 }
 
-/// One of the four stored indexes.
+/// One of the stored indexes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IndexName {
     /// The forward index `E|entity|attr|value|^tick|^tx`.
@@ -96,6 +97,17 @@ pub enum IndexName {
     ELatest,
     /// The latest-revision reverse index `R|target|attr|source|^tick`.
     RLatest,
+    /// The value index `V|attr|value|entity|^tick|^tx` (indexed non-ref
+    /// attributes).
+    V,
+    /// The latest-revision value index `V|attr|value|entity|^tick`.
+    VLatest,
+    /// The folded value index `F|attr|fold|original|entity|^tick|^tx`
+    /// (indexed string attributes, for case-insensitive search).
+    VFold,
+    /// The latest-revision folded value index
+    /// `F|attr|fold|original|entity|^tick`.
+    VFoldLatest,
 }
 
 /// One problem doctor found.
@@ -300,6 +312,7 @@ impl Report {
 
 /// A way to damage one stored index in memory, for doctor's tests (see
 /// [`World::tamper_index`]). Not part of the supported API.
+#[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Tamper {
@@ -327,7 +340,7 @@ pub enum Tamper {
     },
 }
 
-/// Checks a world: its log, a replay of the log, and its four stored
+/// Checks a world: its log, a replay of the log, and its stored
 /// indexes against a rebuild from the log.
 ///
 /// A file-backed world's log is re-read from disk (without taking its lock),
@@ -359,7 +372,10 @@ pub fn doctor(world: &World, opts: &DoctorOptions) -> Report {
         },
         None => Some(world.kept_txns()),
     };
-    if let Some(rebuilt) = txns.and_then(|txns| rebuild(txns, &mut found)) {
+    // Rebuilt with the world's own content hash, so both assign the same
+    // value references (rows are compared with values resolved anyway).
+    let hash = world.content_hash();
+    if let Some(rebuilt) = txns.and_then(|txns| rebuild(txns, hash, &mut found)) {
         compare_indexes(world, &rebuilt, &mut found);
         schema_rules(&rebuilt, opts, &mut found);
     }
@@ -376,7 +392,7 @@ pub fn doctor(world: &World, opts: &DoctorOptions) -> Report {
 pub fn doctor_log(path: &Path, opts: &DoctorOptions) -> Result<Report, Error> {
     let bytes = std::fs::read(path)?;
     let (txns, mut found) = log::survey(&bytes)?;
-    if let Some(rebuilt) = rebuild(txns, &mut found) {
+    if let Some(rebuilt) = rebuild(txns, fnv1a64, &mut found) {
         schema_rules(&rebuilt, opts, &mut found);
     }
     Ok(finish(found, opts))
@@ -398,7 +414,11 @@ fn finish(found: Vec<TaggedFinding>, opts: &DoctorOptions) -> Report {
 /// Replays `txns` (the genesis first) into a new in-memory world, recording
 /// every refused entry, and returns the rebuilt world; `None` if there is no
 /// usable genesis transaction to start from.
-fn rebuild(txns: Vec<SurveyedTxn>, found: &mut Vec<TaggedFinding>) -> Option<World> {
+fn rebuild(
+    txns: Vec<SurveyedTxn>,
+    hash: ContentHash,
+    found: &mut Vec<TaggedFinding>,
+) -> Option<World> {
     let mut txns = txns.into_iter();
     let genesis = match txns.next() {
         Some(t) if t.tx == TxId(0) => t,
@@ -424,6 +444,7 @@ fn rebuild(txns: Vec<SurveyedTxn>, found: &mut Vec<TaggedFinding>) -> Option<Wor
             return None;
         }
     };
+    world.set_rebuild_hash(hash);
     for t in txns {
         let tx = t.tx;
         world.replay_txn_collecting(tx, &t.entries, |entry, fault| {
@@ -494,19 +515,82 @@ fn schema_rules(rebuilt: &World, opts: &DoctorOptions, found: &mut Vec<TaggedFin
 /// `rebuilt` (the world replayed from the log), one index at a time.
 fn compare_indexes(world: &World, rebuilt: &World, found: &mut Vec<TaggedFinding>) {
     let (stored, fresh) = (world.indexes(), rebuilt.indexes());
+    // `E` and `E_latest` rows are compared with their unindexed values
+    // resolved through each world's own value table (see
+    // `World::resolved_e_index`), so a wrong reference or table entry is a
+    // mismatch and the references themselves never are. A stored key whose
+    // reference can't be resolved is undecodable.
+    let stored_e = resolved(IndexName::E, world, stored.e, true, found);
+    let fresh_e = resolved(IndexName::E, rebuilt, fresh.e, true, &mut Vec::new());
+    let stored_e_latest = resolved(IndexName::ELatest, world, stored.e_latest, false, found);
+    let fresh_e_latest = resolved(
+        IndexName::ELatest,
+        rebuilt,
+        fresh.e_latest,
+        false,
+        &mut Vec::new(),
+    );
+    let (stored_e, fresh_e) = (&*stored_e, &*fresh_e);
     compare(
         IndexName::E,
-        stored.e,
-        fresh.e,
+        stored_e,
+        fresh_e,
         describe_e,
         key::e_key_tx,
         found,
+    );
+    // The tick precisions are the payload half of `E` and `E_latest` rows
+    // (kept beside them, sparse), so a wrong, missing or extra precision is
+    // a mismatch of that index. Keys are resolved as for the rows; a
+    // stored key that can't be resolved is reported once, as its row's
+    // `IndexDecode`, and its precision is left out (so the rebuilt one is
+    // reported missing).
+    let mut ignored = Vec::new();
+    let stored_p = resolved(IndexName::E, world, stored.e_precision, true, &mut ignored);
+    let fresh_p = resolved(IndexName::E, rebuilt, fresh.e_precision, true, &mut ignored);
+    compare(
+        IndexName::E,
+        &stored_p,
+        &fresh_p,
+        describe_e,
+        key::e_key_tx,
+        found,
+    );
+    let stored_lp = resolved(
+        IndexName::ELatest,
+        world,
+        stored.e_latest_precision,
+        false,
+        &mut ignored,
+    );
+    let fresh_lp = resolved(
+        IndexName::ELatest,
+        rebuilt,
+        fresh.e_latest_precision,
+        false,
+        &mut ignored,
     );
     compare(
         IndexName::R,
         stored.r,
         fresh.r,
         describe_r,
+        key::e_key_tx,
+        found,
+    );
+    compare(
+        IndexName::V,
+        stored.v,
+        fresh.v,
+        describe_v,
+        key::e_key_tx,
+        found,
+    );
+    compare(
+        IndexName::VFold,
+        stored.vfold,
+        fresh.vfold,
+        describe_vfold,
         key::e_key_tx,
         found,
     );
@@ -521,10 +605,18 @@ fn compare_indexes(world: &World, rebuilt: &World, found: &mut Vec<TaggedFinding
     };
     compare(
         IndexName::ELatest,
-        stored.e_latest,
-        fresh.e_latest,
+        &stored_e_latest,
+        &fresh_e_latest,
         describe_e_latest,
-        |k: &[u8]| latest_tx(stored.e, fresh.e, k),
+        |k: &[u8]| latest_tx(stored_e, fresh_e, k),
+        found,
+    );
+    compare(
+        IndexName::ELatest,
+        &stored_lp,
+        &fresh_lp,
+        describe_e_latest,
+        |k: &[u8]| latest_tx(stored_e, fresh_e, k),
         found,
     );
     compare(
@@ -535,6 +627,39 @@ fn compare_indexes(world: &World, rebuilt: &World, found: &mut Vec<TaggedFinding
         |k: &[u8]| latest_tx(stored.r, fresh.r, k),
         found,
     );
+    compare(
+        IndexName::VLatest,
+        stored.v_latest,
+        fresh.v_latest,
+        describe_v_latest,
+        |k: &[u8]| latest_tx(stored.v, fresh.v, k),
+        found,
+    );
+    compare(
+        IndexName::VFoldLatest,
+        stored.vfold_latest,
+        fresh.vfold_latest,
+        describe_vfold_latest,
+        |k: &[u8]| latest_tx(stored.vfold, fresh.vfold, k),
+        found,
+    );
+}
+
+/// `index` (an `E`-layout index of `w`; `main` for full keys) with its
+/// values resolved (see `World::resolved_e_index`); every key that can't be
+/// resolved is pushed to `found` as [`Finding::IndexDecode`].
+fn resolved<'i, V: Clone>(
+    index: IndexName,
+    w: &World,
+    keys: &'i BTreeMap<Vec<u8>, V>,
+    main: bool,
+    found: &mut Vec<TaggedFinding>,
+) -> std::borrow::Cow<'i, BTreeMap<Vec<u8>, V>> {
+    let (rows, bad) = w.resolved_e_index(keys, main);
+    for key in bad {
+        found.push((None, Finding::IndexDecode { index, key }));
+    }
+    rows
 }
 
 /// Compares one stored index with its rebuild: a stored key that doesn't
@@ -622,6 +747,43 @@ fn describe_r_latest(k: &[u8]) -> Option<String> {
     let (target, attr, source, tick) = key::decode_latest_r_key(k)?;
     Some(format!(
         "R_latest row {target:?} {attr:?} {source:?} @{}",
+        tick.0
+    ))
+}
+
+fn describe_v(k: &[u8]) -> Option<String> {
+    let (attr, value, entity, tick, tx) = world::decode_v_row(k)?;
+    Some(format!(
+        "V row {attr:?} {value:?} {entity:?} @{} tx#{}",
+        tick.0, tx.0
+    ))
+}
+
+fn describe_v_latest(k: &[u8]) -> Option<String> {
+    let (attr, value, entity, tick) = key::decode_latest_v_key(k).ok()?;
+    let value = Value::decode(value).ok()?;
+    Some(format!(
+        "V_latest row {attr:?} {value:?} {entity:?} @{}",
+        tick.0
+    ))
+}
+
+fn describe_vfold(k: &[u8]) -> Option<String> {
+    let (attr, folded, original, entity, tick, tx) = world::decode_vfold_row(k)?;
+    Some(format!(
+        "VFold row {attr:?} {folded:?} {original:?} {entity:?} @{} tx#{}",
+        tick.0, tx.0
+    ))
+}
+
+fn describe_vfold_latest(k: &[u8]) -> Option<String> {
+    let (attr, fold, original, entity, tick) = key::decode_latest_vfold_key(k).ok()?;
+    let Value::Str(folded) = Value::decode(fold).ok()? else {
+        return None;
+    };
+    let original = Value::decode(original).ok()?;
+    Some(format!(
+        "VFold_latest row {attr:?} {folded:?} {original:?} {entity:?} @{}",
         tick.0
     ))
 }

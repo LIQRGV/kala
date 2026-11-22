@@ -3,7 +3,7 @@
 //! Everything else (ID tables, schema, indexes) is a copy rebuilt from it.
 //! Only committed transactions count; [`read_log`] returns exactly those.
 //!
-//! # Byte layout (format version 3)
+//! # Byte layout (format version 4)
 //!
 //! All integers are little-endian. A `str` is `u32 len | len bytes of UTF-8`.
 //!
@@ -24,19 +24,22 @@
 //!                         | [inverse str, if has_inverse = 1]
 //! kind 3  DefineEntity    id u64 | has_handle u8 | [handle str, if has_handle = 1]
 //! kind 4  Fact            entity u64 | attr u32 | tick i64 | op u8
+//!                         | precision u8
 //!                         | value (Value encoding, the rest of the payload)
 //! kind 5  Commit          tx u64 | checksum u32
 //! kind 6  DefineEdge      id u64 | source u64 | attr u32 | target u64
 //! kind 7  Deleted         of u64 | rev u32 | entity u64 | attr u32 | tick i64
 //!                         | value (Value encoding, the rest of the payload)
 //! kind 8  Revised         of u64 | rev u32 | entity u64 | attr u32 | tick i64
-//!                         | op u8 | value (Value encoding, the rest of the payload)
+//!                         | op u8 | precision u8
+//!                         | value (Value encoding, the rest of the payload)
 //!
 //! value_type: 1 bool, 2 i64, 3 f64, 4 str, 5 ref (the Value tags)
 //! kind:       0 state, 1 event
 //! cardinality 0 one,   1 many
 //! reverse_cardinality: 0 none, 1 one, 2 many
 //! op:         0 assert, 1 retract
+//! precision:  0 exact, 1 day, 2 month, 3 year, 4 decade, 5 century
 //! direction:  0 none (non-ref), 1 directed, 2 bidirectional
 //! has_handle, indexed, has_inverse: 0 no, 1 yes
 //! ```
@@ -63,10 +66,17 @@
 //! the chain's current fact (the base, or its last `Revised`), stored as the
 //! fact is (a bidirectional pair normalised, `entity <= value`). A `Revised`
 //! entry is the chain's new current fact: at the same key with another op
-//! (its own revision), or at another key directly after the `Deleted` of the
-//! old key, sharing that `Deleted`'s revision. The original entry is never
-//! touched. Format version
-//! 2 had no corrections; a version 2 file is [`Error::UnsupportedVersion`]
+//! or another precision (its own revision), or at another key directly
+//! after the `Deleted` of the old key, sharing that `Deleted`'s revision.
+//! The original entry is never touched.
+//!
+//! **Precision.** A `Fact` or `Revised` entry carries the
+//! [`Precision`] of its tick (vague time) right after its op. It is a
+//! payload, never part of the entry's key: two entries that differ only in
+//! precision are at the same key.
+//!
+//! **Versions.** Format version 2 had no corrections and version 3 no
+//! precision; a version 1, 2 or 3 file is [`Error::UnsupportedVersion`]
 //! (no migration).
 //!
 //! **Transactions.** Every transaction is a begin record followed by its
@@ -106,7 +116,9 @@
 //!    fsync can't have returned before the power went, and sectors may reach
 //!    the disk out of order).
 //! 7. The body's content is invalid (frames not exactly filling `body_len`,
-//!    an unparseable entry, no `Commit`, more than one or not last, a
+//!    a frame declaring a payload longer than [`MAX_ENTRY_BYTES`] (checked
+//!    before whether it fits, so it is never taken for a short frame), an
+//!    unparseable entry, no `Commit`, more than one or not last, a
 //!    `Commit` tx other than the begin record's, a `Commit` checksum mismatch,
 //!    an entry ID out of sequence): [`Error::Corrupt`].
 //! 8. Otherwise the transaction is committed, and the scan moves on.
@@ -130,7 +142,7 @@ use crate::doctor::Finding;
 use crate::error::Error;
 use crate::id::{AttrId, EdgeId, EntityId, NodeTypeId};
 use crate::schema::{AttrDef, Cardinality, Kind, RefDirection};
-use crate::tick::Tick;
+use crate::tick::{Precision, Tick};
 use crate::value::{Value, ValueType};
 use crate::world::{CutCause, Op, RecoveryReport, TxId};
 
@@ -138,7 +150,28 @@ use crate::world::{CutCause, Op, RecoveryReport, TxId};
 pub const LOG_MAGIC: [u8; 8] = *b"KALALOG\0";
 
 /// The log format version this build writes and reads (header bytes 8..12).
-pub const LOG_FORMAT_VERSION: u32 = 3;
+pub const LOG_FORMAT_VERSION: u32 = 4;
+
+/// The longest entry payload a log frame may hold: 16 MiB. A write whose
+/// entry would be longer is refused before anything is written
+/// ([`Error::EntryTooLarge`] for a value, judged against a `Revised` entry
+/// carrying it; see `revised_payload_len`), and reading a frame that
+/// declares a longer payload is [`Error::Corrupt`] (a doctor finding), never
+/// a torn tail: no writer produces one, so it is damage. It also bounds what
+/// one frame can make a reader allocate.
+pub const MAX_ENTRY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Payload bytes of a `Revised` entry besides its value: kind, entry ID,
+/// of, rev, entity, attr, tick, op, precision. The largest fixed part of any
+/// entry that carries a value (`Fact` and `Deleted` are smaller).
+const REVISED_FIXED_LEN: usize = 1 + 8 + 8 + 4 + 8 + 4 + 8 + 1 + 1;
+
+/// The payload length of a `Revised` entry whose value encoding is
+/// `value_len` bytes: the size a value is judged by against
+/// [`MAX_ENTRY_BYTES`], so any value accepted can later be corrected.
+pub(crate) fn revised_payload_len(value_len: usize) -> usize {
+    REVISED_FIXED_LEN.saturating_add(value_len)
+}
 
 /// Header length: magic plus version.
 const HEADER_LEN: usize = 12;
@@ -207,6 +240,8 @@ pub enum EntryBody {
         tick: Tick,
         /// Assert or retract.
         op: Op,
+        /// How precisely the tick is known (a payload, not part of the key).
+        precision: Precision,
     },
     /// A `DELETED` marker (a correction): from its transaction on, the key
     /// `(entity, attr, value, tick)` holds nothing. Revision `rev` of the
@@ -246,6 +281,8 @@ pub enum EntryBody {
         tick: Tick,
         /// Assert or retract.
         op: Op,
+        /// How precisely the tick is known (a payload, not part of the key).
+        precision: Precision,
     },
     /// Ends a transaction.
     Commit {
@@ -568,6 +605,16 @@ fn parse_body(body: &[u8], tx: u64) -> Result<Vec<LogEntry>, BodyFault> {
             frame: entries.len(),
             why,
         };
+        // Checked before the frame is split off: a declared length over the
+        // limit is damage whatever bytes follow (no writer produces one), so
+        // it is never mistaken for a frame cut short.
+        if let Some(len) = rest.first_chunk::<4>().map(|b| u32::from_le_bytes(*b))
+            && usize::try_from(len).map_or(true, |len| len > MAX_ENTRY_BYTES)
+        {
+            return Err(invalid(format!(
+                "a frame declares a {len}-byte entry, over the {MAX_ENTRY_BYTES}-byte limit"
+            )));
+        }
         let Some((payload, after)) = next_frame(rest) else {
             return Err(if rest.is_empty() {
                 BodyFault::NoCommit
@@ -862,6 +909,7 @@ fn parse_payload(payload: &[u8]) -> Result<LogEntry, String> {
             let attr = AttrId(c.u32()?);
             let tick = Tick(i64::from_le_bytes(c.array()?));
             let op = op_from(c.u8()?)?;
+            let precision = precision_from(c.u8()?)?;
             let value = Value::decode(c.rest()).map_err(|e| format!("fact value: {e}"))?;
             EntryBody::Fact {
                 entity,
@@ -869,6 +917,7 @@ fn parse_payload(payload: &[u8]) -> Result<LogEntry, String> {
                 value,
                 tick,
                 op,
+                precision,
             }
         }
         KIND_COMMIT => EntryBody::Commit {
@@ -910,6 +959,7 @@ fn parse_payload(payload: &[u8]) -> Result<LogEntry, String> {
             let attr = AttrId(c.u32()?);
             let tick = Tick(i64::from_le_bytes(c.array()?));
             let op = op_from(c.u8()?)?;
+            let precision = precision_from(c.u8()?)?;
             let value = Value::decode(c.rest()).map_err(|e| format!("revised value: {e}"))?;
             EntryBody::Revised {
                 of,
@@ -919,6 +969,7 @@ fn parse_payload(payload: &[u8]) -> Result<LogEntry, String> {
                 value,
                 tick,
                 op,
+                precision,
             }
         }
         b => return Err(format!("unknown entry kind {b}")),
@@ -933,6 +984,10 @@ fn op_from(b: u8) -> Result<Op, String> {
         1 => Ok(Op::Retract),
         _ => Err(format!("unknown op {b}")),
     }
+}
+
+fn precision_from(b: u8) -> Result<Precision, String> {
+    Precision::from_byte(b).ok_or_else(|| format!("unknown precision {b}"))
 }
 
 fn op_byte(op: Op) -> u8 {
@@ -992,6 +1047,7 @@ pub(crate) enum NewEntry<'a> {
         value: &'a [u8],
         tick: Tick,
         op: Op,
+        precision: Precision,
     },
     Deleted {
         of: EntryId,
@@ -1009,14 +1065,17 @@ pub(crate) enum NewEntry<'a> {
         value: &'a [u8],
         tick: Tick,
         op: Op,
+        precision: Precision,
     },
 }
 
-/// Too big for a `u32` length field: refused before anything is written.
+/// Too big for a log entry: refused before anything is written. Values are
+/// refused earlier, by the write, with [`Error::EntryTooLarge`]; this is
+/// what is left (a name or handle that long).
 fn too_big(what: &str) -> Error {
     Error::Io {
         kind: std::io::ErrorKind::InvalidInput,
-        message: format!("{what} is too large for a log entry (over 4 GiB)"),
+        message: format!("{what} is too large for a log entry (over {MAX_ENTRY_BYTES} bytes)"),
     }
 }
 
@@ -1039,7 +1098,12 @@ fn push_frame(
     buf.push(kind);
     buf.extend_from_slice(&id.to_le_bytes());
     body(buf)?;
-    let len = u32::try_from(buf.len() - start - 4).map_err(|_| too_big("an entry"))?;
+    // A frame no reader would accept is never written.
+    let len = buf.len() - start - 4;
+    if len > MAX_ENTRY_BYTES {
+        return Err(too_big("an entry"));
+    }
+    let len = u32::try_from(len).map_err(|_| too_big("an entry"))?;
     buf[start..start + 4].copy_from_slice(&len.to_le_bytes());
     Ok(())
 }
@@ -1078,6 +1142,7 @@ impl NewEntry<'_> {
                 value,
                 tick,
                 op,
+                precision,
             } => EntryBody::Fact {
                 entity,
                 attr,
@@ -1087,6 +1152,7 @@ impl NewEntry<'_> {
                     .expect("invariant: a fact to append holds a canonical value encoding"),
                 tick,
                 op,
+                precision,
             },
             NewEntry::Deleted {
                 of,
@@ -1114,6 +1180,7 @@ impl NewEntry<'_> {
                 value,
                 tick,
                 op,
+                precision,
             } => EntryBody::Revised {
                 of,
                 rev,
@@ -1125,6 +1192,7 @@ impl NewEntry<'_> {
                     .expect("invariant: a revised fact holds a canonical value encoding"),
                 tick,
                 op,
+                precision,
             },
         }
     }
@@ -1235,11 +1303,13 @@ pub(crate) fn encode_txn<'a>(
                 value,
                 tick,
                 op,
+                precision,
             } => push_frame(buf, KIND_FACT, id, |b| {
                 b.extend_from_slice(&entity.raw().to_le_bytes());
                 b.extend_from_slice(&attr.0.to_le_bytes());
                 b.extend_from_slice(&tick.0.to_le_bytes());
                 b.push(op_byte(op));
+                b.push(precision.to_byte());
                 b.extend_from_slice(value);
                 Ok(())
             })?,
@@ -1267,6 +1337,7 @@ pub(crate) fn encode_txn<'a>(
                 value,
                 tick,
                 op,
+                precision,
             } => push_frame(buf, KIND_REVISED, id, |b| {
                 b.extend_from_slice(&of.0.to_le_bytes());
                 b.extend_from_slice(&rev.to_le_bytes());
@@ -1274,6 +1345,7 @@ pub(crate) fn encode_txn<'a>(
                 b.extend_from_slice(&attr.0.to_le_bytes());
                 b.extend_from_slice(&tick.0.to_le_bytes());
                 b.push(op_byte(op));
+                b.push(precision.to_byte());
                 b.extend_from_slice(value);
                 Ok(())
             })?,
@@ -1312,6 +1384,7 @@ pub(crate) fn encode_txn<'a>(
 /// A failure to inject into the next log append, for tests of the
 /// writer's failure handling (see `World::inject_log_fault`). Not part of
 /// the supported API.
+#[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogFault {
@@ -1458,6 +1531,7 @@ impl LogWriter {
     }
 
     /// Arms a fault for the next append (see [`LogFault`]).
+    #[cfg(feature = "test-hooks")]
     pub(crate) fn inject_fault(&mut self, fault: LogFault) {
         match fault {
             LogFault::FailNextWrite => self.fail_next_write = true,

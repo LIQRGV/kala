@@ -62,7 +62,12 @@ fn t(x: i64) -> Option<Tick> {
 }
 
 fn rep(value: Option<Value>, tick: Option<Tick>, op: Option<Op>) -> Correction {
-    Correction::Replace { value, tick, op }
+    Correction::Replace {
+        value,
+        tick,
+        op,
+        precision: None,
+    }
 }
 
 fn one(r: WriteResult) -> kala_core::log::EntryId {

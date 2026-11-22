@@ -63,16 +63,16 @@ fn empty_file_is_not_a_valid_log() {
 
 #[test]
 fn versions_other_than_the_current_one_are_unsupported() {
-    // v1 and v2 are older formats (no migration); 4 is from the future.
-    for v in [0u32, 1, 2, 4, u32::MAX] {
+    // v1-v3 are older formats (no migration); 5 is from the future.
+    for v in [0u32, 1, 2, 3, 5, u32::MAX] {
         let (_d, p) = write_file(&header(v));
         assert_eq!(read_log(&p), Err(Error::UnsupportedVersion(v)), "v{v}");
     }
 }
 
 #[test]
-fn current_format_version_is_three() {
-    assert_eq!(LOG_FORMAT_VERSION, 3);
+fn current_format_version_is_four() {
+    assert_eq!(LOG_FORMAT_VERSION, 4);
 }
 
 #[test]

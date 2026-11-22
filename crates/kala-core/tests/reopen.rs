@@ -440,9 +440,9 @@ fn wrong_magic_is_bad_magic() {
 fn unknown_version_is_unsupported_version() {
     let b = built();
     let mut d = bytes(&b.path);
-    d[8..12].copy_from_slice(&4u32.to_le_bytes());
+    d[8..12].copy_from_slice(&5u32.to_le_bytes());
     std::fs::write(&b.path, &d).unwrap();
-    assert_eq!(open_err(&b.path), Error::UnsupportedVersion(4));
+    assert_eq!(open_err(&b.path), Error::UnsupportedVersion(5));
     assert_eq!(bytes(&b.path), d);
 }
 
@@ -491,6 +491,7 @@ fn append_fact_txn(path: &Path, entity: u64, attr: u32, value: &Value) {
     payload.extend_from_slice(&attr.to_le_bytes());
     payload.extend_from_slice(&5i64.to_le_bytes());
     payload.push(0); // assert
+    payload.push(0); // precision byte (v4): Exact
     payload.extend_from_slice(&value.encode().unwrap());
     let mut fact = (payload.len() as u32).to_le_bytes().to_vec();
     fact.extend_from_slice(&payload);
@@ -606,6 +607,7 @@ fn body_fact(entity: u64, attr: u32, tick: i64, retract: bool, value: &[u8]) -> 
     b.extend_from_slice(&attr.to_le_bytes());
     b.extend_from_slice(&tick.to_le_bytes());
     b.push(retract as u8);
+    b.push(0); // precision byte (v4): Exact
     b.extend_from_slice(value);
     (4, b)
 }
