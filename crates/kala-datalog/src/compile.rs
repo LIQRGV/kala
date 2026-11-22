@@ -5,7 +5,7 @@
 //! Every error carries the [`Span`] of what it is about; [`crate::prepare`]
 //! locates it in the query text.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use kala_core::{EntityId, Tick, Value, ValueType, World};
 use kala_query::{
@@ -278,31 +278,21 @@ impl<'w> Compiler<'w> {
         // Per rule: (the plan's head vars, scope index of each definition).
         let mut compiled: Vec<(Vec<Var>, Vec<usize>)> = vec![(Vec::new(), Vec::new()); rules.len()];
         for comp in &comps {
-            // A recursive component's calls into itself may see head
-            // positions not typed yet; its bodies are resolved again until
-            // no position gains a type (types only go from unknown to known,
-            // so this ends within its total arity + 1 passes), and the last
-            // pass, which saw every type, is kept.
-            let out = loop {
-                let before: Vec<Vec<Option<Ty>>> = comp
-                    .rules
-                    .iter()
-                    .map(|&ri| rules[ri].types.clone())
-                    .collect();
-                let mut out = Vec::new();
+            // Resolve once for the initial type seeds, propagate only newly
+            // known head positions, then resolve once more for the original
+            // validations and final IR. Rotating a large recursive head must
+            // not recompile its whole body once per position.
+            let mut out = Vec::new();
+            for &ri in &comp.rules {
+                self.rule_defs(ri, &mut rules, &by_name, &mut out)?;
+            }
+            if comp.recursive {
+                propagate_head_types(comp, &mut rules, &by_name);
+                out.clear();
                 for &ri in &comp.rules {
                     self.rule_defs(ri, &mut rules, &by_name, &mut out)?;
                 }
-                if !comp.recursive
-                    || comp
-                        .rules
-                        .iter()
-                        .zip(&before)
-                        .all(|(&ri, b)| rules[ri].types == *b)
-                {
-                    break out;
-                }
-            };
+            }
             for (ri, scope, body) in out {
                 compiled[ri].1.push(scopes.len());
                 scopes.push(scope);
@@ -1599,6 +1589,71 @@ fn stratify(
         }
     }
     Ok(())
+}
+
+/// Propagate a recursive component's known types along callee-position to
+/// caller-head-position edges. A body's patterns/functions provide the seeds;
+/// rule calls are the only way another position gains a type. Each position is
+/// queued at most once, so propagation is linear in positions and arguments.
+/// Conflicts are left to `rule_defs`, which preserves the existing diagnostics.
+fn propagate_head_types(
+    comp: &Component,
+    rules: &mut [RuleInfo<'_>],
+    by_name: &HashMap<&str, usize>,
+) {
+    let mut offsets = vec![None; rules.len()];
+    let mut types = Vec::new();
+    for &ri in &comp.rules {
+        offsets[ri] = Some(types.len());
+        types.extend_from_slice(&rules[ri].types);
+    }
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); types.len()];
+    for &ri in &comp.rules {
+        let target = offsets[ri].expect("invariant: component member has an offset");
+        for def in &rules[ri].defs {
+            let heads: HashMap<&str, usize> = def
+                .head
+                .iter()
+                .enumerate()
+                .map(|(i, h)| (h.name.as_str(), target + i))
+                .collect();
+            // Every head is bound positively (checked by rule_defs), so a
+            // same-named use inside a negation is shared with the outer body.
+            for call in all_calls(&def.calls, &def.nots) {
+                let callee = by_name[call.name.as_str()];
+                let Some(source) = offsets[callee] else {
+                    continue;
+                };
+                for (i, arg) in call.args.iter().enumerate() {
+                    if let Item::Var(s) = arg
+                        && let Some(&to) = heads.get(s.name.as_str())
+                    {
+                        edges[source + i].push(to);
+                    }
+                }
+            }
+        }
+    }
+    let mut queue: VecDeque<usize> = types
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| t.map(|_| i))
+        .collect();
+    while let Some(from) = queue.pop_front() {
+        for &to in &edges[from] {
+            if types[to].is_none() {
+                types[to] = types[from];
+                queue.push_back(to);
+            }
+        }
+    }
+    for &ri in &comp.rules {
+        let offset = offsets[ri].expect("invariant: component member has an offset");
+        let arity = rules[ri].arity;
+        rules[ri]
+            .types
+            .copy_from_slice(&types[offset..offset + arity]);
+    }
 }
 
 /// The variable renames of definition number `k` (0-based) of its rule,
