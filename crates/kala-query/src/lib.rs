@@ -13,7 +13,10 @@ pub mod exec;
 pub mod ir;
 
 pub use datum::Datum;
-pub use exec::{Limits, MAX_PLAN_DEPTH, Params, QueryError, ResultSet, execute, run};
+pub use exec::{
+    Limits, MAX_PLAN_DEPTH, Params, QueryError, ResultSet, Usage, execute, run, run_with_cancel,
+    run_with_usage,
+};
 pub use ir::{
     Access, Agg, AggFn, AttrRef, CanonSource, CmpOp, Func, MAX_EXPLAIN_BYTES, Op, OpTerm, Plan,
     Predicate, RelDef, Term, TickSource, Var,
