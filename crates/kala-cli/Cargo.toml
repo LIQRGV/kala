@@ -19,6 +19,15 @@ clap = { version = "4.6.9", default-features = false, features = ["std", "derive
 # approved, slice 5).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.154"
+# Minimal terminal editing and interactive-only cancellation; security-consultant
+# approved for the read-only REPL. Persistence uses our bounded history wrapper.
+rustyline = { version = "=19.0.0", default-features = false }
+ctrlc = { version = "=3.5.3", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+# Security-consultant approved: platform constants only, for safe nonblocking,
+# no-follow history opens. Already transitive through the terminal crates.
+libc = "0.2"
 
 [dev-dependencies]
 # End-to-end tests run the real binary in temp dirs and parse its JSON output

@@ -80,6 +80,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::mem::size_of;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use kala_core::{
     Direction, EdgeId, EntityId, Error as CoreError, Interval, IntervalSet, Op as FactOp, Tick,
@@ -154,6 +155,8 @@ pub struct ResultSet {
 /// Why a query couldn't run.
 #[derive(Debug)]
 pub enum QueryError {
+    /// The caller cancelled this run; no partial answer is returned.
+    Cancelled,
     /// A parameter the plan uses or declares has no value.
     MissingParam(String),
     /// A parameter has the wrong type for where it is used.
@@ -195,6 +198,7 @@ pub enum QueryError {
 impl fmt::Display for QueryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            QueryError::Cancelled => write!(f, "cancelled"),
             QueryError::MissingParam(n) => write!(f, "missing parameter ${n}"),
             QueryError::ParamType { name, expected } => {
                 write!(f, "parameter ${name} must be {expected}")
@@ -234,6 +238,38 @@ impl From<CoreError> for QueryError {
     }
 }
 
+/// Runs a plan with a caller-owned cancellation flag.
+pub fn run_with_cancel(
+    world: &World,
+    plan: &Plan,
+    params: &Params,
+    limits: &Limits,
+    cancel: &AtomicBool,
+) -> Result<ResultSet, QueryError> {
+    run_tracked(world, plan, params, limits, cancel).map(|(rows, _)| rows)
+}
+
+/// Measured resource usage of a successful run. A batch can deduct these
+/// values from its remaining budget without changing [`Limits`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    /// Steps charged by the executor, including index reads.
+    pub steps: u64,
+    /// Peak charged live memory, including the final answer.
+    pub peak_bytes: usize,
+}
+
+/// Runs a plan and reports the resources it consumed. Batches conservatively
+/// sum each run's peak memory, even though runs execute sequentially.
+pub fn run_with_usage(
+    world: &World,
+    plan: &Plan,
+    params: &Params,
+    limits: &Limits,
+) -> Result<(ResultSet, Usage), QueryError> {
+    run_tracked(world, plan, params, limits, &AtomicBool::new(false))
+}
+
 /// Resolves `plan.canon` against `world` (a canon past the latest is the
 /// latest) and runs the plan there with [`execute`].
 pub fn run(
@@ -242,6 +278,17 @@ pub fn run(
     params: &Params,
     limits: &Limits,
 ) -> Result<ResultSet, QueryError> {
+    run_with_cancel(world, plan, params, limits, &AtomicBool::new(false))
+}
+
+fn run_tracked(
+    world: &World,
+    plan: &Plan,
+    params: &Params,
+    limits: &Limits,
+    cancel: &AtomicBool,
+) -> Result<(ResultSet, Usage), QueryError> {
+    check_cancel(cancel)?;
     let latest = world.latest_tx();
     let canon = match &plan.canon {
         CanonSource::Latest => latest,
@@ -257,7 +304,14 @@ pub fn run(
             }
         },
     };
-    execute(&world.at_canon(canon.min(latest)), plan, params, limits)
+    execute_on(
+        world,
+        &world.at_canon(canon.min(latest)),
+        plan,
+        params,
+        limits,
+        cancel,
+    )
 }
 
 /// Runs `plan` on `view`. `plan.canon` is ignored: the view is already
@@ -269,7 +323,15 @@ pub fn execute(
     params: &Params,
     limits: &Limits,
 ) -> Result<ResultSet, QueryError> {
-    execute_on(view.world(), view, plan, params, limits)
+    execute_on(
+        view.world(),
+        view,
+        plan,
+        params,
+        limits,
+        &AtomicBool::new(false),
+    )
+    .map(|(rows, _)| rows)
 }
 
 fn execute_on(
@@ -278,7 +340,9 @@ fn execute_on(
     plan: &Plan,
     params: &Params,
     limits: &Limits,
-) -> Result<ResultSet, QueryError> {
+    cancel: &AtomicBool,
+) -> Result<(ResultSet, Usage), QueryError> {
+    check_cancel(cancel)?;
     let depth = plan_depth(&plan.root);
     if depth > MAX_PLAN_DEPTH {
         return Err(QueryError::Plan(format!(
@@ -337,6 +401,8 @@ fn execute_on(
         meter: &meter,
         width,
         budget: Budget {
+            cancel,
+            peak_bytes: 0,
             steps: 0,
             bytes: 0,
             row_bytes: row_bytes(width),
@@ -388,12 +454,19 @@ fn execute_on(
         .into_iter()
         .map(|i| out[i].iter().map(Val::to_datum).collect())
         .collect();
-    Ok(ResultSet {
-        columns: plan.find.clone(),
-        rows,
-        tick: default_tick,
-        canon: view.canon(),
-    })
+    check_cancel(cancel)?;
+    Ok((
+        ResultSet {
+            columns: plan.find.clone(),
+            rows,
+            tick: default_tick,
+            canon: view.canon(),
+        },
+        Usage {
+            steps: ex.budget.steps,
+            peak_bytes: ex.budget.peak_bytes,
+        },
+    ))
 }
 
 /// The order of `rows` (their indices) ascending by [`cmp_real_rows`]: a
@@ -2300,9 +2373,19 @@ impl Acc {
     }
 }
 
+fn check_cancel(cancel: &AtomicBool) -> Result<(), QueryError> {
+    if cancel.load(AtomicOrdering::Relaxed) {
+        Err(QueryError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------- eval
 
-struct Budget {
+struct Budget<'a> {
+    cancel: &'a AtomicBool,
+    peak_bytes: usize,
     steps: u64,
     /// Bytes held now: live row sets, held scans, interned strings.
     bytes: usize,
@@ -2316,14 +2399,16 @@ struct Budget {
     limits: Limits,
 }
 
-impl Budget {
+impl Budget<'_> {
     /// Charges `n` more bytes held. If that exceeds the budget, the memo
     /// (a cache) is dropped first; only then is it an error.
     fn charge_bytes(&mut self, n: usize) -> Result<(), QueryError> {
+        check_cancel(self.cancel)?;
         self.bytes = self.bytes.saturating_add(n);
         if self.bytes > self.limits.max_bytes && self.memo.bytes > 0 {
             self.evict_memo();
         }
+        self.peak_bytes = self.peak_bytes.max(self.bytes);
         if self.bytes > self.limits.max_bytes {
             return Err(QueryError::MemoryBudget {
                 limit: self.limits.max_bytes,
@@ -2350,6 +2435,7 @@ impl Budget {
             }
         }
         self.bytes += n;
+        self.peak_bytes = self.peak_bytes.max(self.bytes);
         self.memo.bytes += n;
         true
     }
@@ -2394,6 +2480,7 @@ impl Budget {
     /// Charges the real-order comparison work done since the last charge
     /// (about one step per 64 bytes, per 4 intervals compared).
     fn charge_cmp(&mut self) -> Result<(), QueryError> {
+        check_cancel(self.cancel)?;
         let n = self.cmp.take_steps();
         if n == 0 {
             return Ok(());
@@ -2402,6 +2489,7 @@ impl Budget {
     }
 
     fn step(&mut self, n: u64) -> Result<(), QueryError> {
+        check_cancel(self.cancel)?;
         self.steps = self.steps.saturating_add(n);
         if self.steps > self.limits.max_steps {
             return Err(QueryError::StepBudget {
@@ -2471,7 +2559,7 @@ struct Exec<'a, 'w> {
     /// Index keys examined by `view`'s reads not yet charged as steps.
     meter: &'a WorkMeter,
     width: usize,
-    budget: Budget,
+    budget: Budget<'a>,
     /// Every string and interval set the query holds, each once with its
     /// id: rows share these and compare them by id.
     interner: Interner,

@@ -14,10 +14,12 @@ mod error;
 mod lex;
 mod parse;
 mod plan;
+mod session;
 
 pub use checks::Check;
 pub use compile::{ParamKind, Prepared};
 pub use error::{DatalogError, ErrorKind, Span};
+pub use session::{SessionDefaults, SessionRule, parse_rules, prepare_with};
 
 use kala_core::World;
 use kala_query::Plan;
@@ -148,4 +150,20 @@ pub fn prepare(world: &World, text: &str) -> Result<Prepared, DatalogError> {
 /// located in `text` (except possibly the size limit).
 pub fn parse_checks(text: &str) -> Result<Vec<Check>, DatalogError> {
     checks::parse_checks(text)
+}
+
+/// Whether more input could complete the current top-level EDN form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Completeness {
+    /// The form has no unclosed brackets or strings.
+    Complete,
+    /// More input is needed (also used for empty input).
+    Incomplete,
+    /// Input already contains an irreparable lexical or bracket error.
+    Invalid,
+}
+
+/// Inspect query input using the Datalog lexer without compiling it.
+pub fn completeness(text: &str) -> Completeness {
+    lex::completeness(text)
 }

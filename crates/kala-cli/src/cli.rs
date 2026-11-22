@@ -219,6 +219,20 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Ask Datalog questions in a read-only snapshot session.
+    Repl {
+        /// The world file.
+        world: PathBuf,
+        /// Initial default story tick.
+        #[arg(long, value_name = "T", allow_negative_numbers = true)]
+        at: Option<i64>,
+        /// Initial default canon: `tx#N` or `N`.
+        #[arg(long, value_name = "C", value_parser = parse_canon)]
+        canon: Option<Canon>,
+        /// Opt in to private, bounded query history at this path.
+        #[arg(long, value_name = "FILE")]
+        history: Option<PathBuf>,
+    },
     /// Print a Datalog query's plan without running it.
     Explain {
         /// The world file.

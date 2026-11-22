@@ -79,7 +79,12 @@ pub fn run(world: &Path, q: &QueryArgs, json: bool) -> Result<String, CliError> 
     let (ctx, prepared, params) = prepare(world, q)?;
     let rs = kala_query::run(&ctx.world, &prepared.plan, &params, &Limits::default())
         .map_err(|e| query_err(e, "query"))?;
-    let (columns, rows) = table(&ctx.world, &rs);
+    Ok(render_result(&ctx.world, &rs, json))
+}
+
+/// The shared one-shot and REPL result format.
+pub(crate) fn render_result(world: &World, rs: &ResultSet, json: bool) -> String {
+    let (columns, rows) = table(world, rs);
     let out = Query {
         command: "query",
         canon: rs.canon.0,
@@ -87,7 +92,7 @@ pub fn run(world: &Path, q: &QueryArgs, json: bool) -> Result<String, CliError> 
         columns,
         rows,
     };
-    Ok(render(&out, json))
+    render(&out, json)
 }
 
 /// A result column's printed name: `?a` for a variable; an aggregate
@@ -133,7 +138,7 @@ fn prepare(world: &Path, q: &QueryArgs) -> Result<(Ctx, Prepared, Params), CliEr
 /// The `--param` texts, each parsed by the kind the query gives it.
 /// Unknown, duplicate (`who` and `?who` are one name) and missing
 /// parameters are user errors.
-fn parse_params(
+pub(crate) fn parse_params(
     ctx: &Ctx,
     kinds: &[(String, ParamKind)],
     given: &[(String, String)],

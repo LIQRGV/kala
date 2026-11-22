@@ -112,6 +112,11 @@ fn counts(bodies: impl Iterator<Item = EntryBody>) -> Counts {
 
 pub fn run(world: &Path, json: bool) -> Result<String, CliError> {
     let w = open_world(world)?;
+    Ok(snapshot(world, &w, json))
+}
+
+/// Renders the already-open snapshot used by a REPL session.
+pub(crate) fn snapshot(world: &Path, w: &kala_core::World, json: bool) -> String {
     let r = w.recovery();
     let out = Info {
         command: "info",
@@ -130,5 +135,5 @@ pub fn run(world: &Path, json: bool) -> Result<String, CliError> {
             quarantine: r.quarantine.as_ref().map(|p| p.display().to_string()),
         },
     };
-    Ok(render(&out, json))
+    render(&out, json)
 }

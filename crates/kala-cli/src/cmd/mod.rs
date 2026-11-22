@@ -13,6 +13,9 @@ pub mod log;
 pub mod neighbors;
 pub mod query;
 mod read;
+pub mod repl;
+mod repl_editor;
+mod repl_history;
 
 use crate::cli::Command;
 use crate::error::CliError;
@@ -99,6 +102,14 @@ pub fn dispatch(cmd: &Command) -> Result<Done, CliError> {
         Command::Info { world, json } => info::run(world, *json),
         Command::Query { world, query, json } => query::run(world, query, *json),
         Command::Explain { world, query } => query::explain(world, query),
+        Command::Repl {
+            world,
+            at,
+            canon,
+            history,
+        } => {
+            return repl::run(world, *at, *canon, history.as_deref());
+        }
         Command::Doctor {
             world,
             canon,

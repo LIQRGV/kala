@@ -16,7 +16,7 @@ use std::path::Path;
 
 use kala_core::{DoctorOptions, Finding, IndexName, Severity, TxId, ValueType, doctor_log};
 use kala_datalog::{MAX_CHECKS_BYTES, Prepared};
-use kala_query::{CanonSource, Limits, Params};
+use kala_query::{CanonSource, Limits, Params, QueryError, Usage};
 use serde::Serialize;
 
 use super::Done;
@@ -52,8 +52,10 @@ struct JFinding {
 /// A story check that returned rows.
 #[derive(Serialize)]
 struct JHint {
-    /// Always `story_check`.
+    /// `story_check` or `budget_exhausted`.
     kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
     /// The check's name, without the `:`.
     check: String,
     /// How many rows the check returned.
@@ -97,6 +99,10 @@ impl Text for Doctor {
         } else if !self.hints.is_empty() {
             let _ = writeln!(s, "hints ({}):", self.hints.len());
             for h in &self.hints {
+                if let Some(message) = &h.message {
+                    let _ = writeln!(s, "  {message}");
+                    continue;
+                }
                 let k = h.rows_total;
                 let _ = writeln!(
                     s,
@@ -154,7 +160,7 @@ pub fn run(world: &Path, o: Options<'_>) -> Result<Done, CliError> {
     }
     if let Some(checks) = checks {
         if out.errors.is_empty() {
-            out.hints = run_checks(world, &checks, o.canon)?;
+            out.hints = run_checks(world, &checks, o.canon, o.json)?;
             out.clean &= out.hints.is_empty();
         } else {
             out.checks_skipped = true;
@@ -182,12 +188,15 @@ fn whose(c: &kala_datalog::Check) -> String {
     format!("check :{}", escape::value(&c.name))
 }
 
-/// Prepares every check, then runs each (default limits; at `canon` if
-/// given, else at the query's own canon). A check with rows is a hint.
+/// Prepares every check, then runs them one after another. The step budget
+/// is shared by all checks: running out of it is one hint covering this and
+/// every later check. Memory is released between checks, so each check gets
+/// the full byte limit, and running out of it only stops that check.
 fn run_checks(
     path: &Path,
     (text, checks): &(String, Vec<kala_datalog::Check>),
     canon: Option<Canon>,
+    json: bool,
 ) -> Result<Vec<JHint>, CliError> {
     let world = open_world(path)?;
     let mut prepared: Vec<Prepared> = Vec::with_capacity(checks.len());
@@ -210,23 +219,81 @@ fn run_checks(
         prepared.push(p);
     }
     let mut hints = Vec::new();
+    let mut remaining = Limits::default();
     for (c, p) in checks.iter().zip(&prepared) {
-        let rs = kala_query::run(&world, &p.plan, &Params::new(), &Limits::default())
-            .map_err(|e| query_err(e, &whose(c)))?;
+        let result = if remaining.max_steps == 0 {
+            Err(QueryError::StepBudget { limit: 0 })
+        } else {
+            kala_query::run_with_usage(&world, &p.plan, &Params::new(), &remaining)
+        };
+        let (mut rs, usage) = match result {
+            Ok(result) => result,
+            Err(e @ (QueryError::StepBudget { .. } | QueryError::MemoryBudget { .. }))
+                if !stops_later_checks(&e) =>
+            {
+                hints.push(JHint {
+                    kind: "memory_exhausted",
+                    message: Some(format!(
+                        "story check :{} skipped: it exceeded the memory budget",
+                        escape::value(&c.name)
+                    )),
+                    check: c.name.clone(),
+                    rows_total: 0,
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                });
+                continue;
+            }
+            Err(QueryError::StepBudget { .. } | QueryError::MemoryBudget { .. }) => {
+                hints.push(JHint {
+                    kind: "budget_exhausted",
+                    message: Some(format!(
+                        "story checks stopped: budget exhausted at :{}",
+                        escape::value(&c.name)
+                    )),
+                    check: c.name.clone(),
+                    rows_total: 0,
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                });
+                break;
+            }
+            Err(e) => return Err(query_err(e, &whose(c))),
+        };
+        remaining = after_check(&remaining, &usage);
         if rs.rows.is_empty() {
             continue;
         }
-        let (columns, mut rows) = table(&world, &rs);
-        rows.truncate(JSON_ROWS);
+        let rows_total = rs.rows.len();
+        // Cut before label resolution/rendering, including in text mode.
+        rs.rows.truncate(if json { JSON_ROWS } else { TEXT_ROWS });
+        let (columns, rows) = table(&world, &rs);
         hints.push(JHint {
             kind: "story_check",
+            message: None,
             check: c.name.clone(),
-            rows_total: rs.rows.len(),
+            rows_total,
             columns,
             rows,
         });
     }
     Ok(hints)
+}
+
+/// Whether running out of a budget stops every later story check: only the
+/// shared step budget does; memory is per check.
+fn stops_later_checks(e: &QueryError) -> bool {
+    matches!(e, QueryError::StepBudget { .. })
+}
+
+/// The budget left for the next story check: steps are shared by all checks
+/// (so a file of many checks can't use many budgets), while memory is
+/// released when a check ends, so each check gets the full byte limit.
+fn after_check(remaining: &Limits, usage: &Usage) -> Limits {
+    Limits {
+        max_steps: remaining.max_steps.saturating_sub(usage.steps),
+        ..*remaining
+    }
 }
 
 fn kind(f: &Finding) -> &'static str {
@@ -362,5 +429,41 @@ fn type_name(t: ValueType) -> &'static str {
         ValueType::F64 => "f64",
         ValueType::Str => "string",
         ValueType::Ref => "ref",
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::after_check;
+    use kala_query::{Limits, Usage};
+
+    // Review round 1: story checks share one step budget, but memory is
+    // released between checks, so a memory-heavy check (e.g. a full memo
+    // cache) must not starve the checks after it.
+    #[test]
+    fn steps_are_shared_but_memory_is_per_check() {
+        let full = Limits::default();
+        let usage = Usage {
+            steps: 1_000,
+            peak_bytes: full.max_bytes,
+        };
+        let next = after_check(&full, &usage);
+        assert_eq!(next.max_steps, full.max_steps - 1_000);
+        assert_eq!(next.max_bytes, full.max_bytes);
+        assert_eq!(next.max_rows, full.max_rows);
+    }
+}
+
+#[cfg(test)]
+mod budget_flow_tests {
+    use super::stops_later_checks;
+    use kala_query::QueryError;
+
+    // Review round 2: memory is per check, so running out of it only stops
+    // that check; running out of the shared steps stops every later check.
+    #[test]
+    fn only_the_shared_step_budget_stops_later_checks() {
+        assert!(stops_later_checks(&QueryError::StepBudget { limit: 1 }));
+        assert!(!stops_later_checks(&QueryError::MemoryBudget { limit: 1 }));
     }
 }
