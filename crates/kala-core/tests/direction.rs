@@ -7,8 +7,9 @@
 //!   `AttrDef::new`: Ref -> direction Some(Directed), else None; inverse None
 //!   `.directed()`, `.bidirectional()`, `.inverse(&str)` builders
 //!   `Error::InvalidDirection(String)` (attribute name)
-//! Log v2 DefineAttr body:
+//! Log DefineAttr body (v3 layout; direction arrived in v2, reverse_cardinality in v3):
 //!   id u32 | name str | value_type u8 | kind u8 | cardinality u8 | indexed u8
+//!   | reverse_cardinality u8 (0 none, 1 one, 2 many)
 //!   | direction u8 (0 none, 1 directed, 2 bidirectional)
 //!   | has_inverse u8 | [inverse str]
 //! `neighbors` / `edge_id` (items 3 and 6) are not tested here.
@@ -478,10 +479,26 @@ fn attr_body(
     dir: u8,
     inverse: Option<&str>,
 ) -> Vec<u8> {
+    attr_body_rc(id, name, vt, kind, card, indexed, 0, dir, inverse)
+}
+
+/// Same, with an explicit `reverse_cardinality` byte (placed after `indexed`).
+#[allow(clippy::too_many_arguments)]
+fn attr_body_rc(
+    id: u32,
+    name: &str,
+    vt: u8,
+    kind: u8,
+    card: u8,
+    indexed: u8,
+    reverse: u8,
+    dir: u8,
+    inverse: Option<&str>,
+) -> Vec<u8> {
     let mut b = id.to_le_bytes().to_vec();
     b.extend_from_slice(&(name.len() as u32).to_le_bytes());
     b.extend_from_slice(name.as_bytes());
-    b.extend_from_slice(&[vt, kind, card, indexed, dir]);
+    b.extend_from_slice(&[vt, kind, card, indexed, reverse, dir]);
     match inverse {
         None => b.push(0),
         Some(i) => {
@@ -527,9 +544,9 @@ fn define_attr_body_follows_the_documented_layout() {
 }
 
 #[test]
-fn reopen_rs_body_define_attr_helper_matches_the_v2_layout() {
-    // tests/reopen.rs writes `[2, 0, 1, 1, 0, 0]` after the name: i64, state,
-    // many, indexed, direction none, no inverse. That is exactly the layout.
+fn reopen_rs_body_define_attr_helper_matches_the_current_layout() {
+    // tests/reopen.rs writes `[2, 0, 1, 1, 0, 0, 0]` after the name: i64, state,
+    // many, indexed, reverse none, direction none, no inverse. That is exactly the layout.
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("w.kala");
     let s = base().attribute(AttrDef::new(
@@ -561,7 +578,7 @@ fn genesis_file(attrs: &[Vec<u8>]) -> Vec<u8> {
     }
     let commit = common::commit_frame(&body, 2 + attrs.len() as u64, 0);
     body.extend(commit);
-    let mut file = common::header(2);
+    let mut file = common::header(kala_core::log::LOG_FORMAT_VERSION);
     file.extend(common::txn(0, &body));
     file
 }
@@ -610,7 +627,7 @@ fn assert_unparseable(attrs: &[Vec<u8>], label: &str) {
 }
 
 #[test]
-fn control_hand_built_v2_genesis_with_directions_opens() {
+fn control_hand_built_genesis_with_directions_opens() {
     let file = genesis_file(&[
         attr_body(0, "parent_of", 5, 0, 1, 1, 1, Some("child_of")),
         attr_body(1, "ally_of", 5, 0, 1, 1, 2, None),
@@ -672,18 +689,18 @@ fn replay_bad_has_inverse_byte_is_corrupt_for_open_and_read_log() {
 
 #[test]
 fn replay_v1_shaped_define_attr_without_the_new_bytes_is_corrupt() {
-    // v1 body: ends right after `indexed`
-    let mut b = 0u32.to_le_bytes().to_vec();
-    b.extend_from_slice(&1u32.to_le_bytes());
-    b.push(b'x');
-    b.extend_from_slice(&[2, 0, 1, 1]);
-    assert_unparseable(&[b], "no direction byte");
-    // ends right after direction
-    let mut b = 0u32.to_le_bytes().to_vec();
-    b.extend_from_slice(&1u32.to_le_bytes());
-    b.push(b'x');
-    b.extend_from_slice(&[2, 0, 1, 1, 0]);
-    assert_unparseable(&[b], "no has_inverse byte");
+    // each prefix of the current layout after `indexed` is unparseable
+    for (tail, label) in [
+        (&[2u8, 0, 1, 1][..], "v1: no reverse_cardinality byte"),
+        (&[2, 0, 1, 1, 0][..], "no direction byte"),
+        (&[2, 0, 1, 1, 0, 0][..], "no has_inverse byte"),
+    ] {
+        let mut b = 0u32.to_le_bytes().to_vec();
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.push(b'x');
+        b.extend_from_slice(tail);
+        assert_unparseable(&[b], label);
+    }
 }
 
 #[test]

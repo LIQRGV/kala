@@ -3,6 +3,7 @@
 use std::fmt;
 
 use crate::id::{EntityId, IdError};
+use crate::log::EntryId;
 use crate::tick::Tick;
 use crate::value::{ValueError, ValueType};
 
@@ -19,9 +20,10 @@ pub enum Error {
     InvalidHandle(String),
     /// A node type or attribute name in the schema isn't valid (e.g. empty).
     InvalidName(String),
-    /// An attribute's direction or inverse doesn't fit its declaration: a
-    /// non-ref attribute with a direction or an inverse, a ref attribute
-    /// without a direction, or an inverse on a bidirectional attribute.
+    /// An attribute's direction, inverse or reverse cardinality doesn't fit
+    /// its declaration: a non-ref attribute with a direction, an inverse or
+    /// a reverse cardinality, a ref attribute without a direction, or an
+    /// inverse or a reverse cardinality on a bidirectional attribute.
     /// Holds the attribute's name.
     InvalidDirection(String),
     /// The attribute name isn't declared in the schema.
@@ -58,6 +60,31 @@ pub enum Error {
         /// The tick both ops are at.
         tick: Tick,
     },
+    /// A correction names an entry ID that no committed log entry has.
+    UnknownEntry(EntryId),
+    /// A correction names an entry that isn't a fact: a `DEFINE`, a
+    /// `Commit` or a `DELETED` marker. Holds the ID given.
+    NotAFact(EntryId),
+    /// A correction names an entry whose revision chain is currently
+    /// deleted: there is nothing left to correct. Holds the ID given.
+    AlreadyDeleted(EntryId),
+    /// The transaction already wrote an entry at this key `(entity,
+    /// attribute, value, tick)`, and a transaction stores at most one entry
+    /// per key (e.g. a correction of a chain it already corrected, or a
+    /// write stored at a key it deleted).
+    TxnKeyConflict {
+        /// The entity of the key (as stored: a bidirectional pair
+        /// normalised).
+        entity: EntityId,
+        /// The attribute of the key.
+        attr: String,
+        /// The tick of the key.
+        tick: Tick,
+    },
+    /// The revision chain of this base entry already has `u32::MAX`
+    /// revisions, the most a correction entry can number; it can't be
+    /// corrected again.
+    TooManyRevisions(EntryId),
     /// An ID can't be built: too many node types in the schema, or a node
     /// type's sequence numbers are exhausted.
     Id(IdError),
@@ -121,6 +148,21 @@ impl fmt::Display for Error {
                 f,
                 "the opposite op is already stored for {entity:?} {attr:?} at tick {}",
                 tick.0
+            ),
+            Error::UnknownEntry(id) => write!(f, "no committed log entry#{}", id.0),
+            Error::NotAFact(id) => write!(f, "log entry#{} is not a fact", id.0),
+            Error::AlreadyDeleted(id) => {
+                write!(f, "log entry#{} is already deleted by a correction", id.0)
+            }
+            Error::TxnKeyConflict { entity, attr, tick } => write!(
+                f,
+                "the transaction already wrote an entry for {entity:?} {attr:?} at tick {}",
+                tick.0
+            ),
+            Error::TooManyRevisions(id) => write!(
+                f,
+                "log entry#{} has the most revisions a correction can number",
+                id.0
             ),
             Error::Id(e) => write!(f, "invalid ID: {e}"),
             Error::TransactionAborted => write!(

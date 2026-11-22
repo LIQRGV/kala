@@ -8,7 +8,7 @@
 //! - `Error::Io { kind: std::io::ErrorKind, message: String }`.
 //! - `kala_core::log::{read_log, LogEntry, EntryBody, EntryId, LOG_MAGIC,
 //!   LOG_FORMAT_VERSION}`; `read_log(path: &Path) -> Result<Vec<LogEntry>, Error>`;
-//!   `LOG_MAGIC: [u8; 8] = *b"KALALOG\0"`, `LOG_FORMAT_VERSION: u32 = 2`;
+//!   `LOG_MAGIC: [u8; 8] = *b"KALALOG\0"`, `LOG_FORMAT_VERSION: u32 = 3`;
 //!   `EntryId(pub u64)`; `LogEntry { pub id: EntryId, pub body: EntryBody }`
 //!   (Debug, Clone, PartialEq); `EntryBody::{DefineNodeType{id: NodeTypeId, name: String},
 //!   DefineAttr{id: AttrId, def: AttrDef}, DefineEntity{id: EntityId, handle: Option<String>},
@@ -126,8 +126,8 @@ fn header_is_magic_then_version_little_endian() {
     assert!(b.len() >= 12);
     assert_eq!(&b[..8], b"KALALOG\0");
     assert_eq!(LOG_MAGIC, *b"KALALOG\0");
-    assert_eq!(LOG_FORMAT_VERSION, 2);
-    assert_eq!(&b[8..12], &2u32.to_le_bytes());
+    assert_eq!(LOG_FORMAT_VERSION, 3);
+    assert_eq!(&b[8..12], &3u32.to_le_bytes());
 }
 
 #[test]

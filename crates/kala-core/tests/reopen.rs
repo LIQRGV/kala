@@ -440,9 +440,9 @@ fn wrong_magic_is_bad_magic() {
 fn unknown_version_is_unsupported_version() {
     let b = built();
     let mut d = bytes(&b.path);
-    d[8..12].copy_from_slice(&3u32.to_le_bytes());
+    d[8..12].copy_from_slice(&4u32.to_le_bytes());
     std::fs::write(&b.path, &d).unwrap();
-    assert_eq!(open_err(&b.path), Error::UnsupportedVersion(3));
+    assert_eq!(open_err(&b.path), Error::UnsupportedVersion(4));
     assert_eq!(bytes(&b.path), d);
 }
 
@@ -621,8 +621,8 @@ fn body_define_attr(id: u32, name: &str) -> (u8, Vec<u8>) {
     let mut b = id.to_le_bytes().to_vec();
     b.extend_from_slice(&(name.len() as u32).to_le_bytes());
     b.extend_from_slice(name.as_bytes());
-    // i64, state, many, indexed, then v2: direction none, no inverse
-    b.extend_from_slice(&[2, 0, 1, 1, 0, 0]);
+    // i64, state, many, indexed, reverse_cardinality none, direction none, no inverse
+    b.extend_from_slice(&[2, 0, 1, 1, 0, 0, 0]);
     (2, b)
 }
 
@@ -883,11 +883,23 @@ fn control_same_value_at_a_different_tick_opens() {
     let b = built();
     let age = attr_id(&b.path, "age");
     let v = Value::I64(30).encode().unwrap();
+    // Slice 3 item 0c: the value must NOT already hold at the new tick, or a
+    // live write would have been a no-op. 30 holds over [-100, -50), so the
+    // control moves to -49 (just after the retract); it was -99 in slice 2.
     append_txn(
         &b.path,
-        &[body_fact(b.ents.greg.raw(), age, -99, false, &v)],
+        &[body_fact(b.ents.greg.raw(), age, -49, false, &v)],
     );
     assert!(World::open(&b.path).is_ok());
+}
+
+#[test]
+fn same_value_asserted_at_a_different_tick_inside_its_held_interval_is_corrupt() {
+    // the slice-2 control (assert 30 @-99), now a replay no-op: Corrupt
+    let b = built();
+    let age = attr_id(&b.path, "age");
+    let v = Value::I64(30).encode().unwrap();
+    assert_corrupt_untouched(&b, &[body_fact(b.ents.greg.raw(), age, -99, false, &v)]);
 }
 
 #[test]

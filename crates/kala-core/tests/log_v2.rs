@@ -186,6 +186,54 @@ fn assert_torn(path: &Path, valid: &[u8], tail: &[u8], label: &str) {
     std::fs::remove_file(&q).unwrap();
 }
 
+/// Slice 3 item 0a: `file` is the clean log `orig` with the LAST txn damaged
+/// (valid begin record, body_crc mismatch, nothing valid after it). open() must
+/// cut it back to `keep` (the end of the previous txn), quarantine the cut
+/// bytes and report `Damaged`; read_log ignores it, the file stays untouched.
+fn assert_damaged_cut(path: &Path, orig: &[u8], file: &[u8], keep: usize, label: &str) {
+    std::fs::write(path, &orig[..keep]).unwrap();
+    let committed: Vec<LogEntry> = read_log(path).unwrap();
+    std::fs::write(path, file).unwrap();
+    assert_eq!(read_log(path).unwrap(), committed, "{label}: read_log");
+    assert_eq!(bytes(path), file, "{label}: read_log modified the file");
+    assert!(
+        quarantine_files(path).is_empty(),
+        "{label}: read_log quarantined"
+    );
+    let w = match World::open(path) {
+        Ok(w) => w,
+        Err(e) => panic!("{label}: expected a cut, got {e:?}"),
+    };
+    assert_eq!(
+        w.recovery().cause,
+        Some(CutCause::Damaged),
+        "{label}: cause"
+    );
+    assert_eq!(
+        bytes_cut(&w),
+        (file.len() - keep) as u64,
+        "{label}: bytes_cut"
+    );
+    let q = qpath(path, &format!(".torn-{keep}"));
+    assert_eq!(
+        quarantine_of(&w),
+        Some(q.clone()),
+        "{label}: quarantine path"
+    );
+    assert_eq!(w.latest_tx(), TxId(3), "{label}: last txn is gone");
+    drop(w);
+    assert_eq!(bytes(path), &file[..keep], "{label}: cut file");
+    assert_eq!(
+        bytes(&q),
+        &file[keep..],
+        "{label}: quarantine holds the cut bytes"
+    );
+    let w = World::open(path).unwrap_or_else(|e| panic!("{label}: second open {e:?}"));
+    assert!(report_is_default(&w), "{label}: second open is clean");
+    drop(w);
+    std::fs::remove_file(&q).unwrap();
+}
+
 /// (tx, entry id of the first frame, frames before the Commit, Commit entry id)
 /// of the LAST txn of a well-formed file.
 fn last_parts(file: &[u8]) -> (u64, u64, Vec<u8>, u64) {
@@ -215,8 +263,8 @@ fn every_txn_starts_with_a_documented_begin_record() {
     let (_d, path) = build();
     let b = bytes(&path);
     assert_eq!(&b[..8], b"KALALOG\0");
-    assert_eq!(&b[8..12], &2u32.to_le_bytes());
-    assert_eq!(LOG_FORMAT_VERSION, 2);
+    assert_eq!(&b[8..12], &3u32.to_le_bytes());
+    assert_eq!(LOG_FORMAT_VERSION, 3);
     let spans = common::spans(&b);
     assert_eq!(spans.len(), 5, "genesis + 4 txns");
     assert_eq!(
@@ -291,6 +339,32 @@ fn a_real_world_with_its_version_rewritten_to_1_is_unsupported() {
     assert_eq!(bytes(&path), b);
 }
 
+#[test]
+fn v2_header_is_unsupported_version_2_for_open_and_read_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut with_txn = common::header(2);
+    with_txn.extend_from_slice(&common::txn(0, &[]));
+    for (i, file) in [common::header(2), with_txn].into_iter().enumerate() {
+        let p = dir.path().join(format!("v2-{i}.kala"));
+        std::fs::write(&p, &file).unwrap();
+        assert_eq!(open_err(&p), Error::UnsupportedVersion(2), "case {i}");
+        assert_eq!(read_log(&p), Err(Error::UnsupportedVersion(2)), "case {i}");
+        assert_eq!(bytes(&p), file, "case {i}: file untouched");
+        assert!(quarantine_files(&p).is_empty());
+    }
+}
+
+#[test]
+fn a_real_world_with_its_version_rewritten_to_2_is_unsupported() {
+    let (_d, path) = build();
+    let mut b = bytes(&path);
+    b[8..12].copy_from_slice(&2u32.to_le_bytes());
+    std::fs::write(&path, &b).unwrap();
+    assert_eq!(open_err(&path), Error::UnsupportedVersion(2));
+    assert_eq!(read_log(&path), Err(Error::UnsupportedVersion(2)));
+    assert_eq!(bytes(&path), b);
+}
+
 // ---------------------------------------------------------------------------
 // Rule 1: clean end; recovery report defaults
 // ---------------------------------------------------------------------------
@@ -324,10 +398,17 @@ fn recovery_report_type_is_debug_clone_eq_default() {
     let r = RecoveryReport {
         bytes_cut: 3,
         quarantine: Some(PathBuf::from("x.torn-1")),
+        cause: Some(CutCause::Torn),
     };
     let c = r.clone();
     assert_eq!(r, c);
     assert_ne!(r, RecoveryReport::default());
+    assert_eq!(RecoveryReport::default().cause, None);
+    let d = RecoveryReport {
+        cause: Some(CutCause::Damaged),
+        ..r.clone()
+    };
+    assert_ne!(r, d);
     assert!(!format!("{r:?}").is_empty());
 }
 
@@ -340,7 +421,7 @@ fn header_only_v2_file_has_no_genesis_and_is_corrupt_untouched_for_open() {
         .into_iter()
         .enumerate()
     {
-        let mut file = common::header(2);
+        let mut file = common::header(kala_core::log::LOG_FORMAT_VERSION);
         file.extend_from_slice(&extra);
         std::fs::write(&p, &file).unwrap();
         assert!(matches!(open_err(&p), Error::Corrupt(_)), "case {i}");
@@ -589,16 +670,17 @@ fn torn_looking_begin_with_a_wrong_tx_is_corrupt_not_torn() {
 // Rule 6: body_crc mismatch with all bytes present -> Corrupt (finding M1)
 // ---------------------------------------------------------------------------
 
+// Slice 3 item 0a (was `..._is_corrupt_and_untouched`, slice-1 finding M1):
+// the last txn with all bytes present but a body_crc mismatch is cut as Damaged.
 #[test]
-fn flipping_any_byte_inside_the_last_committed_txn_body_is_corrupt_and_untouched() {
-    // Slice-1 finding M1: this used to look like a torn write and was cut.
+fn flipping_any_byte_inside_the_last_committed_txn_body_is_cut_as_damaged() {
     let (_d, path) = build();
     let orig = bytes(&path);
     let s = *common::spans(&orig).last().unwrap();
     for i in s.body_start..s.end {
         let mut file = orig.clone();
         file[i] ^= 0x01;
-        assert_refused(&path, &file, &format!("flip body byte {i}"));
+        assert_damaged_cut(&path, &orig, &file, s.start, &format!("flip body byte {i}"));
     }
 }
 
@@ -614,20 +696,30 @@ fn flipping_any_byte_inside_a_middle_txn_body_is_corrupt_and_untouched() {
     }
 }
 
+// Slice 3 item 0a (was `flipping_the_last_commit_checksum_is_corrupt_not_cut`).
 #[test]
-fn flipping_the_last_commit_checksum_is_corrupt_not_cut() {
+fn flipping_the_last_commit_checksum_is_cut_as_damaged() {
     let (_d, path) = build();
     let orig = bytes(&path);
+    let s = *common::spans(&orig).last().unwrap();
     for back in 1..=4 {
         let mut file = orig.clone();
         let n = file.len();
         file[n - back] ^= 0x01;
-        assert_refused(&path, &file, &format!("commit checksum byte -{back}"));
+        assert_damaged_cut(
+            &path,
+            &orig,
+            &file,
+            s.start,
+            &format!("commit checksum byte -{back}"),
+        );
     }
 }
 
+// Slice 3 item 0a (was `begin_with_a_valid_crc_but_a_wrong_body_crc_is_corrupt`).
+// A wrong body_crc under a valid begin record, last txn, nothing after: Damaged.
 #[test]
-fn begin_with_a_valid_crc_but_a_wrong_body_crc_is_corrupt() {
+fn begin_with_a_valid_crc_but_a_wrong_body_crc_in_the_last_txn_is_cut_as_damaged() {
     let (_d, path) = build();
     let orig = bytes(&path);
     let s = *common::spans(&orig).last().unwrap();
@@ -636,7 +728,24 @@ fn begin_with_a_valid_crc_but_a_wrong_body_crc_is_corrupt() {
         let mut file = orig[..s.start].to_vec();
         file.extend_from_slice(&common::begin_raw(BEGIN_TAG, s.tx, body.len() as u64, bad));
         file.extend_from_slice(&body);
-        assert_refused(&path, &file, &format!("body_crc {bad:#x}"));
+        assert_damaged_cut(&path, &orig, &file, s.start, &format!("body_crc {bad:#x}"));
+    }
+}
+
+// The Corrupt variant (kept intent): the same wrong body_crc in a MIDDLE txn,
+// with valid txns after it, is never cut.
+#[test]
+fn begin_with_a_valid_crc_but_a_wrong_body_crc_in_a_middle_txn_is_corrupt() {
+    let (_d, path) = build();
+    let orig = bytes(&path);
+    let s = common::spans(&orig)[2];
+    let body = orig[s.body_start..s.end].to_vec();
+    for bad in [common::crc(&body) ^ 1, 0, u32::MAX] {
+        let mut file = orig[..s.start].to_vec();
+        file.extend_from_slice(&common::begin_raw(BEGIN_TAG, s.tx, body.len() as u64, bad));
+        file.extend_from_slice(&body);
+        file.extend_from_slice(&orig[s.end..]);
+        assert_refused(&path, &file, &format!("middle body_crc {bad:#x}"));
     }
 }
 

@@ -23,6 +23,10 @@
 //! and `R|t|a|` and `R|t|a|s|` are exact prefixes. The tick and tx suffix
 //! is the same as in `E`, so one history sorts newest first in both.
 //!
+//! The latest-revision indexes (`E_latest`, `R_latest`) use the same keys
+//! without the trailing `^tx` ([`without_tx`]): one key per `(…, tick)`,
+//! holding its current entry at the latest canon.
+//!
 //! Keys are built from encoded bytes only (the value is already
 //! [`Value::encode`](crate::value::Value::encode)d), never from `Value`.
 
@@ -97,7 +101,9 @@ pub(crate) fn e_key_tx(key: &[u8]) -> Option<TxId> {
 /// Every key under a value prefix is that prefix plus exactly
 /// [`SUFFIX_LEN`] bytes, so no key under it is greater than the all-`0xFF`
 /// suffix, and every key strictly greater belongs to a later value (or a
-/// later attribute/entity, which the caller's prefix check catches).
+/// later attribute/entity, which the caller's prefix check catches). It
+/// works for latest-revision keys (prefix plus 8 bytes) too: they are
+/// shorter than the all-`0xFF` suffix and still share the prefix.
 pub(crate) fn past_value(value_prefix: &[u8]) -> Vec<u8> {
     let mut k = Vec::with_capacity(value_prefix.len() + SUFFIX_LEN);
     k.extend_from_slice(value_prefix);
@@ -105,16 +111,42 @@ pub(crate) fn past_value(value_prefix: &[u8]) -> Vec<u8> {
     k
 }
 
+/// The largest possible key with the same history prefix and tick as the
+/// full `E` or `R` key `key`; seek *exclusively* past it to reach the next
+/// (older) tick of that history. Both layouts end in `^tx` (8 bytes), so
+/// the all-`0xFF` tx part is the greatest key of that tick.
+pub(crate) fn past_tick(key: &[u8]) -> Vec<u8> {
+    let head = &key[..key.len().saturating_sub(8)];
+    let mut k = Vec::with_capacity(head.len() + 8);
+    k.extend_from_slice(head);
+    k.extend_from_slice(&[0xFF; 8]);
+    k
+}
+
+/// The full `E` or `R` key `key` without its `^tx`: the key's history
+/// prefix and tick, shared by every entry at that `(…, tick)`.
+pub(crate) fn without_tx(key: &[u8]) -> &[u8] {
+    &key[..key.len().saturating_sub(8)]
+}
+
 /// Splits the value encoding out of a full `E` key under `E|e|a|`: returns
 /// the value bytes. Fails if the key is too short or its value part isn't a
 /// well-formed encoding.
 pub(crate) fn e_value_bytes(key: &[u8]) -> Result<&[u8], ValueError> {
+    value_bytes_before(key, SUFFIX_LEN)
+}
+
+/// The value encoding of an `E`-layout key under `E|e|a|` that ends in a
+/// suffix of exactly `suffix_len` bytes after the value.
+fn value_bytes_before(key: &[u8], suffix_len: usize) -> Result<&[u8], ValueError> {
     let rest = key
         .get(E_ATTR_PREFIX_LEN..)
         .ok_or(ValueError::Malformed("index key shorter than its prefix"))?;
     let len = encoded_len(rest)?;
-    if rest.len() != len + SUFFIX_LEN {
-        return Err(ValueError::Malformed("index key suffix is not ^tick|^tx"));
+    if rest.len() != len + suffix_len {
+        return Err(ValueError::Malformed(
+            "index key suffix has the wrong length",
+        ));
     }
     Ok(&rest[..len])
 }
@@ -130,6 +162,68 @@ pub(crate) fn e_value_and_tick(key: &[u8]) -> Result<(&[u8], Tick), ValueError> 
         .and_then(|b| b.try_into().ok())
         .ok_or(ValueError::Malformed("index key suffix is not ^tick|^tx"))?;
     Ok((value, Tick::decode_inverted(tick)))
+}
+
+/// Splits a latest-index `E` key (`E|e|a|v|^tick`, a full key
+/// [`without_tx`]) into its value encoding and tick. Fails if the key isn't
+/// a well-formed latest `E` key.
+pub(crate) fn latest_e_value_and_tick(key: &[u8]) -> Result<(&[u8], Tick), ValueError> {
+    let value = value_bytes_before(key, 8)?;
+    let start = E_ATTR_PREFIX_LEN + value.len();
+    // `value_bytes_before` checked that exactly `^tick` follows the value.
+    let tick: [u8; 8] = key
+        .get(start..start + 8)
+        .and_then(|b| b.try_into().ok())
+        .ok_or(ValueError::Malformed("index key suffix is not ^tick"))?;
+    Ok((value, Tick::decode_inverted(tick)))
+}
+
+/// A decoded latest-index `E` key: `(entity, attr, value encoding, tick)`.
+pub(crate) type LatestEKeyParts<'k> = (EntityId, AttrId, &'k [u8], Tick);
+
+/// Splits a latest-index `E` key (`E|e|a|v|^tick`) into its parts. Fails if
+/// it isn't one (wrong tag, too short, a malformed value part or a suffix
+/// other than exactly `^tick`). Never panics, whatever the bytes.
+pub(crate) fn decode_latest_e_key(key: &[u8]) -> Result<LatestEKeyParts<'_>, ValueError> {
+    if key.first() != Some(&E_TAG) {
+        return Err(ValueError::Malformed("not an E key"));
+    }
+    let (value, tick) = latest_e_value_and_tick(key)?;
+    let short = || ValueError::Malformed("index key shorter than its prefix");
+    let entity = EntityId::from_bytes(bytes8(key, 1).ok_or_else(short)?);
+    let attr: [u8; 4] = key
+        .get(9..13)
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(short)?;
+    Ok((entity, AttrId(u32::from_be_bytes(attr)), value, tick))
+}
+
+/// A decoded latest-index `R` key: `(target, attr, source, tick)`.
+pub(crate) type LatestRKeyParts = (EntityId, AttrId, EntityId, Tick);
+
+/// Splits a latest-index `R` key (`R|t|a|s|^tick`) into its parts, or
+/// `None` if it isn't exactly [`R_LATEST_KEY_LEN`] bytes with the `R` tag.
+pub(crate) fn decode_latest_r_key(key: &[u8]) -> Option<LatestRKeyParts> {
+    let (source, tick) = latest_r_source_and_tick(key)?;
+    let target = EntityId::from_bytes(bytes8(key, 1)?);
+    let attr: [u8; 4] = key.get(9..13)?.try_into().ok()?;
+    Some((target, AttrId(u32::from_be_bytes(attr)), source, tick))
+}
+
+/// Length of a latest-index `R` key: `R|target|attr|source|^tick`.
+pub(crate) const R_LATEST_KEY_LEN: usize = R_KEY_LEN - 8;
+
+/// Splits a latest-index `R` key (`R|t|a|s|^tick`, a full key
+/// [`without_tx`]) into its source and tick, or `None` if it isn't exactly
+/// [`R_LATEST_KEY_LEN`] bytes with the `R` tag.
+pub(crate) fn latest_r_source_and_tick(key: &[u8]) -> Option<(EntityId, Tick)> {
+    if key.len() != R_LATEST_KEY_LEN || key.first() != Some(&R_TAG) {
+        return None;
+    }
+    Some((
+        EntityId::from_bytes(bytes8(key, R_ATTR_PREFIX_LEN)?),
+        Tick::decode_inverted(bytes8(key, R_SOURCE_PREFIX_LEN)?),
+    ))
 }
 
 /// The full `R` key of one ref fact `source attr target`.

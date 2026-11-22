@@ -6,6 +6,8 @@
 //!   replaces it. Damage to bytes that are all present (begin record or body of
 //!   ANY txn, the last included) -> `Err(Error::Corrupt(_))`, file untouched;
 //!   only a cut-short last txn (<25 bytes, body_len past EOF, zero tail) is cut.
+//!   Slice 3 item 0a: a body_crc mismatch under a valid begin record in the
+//!   LAST txn (nothing valid after it) is also cut, as `CutCause::Damaged`.
 //! - H1(b): before cutting a torn tail, `open` writes the cut bytes to
 //!   `<path>.torn-<valid_len>` (`-1`, `-2`, ... if it exists), then cuts.
 //! - H2: `World::create` / `World::open` hold an exclusive lock for the
@@ -125,6 +127,69 @@ fn assert_damage_refused(path: &Path, f: impl FnOnce(&mut Vec<u8>)) {
     );
 }
 
+/// Slice 3 item 0a: the file damaged with `f` has a valid begin record whose
+/// body_crc mismatches, in the LAST txn with nothing valid after it. open()
+/// cuts it like a torn tail (quarantine first) and reports `Damaged`;
+/// read_log ignores it without touching the file.
+fn assert_damage_cut(path: &Path, f: impl FnOnce(&mut Vec<u8>), keep: usize, label: &str) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let committed_expected = {
+        let clean = path.with_extension("clean");
+        std::fs::write(&clean, &bytes[..keep]).unwrap();
+        let v = read_log(&clean).unwrap();
+        std::fs::remove_file(&clean).unwrap();
+        v
+    };
+    f(&mut bytes);
+    std::fs::write(path, &bytes).unwrap();
+    assert_eq!(
+        read_log(path).unwrap(),
+        committed_expected,
+        "{label}: read_log"
+    );
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        bytes,
+        "{label}: read_log modified"
+    );
+    assert!(
+        quarantine_files(path).is_empty(),
+        "{label}: read_log quarantined"
+    );
+    let w = match World::open(path) {
+        Ok(w) => w,
+        Err(e) => panic!("{label}: expected a cut, got {e:?}"),
+    };
+    assert_eq!(w.recovery().cause, Some(CutCause::Damaged), "{label}");
+    assert_eq!(
+        w.recovery().bytes_cut,
+        (bytes.len() - keep) as u64,
+        "{label}"
+    );
+    let q = qpath(path, &format!(".torn-{keep}"));
+    assert_eq!(w.recovery().quarantine, Some(q.clone()), "{label}");
+    assert_eq!(w.latest_tx(), TxId(2), "{label}: tx3 is gone");
+    drop(w);
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        &bytes[..keep],
+        "{label}: cut file"
+    );
+    assert_eq!(
+        std::fs::read(&q).unwrap(),
+        &bytes[keep..],
+        "{label}: quarantine"
+    );
+    let w = World::open(path).unwrap_or_else(|e| panic!("{label}: second open {e:?}"));
+    assert_eq!(
+        *w.recovery(),
+        RecoveryReport::default(),
+        "{label}: second open clean"
+    );
+    drop(w);
+    std::fs::remove_file(&q).unwrap();
+}
+
 fn len_at(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
 }
@@ -194,12 +259,39 @@ fn t1_begin_record_damage_in_a_non_last_txn_is_corrupt() {
     }
 }
 
+// Slice 3 item 0a: split from `t1_length_damage_in_the_last_txn_is_corrupt_too`.
+// A damaged frame length inside the last body is a body_crc mismatch under a
+// valid begin record: cut as Damaged.
 #[test]
-fn t1_length_damage_in_the_last_txn_is_corrupt_too() {
-    // v2 (M1): the last txn is no different from the others when all of its
-    // bytes are present.
+fn t1_length_damage_in_the_last_txn_body_is_cut_as_damaged() {
+    for mode in ["plus256", "minus1", "max"] {
+        let (_d, path) = build();
+        let orig = std::fs::read(&path).unwrap();
+        let t = txns(&orig);
+        let last = t.last().unwrap();
+        let (start, keep) = (last[1].0, last[0].0);
+        assert_damage_cut(
+            &path,
+            |b| match mode {
+                "plus256" => b[start + 1] ^= 1,
+                "max" => set_len(b, start, u32::MAX),
+                _ => {
+                    let l = len_at(b, start);
+                    set_len(b, start, l - 1);
+                }
+            },
+            keep,
+            mode,
+        );
+    }
+}
+
+// A damaged BEGIN record of the last txn is a begin_crc mismatch, which slice
+// 3 item 0a does not touch (only body_crc mismatches under a valid begin are
+// "damaged"): still Corrupt, as slice 2 required.
+#[test]
+fn t1_begin_record_damage_in_the_last_txn_is_still_corrupt() {
     for mode in ["plus256", "minus1"] {
-        length_damage(3, mode);
         length_damage_at(3, mode, 0);
     }
 }
@@ -240,39 +332,42 @@ proptest! {
 
 // ---------- T3: torn tail is cut, and the cut bytes are quarantined ----------
 
-// Rewritten from slice 1 (`t3_damaged_last_txn_payload_cuts_to_previous_tx_and_quarantines`):
-// slice-1 finding M1. Damage inside the last committed txn, with every byte
-// present, is not a torn write: Corrupt, nothing cut, nothing quarantined.
+// Slice 3 item 0a (was `t3_damaged_last_txn_payload_is_corrupt_not_cut`, slice-1
+// finding M1): damage inside the last txn's body with a valid begin record and
+// nothing valid after it is cut as Damaged. Damage in the begin record itself
+// (begin_crc mismatch) stays Corrupt, kept as its own test below.
 #[test]
-fn t3_damaged_last_txn_payload_is_corrupt_not_cut() {
+fn t3_damaged_last_txn_payload_is_cut_as_damaged() {
     let (_d, path) = build();
     let orig = std::fs::read(&path).unwrap();
     let last = txns(&orig).pop().unwrap();
-    for at in [last[1].0 + 4 + 2, last[1].0, last[0].0 + 3] {
-        let mut bytes = orig.clone();
-        bytes[at] ^= 0xFF; // payload byte, frame length byte, begin record byte
-        std::fs::write(&path, &bytes).unwrap();
-        let e = open_err(&path);
-        assert!(is_corrupt(&e), "offset {at}: expected Corrupt, got {e:?}");
-        assert_eq!(std::fs::read(&path).unwrap(), bytes, "offset {at}");
-        assert!(quarantine_files(&path).is_empty(), "offset {at}");
+    let keep = last[0].0;
+    for at in [last[1].0 + 4 + 2, last[1].0] {
+        assert_damage_cut(&path, |b| b[at] ^= 0xFF, keep, &format!("offset {at}"));
+        std::fs::write(&path, &orig).unwrap();
     }
 }
 
-// Rewritten from slice 1 (`t3_damaged_last_commit_checksum_cuts_and_quarantines`): same reason (M1).
 #[test]
-fn t3_damaged_last_commit_checksum_is_corrupt_not_cut() {
+fn t3_damaged_last_txn_begin_record_is_still_corrupt_not_cut() {
     let (_d, path) = build();
     let orig = std::fs::read(&path).unwrap();
-    let mut bytes = orig.clone();
-    *bytes.last_mut().unwrap() ^= 0x01; // checksum byte of the final Commit
-    std::fs::write(&path, &bytes).unwrap();
-    let e = open_err(&path);
-    assert!(is_corrupt(&e), "expected Corrupt, got {e:?}");
-    assert_eq!(std::fs::read(&path).unwrap(), bytes);
-    assert!(quarantine_files(&path).is_empty());
-    let e = read_log(&path).expect_err("read_log must refuse too");
-    assert!(is_corrupt(&e), "{e:?}");
+    let last = txns(&orig).pop().unwrap();
+    assert_damage_refused(&path, |b| b[last[0].0 + 3] ^= 0xFF);
+}
+
+// Slice 3 item 0a (was `t3_damaged_last_commit_checksum_is_corrupt_not_cut`).
+#[test]
+fn t3_damaged_last_commit_checksum_is_cut_as_damaged() {
+    let (_d, path) = build();
+    let orig = std::fs::read(&path).unwrap();
+    let keep = txns(&orig).pop().unwrap()[0].0;
+    assert_damage_cut(
+        &path,
+        |b| *b.last_mut().unwrap() ^= 0x01, // checksum byte of the final Commit
+        keep,
+        "commit checksum",
+    );
 }
 
 #[test]

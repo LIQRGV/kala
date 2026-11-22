@@ -361,8 +361,8 @@ fn repeating_the_same_op_with_the_other_spelling_at_the_same_tick_is_a_noop() {
 // Index rows
 // ---------------------------------------------------------------------------
 
-type ERow = (EntityId, AttrId, Value, Tick, TxId, Op);
-type RRow = (EntityId, AttrId, EntityId, Tick, TxId, Op);
+type ERow = (EntityId, AttrId, Value, Tick, TxId, Mark);
+type RRow = (EntityId, AttrId, EntityId, Tick, TxId, Mark);
 
 fn ref_rows(w: &World) -> (Vec<ERow>, Vec<RRow>) {
     let d = w.index_dump();

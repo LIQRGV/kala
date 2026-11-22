@@ -58,12 +58,19 @@ pub struct AttrDef {
     /// (`parent_of` -> `child_of`). It shares the attribute namespace for
     /// duplicate checks but isn't an attribute: only `neighbors` accepts it.
     pub inverse: Option<String>,
+    /// Cardinality label of the reverse side of a directed `ref` attribute
+    /// ("a city has one ruler": `rules` with reverse `one`), checked through
+    /// the `R` index. `None` means no label. Only a directed `ref` attribute
+    /// may have one (checked when the schema is given to a world): a
+    /// bidirectional attribute's [`cardinality`](AttrDef::cardinality)
+    /// already covers both sides.
+    pub reverse_cardinality: Option<Cardinality>,
 }
 
 impl AttrDef {
     /// An indexed attribute declaration. A `ref` attribute starts
     /// [`Directed`](RefDirection::Directed), any other has no direction;
-    /// neither has an inverse.
+    /// neither has an inverse or a reverse cardinality.
     pub fn new(name: &str, value_type: ValueType, kind: Kind, cardinality: Cardinality) -> AttrDef {
         AttrDef {
             name: name.to_owned(),
@@ -73,6 +80,7 @@ impl AttrDef {
             indexed: true,
             direction: (value_type == ValueType::Ref).then_some(RefDirection::Directed),
             inverse: None,
+            reverse_cardinality: None,
         }
     }
 
@@ -92,6 +100,15 @@ impl AttrDef {
     /// (`parent_of` with inverse `child_of`).
     pub fn inverse(mut self, name: &str) -> AttrDef {
         self.inverse = Some(name.to_owned());
+        self
+    }
+
+    /// Labels the reverse side of a directed `ref` attribute as cardinality
+    /// one: each target is meant to have one source at a time (a city has
+    /// one ruler). A label, like [`cardinality`](AttrDef::cardinality):
+    /// overlaps are reported, never refused.
+    pub fn reverse_one(mut self) -> AttrDef {
+        self.reverse_cardinality = Some(Cardinality::One);
         self
     }
 

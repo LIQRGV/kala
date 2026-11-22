@@ -1,5 +1,5 @@
-//! Byte-level helpers for log format v2 (docs/slice-2-decisions.md, Item 1).
-//! Built only from the documented layout; no private code is called.
+//! Byte-level helpers for the log framing (docs/slice-2-decisions.md, Item 1; unchanged in v3).
+//! Built only from the documented layout; no private code is called. Headers must use `LOG_FORMAT_VERSION`.
 //!
 //! ```text
 //! file  = header(12) txn*

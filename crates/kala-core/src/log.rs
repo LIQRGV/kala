@@ -3,7 +3,7 @@
 //! Everything else (ID tables, schema, indexes) is a copy rebuilt from it.
 //! Only committed transactions count; [`read_log`] returns exactly those.
 //!
-//! # Byte layout (format version 2)
+//! # Byte layout (format version 3)
 //!
 //! All integers are little-endian. A `str` is `u32 len | len bytes of UTF-8`.
 //!
@@ -19,17 +19,23 @@
 //!
 //! kind 1  DefineNodeType  id u16 | name str
 //! kind 2  DefineAttr      id u32 | name str | value_type u8 | kind u8
-//!                         | cardinality u8 | indexed u8 | direction u8
-//!                         | has_inverse u8 | [inverse str, if has_inverse = 1]
+//!                         | cardinality u8 | indexed u8 | reverse_cardinality u8
+//!                         | direction u8 | has_inverse u8
+//!                         | [inverse str, if has_inverse = 1]
 //! kind 3  DefineEntity    id u64 | has_handle u8 | [handle str, if has_handle = 1]
 //! kind 4  Fact            entity u64 | attr u32 | tick i64 | op u8
 //!                         | value (Value encoding, the rest of the payload)
 //! kind 5  Commit          tx u64 | checksum u32
 //! kind 6  DefineEdge      id u64 | source u64 | attr u32 | target u64
+//! kind 7  Deleted         of u64 | rev u32 | entity u64 | attr u32 | tick i64
+//!                         | value (Value encoding, the rest of the payload)
+//! kind 8  Revised         of u64 | rev u32 | entity u64 | attr u32 | tick i64
+//!                         | op u8 | value (Value encoding, the rest of the payload)
 //!
 //! value_type: 1 bool, 2 i64, 3 f64, 4 str, 5 ref (the Value tags)
 //! kind:       0 state, 1 event
 //! cardinality 0 one,   1 many
+//! reverse_cardinality: 0 none, 1 one, 2 many
 //! op:         0 assert, 1 retract
 //! direction:  0 none (non-ref), 1 directed, 2 bidirectional
 //! has_handle, indexed, has_inverse: 0 no, 1 yes
@@ -40,11 +46,28 @@
 //! id must have the edge tag (bit 63) set and a non-zero sequence.
 //!
 //! **IDs are defined before use.** Inside a transaction the entries come in
-//! this order: `DefineEntity`s, then `DefineEdge`s, then `Fact`s, then the
-//! `Commit`. An edge `(source, attr, target)` is defined (with the next edge
+//! this order: `DefineEntity`s, then `DefineEdge`s, then `Fact`s,
+//! `Deleted` markers and `Revised` facts in write order, then the `Commit`.
+//! An edge `(source, attr, target)` is defined (with the next edge
 //! sequence, counted across the whole log) in the transaction that first
-//! stores an assert of that `ref` fact, so every `ref` fact and every fact on
-//! an edge (an edge property) follows its edge's `DefineEdge`.
+//! stores an assert (a `Fact` or a `Revised`) of that `ref` triple, so every
+//! asserted `ref` triple and every fact on an edge (an edge property)
+//! follows its edge's `DefineEdge`.
+//!
+//! **Corrections.** A `Deleted` entry is a `DELETED` marker: it says that,
+//! from its transaction on, the key `(entity, attr, value, tick)` holds
+//! nothing (readers skip that whole tick for that value). It points at the
+//! base `Fact` entry `of` of the revision chain it corrects, never at
+//! another correction, and carries the chain's next revision `rev` (1 for
+//! the first correction). It sits at the chain's current key: the key of
+//! the chain's current fact (the base, or its last `Revised`), stored as the
+//! fact is (a bidirectional pair normalised, `entity <= value`). A `Revised`
+//! entry is the chain's new current fact: at the same key with another op
+//! (its own revision), or at another key directly after the `Deleted` of the
+//! old key, sharing that `Deleted`'s revision. The original entry is never
+//! touched. Format version
+//! 2 had no corrections; a version 2 file is [`Error::UnsupportedVersion`]
+//! (no migration).
 //!
 //! **Transactions.** Every transaction is a begin record followed by its
 //! body. The begin record is framing, not a log entry: it has no entry ID
@@ -74,39 +97,48 @@
 //!    [`Error::Corrupt`].
 //! 5. `body_len` is more than the bytes left after the begin record: **torn**
 //!    (the last append was cut short).
-//! 6. `body_crc` doesn't match: [`Error::Corrupt`]. Every byte is there, so
-//!    this is damage, not a torn write, and is never cut.
+//! 6. `body_crc` doesn't match: **damaged**. Every byte is there but they
+//!    are wrong. If a valid begin record (tag `0x07`, matching `begin_crc`,
+//!    a tx greater than the damaged one) starts at *any* byte offset after
+//!    the damaged body, later transactions may be committed behind the
+//!    damage: [`Error::Corrupt`]. Otherwise the damaged transaction is the
+//!    last one and is cut like a torn tail: it was never acknowledged (its
+//!    fsync can't have returned before the power went, and sectors may reach
+//!    the disk out of order).
 //! 7. The body's content is invalid (frames not exactly filling `body_len`,
 //!    an unparseable entry, no `Commit`, more than one or not last, a
 //!    `Commit` tx other than the begin record's, a `Commit` checksum mismatch,
 //!    an entry ID out of sequence): [`Error::Corrupt`].
 //! 8. Otherwise the transaction is committed, and the scan moves on.
 //!
-//! **Torn** means the valid prefix ends where that transaction starts: only
-//! the last append can be torn, because each one is fsynced before the next
-//! starts. [`read_log`] ignores a torn tail; `World::open` saves it to a
-//! quarantine file and then cuts it. Corruption is reported with the file
-//! left untouched. Because a damaged length field is caught by `begin_crc`
-//! and damaged content by `body_crc`, damage never makes committed
-//! transactions look like a torn tail.
+//! **Torn** and **damaged** both mean the valid prefix ends where that
+//! transaction starts: only the last append can be incomplete, because each
+//! one is fsynced before the next starts. [`read_log`] ignores such a tail;
+//! `World::open` saves it to a quarantine file and then cuts it, and its
+//! [`RecoveryReport::cause`] says which of the two it was ([`CutCause`]).
+//! Corruption is reported with the file left untouched. Because a damaged
+//! length field is caught by `begin_crc`, damaged content by `body_crc`, and
+//! a damaged transaction is only cut when no valid begin record follows it,
+//! damage never makes committed transactions look like an incomplete tail.
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use crate::doctor::Finding;
 use crate::error::Error;
 use crate::id::{AttrId, EdgeId, EntityId, NodeTypeId};
 use crate::schema::{AttrDef, Cardinality, Kind, RefDirection};
 use crate::tick::Tick;
 use crate::value::{Value, ValueType};
-use crate::world::{Op, RecoveryReport, TxId};
+use crate::world::{CutCause, Op, RecoveryReport, TxId};
 
 /// First 8 bytes of every log file.
 pub const LOG_MAGIC: [u8; 8] = *b"KALALOG\0";
 
 /// The log format version this build writes and reads (header bytes 8..12).
-pub const LOG_FORMAT_VERSION: u32 = 2;
+pub const LOG_FORMAT_VERSION: u32 = 3;
 
 /// Header length: magic plus version.
 const HEADER_LEN: usize = 12;
@@ -117,6 +149,8 @@ const KIND_DEFINE_ENTITY: u8 = 3;
 const KIND_FACT: u8 = 4;
 const KIND_COMMIT: u8 = 5;
 const KIND_DEFINE_EDGE: u8 = 6;
+const KIND_DELETED: u8 = 7;
+const KIND_REVISED: u8 = 8;
 
 /// A log entry's position in the whole log: 1, 2, 3, ... in log order,
 /// never reused.
@@ -174,6 +208,45 @@ pub enum EntryBody {
         /// Assert or retract.
         op: Op,
     },
+    /// A `DELETED` marker (a correction): from its transaction on, the key
+    /// `(entity, attr, value, tick)` holds nothing. Revision `rev` of the
+    /// base `Fact` entry `of`; written at that chain's current key.
+    Deleted {
+        /// The base `Fact` entry of the corrected chain.
+        of: EntryId,
+        /// The chain's revision this correction makes (1 for the first).
+        rev: u32,
+        /// The entity of the deleted key (as stored: a bidirectional pair
+        /// normalised).
+        entity: EntityId,
+        /// The attribute of the deleted key.
+        attr: AttrId,
+        /// The value of the deleted key.
+        value: Value,
+        /// The story tick of the deleted key.
+        tick: Tick,
+    },
+    /// A revised fact (a correction): the new current fact of the chain of
+    /// base `Fact` entry `of`, as revision `rev`. Either at the chain's
+    /// current key with the op changed, or at a new key right after the
+    /// `Deleted` marker of the old one (sharing its `rev`).
+    Revised {
+        /// The base `Fact` entry of the corrected chain.
+        of: EntryId,
+        /// The chain's revision this correction makes.
+        rev: u32,
+        /// The entity of the new fact (as stored: a bidirectional pair
+        /// normalised).
+        entity: EntityId,
+        /// The attribute of the new fact.
+        attr: AttrId,
+        /// The value of the new fact.
+        value: Value,
+        /// The story tick of the new fact.
+        tick: Tick,
+        /// Assert or retract.
+        op: Op,
+    },
     /// Ends a transaction.
     Commit {
         /// The transaction's number.
@@ -197,7 +270,7 @@ pub struct LogEntry {
 ///
 /// Fails with [`Error::Io`] if the file can't be read, [`Error::BadMagic`]
 /// if it isn't a Kala log, [`Error::UnsupportedVersion`] for another format
-/// version (including version 1: there is no migration), or
+/// version (including versions 1 and 2: there is no migration), or
 /// [`Error::Corrupt`] for a truncated header or any damage the recovery
 /// rules in the module docs don't classify as a torn tail.
 ///
@@ -215,8 +288,11 @@ struct Scan {
     /// Entries of every committed transaction, in log order.
     entries: Vec<LogEntry>,
     /// Length of the valid prefix: the header plus every committed
-    /// transaction. Bytes past it are a torn tail.
+    /// transaction. Bytes past it are a torn or damaged tail.
     valid_len: usize,
+    /// Why the bytes past `valid_len` aren't committed; `None` if there are
+    /// none.
+    cause: Option<CutCause>,
 }
 
 /// Checks the header and returns the bytes after it.
@@ -247,7 +323,9 @@ fn next_frame(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
 }
 
 /// Scans a whole log file's bytes: see [`read_log`]. This is the one
-/// decoder of the log; reading and reopening both go through it.
+/// decoder of the log; reading and reopening both go through it, and
+/// doctor's [`survey`] judges transactions with the same two steps
+/// ([`begin_step`], [`body_step`]).
 ///
 /// Transactions are judged one at a time from just past the header, by the
 /// rules in the module docs ("Recovery"). The first one that is torn ends
@@ -258,70 +336,186 @@ fn scan(bytes: &[u8]) -> Result<Scan, Error> {
     let mut entries = Vec::new();
     let mut next_entry = 1u64;
     let mut next_tx = 0u64;
-    loop {
+    let cause = loop {
         let at = bytes.len() - rest.len();
-        // Rule 1: a clean end.
-        if rest.is_empty() {
-            break;
-        }
-        // Rule 2: not even a whole begin record: the last append was cut.
-        let Some((begin, after_begin)) = rest.split_first_chunk::<BEGIN_LEN>() else {
-            break;
-        };
-        let begin = Begin::parse(begin);
-        // Rule 3: a damaged begin record. Only a zero-filled tail (how some
-        // file systems expose an append that never reached the disk) is a
-        // torn write; anything else may hide committed data behind it.
-        if !begin.crc_ok {
-            if rest.iter().all(|&b| b == 0) {
-                break;
+        let (begin, after_begin) = match begin_step(rest) {
+            BeginStep::End => break None,
+            BeginStep::Torn => break Some(CutCause::Torn),
+            BeginStep::Damaged => {
+                return Err(Error::Corrupt(format!(
+                    "damaged transaction header at offset {at}"
+                )));
             }
-            return Err(Error::Corrupt(format!(
-                "damaged transaction header at offset {at}"
-            )));
-        }
+            BeginStep::UnknownTag(tag) => {
+                return Err(Error::Corrupt(format!(
+                    "unknown record tag {tag:#04x} at offset {at}"
+                )));
+            }
+            BeginStep::Begin(begin, after_begin) => (begin, after_begin),
+        };
         // Rule 4: a sound begin record that isn't the next transaction's.
-        if begin.tag != BEGIN_TAG {
-            return Err(Error::Corrupt(format!(
-                "unknown record tag {:#04x} at offset {at}",
-                begin.tag
-            )));
-        }
         if begin.tx != next_tx {
             return Err(Error::Corrupt(format!(
                 "tx#{} found at offset {at} where tx#{next_tx} was expected",
                 begin.tx
             )));
         }
-        // Rule 5: the body runs past the end of the file: cut short. The
-        // length is checked against the bytes left before it is used.
-        let Some(body_len) = usize::try_from(begin.body_len)
-            .ok()
-            .filter(|&n| n <= after_begin.len())
+        let BodyStep::Body {
+            verdict,
+            rest: after_body,
+        } = body_step(&begin, after_begin)
         else {
-            break;
+            break Some(CutCause::Torn);
         };
-        let (body, after_body) = after_begin.split_at(body_len);
-        // Rule 6: every byte is there but they don't match: damage, never a
-        // torn write.
-        if crc32fast::hash(body) != begin.body_crc {
-            return Err(Error::Corrupt(format!(
-                "tx#{}: body checksum mismatch at offset {at}",
-                begin.tx
-            )));
+        let mut txn = match verdict {
+            Ok(txn) => txn,
+            Err(BodyFault::Damaged { later: None }) => break Some(CutCause::Damaged),
+            Err(BodyFault::Damaged { later: Some(later) }) => {
+                return Err(Error::Corrupt(format!(
+                    "tx#{}: body checksum mismatch at offset {at}, followed by a valid \
+                     begin record at offset {}",
+                    begin.tx,
+                    bytes.len() - after_body.len() + later
+                )));
+            }
+            Err(fault) => return Err(Error::Corrupt(format!("tx#{}: {fault}", begin.tx))),
+        };
+        // Rule 7, last part: entry IDs continue the log without gaps.
+        for (e, expected) in txn.iter().zip(next_entry..) {
+            if e.id.0 != expected {
+                return Err(Error::Corrupt(format!(
+                    "tx#{}: entry#{} found where entry#{expected} was expected",
+                    begin.tx, e.id.0
+                )));
+            }
         }
-        // Rule 7: sound framing around content a writer can't produce.
-        let mut txn = parse_body(body, begin.tx, next_entry)
-            .map_err(|why| Error::Corrupt(format!("tx#{}: {why}", begin.tx)))?;
         // Rule 8: committed.
         next_entry += txn.len() as u64;
         next_tx += 1;
         entries.append(&mut txn);
         rest = after_body;
-    }
+    };
     Ok(Scan {
         entries,
         valid_len: bytes.len() - rest.len(),
+        cause,
+    })
+}
+
+/// The first half of judging the transaction at the start of `rest`
+/// (recovery rules 1 to 4, all but the tx check, which is the caller's).
+enum BeginStep<'a> {
+    /// Rule 1: no bytes left, a clean end.
+    End,
+    /// Rule 2 (not even a whole begin record), or rule 3 with a zero-filled
+    /// tail: the last append never fully reached the disk.
+    Torn,
+    /// Rule 3: a begin record whose checksum fails, not a zero-filled tail.
+    /// None of its fields can be trusted, so nothing after it can be framed.
+    Damaged,
+    /// Rule 4: a sound begin record with a tag other than `0x07`.
+    UnknownTag(u8),
+    /// A sound begin record and the bytes after it.
+    Begin(Begin, &'a [u8]),
+}
+
+fn begin_step(rest: &[u8]) -> BeginStep<'_> {
+    if rest.is_empty() {
+        return BeginStep::End;
+    }
+    let Some((begin, after_begin)) = rest.split_first_chunk::<BEGIN_LEN>() else {
+        return BeginStep::Torn;
+    };
+    let begin = Begin::parse(begin);
+    // Only a zero-filled tail (how some file systems expose an append that
+    // never reached the disk) is a torn write; anything else may hide
+    // committed data behind it.
+    if !begin.crc_ok {
+        return if rest.iter().all(|&b| b == 0) {
+            BeginStep::Torn
+        } else {
+            BeginStep::Damaged
+        };
+    }
+    if begin.tag != BEGIN_TAG {
+        return BeginStep::UnknownTag(begin.tag);
+    }
+    BeginStep::Begin(begin, after_begin)
+}
+
+/// The second half of judging a transaction with a sound begin record
+/// (recovery rules 5 to 7, all but the entry-ID check, which is the
+/// caller's: the scan and doctor treat gaps differently).
+enum BodyStep<'a> {
+    /// Rule 5: the body runs past the end of the file.
+    Torn,
+    /// The body is all there: its parsed entries (the `Commit` last) or why
+    /// they aren't a committed transaction, and the bytes after the body.
+    Body {
+        verdict: Result<Vec<LogEntry>, BodyFault>,
+        rest: &'a [u8],
+    },
+}
+
+/// Why a whole transaction body (rule 6 or 7) isn't a committed transaction.
+#[derive(Debug)]
+enum BodyFault {
+    /// Rule 6: `body_crc` fails. `later` is the offset, from just past the
+    /// body, of a later valid begin record, if any: without one the
+    /// transaction is a damaged tail.
+    Damaged { later: Option<usize> },
+    /// Rule 7: the body has no `Commit` (its frames end without one).
+    NoCommit,
+    /// Rule 7: the `Commit` checksum doesn't match.
+    CommitChecksum,
+    /// Rule 7: anything else; `frame` is the index of the offending frame.
+    Invalid { frame: usize, why: String },
+}
+
+impl std::fmt::Display for BodyFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BodyFault::Damaged { .. } => f.write_str("body checksum mismatch"),
+            BodyFault::NoCommit => f.write_str("no Commit"),
+            BodyFault::CommitChecksum => f.write_str("Commit checksum mismatch"),
+            BodyFault::Invalid { why, .. } => f.write_str(why),
+        }
+    }
+}
+
+fn body_step<'a>(begin: &Begin, after_begin: &'a [u8]) -> BodyStep<'a> {
+    // The length is checked against the bytes left before it is used.
+    let Some(body_len) = usize::try_from(begin.body_len)
+        .ok()
+        .filter(|&n| n <= after_begin.len())
+    else {
+        return BodyStep::Torn;
+    };
+    let (body, rest) = after_begin.split_at(body_len);
+    // Every byte is there but they don't match: damage. Cut only if nothing
+    // that could be a later committed transaction follows.
+    let verdict = if crc32fast::hash(body) != begin.body_crc {
+        Err(BodyFault::Damaged {
+            later: later_begin(rest, begin.tx),
+        })
+    } else {
+        parse_body(body, begin.tx)
+    };
+    BodyStep::Body { verdict, rest }
+}
+
+/// The offset in `bytes` of the first valid begin record (tag `0x07`,
+/// matching `begin_crc`) whose tx is greater than `tx`, trying every byte
+/// offset: a damaged transaction followed by one may hide committed data, so
+/// it must not be cut (recovery rule 6).
+fn later_begin(bytes: &[u8], tx: u64) -> Option<usize> {
+    (0..bytes.len().saturating_sub(BEGIN_LEN - 1)).find(|&i| {
+        // The tag is checked first so most offsets cost no checksum.
+        bytes[i] == BEGIN_TAG
+            && bytes[i..]
+                .first_chunk::<BEGIN_LEN>()
+                .map(Begin::parse)
+                .is_some_and(|b| b.crc_ok && b.tx > tx)
     })
 }
 
@@ -363,48 +557,180 @@ impl Begin {
 }
 
 /// Parses a transaction body whose framing checked out: frames exactly
-/// filling it, entry IDs consecutive from `first_entry`, exactly one
-/// `Commit`, last, for `tx`, with a matching checksum. Returns its entries,
-/// the `Commit` included.
-fn parse_body(body: &[u8], tx: u64, first_entry: u64) -> Result<Vec<LogEntry>, String> {
+/// filling it, exactly one `Commit`, last, for `tx`, with a matching
+/// checksum. Returns its entries, the `Commit` included. Entry IDs are not
+/// checked here (see [`BodyStep`]).
+fn parse_body(body: &[u8], tx: u64) -> Result<Vec<LogEntry>, BodyFault> {
     let mut entries = Vec::new();
     let mut rest = body;
-    let mut next_entry = first_entry;
     loop {
+        let invalid = |why: String| BodyFault::Invalid {
+            frame: entries.len(),
+            why,
+        };
         let Some((payload, after)) = next_frame(rest) else {
             return Err(if rest.is_empty() {
-                "no Commit".to_owned()
+                BodyFault::NoCommit
             } else {
-                "a frame runs past the end of the transaction".to_owned()
+                invalid("a frame runs past the end of the transaction".to_owned())
             });
         };
         rest = after;
-        let entry = parse_payload(payload)?;
-        if entry.id.0 != next_entry {
-            return Err(format!(
-                "entry#{} found where entry#{next_entry} was expected",
-                entry.id.0
-            ));
-        }
-        next_entry += 1;
+        let entry = parse_payload(payload).map_err(invalid)?;
         if let EntryBody::Commit { tx: ctx, checksum } = entry.body {
             if !rest.is_empty() {
-                return Err("bytes after the Commit".to_owned());
+                return Err(invalid("bytes after the Commit".to_owned()));
             }
             if ctx.0 != tx {
-                return Err(format!("its Commit says tx#{}", ctx.0));
+                return Err(invalid(format!("its Commit says tx#{}", ctx.0)));
             }
             // Covered: every byte of the body except the Commit's own
             // checksum field, its last 4 bytes (a parsed Commit frame is
             // 25 bytes, so the body is at least that long).
             if crc32fast::hash(&body[..body.len() - 4]) != checksum {
-                return Err("Commit checksum mismatch".to_owned());
+                return Err(BodyFault::CommitChecksum);
             }
             entries.push(entry);
             return Ok(entries);
         }
         entries.push(entry);
     }
+}
+
+/// One transaction [`survey`] found whole and parseable, for doctor to
+/// replay: its tx (from its begin record) and its entries, `Commit` last.
+#[derive(Debug)]
+pub(crate) struct SurveyedTxn {
+    pub(crate) tx: TxId,
+    pub(crate) entries: Vec<LogEntry>,
+}
+
+/// A finding of [`survey`], tagged with the tx it belongs to (doctor's
+/// `since` filter).
+pub(crate) type TaggedFinding = (Option<TxId>, Finding);
+
+/// Doctor's scan of a whole log file's bytes: the same judgement as
+/// [`scan`], but collecting instead of failing fast. Never modifies
+/// anything.
+///
+/// Fails only where nothing can be scanned: [`Error::BadMagic`],
+/// [`Error::UnsupportedVersion`] or [`Error::Corrupt`] for a truncated
+/// header. Otherwise every problem is a finding, and the scan goes on past
+/// a bad transaction whenever its begin record is sound (its `body_len` is
+/// trusted to skip it): a body checksum mismatch with a valid begin record
+/// after it, a `Commit` checksum mismatch, a missing `Commit` or any other
+/// invalid body is reported and that transaction skipped; a tx out of
+/// sequence (a [`Finding::TxGap`]) or entry IDs out of sequence (an
+/// [`Finding::EntryIdGap`]) are reported and the transaction kept, unless it
+/// would rewind (a repeated tx or entry ID), when it is skipped too. After a
+/// skipped transaction the next one's first entry ID is taken as it comes
+/// (the skipped one's IDs can't be trusted). The scan stops at a tail
+/// `World::open` would cut ([`Finding::IncompleteTail`] at the offset where
+/// the valid prefix ends) and at a begin record that can't be trusted.
+pub(crate) fn survey(bytes: &[u8]) -> Result<(Vec<SurveyedTxn>, Vec<TaggedFinding>), Error> {
+    let mut rest = check_header(bytes)?;
+    let mut txns = Vec::new();
+    let mut found = Vec::new();
+    let mut next_tx = 0u64;
+    // `None` right after a skipped transaction: resynchronise.
+    let mut next_entry = Some(1u64);
+    // Past every entry ID seen: a lower one would rewind the log.
+    let mut floor = 1u64;
+    loop {
+        // An in-memory buffer's offsets always fit a u64.
+        let at = (bytes.len() - rest.len()) as u64;
+        let expected_tx = TxId(next_tx);
+        let (begin, after_begin) = match begin_step(rest) {
+            BeginStep::End => break,
+            BeginStep::Torn => {
+                found.push((Some(expected_tx), Finding::IncompleteTail { offset: at }));
+                break;
+            }
+            BeginStep::Damaged => {
+                let f = Finding::ChecksumMismatch {
+                    tx: expected_tx,
+                    offset: at,
+                };
+                found.push((Some(expected_tx), f));
+                break;
+            }
+            BeginStep::UnknownTag(tag) => {
+                let f = Finding::InvalidEntry {
+                    entry: EntryId(next_entry.unwrap_or(floor)),
+                    reason: format!("unknown record tag {tag:#04x} at offset {at}"),
+                };
+                found.push((Some(expected_tx), f));
+                break;
+            }
+            BeginStep::Begin(begin, after_begin) => (begin, after_begin),
+        };
+        let tx = TxId(begin.tx);
+        // A repeated or backwards tx is judged at the expected one, so
+        // `since` can't hide it behind an older number.
+        let tag = Some(tx.max(expected_tx));
+        let mut keep = true;
+        if tx != expected_tx {
+            let f = Finding::TxGap {
+                expected: expected_tx,
+                found: tx,
+            };
+            found.push((tag, f));
+            keep = tx > expected_tx;
+        }
+        let BodyStep::Body {
+            verdict,
+            rest: after_body,
+        } = body_step(&begin, after_begin)
+        else {
+            found.push((tag, Finding::IncompleteTail { offset: at }));
+            break;
+        };
+        rest = after_body;
+        next_tx = next_tx.max(begin.tx.saturating_add(1));
+        let entries = match verdict {
+            Ok(entries) => entries,
+            Err(BodyFault::Damaged { later: None }) => {
+                found.push((tag, Finding::IncompleteTail { offset: at }));
+                break;
+            }
+            Err(fault) => {
+                let f = match fault {
+                    BodyFault::Damaged { .. } | BodyFault::CommitChecksum => {
+                        Finding::ChecksumMismatch { tx, offset: at }
+                    }
+                    BodyFault::NoCommit => Finding::MissingCommit { tx, offset: at },
+                    BodyFault::Invalid { frame, why } => Finding::InvalidEntry {
+                        entry: EntryId(next_entry.unwrap_or(floor).saturating_add(frame as u64)),
+                        reason: format!("tx#{}: {why}", tx.0),
+                    },
+                };
+                found.push((tag, f));
+                next_entry = None;
+                continue;
+            }
+        };
+        for e in &entries {
+            if let Some(expected) = next_entry
+                && e.id.0 != expected
+            {
+                let f = Finding::EntryIdGap {
+                    expected: EntryId(expected),
+                    found: e.id,
+                };
+                found.push((tag, f));
+            }
+            if e.id.0 < floor {
+                // Kept entries must ascend (doctor's rebuild finds them by ID).
+                keep = false;
+            }
+            floor = floor.max(e.id.0.saturating_add(1));
+            next_entry = Some(e.id.0.saturating_add(1));
+        }
+        if keep {
+            txns.push(SurveyedTxn { tx, entries });
+        }
+    }
+    Ok((txns, found))
 }
 
 /// A bounds-checked reader over one payload. Every read fails rather than
@@ -499,6 +825,12 @@ fn parse_payload(payload: &[u8]) -> Result<LogEntry, String> {
                 b => return Err(format!("unknown cardinality {b}")),
             };
             let indexed = c.flag()?;
+            let reverse_cardinality = match c.u8()? {
+                0 => None,
+                1 => Some(Cardinality::One),
+                2 => Some(Cardinality::Many),
+                b => return Err(format!("unknown reverse cardinality {b}")),
+            };
             let direction = match c.u8()? {
                 0 => None,
                 1 => Some(RefDirection::Directed),
@@ -516,6 +848,7 @@ fn parse_payload(payload: &[u8]) -> Result<LogEntry, String> {
                     indexed,
                     direction,
                     inverse,
+                    reverse_cardinality,
                 },
             }
         }
@@ -528,11 +861,7 @@ fn parse_payload(payload: &[u8]) -> Result<LogEntry, String> {
             let entity = EntityId::from_bytes(c.u64()?.to_be_bytes());
             let attr = AttrId(c.u32()?);
             let tick = Tick(i64::from_le_bytes(c.array()?));
-            let op = match c.u8()? {
-                0 => Op::Assert,
-                1 => Op::Retract,
-                b => return Err(format!("unknown op {b}")),
-            };
+            let op = op_from(c.u8()?)?;
             let value = Value::decode(c.rest()).map_err(|e| format!("fact value: {e}"))?;
             EntryBody::Fact {
                 entity,
@@ -558,10 +887,59 @@ fn parse_payload(payload: &[u8]) -> Result<LogEntry, String> {
                 target: EntityId::from_bytes(c.u64()?.to_be_bytes()),
             }
         }
+        KIND_DELETED => {
+            let of = EntryId(c.u64()?);
+            let rev = c.u32()?;
+            let entity = EntityId::from_bytes(c.u64()?.to_be_bytes());
+            let attr = AttrId(c.u32()?);
+            let tick = Tick(i64::from_le_bytes(c.array()?));
+            let value = Value::decode(c.rest()).map_err(|e| format!("deleted value: {e}"))?;
+            EntryBody::Deleted {
+                of,
+                rev,
+                entity,
+                attr,
+                value,
+                tick,
+            }
+        }
+        KIND_REVISED => {
+            let of = EntryId(c.u64()?);
+            let rev = c.u32()?;
+            let entity = EntityId::from_bytes(c.u64()?.to_be_bytes());
+            let attr = AttrId(c.u32()?);
+            let tick = Tick(i64::from_le_bytes(c.array()?));
+            let op = op_from(c.u8()?)?;
+            let value = Value::decode(c.rest()).map_err(|e| format!("revised value: {e}"))?;
+            EntryBody::Revised {
+                of,
+                rev,
+                entity,
+                attr,
+                value,
+                tick,
+                op,
+            }
+        }
         b => return Err(format!("unknown entry kind {b}")),
     };
     c.finish()?;
     Ok(LogEntry { id, body })
+}
+
+fn op_from(b: u8) -> Result<Op, String> {
+    match b {
+        0 => Ok(Op::Assert),
+        1 => Ok(Op::Retract),
+        _ => Err(format!("unknown op {b}")),
+    }
+}
+
+fn op_byte(op: Op) -> u8 {
+    match op {
+        Op::Assert => 0,
+        Op::Retract => 1,
+    }
 }
 
 fn value_type_from(b: u8) -> Result<ValueType, String> {
@@ -586,8 +964,8 @@ fn value_type_byte(t: ValueType) -> u8 {
 }
 
 /// An entry to append, borrowing from the caller (the writer's view of
-/// [`EntryBody`]; `Commit` is added by the writer itself). Fact values are
-/// already encoded.
+/// [`EntryBody`]; `Commit` is added by the writer itself). Fact, `Deleted`
+/// and `Revised` values are already encoded.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum NewEntry<'a> {
     NodeType {
@@ -609,6 +987,23 @@ pub(crate) enum NewEntry<'a> {
         target: EntityId,
     },
     Fact {
+        entity: EntityId,
+        attr: AttrId,
+        value: &'a [u8],
+        tick: Tick,
+        op: Op,
+    },
+    Deleted {
+        of: EntryId,
+        rev: u32,
+        entity: EntityId,
+        attr: AttrId,
+        value: &'a [u8],
+        tick: Tick,
+    },
+    Revised {
+        of: EntryId,
+        rev: u32,
         entity: EntityId,
         attr: AttrId,
         value: &'a [u8],
@@ -649,20 +1044,125 @@ fn push_frame(
     Ok(())
 }
 
-/// Appends one transaction to `buf`: its begin record, then its body (its
-/// entries' frames, then its `Commit`), numbering entries from `first_id`.
-/// Returns the next entry ID.
-fn encode_txn<'a>(
-    buf: &mut Vec<u8>,
-    first_id: u64,
+impl NewEntry<'_> {
+    /// What the entry says once appended: the [`EntryBody`] [`read_log`]
+    /// returns for it.
+    fn to_body(self) -> EntryBody {
+        match self {
+            NewEntry::NodeType { id, name } => EntryBody::DefineNodeType {
+                id,
+                name: name.to_owned(),
+            },
+            NewEntry::Attr { id, def } => EntryBody::DefineAttr {
+                id,
+                def: def.clone(),
+            },
+            NewEntry::Entity { id, handle } => EntryBody::DefineEntity {
+                id,
+                handle: handle.map(str::to_owned),
+            },
+            NewEntry::Edge {
+                id,
+                source,
+                attr,
+                target,
+            } => EntryBody::DefineEdge {
+                id,
+                source,
+                attr,
+                target,
+            },
+            NewEntry::Fact {
+                entity,
+                attr,
+                value,
+                tick,
+                op,
+            } => EntryBody::Fact {
+                entity,
+                attr,
+                // Invariant: fact values are only ever encoded by
+                // `Value::encode` (validated writes), so they decode.
+                value: Value::decode(value)
+                    .expect("invariant: a fact to append holds a canonical value encoding"),
+                tick,
+                op,
+            },
+            NewEntry::Deleted {
+                of,
+                rev,
+                entity,
+                attr,
+                value,
+                tick,
+            } => EntryBody::Deleted {
+                of,
+                rev,
+                entity,
+                attr,
+                // Invariant: as for a fact, the value is the encoding of a
+                // stored fact's value.
+                value: Value::decode(value)
+                    .expect("invariant: a DELETED marker holds a canonical value encoding"),
+                tick,
+            },
+            NewEntry::Revised {
+                of,
+                rev,
+                entity,
+                attr,
+                value,
+                tick,
+                op,
+            } => EntryBody::Revised {
+                of,
+                rev,
+                entity,
+                attr,
+                // Invariant: a revised value is validated and encoded by
+                // `Value::encode`, as for a fact.
+                value: Value::decode(value)
+                    .expect("invariant: a revised fact holds a canonical value encoding"),
+                tick,
+                op,
+            },
+        }
+    }
+}
+
+/// One encoded transaction, ready to append: its bytes and the entries
+/// they hold, as [`read_log`] will return them.
+#[derive(Debug)]
+pub(crate) struct EncodedTxn {
+    /// Begin record plus body (no file header).
+    pub(crate) bytes: Vec<u8>,
+    /// Its entries in log order, the `Commit` (with its checksum) last.
+    pub(crate) entries: Vec<LogEntry>,
+}
+
+/// Encodes one transaction: its begin record, then its body (its entries'
+/// frames, then its `Commit` for `tx`), numbering entries from `first_id`.
+/// Encoding touches no file, so an in-memory world numbers and checksums
+/// its entries exactly as a file-backed one. Fails only for an entry too
+/// large for its length fields.
+pub(crate) fn encode_txn<'a>(
+    first_id: EntryId,
     tx: TxId,
     entries: impl IntoIterator<Item = NewEntry<'a>>,
-) -> Result<u64, Error> {
+) -> Result<EncodedTxn, Error> {
+    let mut bytes = Vec::new();
+    // The frame encoders below all write through this one buffer.
+    let buf = &mut bytes;
+    let mut listed = Vec::new();
     let begin = buf.len();
     buf.extend_from_slice(&[0; BEGIN_LEN]); // patched once the body is known
     let start = buf.len();
-    let mut id = first_id;
+    let mut id = first_id.0;
     for entry in entries {
+        listed.push(LogEntry {
+            id: EntryId(id),
+            body: entry.to_body(),
+        });
         match entry {
             NewEntry::NodeType { id: t, name } => {
                 push_frame(buf, KIND_DEFINE_NODE_TYPE, id, |b| {
@@ -683,6 +1183,11 @@ fn encode_txn<'a>(
                     Cardinality::Many => 1,
                 });
                 b.push(u8::from(def.indexed));
+                b.push(match def.reverse_cardinality {
+                    None => 0,
+                    Some(Cardinality::One) => 1,
+                    Some(Cardinality::Many) => 2,
+                });
                 b.push(match def.direction {
                     None => 0,
                     Some(RefDirection::Directed) => 1,
@@ -734,10 +1239,41 @@ fn encode_txn<'a>(
                 b.extend_from_slice(&entity.raw().to_le_bytes());
                 b.extend_from_slice(&attr.0.to_le_bytes());
                 b.extend_from_slice(&tick.0.to_le_bytes());
-                b.push(match op {
-                    Op::Assert => 0,
-                    Op::Retract => 1,
-                });
+                b.push(op_byte(op));
+                b.extend_from_slice(value);
+                Ok(())
+            })?,
+            NewEntry::Deleted {
+                of,
+                rev,
+                entity,
+                attr,
+                value,
+                tick,
+            } => push_frame(buf, KIND_DELETED, id, |b| {
+                b.extend_from_slice(&of.0.to_le_bytes());
+                b.extend_from_slice(&rev.to_le_bytes());
+                b.extend_from_slice(&entity.raw().to_le_bytes());
+                b.extend_from_slice(&attr.0.to_le_bytes());
+                b.extend_from_slice(&tick.0.to_le_bytes());
+                b.extend_from_slice(value);
+                Ok(())
+            })?,
+            NewEntry::Revised {
+                of,
+                rev,
+                entity,
+                attr,
+                value,
+                tick,
+                op,
+            } => push_frame(buf, KIND_REVISED, id, |b| {
+                b.extend_from_slice(&of.0.to_le_bytes());
+                b.extend_from_slice(&rev.to_le_bytes());
+                b.extend_from_slice(&entity.raw().to_le_bytes());
+                b.extend_from_slice(&attr.0.to_le_bytes());
+                b.extend_from_slice(&tick.0.to_le_bytes());
+                b.push(op_byte(op));
                 b.extend_from_slice(value);
                 Ok(())
             })?,
@@ -763,7 +1299,31 @@ fn encode_txn<'a>(
     rec[17..21].copy_from_slice(&body_crc.to_le_bytes());
     let begin_crc = crc32fast::hash(&rec[..BEGIN_COVERED]);
     rec[BEGIN_COVERED..].copy_from_slice(&begin_crc.to_le_bytes());
-    Ok(id + 1)
+    listed.push(LogEntry {
+        id: EntryId(id),
+        body: EntryBody::Commit { tx, checksum },
+    });
+    Ok(EncodedTxn {
+        bytes,
+        entries: listed,
+    })
+}
+
+/// A failure to inject into the next log append, for tests of the
+/// writer's failure handling (see `World::inject_log_fault`). Not part of
+/// the supported API.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogFault {
+    /// The next append's fsync fails after its bytes were written.
+    FailNextSync,
+    /// The next append's write fails before any byte is written.
+    FailNextWrite,
+}
+
+/// The error an injected [`LogFault`] produces.
+fn injected(what: &str) -> std::io::Error {
+    std::io::Error::other(format!("injected log fault: {what} failed"))
 }
 
 /// The append side of an open log file.
@@ -778,26 +1338,30 @@ fn encode_txn<'a>(
 pub(crate) struct LogWriter {
     /// The log file, locked exclusively.
     file: File,
-    /// The ID the next appended entry gets.
-    next_entry: u64,
+    /// Where the log file is: doctor re-reads it from disk.
+    path: PathBuf,
+    /// The file's length: just past the last committed transaction. A
+    /// transaction whose fsync failed is cut back to it.
+    len: u64,
     /// Set by a failed append or fsync: the file may end in a torn
     /// transaction, so nothing more is appended until the world is reopened.
     failed: Option<Error>,
+    /// Faults injected by tests, consumed by the next append that reaches
+    /// them. Both `false` in normal use.
+    fail_next_write: bool,
+    fail_next_sync: bool,
 }
 
 impl LogWriter {
     /// Creates a new log file at `path` (failing if anything exists there)
-    /// holding the header and the genesis transaction tx#0 with the given
-    /// schema entries, and makes it durable: the file's data and the
-    /// directory entry are fsynced.
-    pub(crate) fn create<'a>(
-        path: &Path,
-        schema: impl IntoIterator<Item = NewEntry<'a>>,
-    ) -> Result<LogWriter, Error> {
-        let mut buf = Vec::new();
+    /// holding the header and `genesis`, the encoded genesis transaction
+    /// tx#0 (see [`encode_txn`]), and makes it durable: the file's data and
+    /// the directory entry are fsynced.
+    pub(crate) fn create(path: &Path, genesis: &EncodedTxn) -> Result<LogWriter, Error> {
+        let mut buf = Vec::with_capacity(HEADER_LEN + genesis.bytes.len());
         buf.extend_from_slice(&LOG_MAGIC);
         buf.extend_from_slice(&LOG_FORMAT_VERSION.to_le_bytes());
-        let next_entry = encode_txn(&mut buf, 1, TxId(0), schema)?;
+        buf.extend_from_slice(&genesis.bytes);
         let mut file = OpenOptions::new()
             .append(true)
             .create_new(true)
@@ -808,8 +1372,12 @@ impl LogWriter {
         sync_parent_dir(path)?;
         Ok(LogWriter {
             file,
-            next_entry,
+            path: path.to_owned(),
+            // An in-memory buffer's length always fits a u64.
+            len: buf.len() as u64,
             failed: None,
+            fail_next_write: false,
+            fail_next_sync: false,
         })
     }
 
@@ -841,7 +1409,11 @@ impl LogWriter {
         lock(&file)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        let Scan { entries, valid_len } = scan(&bytes)?;
+        let Scan {
+            entries,
+            valid_len,
+            cause,
+        } = scan(&bytes)?;
         let replayed = replay(&entries)?;
         let mut report = RecoveryReport::default();
         if valid_len != bytes.len() {
@@ -856,17 +1428,25 @@ impl LogWriter {
             file.set_len(valid_len as u64)?;
             file.sync_all()?;
             report.bytes_cut = tail.len() as u64;
+            report.cause = cause;
         }
-        let next_entry = entries.last().map_or(1, |e| e.id.0 + 1);
         Ok((
             replayed,
             LogWriter {
                 file,
-                next_entry,
+                path: path.to_owned(),
+                len: valid_len as u64,
                 failed: None,
+                fail_next_write: false,
+                fail_next_sync: false,
             },
             report,
         ))
+    }
+
+    /// The path the log file was created or opened at.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     /// `Err` if an earlier append failed: the world refuses further writes.
@@ -877,24 +1457,44 @@ impl LogWriter {
         }
     }
 
-    /// Appends one transaction (its begin record, its entries, then a
-    /// `Commit` for `tx`) with a single write, then fsyncs. Returns only once the transaction is
-    /// durable; on failure the writer is marked failed (the file may now
-    /// end in a torn transaction).
-    pub(crate) fn append<'a>(
-        &mut self,
-        tx: TxId,
-        entries: impl IntoIterator<Item = NewEntry<'a>>,
-    ) -> Result<(), Error> {
+    /// Arms a fault for the next append (see [`LogFault`]).
+    pub(crate) fn inject_fault(&mut self, fault: LogFault) {
+        match fault {
+            LogFault::FailNextWrite => self.fail_next_write = true,
+            LogFault::FailNextSync => self.fail_next_sync = true,
+        }
+    }
+
+    /// Appends one encoded transaction (from [`encode_txn`], numbered to
+    /// continue the log) with a single write, then fsyncs. Returns only
+    /// once the transaction is durable. On failure the writer is marked
+    /// failed and refuses further appends. If the write went through but the
+    /// fsync failed, the file is first cut back (best effort) to its length
+    /// before the transaction: the caller is told the transaction failed, so
+    /// it must not reappear on reopen if the bytes reach the disk anyway. A
+    /// failed write may leave a torn tail, which reopening cuts.
+    pub(crate) fn append(&mut self, txn: &EncodedTxn) -> Result<(), Error> {
         self.check()?;
-        let mut buf = Vec::new();
-        // Encoding fails only for an oversized entry, before any byte is
-        // written, so the writer stays usable.
-        let next_entry = encode_txn(&mut buf, self.next_entry, tx, entries)?;
-        let res = self
-            .file
-            .write_all(&buf)
-            .and_then(|()| self.file.sync_data());
+        let buf = &txn.bytes;
+        let res = if std::mem::take(&mut self.fail_next_write) {
+            Err(injected("write"))
+        } else {
+            self.file.write_all(buf)
+        };
+        let res = res.and_then(|()| {
+            let synced = if std::mem::take(&mut self.fail_next_sync) {
+                Err(injected("fsync"))
+            } else {
+                self.file.sync_data()
+            };
+            if synced.is_err() {
+                // Best effort: if the cut fails too, the writer is failed
+                // anyway and reopening judges whatever reached the disk.
+                let _ = self.file.set_len(self.len);
+                let _ = self.file.sync_data();
+            }
+            synced
+        });
         if let Err(e) = res {
             let err = Error::from(e);
             self.failed = Some(match &err {
@@ -908,7 +1508,8 @@ impl LogWriter {
             });
             return Err(err);
         }
-        self.next_entry = next_entry;
+        // An in-memory buffer's length always fits a u64.
+        self.len += buf.len() as u64;
         Ok(())
     }
 }

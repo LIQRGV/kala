@@ -4,8 +4,9 @@
 //! cut off: the file is truncated to the end of the last committed transaction.
 //! All committed transactions survive; writing afterwards continues tx and
 //! entry IDs from the last committed ones. Damage to bytes that are all present
-//! (begin record or body, in ANY transaction, the last one included) is
-//! `Corrupt`, with the file untouched (slice-1 finding M1).
+//! is `Corrupt` (file untouched) unless it is in the LAST transaction with no
+//! valid begin record after it: then (slice 3 item 0a) it is cut like a torn
+//! tail and reported as `CutCause::Damaged`.
 mod common;
 
 use kala_core::log::{EntryBody, read_log};
@@ -171,6 +172,48 @@ fn assert_corrupt_untouched(p: &Path) {
     assert_eq!(bytes(p), before, "file must stay untouched");
 }
 
+/// `p` holds the fixture log with the LAST transaction damaged (all its bytes
+/// present) and no valid begin record after it. open() must cut it exactly
+/// like a torn tail but report `CutCause::Damaged`: file cut back to `keep`,
+/// quarantine `<file>.torn-<keep>` holds exactly the cut bytes, the world is
+/// the one before the last txn (`before`), and a second open is clean.
+/// read_log must ignore the damaged tail without touching the file.
+fn assert_cut_as_damaged(p: &Path, keep: u64, before: &str, e: &Ents) {
+    let damaged = bytes(p);
+    let committed = read_log(p).unwrap();
+    assert_eq!(bytes(p), damaged, "read_log must not modify the file");
+    {
+        let scratch = tempfile::tempdir().unwrap();
+        let clean = scratch.path().join("clean.kala");
+        std::fs::write(&clean, &damaged[..keep as usize]).unwrap();
+        assert_eq!(
+            committed,
+            read_log(&clean).unwrap(),
+            "read_log ignores the damaged tail"
+        );
+    }
+    let w = open_ok(p);
+    let r = w.recovery().clone();
+    assert_eq!(r.cause, Some(CutCause::Damaged));
+    assert_eq!(r.bytes_cut, damaged.len() as u64 - keep);
+    let mut q = p.as_os_str().to_owned();
+    q.push(format!(".torn-{keep}"));
+    let q = PathBuf::from(q);
+    assert_eq!(r.quarantine, Some(q.clone()));
+    assert_eq!(snapshot(&w, e), before);
+    assert_eq!(w.entity_by_handle("lisa"), None);
+    drop(w);
+    assert_eq!(bytes(p), damaged[..keep as usize]);
+    assert_eq!(bytes(&q), damaged[keep as usize..]);
+    assert_eq!(
+        read_log(p).unwrap(),
+        committed,
+        "read_log == committed prefix"
+    );
+    let w = open_ok(p);
+    assert_eq!(*w.recovery(), RecoveryReport::default());
+}
+
 /// After recovery: writing works, tx = last committed + 1, entry IDs continue
 /// from the last committed entry, and a further reopen sees the write.
 fn check_writes_continue(p: &Path, e: &Ents) {
@@ -268,12 +311,13 @@ fn cut_txns_tx_and_entry_numbers_are_reused() {
     entry_ids_contiguous(&p);
 }
 
-// Rewritten from slice 1 (`..._cuts_that_txn`): with all bytes of the last txn
-// present, a damaged Commit checksum is damage (body_crc mismatch), not a torn
-// write. It must never be cut.
+// Slice 3 item 0a (CHANGES slice 2 rule 6): a damaged LAST txn with no valid
+// begin record after it is cut like a torn tail, but reported as Damaged.
+// (Slice-2 name: `..._is_corrupt_and_untouched`.) The Corrupt variant, with a
+// later valid begin record, is the next test.
 #[test]
-fn bad_checksum_field_on_the_last_commit_is_corrupt_and_untouched() {
-    let (f, _, _) = fixture();
+fn bad_checksum_field_on_the_last_commit_is_cut_as_damaged() {
+    let (f, before, _) = fixture();
     let scratch = tempfile::tempdir().unwrap();
     for off in 1..=4u64 {
         let p = scratch.path().join(format!("c{off}.kala"));
@@ -281,15 +325,41 @@ fn bad_checksum_field_on_the_last_commit_is_corrupt_and_untouched() {
         let n = d.len();
         d[n - off as usize] ^= 0x01;
         std::fs::write(&p, &d).unwrap();
+        assert_cut_as_damaged(&p, l0(&f), &before, &f.ents);
+    }
+}
+
+#[test]
+fn bad_checksum_field_on_the_last_commit_is_corrupt_when_a_later_valid_txn_follows() {
+    // keeps the slice-2 intent: damage that is NOT at the tail is never cut.
+    // A real, fully valid txn is appended through the API after the fixture,
+    // then the (former) last txn's Commit checksum is damaged.
+    let (f, _, _) = fixture();
+    let scratch = tempfile::tempdir().unwrap();
+    let base = scratch.path().join("base.kala");
+    std::fs::copy(&f.path, &base).unwrap();
+    {
+        let mut w = open_ok(&base);
+        w.assert(f.ents.greg, "age", Value::I64(77), t(8)).unwrap();
+    }
+    let orig = bytes(&base);
+    let spans = common::spans(&orig);
+    let damaged = spans[spans.len() - 2];
+    for off in 1..=4usize {
+        let p = scratch.path().join(format!("cl{off}.kala"));
+        let mut d = orig.clone();
+        d[damaged.end - off] ^= 0x01;
+        std::fs::write(&p, &d).unwrap();
         assert_corrupt_untouched(&p);
         assert_read_log_corrupt_untouched(&p);
     }
 }
 
-// Rewritten from slice 1 (`..._cuts_that_txn`): same reason (M1).
+// Slice 3 item 0a (was `..._is_corrupt_and_untouched`): damaged last txn with
+// nothing valid after it is cut as Damaged.
 #[test]
-fn bad_byte_in_a_fact_payload_of_the_last_txn_is_corrupt_and_untouched() {
-    let (f, _, _) = fixture();
+fn bad_byte_in_a_fact_payload_of_the_last_txn_is_cut_as_damaged() {
+    let (f, before, _) = fixture();
     let scratch = tempfile::tempdir().unwrap();
     // bytes inside the last fact frame, just before the 25-byte Commit frame
     for back in [26u64, 27, 30, 33] {
@@ -298,8 +368,7 @@ fn bad_byte_in_a_fact_payload_of_the_last_txn_is_corrupt_and_untouched() {
         let at = d.len() - back as usize;
         d[at] ^= 0x40;
         std::fs::write(&p, &d).unwrap();
-        assert_corrupt_untouched(&p);
-        assert_read_log_corrupt_untouched(&p);
+        assert_cut_as_damaged(&p, l0(&f), &before, &f.ents);
     }
 }
 
@@ -470,14 +539,15 @@ fn read_log_on_a_torn_file_returns_only_committed_entries_and_does_not_modify_it
             "k={k}: read_log must not modify the file"
         );
     }
-    // bad checksum on the last commit: all bytes are present, so this is
-    // damage (v2), not a torn write: Corrupt, file untouched.
+    // bad checksum on the last commit: slice 3 item 0a: a damaged tail is
+    // ignored by read_log like a torn one (committed prefix, file untouched).
     let p = scratch.path().join("bad.kala");
     let mut d = full.clone();
     let n = d.len();
     d[n - 1] ^= 1;
     std::fs::write(&p, &d).unwrap();
-    assert_read_log_corrupt_untouched(&p);
+    assert_eq!(read_log(&p).unwrap(), clean_at_l0, "damaged tail ignored");
+    assert_eq!(bytes(&p), d, "read_log must not modify the file");
 }
 
 #[test]

@@ -13,8 +13,8 @@ use kala_core::*;
 use proptest::prelude::*;
 use std::path::PathBuf;
 
-type ERow = (EntityId, AttrId, Value, Tick, TxId, Op);
-type RRow = (EntityId, AttrId, EntityId, Tick, TxId, Op);
+type ERow = (EntityId, AttrId, Value, Tick, TxId, Mark);
+type RRow = (EntityId, AttrId, EntityId, Tick, TxId, Mark);
 
 const LOCATED_IN: AttrId = AttrId(0);
 const BOUGHT: AttrId = AttrId(1);
@@ -178,7 +178,7 @@ fn claude_md_example_gives_three_r_rows_newest_tick_first() {
                 f.greg,
                 Tick(-200),
                 TxId(tx0 + 2),
-                Op::Assert
+                Mark::Assert
             ),
             (
                 f.varrow,
@@ -186,7 +186,7 @@ fn claude_md_example_gives_three_r_rows_newest_tick_first() {
                 f.greg,
                 Tick(-250),
                 TxId(tx0 + 1),
-                Op::Retract
+                Mark::Retract
             ),
             (
                 f.varrow,
@@ -194,7 +194,7 @@ fn claude_md_example_gives_three_r_rows_newest_tick_first() {
                 f.greg,
                 Tick(-300),
                 TxId(tx0),
-                Op::Assert
+                Mark::Assert
             ),
         ]
     );
@@ -372,7 +372,7 @@ fn ref_to_an_edge_target_mirrors() {
             .expect("R row under the edge as target");
     assert_eq!(
         (row.1, row.2, row.3, row.5),
-        (WITNESS, f.edwin, Tick(1), Op::Assert)
+        (WITNESS, f.edwin, Tick(1), Mark::Assert)
     );
 }
 
@@ -395,9 +395,9 @@ fn ref_with_an_edge_source_mirrors() {
     assert_eq!(rows.len(), 2);
     assert_eq!(
         (rows[0].1, rows[0].2, rows[0].3, rows[0].5),
-        (WITNESS, edge, Tick(5), Op::Retract)
+        (WITNESS, edge, Tick(5), Mark::Retract)
     );
-    assert_eq!((rows[1].3, rows[1].5), (Tick(1), Op::Assert));
+    assert_eq!((rows[1].3, rows[1].5), (Tick(1), Mark::Assert));
     assert!(d.e.iter().any(|r| r.1 == NOTE));
     assert!(d.r.iter().all(|r| r.1 != NOTE));
 }
@@ -552,7 +552,7 @@ proptest! {
                         v,
                         Tick(x.tick),
                         TxId(0), // patched at commit
-                        if retract { Op::Retract } else { Op::Assert },
+                        if retract { Mark::Retract } else { Mark::Assert },
                     )),
                     Ok(_) => {}
                     Err(_) => { failed = true; break; }
