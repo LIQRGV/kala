@@ -13,8 +13,10 @@ fn checks_stop_once_when_the_shared_budget_is_exhausted() {
         kala_query::run_with_usage(&fx.mem, &prepared.plan, &Params::new(), &Limits::default())
             .unwrap();
     let limit = Limits::default();
-    let completed =
-        (limit.max_steps / usage.steps).min((limit.max_bytes / usage.peak_bytes) as u64) as usize;
+    // Steps are shared across checks; memory is released after each check,
+    // so only the step budget decides how many checks complete (review round 1).
+    assert!(usage.peak_bytes < limit.max_bytes);
+    let completed = (limit.max_steps / usage.steps) as usize;
     assert!(
         (1..256).contains(&completed),
         "fixture must exhaust a shared budget: {usage:?}"

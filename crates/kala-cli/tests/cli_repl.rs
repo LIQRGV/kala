@@ -332,3 +332,36 @@ fn force_replacement_is_seen_only_after_reload() {
     assert_eq!(after["rows"].as_array().unwrap().len(), 1);
     assert_eq!(after["rows"][0][0]["value"], "Zed");
 }
+
+// Review round 1: inside a pending multi-line input, a line starting with `.`
+// is query text (it may continue a string), and only an exact `.cancel` is a
+// command.
+#[test]
+fn dot_line_inside_pending_input_is_query_text() {
+    let fx = varrow();
+    let input = "[:find ?e :where [?e :name \"He left.\n.reload and came back\"]]\n";
+    let o = repl(&fx, input.as_bytes(), &[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(stderr(&o), "");
+    assert!(stdout(&o).contains("0 rows"), "{}", stdout(&o));
+}
+
+#[test]
+fn exact_cancel_still_discards_pending_input() {
+    let fx = varrow();
+    let input = format!("[:find ?a\n  .cancel  \n{ALLIES}\n");
+    let o = repl(&fx, input.as_bytes(), &[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(stdout(&o), fx.text("query", &[ALLIES]));
+}
+
+// Review round 1: a broken session rule only affects queries that reach it.
+#[test]
+fn broken_session_rule_does_not_break_unrelated_queries() {
+    let fx = varrow();
+    let input = format!(".rule [[(r ?e) [?e :ally_off ?x]]]\n{ALLIES}\n[:find ?e :where (r ?e)]\n");
+    let o = repl(&fx, input.as_bytes(), &[]);
+    assert_eq!(code(&o), 1);
+    assert_eq!(stdout(&o), fx.text("query", &[ALLIES]));
+    assert!(stderr(&o).contains("rule `r`"), "{}", stderr(&o));
+}

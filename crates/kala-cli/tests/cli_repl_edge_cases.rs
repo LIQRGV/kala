@@ -237,3 +237,33 @@ fn oversized_history_is_rejected_without_truncation() {
     assert_ne!(code(&o), 0);
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 1024 * 1024 + 1);
 }
+
+// Review round 1: history is saved even when the session ends on an output
+// error (stdout on a full device).
+#[cfg(target_os = "linux")]
+#[test]
+fn history_is_saved_when_stdout_fails() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let fx = varrow();
+    let history = fx.dir.path().join("history");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kala"))
+        .arg("repl")
+        .arg(&fx.path)
+        .args(["--history", history.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(std::fs::File::create("/dev/full").unwrap())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"[:find ?a :at -210 :where [:edwin :ally_of ?a]]\n")
+        .unwrap();
+    let o = child.wait_with_output().unwrap();
+    assert_eq!(o.status.code(), Some(3));
+    let saved = std::fs::read_to_string(&history).unwrap();
+    assert!(saved.contains(":edwin :ally_of"), "history: {saved:?}");
+}

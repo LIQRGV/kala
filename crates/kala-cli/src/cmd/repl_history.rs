@@ -133,13 +133,16 @@ impl History {
                 return Err(io("history acquired a hard link or was removed"));
             }
         }
+        // Encode everything first, so a failure can't leave a half-written
+        // file; then replace the contents in one write.
+        let mut buf = Vec::with_capacity(self.bytes + 4 * self.entries.len());
+        for entry in &self.entries {
+            serde_json::to_writer(&mut buf, entry).map_err(io)?;
+            buf.push(b'\n');
+        }
         self.file.seek(SeekFrom::Start(0)).map_err(io)?;
         self.file.set_len(0).map_err(io)?;
-        for entry in &self.entries {
-            serde_json::to_writer(&mut self.file, entry)
-                .map_err(|e| CliError::Store(format!("saving history: {e}")))?;
-            self.file.write_all(b"\n").map_err(io)?;
-        }
+        self.file.write_all(&buf).map_err(io)?;
         self.file.flush().map_err(io)
     }
 }

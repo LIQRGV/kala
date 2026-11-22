@@ -16,7 +16,7 @@ use std::path::Path;
 
 use kala_core::{DoctorOptions, Finding, IndexName, Severity, TxId, ValueType, doctor_log};
 use kala_datalog::{MAX_CHECKS_BYTES, Prepared};
-use kala_query::{CanonSource, Limits, Params, QueryError};
+use kala_query::{CanonSource, Limits, Params, QueryError, Usage};
 use serde::Serialize;
 
 use super::Done;
@@ -220,7 +220,7 @@ fn run_checks(
     let mut hints = Vec::new();
     let mut remaining = Limits::default();
     for (c, p) in checks.iter().zip(&prepared) {
-        let result = if remaining.max_steps == 0 || remaining.max_bytes == 0 {
+        let result = if remaining.max_steps == 0 {
             Err(QueryError::StepBudget { limit: 0 })
         } else {
             kala_query::run_with_usage(&world, &p.plan, &Params::new(), &remaining)
@@ -243,8 +243,7 @@ fn run_checks(
             }
             Err(e) => return Err(query_err(e, &whose(c))),
         };
-        remaining.max_steps = remaining.max_steps.saturating_sub(usage.steps);
-        remaining.max_bytes = remaining.max_bytes.saturating_sub(usage.peak_bytes);
+        remaining = after_check(&remaining, &usage);
         if rs.rows.is_empty() {
             continue;
         }
@@ -262,6 +261,16 @@ fn run_checks(
         });
     }
     Ok(hints)
+}
+
+/// The budget left for the next story check: steps are shared by all checks
+/// (so a file of many checks can't use many budgets), while memory is
+/// released when a check ends, so each check gets the full byte limit.
+fn after_check(remaining: &Limits, usage: &Usage) -> Limits {
+    Limits {
+        max_steps: remaining.max_steps.saturating_sub(usage.steps),
+        ..*remaining
+    }
 }
 
 fn kind(f: &Finding) -> &'static str {
@@ -397,5 +406,27 @@ fn type_name(t: ValueType) -> &'static str {
         ValueType::F64 => "f64",
         ValueType::Str => "string",
         ValueType::Ref => "ref",
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::after_check;
+    use kala_query::{Limits, Usage};
+
+    // Review round 1: story checks share one step budget, but memory is
+    // released between checks, so a memory-heavy check (e.g. a full memo
+    // cache) must not starve the checks after it.
+    #[test]
+    fn steps_are_shared_but_memory_is_per_check() {
+        let full = Limits::default();
+        let usage = Usage {
+            steps: 1_000,
+            peak_bytes: full.max_bytes,
+        };
+        let next = after_check(&full, &usage);
+        assert_eq!(next.max_steps, full.max_steps - 1_000);
+        assert_eq!(next.max_bytes, full.max_bytes);
+        assert_eq!(next.max_rows, full.max_rows);
     }
 }

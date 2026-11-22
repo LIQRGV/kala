@@ -232,6 +232,16 @@ impl Session<'_> {
 
     fn line(&mut self, line: &str) -> Result<Action, CliError> {
         let trimmed = line.trim();
+        // While a multi-line input is pending, every line is input (it may
+        // continue a string that starts with `.`); only an exact `.cancel`
+        // is a command.
+        if self.incomplete() {
+            if trimmed == ".cancel" {
+                self.discard();
+                return Ok(Action::Continue);
+            }
+            return self.append(line);
+        }
         if !trimmed.starts_with('.') {
             if self.buffer.is_empty() && (trimmed.is_empty() || trimmed.starts_with(';')) {
                 return Ok(Action::Continue);
@@ -303,9 +313,6 @@ impl Session<'_> {
                 Ok(Action::Output(out))
             }
             ".rule" | ".explain" => {
-                if self.incomplete() {
-                    return Err(user("incomplete input; use .cancel first"));
-                }
                 self.pending = if command == ".rule" {
                     Pending::Rules
                 } else {
@@ -466,10 +473,32 @@ pub fn run(
 ) -> Result<Done, CliError> {
     let ctx = Ctx::open(world, None).map_err(|e| CliError::Store(e.message().into()))?;
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
-    let cancel = Arc::new(AtomicBool::new(false));
     let mut history = history_path
         .map(|path| History::open(path, world))
         .transpose()?;
+    // Save the history on every way out, errors included; an error from the
+    // session itself wins over one from saving.
+    let result = drive(world, at, canon, ctx, interactive, &mut history);
+    if let Some(h) = &mut history {
+        let saved = h.save();
+        if result.is_ok() {
+            saved?;
+        }
+    }
+    result
+}
+
+/// The session loop of [`run`], with the world opened and the history (if
+/// any) loaded.
+fn drive(
+    world: &Path,
+    at: Option<i64>,
+    canon: Option<Canon>,
+    ctx: Ctx,
+    interactive: bool,
+    history: &mut Option<History>,
+) -> Result<Done, CliError> {
+    let cancel = Arc::new(AtomicBool::new(false));
     let stdin = io::stdin();
     let mut input = if interactive {
         let flag = Arc::clone(&cancel);
@@ -484,7 +513,7 @@ pub fn run(
             .build();
         let mut editor = Editor::with_config(config).map_err(|e| user(e.to_string()))?;
         editor.set_helper(Some(SafeHelper));
-        if let Some(h) = &history {
+        if let Some(h) = history.as_ref() {
             for entry in h.entries() {
                 editor
                     .add_history_entry(entry)
@@ -535,7 +564,7 @@ pub fn run(
                 Err(user(message))
             }
             Event::Line(line) => {
-                if let Some(h) = &mut history {
+                if let Some(h) = history {
                     h.push(&line);
                 }
                 session.line(&line)
@@ -560,9 +589,6 @@ pub fn run(
                 )?;
             }
         }
-    }
-    if let Some(h) = &mut history {
-        h.save()?;
     }
     Ok(Done {
         text: String::new(),

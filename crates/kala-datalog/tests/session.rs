@@ -98,8 +98,11 @@ fn merging_session_rules_enforces_pattern_and_rule_and_source_limits() {
         prepare_with(&world, "[:find ?e :where [?e :name _] (r ?e)]", &defaults).unwrap_err();
     assert_eq!(error.kind, ErrorKind::Limit, "{error}");
     let mut rules = Vec::new();
+    // A chain r0 -> r1 -> ... so every definition is reachable from the query
+    // (unreachable session rules are not merged, see below).
     for i in 0..=MAX_RULES {
-        rules.extend(parse_rules(&format!("[[(r{i} ?e) [?e :name _]]]")).unwrap());
+        let next = i + 1;
+        rules.extend(parse_rules(&format!("[[(r{i} ?e) [?e :name _] (r{next} ?e)]]")).unwrap());
     }
     let defaults = SessionDefaults {
         rules,
@@ -118,4 +121,29 @@ fn merging_session_rules_enforces_pattern_and_rule_and_source_limits() {
     let source = format!("[:find ?e :where (r ?e)] ;{}", "x".repeat(100));
     let error = prepare_with(&world, &source, &defaults).unwrap_err();
     assert_eq!(error.kind, ErrorKind::Limit, "{error}");
+}
+
+// Review round 1: only session rules a query can reach are merged, directly
+// or through other rules and negations.
+#[test]
+fn unreachable_session_rules_are_not_compiled() {
+    let world = world();
+    let rules = parse_rules(
+        "[[(broken ?e) [?e :ally_off ?x]] [(ally ?a ?b) [?a :ally_of ?b]] [(via ?a ?b) (ally ?a ?b)]]",
+    )
+    .unwrap();
+    let defaults = SessionDefaults {
+        rules,
+        ..Default::default()
+    };
+    prepare_with(&world, "[:find ?a :where [:edwin :ally_of ?a]]", &defaults).unwrap();
+    prepare_with(&world, "[:find ?b :where (via :edwin ?b)]", &defaults).unwrap();
+    prepare_with(
+        &world,
+        "[:find ?b :where [:edwin :ally_of ?b] (not (via :mara ?b))]",
+        &defaults,
+    )
+    .unwrap();
+    let err = prepare_with(&world, "[:find ?e :where (broken ?e)]", &defaults).unwrap_err();
+    assert!(err.to_string().contains("rule `broken`"), "{err}");
 }

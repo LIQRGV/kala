@@ -71,10 +71,27 @@ pub fn prepare_with(
         query.canon = defaults.canon.map(|c| ast::CanonExpr::Int(c.0, query.span));
     }
     let names: HashSet<&str> = query.rules.iter().map(|r| r.name.as_str()).collect();
+    // Only session rules the query can reach (through `:where`, its own rules
+    // and other session rules, negations included) are merged, so a broken
+    // session rule only fails the queries that use it.
+    let mut reach: HashSet<String> = HashSet::new();
+    let mut todo: Vec<String> = Vec::new();
+    calls_of(&query.calls, &query.nots, &mut todo);
+    for r in &query.rules {
+        calls_of(&r.calls, &r.nots, &mut todo);
+    }
+    while let Some(name) = todo.pop() {
+        if names.contains(name.as_str()) || !reach.insert(name.clone()) {
+            continue;
+        }
+        for r in defaults.rules.iter().filter(|r| r.name() == name) {
+            calls_of(&r.rule.calls, &r.rule.nots, &mut todo);
+        }
+    }
     let extra: Vec<&SessionRule> = defaults
         .rules
         .iter()
-        .filter(|r| !names.contains(r.name()))
+        .filter(|r| !names.contains(r.name()) && reach.contains(r.name()))
         .collect();
     let mut bytes = text.len();
     for rule in &extra {
@@ -281,4 +298,13 @@ fn check_limits(q: &ast::Query) -> Result<(), DatalogError> {
         }
     }
     Ok(())
+}
+
+/// Pushes the names of the rules called by `calls` and, recursively, by the
+/// negations `nots`.
+fn calls_of(calls: &[ast::Call], nots: &[ast::Not], out: &mut Vec<String>) {
+    out.extend(calls.iter().map(|c| c.name.clone()));
+    for n in nots {
+        calls_of(&n.calls, &n.nots, out);
+    }
 }

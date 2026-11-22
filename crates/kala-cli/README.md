@@ -34,16 +34,18 @@ Session defaults apply only when a query has no explicit `:at` or `:canon`.
 Queries, `.rule` definitions and `.explain` queries may span lines. Continuation
 uses the `  ...> ` prompt. Strings, escapes and `;` comments use Datalog's normal
 lexer. An unmatched closer reports an error immediately. Blank lines do not
-finish incomplete input; `.cancel` discards it. Each accumulated input is capped
+finish incomplete input. While input is incomplete every line belongs to it,
+even one starting with `.` (it may continue a string); only a line that is
+exactly `.cancel` is a command, and it discards the input. Each accumulated input is capped
 at 65,536 bytes. Session parameters and rule definitions are also bounded.
 
 | Command | Effect |
 | --- | --- |
 | `.at [T]` | Set the default signed 64-bit tick; no argument clears it. |
 | `.canon [C]` | Set the default canon (`N` or `tx#N`); no argument clears it. |
-| `.param NAME VALUE` | Set a parameter, with or without `?` in its name. Values use the same type-directed parsing as `query --param`. |
+| `.param NAME VALUE` | Set a parameter, with or without `?` in its name. Values use the same type-directed parsing as `query --param`, except that surrounding whitespace is trimmed (use `kala query --param` for a value that starts or ends with spaces). |
 | `.unparam NAME` / `.params` | Remove a parameter / list stored parameters. |
-| `.rule [[(name ?a) ...]]` | Add definitions using the `:rules` vector syntax. |
+| `.rule [[(name ?a) ...]]` | Add definitions using the `:rules` vector syntax. A query only compiles the session rules it reaches, so a broken rule only fails queries that call it. |
 | `.unrule NAME` / `.rules` | Remove all definitions of a name / list stored definitions. |
 | `.explain QUERY` | Print a plan with the session defaults, rules and parameters applied. |
 | `.load FILE` | Run one UTF-8 query file (regular files only, at most 65,536 bytes). |
