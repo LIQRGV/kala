@@ -79,11 +79,16 @@ fn is_name_char(c: char) -> bool {
 pub(crate) struct Lexer<'a> {
     text: &'a str,
     pos: usize,
+    unfinished_string: bool,
 }
 
 impl<'a> Lexer<'a> {
     pub(crate) fn new(text: &'a str) -> Lexer<'a> {
-        Lexer { text, pos: 0 }
+        Lexer {
+            text,
+            pos: 0,
+            unfinished_string: false,
+        }
     }
 
     fn peek(&self) -> Option<char> {
@@ -156,6 +161,7 @@ impl<'a> Lexer<'a> {
             .map(|(i, c)| (start + 1 + i, c));
         loop {
             let Some((i, c)) = chars.next() else {
+                self.unfinished_string = true;
                 return Err(unterminated());
             };
             match c {
@@ -168,6 +174,7 @@ impl<'a> Lexer<'a> {
                 }
                 '\\' => {
                     let Some((j, e)) = chars.next() else {
+                        self.unfinished_string = true;
                         return Err(unterminated());
                     };
                     let after = j + e.len_utf8();
@@ -182,6 +189,7 @@ impl<'a> Lexer<'a> {
                             let mut end = after;
                             for _ in 0..4 {
                                 let Some((k, h)) = chars.next() else {
+                                    self.unfinished_string = true;
                                     return Err(unterminated());
                                 };
                                 end = k + h.len_utf8();
@@ -359,4 +367,55 @@ fn number(run: &str, span: Span) -> Result<Tok, DatalogError> {
             .and_then(|m| m.checked_add(i128::from(d - b'0')));
     }
     Ok(Tok::Int(mag.map(|m| if neg { -m } else { m })))
+}
+
+/// Structural completeness uses the same tokenizer as the parser, including
+/// its escape validation. No AST is built, and nesting has a fixed cap.
+pub(crate) fn completeness(text: &str) -> crate::Completeness {
+    use crate::Completeness::{Complete, Incomplete, Invalid};
+    if text.len() > crate::MAX_QUERY_BYTES {
+        return Invalid;
+    }
+    let mut lexer = Lexer::new(text);
+    let mut stack = Vec::new();
+    let mut seen = false;
+    let mut finished = false;
+    loop {
+        let token = match lexer.next_token() {
+            Ok(Some(token)) => token,
+            Ok(None) => {
+                return if seen && stack.is_empty() {
+                    Complete
+                } else {
+                    Incomplete
+                };
+            }
+            Err(_) => {
+                return if lexer.unfinished_string && !finished {
+                    Incomplete
+                } else {
+                    Invalid
+                };
+            }
+        };
+        if finished {
+            return Invalid;
+        }
+        seen = true;
+        match token.tok {
+            Tok::Open(bracket) => {
+                if stack.len() == crate::MAX_DEPTH {
+                    return Invalid;
+                }
+                stack.push(bracket);
+            }
+            Tok::Close(bracket) => {
+                if stack.pop() != Some(bracket) {
+                    return Invalid;
+                }
+                finished = stack.is_empty();
+            }
+            _ => finished = stack.is_empty(),
+        }
+    }
 }

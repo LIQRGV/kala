@@ -72,6 +72,31 @@ pub(crate) fn parse(text: &str) -> Result<Query, DatalogError> {
     parse_unlocated(text).map_err(|e| e.locate(text))
 }
 
+/// Parse the same vector accepted after `:rules`, without a query wrapper.
+pub(crate) fn parse_rules(text: &str) -> Result<Vec<Rule>, DatalogError> {
+    let parse = || {
+        if text.len() > MAX_QUERY_BYTES {
+            return Err(DatalogError::limit(
+                None,
+                format!(
+                    "rules are {} bytes; the limit is {MAX_QUERY_BYTES}",
+                    text.len()
+                ),
+            ));
+        }
+        let mut lex = Lexer::new(text);
+        let form = read_form(&mut lex, text.len())?;
+        if let Some(t) = lex.next_token()? {
+            return Err(DatalogError::syntax(
+                t.span,
+                "unexpected input after the rules",
+            ));
+        }
+        rules(form, &mut Counts::default())
+    };
+    parse().map_err(|e| e.locate(text))
+}
+
 fn parse_unlocated(text: &str) -> Result<Query, DatalogError> {
     // Size first: nothing else looks at an oversized input.
     if text.len() > MAX_QUERY_BYTES {
