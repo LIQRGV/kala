@@ -6,9 +6,10 @@ use std::fmt::Write as _;
 use std::io::Read as _;
 use std::path::Path;
 
+use kala_core::World;
 use kala_core::{Value, ValueType};
 use kala_datalog::{MAX_QUERY_BYTES, ParamKind, Prepared};
-use kala_query::{Limits, Params, QueryError};
+use kala_query::{Limits, Params, QueryError, ResultSet};
 use serde::Serialize;
 
 use super::read::{Ctx, parse_value};
@@ -22,7 +23,8 @@ struct Query {
     command: &'static str,
     canon: u64,
     tick: i64,
-    /// `?a`, in `:find` order.
+    /// `?a` for a variable, the aggregate's text (`(count ?c)`) for an
+    /// aggregate, in `:find` order.
     columns: Vec<String>,
     rows: Vec<Vec<JValue>>,
 }
@@ -44,11 +46,31 @@ impl Text for Query {
             s.push_str("  (no rows)\n");
         }
         for r in &self.rows {
-            let vals: Vec<String> = r.iter().map(value_text).collect();
-            let _ = writeln!(s, "  {}", vals.join("  "));
+            let _ = writeln!(s, "  {}", row_text(r));
         }
         s
     }
+}
+
+/// A result row's text: each value as [`value_text`] prints it, two spaces
+/// apart. Shared with `kala doctor --checks`.
+pub(crate) fn row_text(r: &[JValue]) -> String {
+    let vals: Vec<String> = r.iter().map(value_text).collect();
+    vals.join("  ")
+}
+
+/// A result's columns (see [`column_name`]) and its rows as JSON values,
+/// entities shown at the result's own default tick and canon. Shared with
+/// `kala doctor --checks`.
+pub(crate) fn table(world: &World, rs: &ResultSet) -> (Vec<String>, Vec<Vec<JValue>>) {
+    let l = Labeler::new(world, rs.canon, rs.tick);
+    let columns = rs.columns.iter().map(|v| column_name(&v.0)).collect();
+    let rows = rs
+        .rows
+        .iter()
+        .map(|r| r.iter().map(|d| l.datum(d)).collect())
+        .collect();
+    (columns, rows)
 }
 
 /// `kala query`: runs the query and prints its rows. Entities are shown
@@ -56,20 +78,27 @@ impl Text for Query {
 pub fn run(world: &Path, q: &QueryArgs, json: bool) -> Result<String, CliError> {
     let (ctx, prepared, params) = prepare(world, q)?;
     let rs = kala_query::run(&ctx.world, &prepared.plan, &params, &Limits::default())
-        .map_err(query_err)?;
-    let l = Labeler::new(&ctx.world, rs.canon, rs.tick);
+        .map_err(|e| query_err(e, "query"))?;
+    let (columns, rows) = table(&ctx.world, &rs);
     let out = Query {
         command: "query",
         canon: rs.canon.0,
         tick: rs.tick.0,
-        columns: rs.columns.iter().map(|v| format!("?{}", v.0)).collect(),
-        rows: rs
-            .rows
-            .iter()
-            .map(|r| r.iter().map(|v| l.value(v)).collect())
-            .collect(),
+        columns,
+        rows,
     };
     Ok(render(&out, json))
+}
+
+/// A result column's printed name: `?a` for a variable; an aggregate
+/// column is already named by its text (`(count ?c)`), and variable names
+/// never start with `(`.
+fn column_name(name: &str) -> String {
+    if name.starts_with('(') {
+        name.to_string()
+    } else {
+        format!("?{name}")
+    }
 }
 
 /// `kala explain`: prints the plan. Every parameter must be given and is
@@ -84,7 +113,7 @@ pub fn explain(world: &Path, q: &QueryArgs) -> Result<String, CliError> {
 fn prepare(world: &Path, q: &QueryArgs) -> Result<(Ctx, Prepared, Params), CliError> {
     let text = match (&q.query, &q.file) {
         (Some(t), None) => t.clone(),
-        (None, Some(f)) => read_query_file(f)?,
+        (None, Some(f)) => read_text_file(f, MAX_QUERY_BYTES, "the query")?,
         // clap's required `source` group already refuses both and neither.
         _ => {
             return Err(CliError::Usage(
@@ -167,11 +196,12 @@ fn parse_param(ctx: &Ctx, name: &str, kind: &ParamKind, s: &str) -> Result<Value
     }
 }
 
-/// A query file's text: a regular file only (a directory, FIFO or device
-/// is refused before it is opened, so it can't hang or read without
-/// bound), at most [`MAX_QUERY_BYTES`], UTF-8. Every failure is the user's
-/// except an I/O error other than not-found on a regular file.
-fn read_query_file(path: &Path) -> Result<String, CliError> {
+/// A query (or checks) file's text: a regular file only (a directory, FIFO
+/// or device is refused before it is opened, so it can't hang or read
+/// without bound), at most `max` bytes, UTF-8. `what` names the content in
+/// messages (`the query`). Every failure is the user's except an I/O error
+/// other than not-found on a regular file.
+pub(crate) fn read_text_file(path: &Path, max: usize, what: &str) -> Result<String, CliError> {
     let shown = escape::path(path);
     let io = |e: std::io::Error| CliError::io(e.kind(), format!("{shown}: {e}"));
     let not_regular = || CliError::User(format!("{shown}: not a regular file"));
@@ -186,27 +216,31 @@ fn read_query_file(path: &Path) -> Result<String, CliError> {
     }
     let mut buf = Vec::new();
     // One byte past the limit tells "at the limit" from "over it".
-    let cap = u64::try_from(MAX_QUERY_BYTES).map_or(u64::MAX, |m| m.saturating_add(1));
+    let cap = u64::try_from(max).map_or(u64::MAX, |m| m.saturating_add(1));
     file.take(cap).read_to_end(&mut buf).map_err(io)?;
-    if buf.len() > MAX_QUERY_BYTES {
+    if buf.len() > max {
         return Err(CliError::User(format!(
-            "{shown}: the query is longer than {MAX_QUERY_BYTES} bytes"
+            "{shown}: {what} is longer than {max} bytes"
         )));
     }
-    String::from_utf8(buf).map_err(|_| CliError::User(format!("{shown}: the query is not UTF-8")))
+    String::from_utf8(buf).map_err(|_| CliError::User(format!("{shown}: {what} is not UTF-8")))
 }
 
-/// An executor error: kala-core errors keep their slice-5 exit codes,
-/// everything else is the user's (exit 1).
-fn query_err(e: QueryError) -> CliError {
+/// An executor error, its message prefixed by `whose` (`query`, `check
+/// :name`): kala-core errors keep their slice-5 exit codes, everything
+/// else is the user's (exit 1).
+pub(crate) fn query_err(e: QueryError, whose: &str) -> CliError {
     match e {
-        QueryError::Core(c) => CliError::core(&c, format!("query: {c}")),
+        QueryError::Core(c) => CliError::core(&c, format!("{whose}: {c}")),
         QueryError::RowLimit { limit } => CliError::User(format!(
-            "query: stopped: an operator produced more than {limit} rows; narrow the query"
+            "{whose}: stopped: an operator produced more than {limit} rows; narrow the query"
         )),
         QueryError::StepBudget { limit } => CliError::User(format!(
-            "query: stopped: the query took more than {limit} steps; narrow the query"
+            "{whose}: stopped: the query took more than {limit} steps; narrow the query"
         )),
-        e => CliError::User(format!("query: {e}")),
+        QueryError::MemoryBudget { limit } => CliError::User(format!(
+            "{whose}: stopped: the query needed more than {limit} bytes of memory; narrow the query"
+        )),
+        e => CliError::User(format!("{whose}: {e}")),
     }
 }

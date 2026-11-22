@@ -1,22 +1,45 @@
-//! `kala doctor <world> [--canon C] [--since C]`.
+//! `kala doctor <world> [--canon C] [--since C] [--checks FILE]`.
 //!
 //! Always [`kala_core::doctor_log`] on the file, never `World::open`: an
 //! open would cut a torn tail (and refuse a corrupt log), and doctor must
 //! report damage, not repair it. Read-only: the file and its directory are
 //! left exactly as they are.
+//!
+//! Story checks (CLAUDE.md "Doctor", third layer): with `--checks FILE`,
+//! each named Datalog query of the file that returns rows is a hint. They
+//! run only on a store without errors, through `World::open_read_only`
+//! (which never changes the file). Every check is prepared before any runs,
+//! so a broken file prints no partial report.
 
 use std::fmt::Write as _;
 use std::path::Path;
 
 use kala_core::{DoctorOptions, Finding, IndexName, Severity, TxId, ValueType, doctor_log};
+use kala_datalog::{MAX_CHECKS_BYTES, Prepared};
+use kala_query::{CanonSource, Limits, Params};
 use serde::Serialize;
 
 use super::Done;
+use super::query::{query_err, read_text_file, row_text, table};
+use super::read::open_world;
 use crate::cli::Canon;
 use crate::error::CliError;
 use crate::escape;
 use crate::names::{self, LogNames, Names};
-use crate::out::{Text, render};
+use crate::out::{JValue, Text, render};
+
+/// Rows of one hint shown in the text output.
+const TEXT_ROWS: usize = 5;
+/// Rows of one hint carried in the JSON output (`rows_total` is exact).
+const JSON_ROWS: usize = 100;
+
+/// `kala doctor`'s options.
+pub struct Options<'a> {
+    pub canon: Option<Canon>,
+    pub since: Option<Canon>,
+    pub checks: Option<&'a Path>,
+    pub json: bool,
+}
 
 #[derive(Serialize)]
 struct JFinding {
@@ -24,6 +47,21 @@ struct JFinding {
     kind: &'static str,
     /// One line naming what is wrong and where, already escaped.
     message: String,
+}
+
+/// A story check that returned rows.
+#[derive(Serialize)]
+struct JHint {
+    /// Always `story_check`.
+    kind: &'static str,
+    /// The check's name, without the `:`.
+    check: String,
+    /// How many rows the check returned.
+    rows_total: usize,
+    /// As `kala query --json` names them.
+    columns: Vec<String>,
+    /// The first [`JSON_ROWS`] rows, as `kala query --json` prints them.
+    rows: Vec<Vec<JValue>>,
 }
 
 #[derive(Serialize)]
@@ -34,6 +72,9 @@ struct Doctor {
     clean: bool,
     errors: Vec<JFinding>,
     warnings: Vec<JFinding>,
+    hints: Vec<JHint>,
+    /// `--checks` was given but not run, because the store has errors.
+    checks_skipped: bool,
 }
 
 impl Text for Doctor {
@@ -51,19 +92,38 @@ impl Text for Doctor {
                 let _ = writeln!(s, "  {}: {}", f.kind, f.message);
             }
         }
+        if self.checks_skipped {
+            s.push_str("hints: skipped (the store has errors)\n");
+        } else if !self.hints.is_empty() {
+            let _ = writeln!(s, "hints ({}):", self.hints.len());
+            for h in &self.hints {
+                let k = h.rows_total;
+                let _ = writeln!(
+                    s,
+                    "  {}: :{}: {k} {}",
+                    h.kind,
+                    escape::value(&h.check),
+                    if k == 1 { "row" } else { "rows" }
+                );
+                for r in h.rows.iter().take(TEXT_ROWS) {
+                    let _ = writeln!(s, "    {}", row_text(r));
+                }
+                if k > TEXT_ROWS {
+                    let _ = writeln!(s, "    ... ({} more)", k - TEXT_ROWS);
+                }
+            }
+        }
         s
     }
 }
 
-pub fn run(
-    world: &Path,
-    canon: Option<Canon>,
-    since: Option<Canon>,
-    json: bool,
-) -> Result<Done, CliError> {
+pub fn run(world: &Path, o: Options<'_>) -> Result<Done, CliError> {
+    // The file's shape is checked whatever the store's state, before any
+    // report is printed.
+    let checks = o.checks.map(read_checks).transpose()?;
     let opts = DoctorOptions {
-        canon: canon.map(|c| TxId(c.0)),
-        since: since.map(|c| TxId(c.0)),
+        canon: o.canon.map(|c| TxId(c.0)),
+        since: o.since.map(|c| TxId(c.0)),
     };
     let report = doctor_log(world, &opts).map_err(|e| CliError::at_path(world, &e))?;
     // Labels come from the committed entries, read without a lock and
@@ -74,11 +134,13 @@ pub fn run(
         .unwrap_or_default();
     let mut out = Doctor {
         command: "doctor",
-        canon: canon.map(|c| c.0),
-        since: since.map(|c| c.0),
+        canon: o.canon.map(|c| c.0),
+        since: o.since.map(|c| c.0),
         clean: report.is_clean(),
         errors: Vec::new(),
         warnings: Vec::new(),
+        hints: Vec::new(),
+        checks_skipped: false,
     };
     for f in &report.findings {
         let j = JFinding {
@@ -90,10 +152,81 @@ pub fn run(
             Severity::Warning => out.warnings.push(j),
         }
     }
+    if let Some(checks) = checks {
+        if out.errors.is_empty() {
+            out.hints = run_checks(world, &checks, o.canon)?;
+            out.clean &= out.hints.is_empty();
+        } else {
+            out.checks_skipped = true;
+        }
+    }
     Ok(Done {
         findings: !out.errors.is_empty(),
-        text: render(&out, json),
+        text: render(&out, o.json),
     })
+}
+
+/// The checks file, read like `query -f` and parsed (not compiled).
+/// Returns the file text too, so compile errors can be located in it.
+fn read_checks(path: &Path) -> Result<(String, Vec<kala_datalog::Check>), CliError> {
+    let text = read_text_file(path, MAX_CHECKS_BYTES, "the checks file")?;
+    // Datalog messages escape the input they echo; `main` escapes the
+    // whole line again.
+    let checks = kala_datalog::parse_checks(&text)
+        .map_err(|e| CliError::User(format!("{}: {e}", escape::path(path))))?;
+    Ok((text, checks))
+}
+
+/// `check :name` for messages.
+fn whose(c: &kala_datalog::Check) -> String {
+    format!("check :{}", escape::value(&c.name))
+}
+
+/// Prepares every check, then runs each (default limits; at `canon` if
+/// given, else at the query's own canon). A check with rows is a hint.
+fn run_checks(
+    path: &Path,
+    (text, checks): &(String, Vec<kala_datalog::Check>),
+    canon: Option<Canon>,
+) -> Result<Vec<JHint>, CliError> {
+    let world = open_world(path)?;
+    let mut prepared: Vec<Prepared> = Vec::with_capacity(checks.len());
+    for c in checks {
+        // `prepare` locates errors in the query text; relocate them in the
+        // checks file, where the author can find them.
+        let mut p = kala_datalog::prepare(&world, &c.query).map_err(|e| {
+            let e = e.offset_by(c.query_span.start).locate(text);
+            CliError::User(format!("{}: {e}", whose(c)))
+        })?;
+        if !p.params.is_empty() {
+            return Err(CliError::User(format!(
+                "{}: a story check takes no `:in` parameters",
+                whose(c)
+            )));
+        }
+        if let Some(canon) = canon {
+            p.plan.canon = CanonSource::Const(canon.0);
+        }
+        prepared.push(p);
+    }
+    let mut hints = Vec::new();
+    for (c, p) in checks.iter().zip(&prepared) {
+        let rs = kala_query::run(&world, &p.plan, &Params::new(), &Limits::default())
+            .map_err(|e| query_err(e, &whose(c)))?;
+        if rs.rows.is_empty() {
+            continue;
+        }
+        let (columns, mut rows) = table(&world, &rs);
+        rows.truncate(JSON_ROWS);
+        hints.push(JHint {
+            kind: "story_check",
+            check: c.name.clone(),
+            rows_total: rs.rows.len(),
+            columns,
+            rows,
+        });
+    }
+    Ok(hints)
 }
 
 fn kind(f: &Finding) -> &'static str {

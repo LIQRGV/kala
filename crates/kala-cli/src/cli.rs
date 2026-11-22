@@ -179,6 +179,10 @@ pub enum Command {
         /// Check only what changed since this canon: `tx#N` or `N`.
         #[arg(long, value_name = "C", value_parser = parse_canon)]
         since: Option<Canon>,
+        /// Also run the story checks in this file (`[[:name [:find ...]] ...]`);
+        /// each one returning rows is a hint.
+        #[arg(long, value_name = "FILE")]
+        checks: Option<PathBuf>,
         /// Print one JSON document instead of text.
         #[arg(long)]
         json: bool,

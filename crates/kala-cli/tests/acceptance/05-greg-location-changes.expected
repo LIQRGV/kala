@@ -1,0 +1,7 @@
+query at tick 700, canon tx#12: 5 rows
+  ?t  ?p  ?op
+  -100  carnath  :assert
+  150  carnath  :retract
+  200  varrow  :assert
+  250  varrow  :retract
+  601  ashford  :assert

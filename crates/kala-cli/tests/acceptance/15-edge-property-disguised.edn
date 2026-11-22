@@ -1,0 +1,7 @@
+; Story question: how did the `disguised` property of presence edges change?
+; Derivation (properties are facts on the edge): Edwin's `present` edge to carnath
+; has disguised=true asserted -250, retracted -220, replaced by disguised=false
+; asserted -220 (tx4). Mara's `present` edge to graymoor has disguised=false
+; asserted -190. No other edge has the property. Rows sort false before true, then
+; by tick.
+[:find ?d ?t ?op :where [?e :disguised ?d ?t ?op]]

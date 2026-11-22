@@ -8,11 +8,17 @@
 use std::collections::{BTreeSet, HashMap};
 
 use kala_core::{EntityId, Tick, Value, ValueType, World};
-use kala_query::{AttrRef, CanonSource, Plan, Predicate, Term, TickSource, Var};
+use kala_query::{
+    Agg, AggFn, AttrRef, CanonSource, CmpOp, Func, Op, OpTerm, Plan, Predicate, RelDef, Term,
+    TickSource, Var,
+};
 
-use crate::ast::{CanonExpr, Clause, Input, Item, Pattern, Pred, Query, Sym, TickExpr};
+use crate::ast::{
+    Call, CanonExpr, Clause, During, FnClause, HistoryPos, Input, Item, Not, OpItem, Pattern, Pred,
+    Query, Rule, Sym, TickExpr,
+};
 use crate::error::{DatalogError, ErrorKind, Span, show};
-use crate::plan::{self, Filt, Pat, PatAttr};
+use crate::plan::{self, App, Filt, Hist, Pat, PatAttr};
 
 /// What a query parameter must be given, decided from where the query uses
 /// it. Tools parse parameter text by it (an entity by ID or handle, a value
@@ -54,6 +60,53 @@ fn type_name(t: ValueType) -> &'static str {
     }
 }
 
+/// The type of a variable: a stored value's type, a change point's op (a
+/// history pattern's op position) or an interval set (`during` and the set
+/// functions). Parameters are always values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ty {
+    Val(ValueType),
+    Op,
+    Intervals,
+}
+
+fn ty_name(t: Ty) -> &'static str {
+    match t {
+        Ty::Val(v) => type_name(v),
+        Ty::Op => "an op",
+        Ty::Intervals => "an interval set",
+    }
+}
+
+/// Refuses an aggregate whose variable can never be of a type it takes:
+/// `min`/`max` take i64, f64 or string; `sum` i64 or f64; counts anything.
+fn check_agg_type(func: AggFn, var: &Sym, ty: Option<Ty>, span: Span) -> Result<(), DatalogError> {
+    let ok = match (func, ty) {
+        (AggFn::Count | AggFn::CountDistinct, _) | (_, None) => true,
+        (AggFn::Min | AggFn::Max, Some(t)) => {
+            matches!(t, Ty::Val(ValueType::I64 | ValueType::F64 | ValueType::Str))
+        }
+        (AggFn::Sum, Some(t)) => matches!(t, Ty::Val(ValueType::I64 | ValueType::F64)),
+    };
+    match ty {
+        Some(t) if !ok => Err(mismatch(
+            span,
+            format!(
+                "`{}` takes {}, but ?{} is {}",
+                func.name(),
+                if func == AggFn::Sum {
+                    "i64 or f64 values"
+                } else {
+                    "i64, f64 or string values"
+                },
+                show(&var.name),
+                ty_name(t)
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn mismatch(span: Span, message: impl Into<String>) -> DatalogError {
     DatalogError::new(ErrorKind::TypeMismatch, Some(span), message)
 }
@@ -69,16 +122,81 @@ struct Param {
     used: bool,
 }
 
+/// One variable scope: `:where`, one rule definition, or one `(not ..)`
+/// (which starts as a copy of its enclosing scope, so the variables bound
+/// outside are bound inside, while the ones it binds stay local to it).
+/// Variables are local to their scope; parameters are global (in
+/// [`Compiler`]).
+#[derive(Clone, Default)]
+struct Scope {
+    /// The type of every variable of this scope used so far.
+    types: HashMap<String, Ty>,
+    /// Variables a pattern or a rule call binds.
+    bound: BTreeSet<String>,
+    /// Variable names as written -> as named in the plan. Only rule
+    /// definitions after a rule's first rename (see [`Compiler::run`]).
+    rename: HashMap<String, String>,
+    /// A rule definition's head variables: local even if a parameter has
+    /// the same name (the head names the rule's own arguments), so they
+    /// shadow it in that definition.
+    locals: BTreeSet<String>,
+}
+
+impl Scope {
+    /// The plan variable for the variable written `?name` in this scope.
+    fn var(&self, name: &str) -> Var {
+        Var(self
+            .rename
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_owned()))
+    }
+}
+
+/// All definitions of one rule name.
+struct RuleInfo<'q> {
+    /// The definitions, in text order.
+    defs: Vec<&'q Rule>,
+    /// The head length every definition and call shares.
+    arity: usize,
+    /// The type of each head position, unified across definitions.
+    types: Vec<Option<Ty>>,
+    /// The rules this one's bodies call (indices into the rule list).
+    callees: BTreeSet<usize>,
+}
+
+/// One body (`:where`, a definition or a `not`) resolved for the planner.
+struct BodyC<'q> {
+    pats: Vec<Pat>,
+    calls: Vec<plan::Call>,
+    /// The body's predicates, resolved once every scope is typed.
+    preds: Vec<&'q Pred>,
+    /// The body's interval-set function clauses, whose arguments are
+    /// checked once every scope is typed (their outputs are bound and typed
+    /// right away).
+    fns: Vec<&'q FnClause>,
+    /// The body's negations, each with its own scope.
+    nots: Vec<NotC<'q>>,
+}
+
+/// A `(not ..)` resolved for the planner.
+struct NotC<'q> {
+    /// Its scope (its predicates are typed and checked in it).
+    scope: Scope,
+    body: BodyC<'q>,
+    /// The plan variables it shares with the enclosing body (see
+    /// [`plan::Neg::uses`]).
+    uses: Vec<String>,
+}
+
 struct Compiler<'w> {
     world: &'w World,
     /// Parameters by name.
     params: HashMap<String, Param>,
     /// `:in` order.
     param_order: Vec<String>,
-    /// The type of every variable and parameter used so far.
+    /// The type of every parameter used so far.
     types: HashMap<String, ValueType>,
-    /// Variables that appear in some pattern (so a read binds them).
-    pattern_vars: BTreeSet<String>,
 }
 
 impl<'w> Compiler<'w> {
@@ -88,10 +206,16 @@ impl<'w> Compiler<'w> {
             params: HashMap::new(),
             param_order: Vec::new(),
             types: HashMap::new(),
-            pattern_vars: BTreeSet::new(),
         }
     }
 
+    /// Compiles and plans `q`. Rules are checked in four passes: names and
+    /// arities (grouping definitions by name; every call resolves), the
+    /// call graph's components (mutually recursive rules share one), then
+    /// bodies component by component in dependency order, callees first,
+    /// so every call's head positions are already typed (within a
+    /// recursive component, after enough passes). Every definition is
+    /// checked; only rules reachable from `:where` are planned.
     fn run(mut self, q: &Query) -> Result<Prepared, DatalogError> {
         for input in &q.inputs {
             if let Input::Var(s) = input {
@@ -114,6 +238,23 @@ impl<'w> Compiler<'w> {
             }
         }
 
+        let (mut rules, by_name) = group_rules(&q.rules)?;
+        // A call inside a `not` is a dependency like any other: the rule
+        // needs the callee's relation complete before it can negate it.
+        for r in &q.rules {
+            let caller = by_name[r.name.as_str()];
+            for c in all_calls(&r.calls, &r.nots) {
+                let callee = resolve_call(c, &rules, &by_name)?;
+                rules[caller].callees.insert(callee);
+            }
+        }
+        let mut where_callees = BTreeSet::new();
+        for c in all_calls(&q.calls, &q.nots) {
+            where_callees.insert(resolve_call(c, &rules, &by_name)?);
+        }
+        let comps = components(&rules);
+        stratify(&q.rules, &by_name, &comps)?;
+
         let default_tick = match &q.at {
             None => TickSource::Default,
             Some(TickExpr::Int(n, _)) => TickSource::Const(Tick(*n)),
@@ -131,63 +272,90 @@ impl<'w> Compiler<'w> {
             }
         };
 
-        let mut pats = Vec::new();
-        let mut preds: Vec<&Pred> = Vec::new();
-        // Tick variables (not params) of `(at ?t ..)` clauses, checked once
-        // every pattern is known: clause order in the text doesn't matter.
-        let mut tick_vars: Vec<&Sym> = Vec::new();
-        for clause in &q.clauses {
-            match clause {
-                Clause::Pattern(p) => pats.push(self.pattern(p, TickSource::Default, None)?),
-                Clause::At { tick, patterns, .. } => {
-                    let (source, tick_var) = match tick {
-                        TickExpr::Int(n, _) => (TickSource::Const(Tick(*n)), None),
-                        TickExpr::Var(s) if self.params.contains_key(&s.name) => {
-                            self.use_param(s, ValueType::I64, ParamKind::Tick)?;
-                            (TickSource::Param(s.name.clone()), None)
-                        }
-                        TickExpr::Var(s) => {
-                            self.unify(&s.name, ValueType::I64, s.span)?;
-                            tick_vars.push(s);
-                            (
-                                TickSource::Var(Var(s.name.clone())),
-                                Some((s.name.clone(), s.span)),
-                            )
-                        }
-                    };
-                    for p in patterns {
-                        pats.push(self.pattern(p, source.clone(), tick_var.clone())?);
+        // Every scope (rule definitions, then `:where` last) and its body.
+        let mut scopes: Vec<Scope> = Vec::new();
+        let mut bodies: Vec<BodyC<'_>> = Vec::new();
+        // Per rule: (the plan's head vars, scope index of each definition).
+        let mut compiled: Vec<(Vec<Var>, Vec<usize>)> = vec![(Vec::new(), Vec::new()); rules.len()];
+        for comp in &comps {
+            // A recursive component's calls into itself may see head
+            // positions not typed yet; its bodies are resolved again until
+            // no position gains a type (types only go from unknown to known,
+            // so this ends within its total arity + 1 passes), and the last
+            // pass, which saw every type, is kept.
+            let out = loop {
+                let before: Vec<Vec<Option<Ty>>> = comp
+                    .rules
+                    .iter()
+                    .map(|&ri| rules[ri].types.clone())
+                    .collect();
+                let mut out = Vec::new();
+                for &ri in &comp.rules {
+                    self.rule_defs(ri, &mut rules, &by_name, &mut out)?;
+                }
+                if !comp.recursive
+                    || comp
+                        .rules
+                        .iter()
+                        .zip(&before)
+                        .all(|(&ri, b)| rules[ri].types == *b)
+                {
+                    break out;
+                }
+            };
+            for (ri, scope, body) in out {
+                compiled[ri].1.push(scopes.len());
+                scopes.push(scope);
+                bodies.push(body);
+            }
+            for &ri in &comp.rules {
+                compiled[ri].0 = rules[ri].defs[0]
+                    .head
+                    .iter()
+                    .map(|h| Var(h.name.clone()))
+                    .collect();
+            }
+        }
+
+        let where_scope = scopes.len();
+        scopes.push(Scope::default());
+        let body = self.body(
+            Clauses::of_query(q),
+            &mut scopes[where_scope],
+            &rules,
+            &by_name,
+        )?;
+        bodies.push(body);
+
+        let mut planned = self.predicates(&scopes, bodies)?;
+
+        // The columns, and for an aggregate query its groups (the plain
+        // variables) and aggregates (each distinct one once).
+        let mut find = Vec::with_capacity(q.find.len());
+        let mut group: Vec<Var> = Vec::new();
+        let mut aggs: Vec<Agg> = Vec::new();
+        for f in &q.find {
+            let col = Var(f.name.clone());
+            match &f.agg {
+                None => {
+                    self.find_var(&scopes[where_scope], &f.name, f.span)?;
+                    if !group.contains(&col) {
+                        group.push(col.clone());
                     }
                 }
-                Clause::Pred(p) => preds.push(p),
+                Some(a) => {
+                    let ty = self.find_var(&scopes[where_scope], &a.var.name, a.var.span)?;
+                    check_agg_type(a.func, &a.var, ty, f.span)?;
+                    if !aggs.iter().any(|g| g.out == col) {
+                        aggs.push(Agg {
+                            func: a.func,
+                            var: Var(a.var.name.clone()),
+                            out: col.clone(),
+                        });
+                    }
+                }
             }
-        }
-
-        for s in tick_vars {
-            if !self.pattern_vars.contains(&s.name) {
-                return Err(unbound(
-                    s.span,
-                    format!(
-                        "tick variable ?{} is not bound by any pattern or `:in` parameter",
-                        show(&s.name)
-                    ),
-                ));
-            }
-        }
-
-        let filts = self.predicates(&preds)?;
-
-        let mut find = Vec::with_capacity(q.find.len());
-        for s in &q.find {
-            if !self.pattern_vars.contains(&s.name) {
-                let what = if self.params.contains_key(&s.name) {
-                    "is a parameter; `:find` needs a variable a pattern binds"
-                } else {
-                    "is not bound by any pattern"
-                };
-                return Err(unbound(s.span, format!("?{} {what}", show(&s.name))));
-            }
-            find.push(Var(s.name.clone()));
+            find.push(col);
         }
 
         let mut params = Vec::with_capacity(self.param_order.len());
@@ -204,7 +372,55 @@ impl<'w> Compiler<'w> {
             }
         }
 
-        let root = plan::plan(self.world, pats, filts, &find)?;
+        // Plan the rules `:where` reaches, each body as a conjunctive
+        // query projected onto the head: one `Fixpoint` per component of
+        // the call graph (all of a component's relations, so mutually
+        // recursive rules are evaluated together), in dependency order.
+        let reach = reachable(&rules, &where_callees);
+        let mut fixes: Vec<Vec<RelDef>> = Vec::new();
+        for comp in comps.iter().filter(|c| reach.contains(&c.rules[0])) {
+            let mut rels = Vec::with_capacity(comp.rules.len());
+            for &ri in &comp.rules {
+                let (head, defs) = &compiled[ri];
+                let mut bodies = Vec::with_capacity(defs.len());
+                for &si in defs {
+                    let b = std::mem::take(&mut planned[si]);
+                    bodies.push(plan::plan(self.world, b, BTreeSet::new(), Some(head))?);
+                }
+                rels.push(RelDef {
+                    name: rules[ri].defs[0].name.clone(),
+                    vars: head.clone(),
+                    rules: bodies,
+                });
+            }
+            fixes.push(rels);
+        }
+        let b = planned
+            .pop()
+            .expect("invariant: the :where body is the last one planned");
+        // An aggregate groups every binding of the body (all its positively
+        // bound variables, before any projection), then the groups are
+        // projected onto the columns.
+        let mut root = if aggs.is_empty() {
+            plan::plan(self.world, b, BTreeSet::new(), Some(&find))?
+        } else {
+            Op::Project {
+                input: Box::new(Op::Aggregate {
+                    input: Box::new(plan::plan(self.world, b, BTreeSet::new(), None)?),
+                    group,
+                    aggs,
+                }),
+                vars: find.clone(),
+            }
+        };
+        // The lowest stratum outermost: a component's rules read only its
+        // own relations and those of enclosing Fixpoints.
+        for rels in fixes.into_iter().rev() {
+            root = Op::Fixpoint {
+                rels,
+                body: Box::new(root),
+            };
+        }
         Ok(Prepared {
             plan: Plan {
                 find,
@@ -215,6 +431,282 @@ impl<'w> Compiler<'w> {
             },
             params,
         })
+    }
+
+    /// Checks that `:find` may use the `:where` variable `name` (a positive
+    /// clause binds it; a parameter doesn't count) and returns its type, if
+    /// known.
+    fn find_var(&self, scope: &Scope, name: &str, span: Span) -> Result<Option<Ty>, DatalogError> {
+        if !scope.bound.contains(name) {
+            let what = if self.params.contains_key(name) {
+                "is a parameter; `:find` needs a variable a pattern binds"
+            } else {
+                "is not bound by any pattern or rule call"
+            };
+            return Err(unbound(span, format!("?{} {what}", show(name))));
+        }
+        Ok(scope.types.get(name).copied())
+    }
+
+    /// Resolves every definition of rule `ri` into `out` as (rule, scope,
+    /// body), typing the rule's head positions from them. The plan names a
+    /// rule's columns after its first definition's head; later definitions
+    /// are renamed to match (see `renames`).
+    fn rule_defs<'q>(
+        &mut self,
+        ri: usize,
+        rules: &mut [RuleInfo<'q>],
+        by_name: &HashMap<&str, usize>,
+        out: &mut Vec<(usize, Scope, BodyC<'q>)>,
+    ) -> Result<(), DatalogError> {
+        let defs = rules[ri].defs.clone();
+        let canon_head: Vec<String> = defs[0].head.iter().map(|h| h.name.clone()).collect();
+        for (k, &def) in defs.iter().enumerate() {
+            let mut scope = Scope {
+                rename: renames(def, &canon_head, k),
+                locals: def.head.iter().map(|h| h.name.clone()).collect(),
+                ..Scope::default()
+            };
+            let body = self.body(Clauses::of_rule(def), &mut scope, rules, by_name)?;
+            for (i, h) in def.head.iter().enumerate() {
+                if !scope.bound.contains(&h.name) {
+                    return Err(unbound(
+                        h.span,
+                        format!(
+                            "head variable ?{} is not bound by any pattern or rule call of the body",
+                            show(&h.name)
+                        ),
+                    ));
+                }
+                if let Some(&t) = scope.types.get(&h.name) {
+                    match rules[ri].types[i] {
+                        Some(prev) if prev != t => {
+                            return Err(mismatch(
+                                h.span,
+                                format!(
+                                    "position {} of rule `{}` is {} here but {} in another definition",
+                                    i + 1,
+                                    show(&def.name),
+                                    ty_name(t),
+                                    ty_name(prev)
+                                ),
+                            ));
+                        }
+                        Some(_) => {}
+                        None => rules[ri].types[i] = Some(t),
+                    }
+                }
+            }
+            out.push((ri, scope, body));
+        }
+        Ok(())
+    }
+
+    /// Resolves one body's patterns, `(at ..)` clauses and rule calls into
+    /// `scope` (its predicates are resolved later, with every scope's),
+    /// then its negations, each in a scope of its own that starts with
+    /// everything this body binds. Recursion only follows `not` nesting,
+    /// which the parser bounded.
+    fn body<'q>(
+        &mut self,
+        c: Clauses<'q>,
+        scope: &mut Scope,
+        rules: &[RuleInfo<'_>],
+        by_name: &HashMap<&str, usize>,
+    ) -> Result<BodyC<'q>, DatalogError> {
+        let mut pats = Vec::new();
+        let mut preds: Vec<&Pred> = Vec::new();
+        let mut fns: Vec<&FnClause> = Vec::new();
+        // Tick variables (not params) of `(at ?t ..)` clauses, checked once
+        // every pattern is known: clause order in the text doesn't matter.
+        let mut tick_vars: Vec<&Sym> = Vec::new();
+        for clause in c.clauses {
+            match clause {
+                Clause::Pattern(p) => {
+                    pats.push(self.pattern(p, TickSource::Default, None, scope)?)
+                }
+                Clause::At { tick, patterns, .. } => {
+                    let (source, tick_var) = match tick {
+                        TickExpr::Int(n, _) => (TickSource::Const(Tick(*n)), None),
+                        TickExpr::Var(s) if self.is_param(scope, &s.name) => {
+                            self.use_param(s, ValueType::I64, ParamKind::Tick)?;
+                            (TickSource::Param(s.name.clone()), None)
+                        }
+                        TickExpr::Var(s) => {
+                            unify_var(scope, &s.name, Ty::Val(ValueType::I64), s.span)?;
+                            tick_vars.push(s);
+                            let v = scope.var(&s.name);
+                            (TickSource::Var(v.clone()), Some((v.0, s.span)))
+                        }
+                    };
+                    for p in patterns {
+                        pats.push(self.pattern(p, source.clone(), tick_var.clone(), scope)?);
+                    }
+                }
+                Clause::Pred(p) => preds.push(p),
+            }
+        }
+        for d in c.durings {
+            pats.push(self.during(d, scope)?);
+        }
+        // A function's output is bound (and an interval set) right away;
+        // its arguments are checked once every scope is typed.
+        for f in c.fns {
+            if let Some(out) = &f.out {
+                self.interval_out(out, scope)?;
+            }
+            fns.push(f);
+        }
+        let mut out_calls = Vec::with_capacity(c.calls.len());
+        for call in c.calls {
+            let ri = by_name[call.name.as_str()];
+            out_calls.push(self.call(call, &rules[ri], scope)?);
+        }
+        for s in tick_vars {
+            if !scope.bound.contains(&s.name) {
+                return Err(unbound(
+                    s.span,
+                    format!(
+                        "tick variable ?{} is not bound by any pattern, rule call or `:in` parameter",
+                        show(&s.name)
+                    ),
+                ));
+            }
+        }
+        let mut out_nots = Vec::with_capacity(c.nots.len());
+        for n in c.nots {
+            out_nots.push(self.not(n, scope, rules, by_name)?);
+        }
+        Ok(BodyC {
+            pats,
+            calls: out_calls,
+            preds,
+            fns,
+            nots: out_nots,
+        })
+    }
+
+    /// One `(not ..)` of a body whose positive clauses are resolved into
+    /// `scope`: its clauses are resolved in a copy of `scope`, so what they
+    /// bind stays local, while the variables `scope` binds are constraints.
+    fn not<'q>(
+        &mut self,
+        n: &'q Not,
+        scope: &mut Scope,
+        rules: &[RuleInfo<'_>],
+        by_name: &HashMap<&str, usize>,
+    ) -> Result<NotC<'q>, DatalogError> {
+        let mut sub = scope.clone();
+        let body = self.body(Clauses::of_not(n), &mut sub, rules, by_name)?;
+        // A variable bound outside but first typed inside (bound outside by
+        // a call whose head isn't typed yet) has that type outside too.
+        for (name, &ty) in &sub.types {
+            if scope.bound.contains(name) {
+                scope.types.entry(name.clone()).or_insert(ty);
+            }
+        }
+        let mut mentioned = Vec::new();
+        body_vars(Clauses::of_not(n), &mut mentioned);
+        let uses: BTreeSet<String> = mentioned
+            .into_iter()
+            .filter(|v| scope.bound.contains(*v) && !self.is_param(scope, v))
+            .map(|v| scope.var(v).0)
+            .collect();
+        Ok(NotC {
+            scope: sub,
+            body,
+            uses: uses.into_iter().collect(),
+        })
+    }
+
+    /// A rule call whose name and arity are already checked: arguments
+    /// typed by the rule's head positions.
+    fn call(
+        &mut self,
+        c: &Call,
+        rule: &RuleInfo<'_>,
+        scope: &mut Scope,
+    ) -> Result<plan::Call, DatalogError> {
+        let mut args = Vec::with_capacity(c.args.len());
+        for (i, a) in c.args.iter().enumerate() {
+            let ty = rule.types.get(i).copied().flatten();
+            args.push(match (a, ty) {
+                (Item::Var(s), ty) if self.is_param(scope, &s.name) => {
+                    match ty {
+                        Some(Ty::Val(ty)) => self.use_param(s, ty, param_kind(ty))?,
+                        Some(t) => return Err(param_not_a_value(s, t)),
+                        None => {}
+                    }
+                    Term::Param(s.name.clone())
+                }
+                (Item::Var(s), ty) => {
+                    if let Some(ty) = ty {
+                        unify_var(scope, &s.name, ty, s.span)?;
+                    }
+                    scope.bound.insert(s.name.clone());
+                    Term::Var(scope.var(&s.name))
+                }
+                (Item::Any(_), _) => Term::Any,
+                (other, None) => Term::Const(self.constant(other)?.0),
+                (other, Some(Ty::Op)) => match op_constant(other) {
+                    Some(o) => Term::Op(o),
+                    None => {
+                        return Err(mismatch(
+                            other.span(),
+                            format!(
+                                "argument {} of `{}` is an op (`:assert` or `:retract`)",
+                                i + 1,
+                                show(&c.name)
+                            ),
+                        ));
+                    }
+                },
+                (other, Some(Ty::Intervals)) => {
+                    return Err(mismatch(
+                        other.span(),
+                        format!(
+                            "argument {} of `{}` is an interval set, which can't be a constant",
+                            i + 1,
+                            show(&c.name)
+                        ),
+                    ));
+                }
+                (other, Some(Ty::Val(ty))) => {
+                    let (v, got) = self.constant(other)?;
+                    match (ty, v) {
+                        (t, v) if v.value_type() == t => Term::Const(v),
+                        (ValueType::F64, Value::I64(n)) => {
+                            Term::Const(int_as_f64(n, other.span())?)
+                        }
+                        _ => {
+                            let want = if ty == ValueType::Ref {
+                                "an entity (`:handle`, `TYPE#n` or `edge#n`)".to_string()
+                            } else {
+                                format!("a {}", type_name(ty))
+                            };
+                            return Err(mismatch(
+                                other.span(),
+                                format!(
+                                    "argument {} of `{}` needs {want}, not {got}",
+                                    i + 1,
+                                    show(&c.name)
+                                ),
+                            ));
+                        }
+                    }
+                }
+            });
+        }
+        Ok(plan::Call {
+            name: c.name.clone(),
+            args,
+        })
+    }
+
+    /// Whether `?name` in `scope` is a parameter (declared in `:in` and not
+    /// shadowed by a head variable of the definition).
+    fn is_param(&self, scope: &Scope, name: &str) -> bool {
+        self.params.contains_key(name) && !scope.locals.contains(name)
     }
 
     /// A parameter named in `:at` / `:canon`: it must be declared in `:in`.
@@ -236,24 +728,9 @@ impl<'w> Compiler<'w> {
         self.use_param(s, ValueType::I64, kind)
     }
 
-    /// Records that `name` (a variable or param) has type `ty` here.
+    /// Records that param `name` has type `ty` here.
     fn unify(&mut self, name: &str, ty: ValueType, span: Span) -> Result<(), DatalogError> {
-        match self.types.get(name) {
-            Some(&t) if t != ty => Err(mismatch(
-                span,
-                format!(
-                    "?{} is used as {} here but as {} elsewhere",
-                    show(name),
-                    type_name(ty),
-                    type_name(t)
-                ),
-            )),
-            Some(_) => Ok(()),
-            None => {
-                self.types.insert(name.to_owned(), ty);
-                Ok(())
-            }
-        }
+        unify_in(&mut self.types, name, ty, span)
     }
 
     /// Records a use of param `s` with type `ty`; its kind is the one of its
@@ -272,7 +749,23 @@ impl<'w> Compiler<'w> {
         p: &Pattern,
         tick: TickSource,
         tick_var: Option<(String, Span)>,
+        scope: &mut Scope,
     ) -> Result<Pat, DatalogError> {
+        // The parser refuses both; an AST built by hand may not.
+        if p.history.is_some() && (tick_var.is_some() || tick != TickSource::Default) {
+            return Err(DatalogError::new(
+                ErrorKind::Syntax,
+                Some(p.span),
+                "a history pattern can't be inside `(at ..)`: history patterns read every tick",
+            ));
+        }
+        if p.history.is_some() && p.a.name == "handle" {
+            return Err(DatalogError::new(
+                ErrorKind::Syntax,
+                Some(p.a.span),
+                "`:handle` has no history; a history pattern needs a schema attribute",
+            ));
+        }
         let (attr, info, value_type) = if p.a.name == "handle" {
             (AttrRef::Handle, PatAttr::Handle, ValueType::Str)
         } else {
@@ -290,8 +783,15 @@ impl<'w> Compiler<'w> {
             };
             (AttrRef::Named(p.a.name.clone()), info, value_type)
         };
-        let entity = self.position(&p.e, ValueType::Ref, true)?;
-        let value = self.position(&p.v, value_type, false)?;
+        if let (PatAttr::Handle, Item::Keyword(k, span)) = (&info, &p.v) {
+            return Err(handle_keyword(&p.e, k, *span));
+        }
+        let entity = self.position(&p.e, ValueType::Ref, true, scope)?;
+        let value = self.position(&p.v, value_type, false, scope)?;
+        let history = match &p.history {
+            Some(h) => Some(self.history(h, scope)?),
+            None => None,
+        };
         Ok(Pat {
             entity,
             attr,
@@ -299,8 +799,59 @@ impl<'w> Compiler<'w> {
             value,
             tick,
             tick_var,
+            history,
+            during: None,
             span: p.span,
         })
+    }
+
+    /// The tick and op positions of a history pattern. The tick is an
+    /// `i64` (a parameter there is a [`ParamKind::Tick`]); an op variable
+    /// binds an op (its own type, never a value's: compared with it,
+    /// `:assert` / `:retract` are op constants, not handles).
+    fn history(&mut self, h: &HistoryPos, scope: &mut Scope) -> Result<Hist, DatalogError> {
+        let tick = match &h.tick {
+            Item::Var(s) if self.is_param(scope, &s.name) => {
+                self.use_param(s, ValueType::I64, ParamKind::Tick)?;
+                Term::Param(s.name.clone())
+            }
+            Item::Var(s) => {
+                unify_var(scope, &s.name, Ty::Val(ValueType::I64), s.span)?;
+                scope.bound.insert(s.name.clone());
+                Term::Var(scope.var(&s.name))
+            }
+            Item::Int(n, _) => Term::Const(Value::I64(*n)),
+            Item::Any(_) => Term::Any,
+            // The parser refuses these; an AST built by hand may not.
+            other => {
+                return Err(DatalogError::new(
+                    ErrorKind::Syntax,
+                    Some(other.span()),
+                    "the tick position of a history pattern is a variable, an integer or `_`",
+                ));
+            }
+        };
+        let op = match &h.op {
+            None | Some(OpItem::Any(_)) => OpTerm::Any,
+            Some(OpItem::Assert(_)) => OpTerm::Const(kala_core::Op::Assert),
+            Some(OpItem::Retract(_)) => OpTerm::Const(kala_core::Op::Retract),
+            Some(OpItem::Var(s)) if self.is_param(scope, &s.name) => {
+                return Err(mismatch(
+                    s.span,
+                    format!(
+                        "?{} is a parameter; the op position of a history pattern takes a \
+                         variable, `_`, `:assert` or `:retract`",
+                        show(&s.name)
+                    ),
+                ));
+            }
+            Some(OpItem::Var(s)) => {
+                unify_var(scope, &s.name, Ty::Op, s.span)?;
+                scope.bound.insert(s.name.clone());
+                OpTerm::Var(scope.var(&s.name))
+            }
+        };
+        Ok(Hist { tick, op })
     }
 
     /// An attribute's value type and `indexed` flag; an inverse name reads
@@ -322,20 +873,17 @@ impl<'w> Compiler<'w> {
         item: &Item,
         ty: ValueType,
         entity_pos: bool,
+        scope: &mut Scope,
     ) -> Result<Term, DatalogError> {
         Ok(match item {
             Item::Var(s) => {
-                if self.params.contains_key(&s.name) {
-                    let kind = match ty {
-                        ValueType::Ref => ParamKind::Entity,
-                        t => ParamKind::Value(t),
-                    };
-                    self.use_param(s, ty, kind)?;
+                if self.is_param(scope, &s.name) {
+                    self.use_param(s, ty, param_kind(ty))?;
                     Term::Param(s.name.clone())
                 } else {
-                    self.unify(&s.name, ty, s.span)?;
-                    self.pattern_vars.insert(s.name.clone());
-                    Term::Var(Var(s.name.clone()))
+                    unify_var(scope, &s.name, Ty::Val(ty), s.span)?;
+                    scope.bound.insert(s.name.clone());
+                    Term::Var(scope.var(&s.name))
                 }
             }
             Item::Any(_) => Term::Any,
@@ -397,33 +945,46 @@ impl<'w> Compiler<'w> {
         })
     }
 
-    /// Whether `id` (a parsed ID) is defined at the latest canon.
+    /// Whether `id` (a parsed ID) is defined at the latest canon: one
+    /// constant-time lookup in the world's ID tables.
     fn defined(&self, id: EntityId) -> bool {
-        if let Some(edge) = id.as_edge() {
-            return self.world.edge(edge).is_some();
-        }
-        let Some(type_name) = self.world.node_types().nth(usize::from(id.node_type().0)) else {
-            return false;
-        };
-        // Compile time only, and worlds are small: a linear check is fine.
-        self.world
-            .entities_of_type(type_name)
-            .is_ok_and(|mut it| it.any(|e| e == id))
+        self.world.is_defined(id)
     }
 
-    /// Types and resolves the predicates. A parameter only predicates use
+    /// Types and resolves every scope's predicates, returning each body
+    /// with its filters (in scope order). A parameter only predicates use
     /// takes the type of what it is compared with, so they are revisited
-    /// until no more types are learned.
-    fn predicates(&mut self, preds: &[&Pred]) -> Result<Vec<Filt>, DatalogError> {
+    /// (across all scopes: parameters are global) until no more types are
+    /// learned.
+    fn predicates(
+        &mut self,
+        scopes: &[Scope],
+        bodies: Vec<BodyC<'_>>,
+    ) -> Result<Vec<plan::Body>, DatalogError> {
+        // (scope, predicate) in scope order; within a body, its own in text
+        // order, then its negations' (depth first).
+        let mut preds: Vec<(&Scope, &Pred)> = Vec::new();
+        let mut fns: Vec<(&Scope, &FnClause)> = Vec::new();
+        for (scope, b) in scopes.iter().zip(&bodies) {
+            collect_preds(scope, b, &mut preds, &mut fns);
+        }
+        // Function arguments depend only on the scopes' types.
+        let mut apps = Vec::with_capacity(fns.len());
+        for &(scope, f) in &fns {
+            apps.push(self.func(f, scope)?);
+        }
         // Operand checks that don't depend on other predicates come first.
-        for p in preds {
+        for &(scope, p) in &preds {
             for item in [&p.left, &p.right] {
                 match item {
-                    Item::Var(s) if !self.params.contains_key(&s.name) => {
-                        if !self.pattern_vars.contains(&s.name) {
+                    Item::Var(s) if !self.is_param(scope, &s.name) => {
+                        if !scope.bound.contains(&s.name) {
                             return Err(unbound(
                                 s.span,
-                                format!("?{} is not bound by any pattern", show(&s.name)),
+                                format!(
+                                    "?{} is not bound by any pattern or rule call",
+                                    show(&s.name)
+                                ),
                             ));
                         }
                     }
@@ -442,11 +1003,11 @@ impl<'w> Compiler<'w> {
         let mut out: Vec<Option<Filt>> = (0..preds.len()).map(|_| None).collect();
         loop {
             let mut progress = false;
-            for (i, p) in preds.iter().enumerate() {
+            for (i, &(scope, p)) in preds.iter().enumerate() {
                 if done[i] {
                     continue;
                 }
-                if let Some(f) = self.predicate(p)? {
+                if let Some(f) = self.predicate(p, scope)? {
                     out[i] = Some(f);
                     done[i] = true;
                     progress = true;
@@ -457,7 +1018,7 @@ impl<'w> Compiler<'w> {
             }
         }
         if let Some(i) = done.iter().position(|d| !d) {
-            let p = preds[i];
+            let p = preds[i].1;
             let span = [&p.left, &p.right]
                 .into_iter()
                 .find_map(|it| match it {
@@ -470,33 +1031,57 @@ impl<'w> Compiler<'w> {
                 "can't tell the type of a parameter that is only compared with another parameter",
             ));
         }
-        Ok(out.into_iter().flatten().collect())
+        // Every predicate is resolved; hand them back in collection order.
+        let mut filts = out.into_iter().flatten();
+        let mut apps = apps.into_iter();
+        Ok(bodies
+            .into_iter()
+            .map(|b| planned_body(b, &mut filts, &mut apps))
+            .collect())
     }
 
     /// One predicate, or `None` if both operands are still untyped params.
-    fn predicate(&mut self, p: &Pred) -> Result<Option<Filt>, DatalogError> {
-        let lt = self.operand_type(&p.left)?;
-        let rt = self.operand_type(&p.right)?;
+    /// Variables and params are typed first: `:assert` / `:retract`
+    /// compared with an op is an op constant, not a handle.
+    fn predicate(&mut self, p: &Pred, scope: &Scope) -> Result<Option<Filt>, DatalogError> {
+        let lv = self.var_type(&p.left, scope);
+        let rv = self.var_type(&p.right, scope);
+        let lt = match lv {
+            Some(t) => Some(t),
+            None => self.const_type(&p.left, rv)?,
+        };
+        let rt = match rv {
+            Some(t) => Some(t),
+            None => self.const_type(&p.right, lv)?,
+        };
+        const F64: Ty = Ty::Val(ValueType::F64);
+        const I64: Ty = Ty::Val(ValueType::I64);
         let ty = match (lt, rt) {
             (None, None) => return Ok(None),
             (Some(t), None) | (None, Some(t)) => t,
             (Some(l), Some(r)) if l == r => l,
             // An integer literal compares with an f64 as a float.
-            (Some(ValueType::F64), Some(ValueType::I64)) if matches!(p.right, Item::Int(..)) => {
-                ValueType::F64
-            }
-            (Some(ValueType::I64), Some(ValueType::F64)) if matches!(p.left, Item::Int(..)) => {
-                ValueType::F64
-            }
+            (Some(F64), Some(I64)) if matches!(p.right, Item::Int(..)) => F64,
+            (Some(I64), Some(F64)) if matches!(p.left, Item::Int(..)) => F64,
             (Some(l), Some(r)) => {
                 return Err(mismatch(
                     p.span,
-                    format!("can't compare {} with {}", type_name(l), type_name(r)),
+                    format!("can't compare {} with {}", ty_name(l), ty_name(r)),
                 ));
             }
         };
-        let left = self.operand(&p.left, ty)?;
-        let right = self.operand(&p.right, ty)?;
+        if ty == Ty::Intervals && !matches!(p.op, CmpOp::Eq | CmpOp::Ne) {
+            return Err(mismatch(
+                p.span,
+                format!(
+                    "interval sets have no order; `{}` can't compare them (use = or !=, or \
+                     the interval-set functions)",
+                    p.op.symbol()
+                ),
+            ));
+        }
+        let left = self.operand(&p.left, ty, scope)?;
+        let right = self.operand(&p.right, ty, scope)?;
         let mut vars = Vec::new();
         for t in [&left, &right] {
             if let Term::Var(v) = t {
@@ -513,36 +1098,184 @@ impl<'w> Compiler<'w> {
         }))
     }
 
-    /// The type of an operand, if known yet.
-    fn operand_type(&self, item: &Item) -> Result<Option<ValueType>, DatalogError> {
+    /// The type of a variable or param operand, if known yet (`None` for a
+    /// constant too).
+    fn var_type(&self, item: &Item, scope: &Scope) -> Option<Ty> {
+        match item {
+            Item::Var(s) if self.is_param(scope, &s.name) => {
+                self.types.get(&s.name).copied().map(Ty::Val)
+            }
+            Item::Var(s) => scope.types.get(&s.name).copied(),
+            _ => None,
+        }
+    }
+
+    /// The type of a constant operand compared with an operand of type
+    /// `other` (`None` for a variable or param).
+    fn const_type(&self, item: &Item, other: Option<Ty>) -> Result<Option<Ty>, DatalogError> {
         Ok(match item {
-            Item::Var(s) => self.types.get(&s.name).copied(),
-            Item::Any(_) => None,
-            other => Some(self.constant(other)?.0.value_type()),
+            Item::Var(_) | Item::Any(_) => None,
+            _ if other == Some(Ty::Op) && op_constant(item).is_some() => Some(Ty::Op),
+            other => Some(Ty::Val(self.constant(other)?.0.value_type())),
         })
     }
 
     /// An operand as a term of type `ty` (already checked compatible).
-    fn operand(&mut self, item: &Item, ty: ValueType) -> Result<Term, DatalogError> {
+    fn operand(&mut self, item: &Item, ty: Ty, scope: &Scope) -> Result<Term, DatalogError> {
         Ok(match item {
-            Item::Var(s) if self.params.contains_key(&s.name) => {
-                let kind = match ty {
-                    ValueType::Ref => ParamKind::Entity,
-                    t => ParamKind::Value(t),
-                };
-                self.use_param(s, ty, kind)?;
-                Term::Param(s.name.clone())
-            }
-            Item::Var(s) => Term::Var(Var(s.name.clone())),
+            Item::Var(s) if self.is_param(scope, &s.name) => match ty {
+                Ty::Val(ty) => {
+                    self.use_param(s, ty, param_kind(ty))?;
+                    Term::Param(s.name.clone())
+                }
+                t => return Err(param_not_a_value(s, t)),
+            },
+            Item::Var(s) => Term::Var(scope.var(&s.name)),
             Item::Any(span) => {
                 unreachable!("invariant: `_` operands were rejected before typing ({span:?})")
             }
+            other if ty == Ty::Op => match op_constant(other) {
+                Some(o) => Term::Op(o),
+                None => unreachable!("invariant: an op-typed constant is :assert or :retract"),
+            },
             other => match (ty, self.constant(other)?.0) {
-                (ValueType::F64, Value::I64(n)) => Term::Const(int_as_f64(n, other.span())?),
+                (Ty::Val(ValueType::F64), Value::I64(n)) => {
+                    Term::Const(int_as_f64(n, other.span())?)
+                }
                 (_, v) => Term::Const(v),
             },
         })
     }
+
+    /// `(during [e a v] ?s)`: the pattern resolved as for a read (it reads
+    /// every tick, at the query's canon), with `?s` an interval set.
+    fn during(&mut self, d: &During, scope: &mut Scope) -> Result<Pat, DatalogError> {
+        // The parser refuses both; an AST built by hand may not.
+        if d.pattern.history.is_some() || d.pattern.a.name == "handle" {
+            return Err(DatalogError::new(
+                ErrorKind::Syntax,
+                Some(d.pattern.span),
+                "`during` takes a 3-element pattern over a schema attribute",
+            ));
+        }
+        let mut pat = self.pattern(&d.pattern, TickSource::Default, None, scope)?;
+        pat.during = Some(self.interval_out(&d.out, scope)?);
+        Ok(pat)
+    }
+
+    /// The output variable of `during` or a set function: bound here, an
+    /// interval set (a constraint if something else binds it too).
+    fn interval_out(&mut self, out: &Sym, scope: &mut Scope) -> Result<Var, DatalogError> {
+        if self.is_param(scope, &out.name) {
+            return Err(param_not_a_value(out, Ty::Intervals));
+        }
+        unify_var(scope, &out.name, Ty::Intervals, out.span)?;
+        scope.bound.insert(out.name.clone());
+        Ok(scope.var(&out.name))
+    }
+
+    /// An interval-set function clause, once every scope is typed: each
+    /// argument must be bound and an interval set (`contains`'s tick an
+    /// i64 variable, integer or param).
+    fn func(&mut self, f: &FnClause, scope: &Scope) -> Result<App, DatalogError> {
+        let name = f.func.name();
+        let mut args = Vec::with_capacity(f.args.len());
+        let mut vars = Vec::new();
+        for (i, a) in f.args.iter().enumerate() {
+            let tick = f.func == Func::Contains && i == 1;
+            let want = if tick {
+                Ty::Val(ValueType::I64)
+            } else {
+                Ty::Intervals
+            };
+            args.push(match a {
+                Item::Any(span) => {
+                    return Err(DatalogError::new(
+                        ErrorKind::Syntax,
+                        Some(*span),
+                        format!("`_` can't be an argument of `{name}`"),
+                    ));
+                }
+                Item::Var(s) if self.is_param(scope, &s.name) => {
+                    if !tick {
+                        return Err(param_not_a_value(s, want));
+                    }
+                    self.use_param(s, ValueType::I64, ParamKind::Tick)?;
+                    Term::Param(s.name.clone())
+                }
+                Item::Var(s) => {
+                    if !scope.bound.contains(&s.name) {
+                        return Err(unbound(
+                            s.span,
+                            format!(
+                                "?{} is not bound by any pattern, rule call or function",
+                                show(&s.name)
+                            ),
+                        ));
+                    }
+                    if let Some(&t) = scope.types.get(&s.name)
+                        && t != want
+                    {
+                        return Err(mismatch(
+                            s.span,
+                            format!(
+                                "argument {} of `{name}` needs {}, but ?{} is {}",
+                                i + 1,
+                                ty_name(want),
+                                show(&s.name),
+                                ty_name(t)
+                            ),
+                        ));
+                    }
+                    let v = scope.var(&s.name);
+                    vars.push(v.0.clone());
+                    Term::Var(v)
+                }
+                Item::Int(n, _) if tick => Term::Const(Value::I64(*n)),
+                other => {
+                    return Err(mismatch(
+                        other.span(),
+                        format!(
+                            "argument {} of `{name}` needs {}, not a constant of another type",
+                            i + 1,
+                            if tick {
+                                "an i64 tick"
+                            } else {
+                                "an interval set (a variable bound by `during` or a set function)"
+                            }
+                        ),
+                    ));
+                }
+            });
+        }
+        Ok(App {
+            func: f.func,
+            args,
+            out: f.out.as_ref().map(|o| scope.var(&o.name)),
+            vars,
+            span: f.span,
+        })
+    }
+}
+
+/// `[?p :handle :varrow]`: a handle keyword where `:handle` needs the
+/// handle's text. The keyword already is the entity, so say both ways to
+/// write what was probably meant (the handle and variable echoed safely).
+fn handle_keyword(entity: &Item, handle: &str, span: Span) -> DatalogError {
+    let e = match entity {
+        Item::Var(s) => format!("?{}", show(&s.name)),
+        _ => "?e".to_owned(),
+    };
+    let h = show(handle);
+    mismatch(
+        span,
+        format!(
+            "the value position of `:handle` needs a string, not the entity `:{h}`; \
+             a handle keyword already is its entity, so use it directly \
+             (as in `[?c :located_in :varrow]`), or match the handle's text: \
+             `[{e} :handle \"{h}\"]`"
+        ),
+    )
 }
 
 fn float(f: f64, span: Span) -> Result<Value, DatalogError> {
@@ -552,4 +1285,453 @@ fn float(f: f64, span: Span) -> Result<Value, DatalogError> {
 fn int_as_f64(n: i64, span: Span) -> Result<Value, DatalogError> {
     // Large integers round to the nearest float, as an f64 literal would.
     float(n as f64, span)
+}
+
+/// The parameter kind a use at a position of type `ty` gives.
+fn param_kind(ty: ValueType) -> ParamKind {
+    match ty {
+        ValueType::Ref => ParamKind::Entity,
+        t => ParamKind::Value(t),
+    }
+}
+
+/// Records in `types` that param `name` has type `ty` here.
+fn unify_in(
+    types: &mut HashMap<String, ValueType>,
+    name: &str,
+    ty: ValueType,
+    span: Span,
+) -> Result<(), DatalogError> {
+    match types.get(name) {
+        Some(&t) if t != ty => Err(mismatch(
+            span,
+            format!(
+                "?{} is used as {} here but as {} elsewhere",
+                show(name),
+                type_name(ty),
+                type_name(t)
+            ),
+        )),
+        Some(_) => Ok(()),
+        None => {
+            types.insert(name.to_owned(), ty);
+            Ok(())
+        }
+    }
+}
+
+/// Records that variable `name` of `scope` has type `ty` here.
+fn unify_var(scope: &mut Scope, name: &str, ty: Ty, span: Span) -> Result<(), DatalogError> {
+    match scope.types.get(name) {
+        Some(&t) if t != ty => Err(mismatch(
+            span,
+            format!(
+                "?{} is used as {} here but as {} elsewhere",
+                show(name),
+                ty_name(ty),
+                ty_name(t)
+            ),
+        )),
+        Some(_) => Ok(()),
+        None => {
+            scope.types.insert(name.to_owned(), ty);
+            Ok(())
+        }
+    }
+}
+
+/// `:assert` / `:retract` as an op constant (where the other side of a
+/// comparison, or a rule position, is an op), else `None`.
+fn op_constant(item: &Item) -> Option<kala_core::Op> {
+    match item {
+        Item::Keyword(k, _) if k == "assert" => Some(kala_core::Op::Assert),
+        Item::Keyword(k, _) if k == "retract" => Some(kala_core::Op::Retract),
+        _ => None,
+    }
+}
+
+/// Parameter `?s` used where only an op or an interval set can be: a
+/// parameter is always a value.
+fn param_not_a_value(s: &Sym, t: Ty) -> DatalogError {
+    mismatch(
+        s.span,
+        format!(
+            "?{} is a parameter, so it is a value; it can't be used as {}",
+            show(&s.name),
+            ty_name(t)
+        ),
+    )
+}
+
+/// Groups the definitions by name (in order of first definition) and checks
+/// that each name's definitions agree on the head length.
+fn group_rules(defs: &[Rule]) -> Result<(Vec<RuleInfo<'_>>, HashMap<&str, usize>), DatalogError> {
+    let mut rules: Vec<RuleInfo<'_>> = Vec::new();
+    let mut by_name: HashMap<&str, usize> = HashMap::new();
+    for d in defs {
+        match by_name.get(d.name.as_str()) {
+            Some(&i) => {
+                let r = &mut rules[i];
+                if r.arity != d.head.len() {
+                    return Err(DatalogError::new(
+                        ErrorKind::Arity,
+                        Some(d.name_span),
+                        format!(
+                            "rule `{}` is defined with {} head variables here but {} before",
+                            show(&d.name),
+                            d.head.len(),
+                            r.arity
+                        ),
+                    ));
+                }
+                r.defs.push(d);
+            }
+            None => {
+                by_name.insert(d.name.as_str(), rules.len());
+                rules.push(RuleInfo {
+                    defs: vec![d],
+                    arity: d.head.len(),
+                    types: vec![None; d.head.len()],
+                    callees: BTreeSet::new(),
+                });
+            }
+        }
+    }
+    Ok((rules, by_name))
+}
+
+/// The rule `c` calls, checking it exists and takes that many arguments.
+fn resolve_call(
+    c: &Call,
+    rules: &[RuleInfo<'_>],
+    by_name: &HashMap<&str, usize>,
+) -> Result<usize, DatalogError> {
+    let Some(&i) = by_name.get(c.name.as_str()) else {
+        return Err(DatalogError::new(
+            ErrorKind::UnknownRule,
+            Some(c.name_span),
+            format!("no rule named `{}` in `:rules`", show(&c.name)),
+        ));
+    };
+    let arity = rules[i].arity;
+    if c.args.len() != arity {
+        return Err(DatalogError::new(
+            ErrorKind::Arity,
+            Some(c.span),
+            format!(
+                "rule `{}` takes {arity} argument{}, not {}",
+                show(&c.name),
+                if arity == 1 { "" } else { "s" },
+                c.args.len()
+            ),
+        ));
+    }
+    Ok(i)
+}
+
+/// A strongly connected component of the rule call graph: rules that call
+/// each other, directly or through other rules, evaluated together as one
+/// `Fixpoint`.
+///
+/// This is where stratification belongs: negation (slice 7 item 4) must
+/// not reach a rule of its own component through a negated call.
+struct Component {
+    /// Its rules (indices into the rule list), in order of first definition.
+    rules: Vec<usize>,
+    /// Whether it is recursive: more than one rule, or a rule calling itself.
+    recursive: bool,
+}
+
+/// The call graph's components in dependency order (every component after
+/// the components it calls; otherwise in order of first definition), every
+/// rule in exactly one. A cycle, even among rules `:where` never calls, is
+/// recursion: its rules share a component.
+fn components(rules: &[RuleInfo<'_>]) -> Vec<Component> {
+    let n = rules.len();
+    // At most 64 rules: a reachability matrix and quadratic walks are cheap.
+    let reach: Vec<BTreeSet<usize>> = (0..n)
+        .map(|i| reachable(rules, &rules[i].callees))
+        .collect();
+    let mut comp_of = vec![usize::MAX; n];
+    let mut comps: Vec<Component> = Vec::new();
+    for i in 0..n {
+        if comp_of[i] != usize::MAX {
+            continue;
+        }
+        let members: Vec<usize> = (i..n)
+            .filter(|&j| j == i || (reach[i].contains(&j) && reach[j].contains(&i)))
+            .collect();
+        for &j in &members {
+            comp_of[j] = comps.len();
+        }
+        comps.push(Component {
+            recursive: reach[i].contains(&i),
+            rules: members,
+        });
+    }
+    let mut done = vec![false; comps.len()];
+    let mut order = Vec::with_capacity(comps.len());
+    while order.len() < comps.len() {
+        let next = (0..comps.len())
+            .find(|&c| {
+                !done[c]
+                    && comps[c].rules.iter().all(|&r| {
+                        rules[r]
+                            .callees
+                            .iter()
+                            .all(|&k| comp_of[k] == c || done[comp_of[k]])
+                    })
+            })
+            .expect("invariant: the component graph is acyclic");
+        done[next] = true;
+        order.push(next);
+    }
+    let mut slots: Vec<Option<Component>> = comps.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .map(|c| {
+            slots[c]
+                .take()
+                .expect("invariant: each component is ordered once")
+        })
+        .collect()
+}
+
+/// The rules reachable from `roots` through calls.
+fn reachable(rules: &[RuleInfo<'_>], roots: &BTreeSet<usize>) -> BTreeSet<usize> {
+    let mut seen = BTreeSet::new();
+    let mut todo: Vec<usize> = roots.iter().copied().collect();
+    while let Some(i) = todo.pop() {
+        if seen.insert(i) {
+            todo.extend(rules[i].callees.iter().copied());
+        }
+    }
+    seen
+}
+
+/// Appends `b`'s predicates and function clauses with their scope, then
+/// its negations' (depth first): the order [`planned_body`] hands them
+/// back in.
+fn collect_preds<'a, 'q>(
+    scope: &'a Scope,
+    b: &'a BodyC<'q>,
+    out: &mut Vec<(&'a Scope, &'q Pred)>,
+    fns: &mut Vec<(&'a Scope, &'q FnClause)>,
+) {
+    out.extend(b.preds.iter().map(|p| (scope, *p)));
+    fns.extend(b.fns.iter().map(|f| (scope, *f)));
+    for n in &b.nots {
+        collect_preds(&n.scope, &n.body, out, fns);
+    }
+}
+
+/// `b` for the planner, taking its filters and function applications (and
+/// its negations') from `filts` and `apps` in [`collect_preds`] order.
+fn planned_body(
+    b: BodyC<'_>,
+    filts: &mut impl Iterator<Item = Filt>,
+    apps: &mut impl Iterator<Item = App>,
+) -> plan::Body {
+    let own = filts.by_ref().take(b.preds.len()).collect();
+    let own_apps = apps.by_ref().take(b.fns.len()).collect();
+    let nots = b
+        .nots
+        .into_iter()
+        .map(|n| plan::Neg {
+            body: planned_body(n.body, filts, apps),
+            uses: n.uses,
+        })
+        .collect();
+    plan::Body {
+        pats: b.pats,
+        calls: b.calls,
+        filts: own,
+        apps: own_apps,
+        nots,
+    }
+}
+
+/// Every rule call of a body, those inside its negations (at any depth)
+/// included.
+fn all_calls<'q>(calls: &'q [Call], nots: &'q [Not]) -> Vec<&'q Call> {
+    let mut out: Vec<&Call> = calls.iter().collect();
+    let mut todo: Vec<&Not> = nots.iter().collect();
+    while let Some(n) = todo.pop() {
+        out.extend(&n.calls);
+        todo.extend(&n.nots);
+    }
+    out
+}
+
+/// Stratification: a rule's `not` may only reach rules of lower strata. A
+/// call inside a `not` (at any depth) of a rule in the same component as
+/// the rule would make the rule depend negatively on itself. Checked per
+/// definition, in text order.
+fn stratify(
+    defs: &[Rule],
+    by_name: &HashMap<&str, usize>,
+    comps: &[Component],
+) -> Result<(), DatalogError> {
+    let mut comp_of: HashMap<usize, usize> = HashMap::new();
+    for (ci, c) in comps.iter().enumerate() {
+        for &r in &c.rules {
+            comp_of.insert(r, ci);
+        }
+    }
+    for d in defs {
+        let me = comp_of[&by_name[d.name.as_str()]];
+        let negated = all_calls(&[], &d.nots);
+        if let Some(c) = negated
+            .into_iter()
+            .find(|c| comp_of[&by_name[c.name.as_str()]] == me)
+        {
+            return Err(DatalogError::new(
+                ErrorKind::Stratification,
+                Some(c.span),
+                format!(
+                    "rule `{}` negates `{}`, which depends on `{}` itself: negation through \
+                     recursion can't be stratified",
+                    show(&d.name),
+                    show(&c.name),
+                    show(&d.name)
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The variable renames of definition number `k` (0-based) of its rule,
+/// whose plan columns are named `canon` (the first definition's head).
+/// Head variable `i` becomes `canon[i]`; a body variable that happens to be
+/// named like a column it isn't gets a name no query can write (`?a'1`:
+/// `'` is not a name character), so it can't be confused with the column.
+fn renames(def: &Rule, canon: &[String], k: usize) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    if k == 0 {
+        return out;
+    }
+    for (h, c) in def.head.iter().zip(canon) {
+        out.insert(h.name.clone(), c.clone());
+    }
+    let mut vars: Vec<&str> = Vec::new();
+    body_vars(Clauses::of_rule(def), &mut vars);
+    for v in vars {
+        if !out.contains_key(v) && canon.iter().any(|c| c == v) {
+            out.insert(v.to_owned(), format!("{v}'{k}"));
+        }
+    }
+    out
+}
+
+/// One body's clauses as parsed (`:where`, a rule definition's or a
+/// `not`'s), by kind.
+#[derive(Clone, Copy)]
+struct Clauses<'q> {
+    clauses: &'q [Clause],
+    calls: &'q [Call],
+    nots: &'q [Not],
+    durings: &'q [During],
+    fns: &'q [FnClause],
+}
+
+impl<'q> Clauses<'q> {
+    fn of_query(q: &'q Query) -> Clauses<'q> {
+        Clauses {
+            clauses: &q.clauses,
+            calls: &q.calls,
+            nots: &q.nots,
+            durings: &q.durings,
+            fns: &q.fns,
+        }
+    }
+
+    fn of_rule(r: &'q Rule) -> Clauses<'q> {
+        Clauses {
+            clauses: &r.clauses,
+            calls: &r.calls,
+            nots: &r.nots,
+            durings: &r.durings,
+            fns: &r.fns,
+        }
+    }
+
+    fn of_not(n: &'q Not) -> Clauses<'q> {
+        Clauses {
+            clauses: &n.clauses,
+            calls: &n.calls,
+            nots: &n.nots,
+            durings: &n.durings,
+            fns: &n.fns,
+        }
+    }
+}
+
+/// Every variable a body mentions (patterns, `(at ?t ..)` ticks,
+/// predicates, `during` reads, function clauses, call arguments, and its
+/// negations at any depth), with repeats, parameters included.
+fn body_vars<'q>(c: Clauses<'q>, out: &mut Vec<&'q str>) {
+    let mut todo: Vec<Clauses<'q>> = vec![c];
+    while let Some(c) = todo.pop() {
+        for d in c.durings {
+            pattern_vars(&d.pattern, out);
+            out.push(&d.out.name);
+        }
+        for f in c.fns {
+            for it in &f.args {
+                if let Item::Var(s) = it {
+                    out.push(&s.name);
+                }
+            }
+            if let Some(o) = &f.out {
+                out.push(&o.name);
+            }
+        }
+        for clause in c.clauses {
+            match clause {
+                Clause::Pattern(p) => pattern_vars(p, out),
+                Clause::At { tick, patterns, .. } => {
+                    if let TickExpr::Var(s) = tick {
+                        out.push(&s.name);
+                    }
+                    for p in patterns {
+                        pattern_vars(p, out);
+                    }
+                }
+                Clause::Pred(p) => {
+                    for it in [&p.left, &p.right] {
+                        if let Item::Var(s) = it {
+                            out.push(&s.name);
+                        }
+                    }
+                }
+            }
+        }
+        for call in c.calls {
+            for a in &call.args {
+                if let Item::Var(s) = a {
+                    out.push(&s.name);
+                }
+            }
+        }
+        for n in c.nots {
+            todo.push(Clauses::of_not(n));
+        }
+    }
+}
+
+fn pattern_vars<'p>(p: &'p Pattern, out: &mut Vec<&'p str>) {
+    let tick = p.history.as_ref().map(|h| &h.tick);
+    for it in [Some(&p.e), Some(&p.v), tick].into_iter().flatten() {
+        if let Item::Var(s) = it {
+            out.push(&s.name);
+        }
+    }
+    if let Some(HistoryPos {
+        op: Some(OpItem::Var(s)),
+        ..
+    }) = &p.history
+    {
+        out.push(&s.name);
+    }
 }

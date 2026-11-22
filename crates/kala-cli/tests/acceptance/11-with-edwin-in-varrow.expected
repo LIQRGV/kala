@@ -1,0 +1,7 @@
+query at tick 700, canon tx#12: 5 rows
+  ?c  ?both
+  tomas  {[-300, -250)}
+  hild  {[-270, -250)}
+  osric  {[-300, -250)}
+  v01  {[-300, -250)}
+  v15  {[-300, -250)}

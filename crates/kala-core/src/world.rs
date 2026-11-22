@@ -44,11 +44,13 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 #[cfg(feature = "test-hooks")]
 use crate::doctor::{IndexName, Tamper};
 use crate::error::Error;
 use crate::id::{AttrId, EdgeId, EntityId, IdError, MAX_NODE_TYPE, NodeTypeId};
+use crate::interval::IntervalSet;
 use crate::key::{self, ValueRef};
 use crate::log::{
     self, EncodedTxn, EntryBody, EntryId, LogEntry, LogWriter, NewEntry, SurveyedTxn,
@@ -1215,7 +1217,7 @@ impl World {
                     )));
                 }
                 for end in [source, target] {
-                    if !self.is_defined(&StagedIds::default(), *end) {
+                    if !self.is_defined_staged(&StagedIds::default(), *end) {
                         return Err(ReplayFault::DanglingId(*end));
                     }
                 }
@@ -1298,7 +1300,7 @@ impl World {
                 // that holds at its tick, or a retract of one that doesn't.
                 // Judged like a live write, against everything before it
                 // (the current transaction's earlier facts are already in).
-                let held = holds(&[&self.e_index], &mut prefix, fact.tick, all);
+                let held = holds(&[&self.e_index], &mut prefix, fact.tick, all, Work::NONE);
                 if held == (fact.op == Op::Assert) {
                     return Err(corrupt(&format!(
                         "a no-op {:?} at {:?} (the value {} held there)",
@@ -2186,7 +2188,7 @@ impl World {
         }
         let mut value = v.encode()?;
         if let Value::Ref(target) = v
-            && !self.is_defined(staged, *target)
+            && !self.is_defined_staged(staged, *target)
         {
             return Err(Error::UnknownEntity(*target));
         }
@@ -2309,7 +2311,7 @@ impl World {
             .attr_by_name
             .get(attr)
             .ok_or_else(|| Error::UnknownAttribute(attr.to_owned()))?;
-        if !self.is_defined(staged, entity) {
+        if !self.is_defined_staged(staged, entity) {
             return Err(Error::UnknownEntity(entity));
         }
         Ok((attr_id, &self.attributes[attr_id.0 as usize]))
@@ -2330,6 +2332,7 @@ impl World {
             world: self,
             canon,
             latest: canon == self.latest_tx,
+            work: Work::NONE,
         }
     }
 
@@ -2344,6 +2347,7 @@ impl World {
             world: self,
             canon: tx.min(self.latest_tx),
             latest: false,
+            work: Work::NONE,
         }
     }
 
@@ -2434,6 +2438,24 @@ impl World {
         self.at_canon(self.latest_tx).history(entity, attr)
     }
 
+    /// The change points of `attr` across every entity and edge (latest
+    /// canon). Same as [`View::history_scan`] on `at_canon(latest_tx())`.
+    pub fn history_scan(&self, attr: &str) -> Result<Vec<(EntityId, Change)>, Error> {
+        self.at_canon(self.latest_tx).history_scan(attr)
+    }
+
+    /// The ticks where `entity.attr` holds `value` (latest canon).
+    /// Same as [`View::holds_during`] on `at_canon(latest_tx())`.
+    pub fn holds_during(
+        &self,
+        entity: EntityId,
+        attr: &str,
+        value: &Value,
+    ) -> Result<IntervalSet, Error> {
+        self.at_canon(self.latest_tx)
+            .holds_during(entity, attr, value)
+    }
+
     /// Every cardinality overlap of `attr` (latest canon).
     /// Same as [`View::overlaps`] on `at_canon(latest_tx())`.
     pub fn overlaps(&self, attr: &str) -> Result<Vec<Overlap>, Error> {
@@ -2486,9 +2508,17 @@ impl World {
         }
     }
 
+    /// Whether the entity or edge `id` is defined at the latest canon (its
+    /// `DEFINE` is committed). Same as [`View::is_defined`] on
+    /// `at_canon(latest_tx())`. Constant time: sequences are assigned without
+    /// gaps, so no walk over the type's entities is needed.
+    pub fn is_defined(&self, id: EntityId) -> bool {
+        self.is_defined_staged(&StagedIds::default(), id)
+    }
+
     /// Whether `id` names an entity or edge defined in this world or staged
     /// in `staged` by the transaction asking.
-    fn is_defined(&self, staged: &StagedIds, id: EntityId) -> bool {
+    fn is_defined_staged(&self, staged: &StagedIds, id: EntityId) -> bool {
         // Sequences are assigned without gaps, so sequences 1..=last of a
         // declared node type, or of the edges, are exactly the defined IDs.
         if id.is_edge() {
@@ -3680,12 +3710,78 @@ pub struct View<'w> {
     /// Read the latest-revision indexes (`canon` is the latest tx) instead
     /// of the main ones with the canon skip.
     latest: bool,
+    /// Where reads count the index keys they examine ([`View::metered`]).
+    work: Work<'w>,
+}
+
+/// A counter of index work, for callers that budget reads (a query
+/// executor's step budget): a [`View::metered`] view adds one per index key
+/// its reads examine, i.e. every key a seek lands on or steps over and
+/// every key a scan walks, the key that ends a prefix walk included.
+///
+/// The count is deterministic: it depends only on the indexes and the
+/// reads, never on timing. Shared by reference, so a `View` stays `Copy`;
+/// atomic, so a metered view stays `Send` and `Sync`.
+#[derive(Debug, Default)]
+pub struct WorkMeter {
+    keys: AtomicU64,
+}
+
+impl WorkMeter {
+    /// A meter at zero.
+    pub fn new() -> WorkMeter {
+        WorkMeter::default()
+    }
+
+    /// The index keys examined since the meter was made or last taken.
+    pub fn keys(&self) -> u64 {
+        self.keys.load(AtomicOrdering::Relaxed)
+    }
+
+    /// The index keys examined since the meter was made or last taken, and
+    /// resets it to zero.
+    pub fn take(&self) -> u64 {
+        self.keys.swap(0, AtomicOrdering::Relaxed)
+    }
+}
+
+/// The meter a read charges, if any (unmetered views and the write path
+/// charge nothing).
+#[derive(Clone, Copy, Debug, Default)]
+struct Work<'a>(Option<&'a WorkMeter>);
+
+impl Work<'_> {
+    /// Not metered.
+    const NONE: Work<'static> = Work(None);
+
+    /// Charges `keys` examined index keys.
+    #[inline]
+    fn add(self, keys: u64) {
+        if let Some(m) = self.0 {
+            m.keys.fetch_add(keys, AtomicOrdering::Relaxed);
+        }
+    }
 }
 
 impl<'w> View<'w> {
     /// The world this view reads.
     pub fn world(&self) -> &'w World {
         self.world
+    }
+
+    /// This view (same world, canon and indexes), with every read adding
+    /// the index keys it examines to `meter` (see [`WorkMeter`]). Answers
+    /// are unchanged. Metering an already metered view replaces its meter.
+    pub fn metered<'m>(&self, meter: &'m WorkMeter) -> View<'m>
+    where
+        'w: 'm,
+    {
+        View {
+            world: self.world,
+            canon: self.canon,
+            latest: self.latest,
+            work: Work(Some(meter)),
+        }
     }
 
     /// Every entity of node type `node_type` defined in this canon (its
@@ -3725,7 +3821,13 @@ impl View<'_> {
     }
 
     /// Whether the entity or edge `id` was defined at this view's canon (its
-    /// `DEFINE` is in a transaction `<=` the canon).
+    /// `DEFINE` is in a transaction `<=` the canon). False for an ID the
+    /// world never defined. Constant time (one lookup in the ID tables).
+    pub fn is_defined(&self, id: EntityId) -> bool {
+        self.id_visible(id)
+    }
+
+    /// [`View::is_defined`].
     fn id_visible(&self, id: EntityId) -> bool {
         if let Some(edge) = id.as_edge() {
             return self.edge_visible(edge);
@@ -3801,6 +3903,8 @@ impl View<'_> {
         // The key (history and tick) whose current entry at the canon was
         // already found: its older entries are skipped.
         let mut done: Option<&[u8]> = None;
+        // Every stored entry is examined.
+        self.work.add(self.world.e_index.len() as u64);
         for (k, mark) in &self.world.e_index {
             let at_key = key::without_tx(k);
             if done == Some(at_key) {
@@ -3865,9 +3969,15 @@ impl View<'_> {
     /// key buffer; it is restored before returning.
     fn holds_e(&self, value_prefix: &mut Vec<u8>, t: Tick) -> bool {
         if self.latest {
-            holds_latest(&self.world.e_latest, value_prefix, t)
+            holds_latest(&self.world.e_latest, value_prefix, t, self.work)
         } else {
-            holds(&[&self.world.e_index], value_prefix, t, self.canon)
+            holds(
+                &[&self.world.e_index],
+                value_prefix,
+                t,
+                self.canon,
+                self.work,
+            )
         }
     }
 
@@ -4042,9 +4152,21 @@ impl View<'_> {
                 out.push((bytes, change));
             };
             if self.latest {
-                for_each_history(&world.r_latest, &prefix, source_end, &mut on_history);
+                for_each_history(
+                    &world.r_latest,
+                    &prefix,
+                    source_end,
+                    self.work,
+                    &mut on_history,
+                );
             } else {
-                for_each_history(&world.r_index, &prefix, source_end, &mut on_history);
+                for_each_history(
+                    &world.r_index,
+                    &prefix,
+                    source_end,
+                    self.work,
+                    &mut on_history,
+                );
             }
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -4065,11 +4187,17 @@ impl View<'_> {
         t: Tick,
     ) -> Option<(&'i [u8], Op)> {
         if self.latest {
-            return latest_seek(latest, value_prefix, t);
+            return latest_seek(latest, value_prefix, t, self.work);
         }
         let len = value_prefix.len();
         key::push_seek_tick(value_prefix, t);
-        let found = seek_entry(&[main], value_prefix, &value_prefix[..len], self.canon);
+        let found = seek_entry(
+            &[main],
+            value_prefix,
+            &value_prefix[..len],
+            self.canon,
+            self.work,
+        );
         value_prefix.truncate(len);
         found
     }
@@ -4110,7 +4238,7 @@ impl View<'_> {
         let mut out = Vec::new();
         match v {
             Value::Ref(x) => {
-                if !world.is_defined(&StagedIds::default(), *x) {
+                if !world.is_defined_staged(&StagedIds::default(), *x) {
                     return Ok(out);
                 }
                 let both = world.is_bidirectional(attr_id);
@@ -4217,12 +4345,13 @@ impl View<'_> {
             f(key::v_prefix_entity(p)
                 .expect("invariant: a value index history prefix ends in its entity"))
         };
+        let work = self.work;
         if self.latest {
-            let holds_at = |p: &mut Vec<u8>| holds_latest(latest, p, t);
-            for_each_holding(latest, value_prefix, history_end, holds_at, f);
+            let holds_at = |p: &mut Vec<u8>| holds_latest(latest, p, t, work);
+            for_each_holding(latest, value_prefix, history_end, work, holds_at, f);
         } else {
-            let holds_at = |p: &mut Vec<u8>| holds(&[main], p, t, self.canon);
-            for_each_holding(main, value_prefix, history_end, holds_at, f);
+            let holds_at = |p: &mut Vec<u8>| holds(&[main], p, t, self.canon, work);
+            for_each_holding(main, value_prefix, history_end, work, holds_at, f);
         }
     }
 
@@ -4257,14 +4386,15 @@ impl View<'_> {
             let f =
                 |p: &[u8]| f(key::r_source(p).expect("invariant: R index keys are fixed-width"));
             let world = self.world;
+            let work = self.work;
             if self.latest {
                 let index = &world.r_latest;
-                let holds_at = |p: &mut Vec<u8>| holds_latest(index, p, t);
-                for_each_holding(index, &prefix, source_end, holds_at, f);
+                let holds_at = |p: &mut Vec<u8>| holds_latest(index, p, t, work);
+                for_each_holding(index, &prefix, source_end, work, holds_at, f);
             } else {
                 let index = &world.r_index;
-                let holds_at = |p: &mut Vec<u8>| holds(&[index], p, t, self.canon);
-                for_each_holding(index, &prefix, source_end, holds_at, f);
+                let holds_at = |p: &mut Vec<u8>| holds(&[index], p, t, self.canon, work);
+                for_each_holding(index, &prefix, source_end, work, holds_at, f);
             }
         }
     }
@@ -4303,7 +4433,7 @@ impl View<'_> {
                         .0
                         .len()
             };
-            for_each_history(&world.e_latest, &prefix, value_end, f);
+            for_each_history(&world.e_latest, &prefix, value_end, self.work, f);
         } else {
             let value_end = |k: &[u8]| {
                 key::E_ATTR_PREFIX_LEN
@@ -4311,7 +4441,7 @@ impl View<'_> {
                         .expect("invariant: E index keys are built only by key::e_fact_key")
                         .len()
             };
-            for_each_history(&world.e_index, &prefix, value_end, f);
+            for_each_history(&world.e_index, &prefix, value_end, self.work, f);
         }
     }
 
@@ -4321,7 +4451,7 @@ impl View<'_> {
     fn e_current<'v>(&'v self, attr_prefix: &'v [u8]) -> Vec<(Tick, &'v [u8], Op, Precision)> {
         let world = self.world;
         if self.latest {
-            under(&world.e_latest, attr_prefix)
+            under(&world.e_latest, attr_prefix, self.work)
                 .map(|(k, op)| {
                     let (value, tick) = key::latest_e_value_and_tick(k)
                         .expect("invariant: E_latest keys are E keys without their ^tx");
@@ -4329,7 +4459,7 @@ impl View<'_> {
                 })
                 .collect()
         } else {
-            current_entries(&world.e_index, attr_prefix, self.canon)
+            current_entries_metered(&world.e_index, attr_prefix, self.canon, self.work)
                 .map(|(k, op)| {
                     let (value, tick) = key::e_value_and_tick(k)
                         .expect("invariant: E index keys are built only by key::e_fact_key");
@@ -4384,7 +4514,7 @@ impl View<'_> {
         let world = self.world;
         let attr_prefix = key::r_attr_prefix(target, attr);
         if self.latest {
-            under(&world.r_latest, &attr_prefix)
+            under(&world.r_latest, &attr_prefix, self.work)
                 .map(|(k, op)| {
                     let (source, tick) = key::latest_r_source_and_tick(k)
                         .expect("invariant: R_latest keys are R keys without their ^tx");
@@ -4394,7 +4524,7 @@ impl View<'_> {
                 })
                 .collect()
         } else {
-            current_entries(&world.r_index, &attr_prefix, self.canon)
+            current_entries_metered(&world.r_index, &attr_prefix, self.canon, self.work)
                 .map(|(k, op)| {
                     let (_, _, source, tick, tx) =
                         key::decode_r_key(k).expect("invariant: R index keys are fixed-width");
@@ -4487,6 +4617,72 @@ impl View<'_> {
     pub fn history(&self, entity: EntityId, attr: &str) -> Result<Vec<Change>, Error> {
         let (attr_id, _) = self.resolve(entity, attr)?;
         Ok(self.changes(entity, attr_id))
+    }
+
+    /// The change points of `attr` across every entity and edge ID defined
+    /// at this canon: for each ID, ascending, exactly what
+    /// [`View::history`] returns for it, in the same order (by tick, then
+    /// value), as `(id, change)` rows. IDs with no history under `attr`,
+    /// and IDs defined after the canon, contribute nothing. Corrections and
+    /// precision are honoured as in [`View::history`] (same code, run per
+    /// ID).
+    ///
+    /// An inverse name (`child_of` for `parent_of`) reads the base
+    /// attribute through `R`: for each target, the changes of the pairs
+    /// pointing at it, with `Ref(source)` as value (as [`View::attr_scan`]
+    /// lists `(child, parent)`).
+    ///
+    /// Cost: one `E` (or `R`) prefix seek per defined ID (plus one `R` seek
+    /// for a bidirectional attribute), and a walk over each ID's own keys:
+    /// linear in the world's ID count even for a rare attribute, like
+    /// [`View::attr_scan`]. Fails with [`Error::UnknownAttribute`] for a
+    /// name that is neither an attribute nor an inverse name.
+    pub fn history_scan(&self, attr: &str) -> Result<Vec<(EntityId, Change)>, Error> {
+        let world = self.world;
+        let (attr_id, inverse) = match world.attr_by_name.get(attr) {
+            Some(&id) => (id, false),
+            None => (
+                *world
+                    .inverse_by_name
+                    .get(attr)
+                    .ok_or_else(|| Error::UnknownAttribute(attr.to_owned()))?,
+                true,
+            ),
+        };
+        let mut out = Vec::new();
+        for id in world.defined_ids().filter(|&id| self.id_visible(id)) {
+            let changes = if inverse {
+                self.reverse_changes(id, attr_id)
+            } else {
+                self.changes(id, attr_id)
+            };
+            out.extend(changes.into_iter().map(|c| (id, c)));
+        }
+        Ok(out)
+    }
+
+    /// The ticks where `entity.attr` holds `value` in this canon, as an
+    /// [`IntervalSet`]: [`IntervalSet::from_changes`] of the
+    /// [`View::history`] changes whose value is `value`. For a
+    /// bidirectional attribute the pair is read from either side.
+    ///
+    /// Cost: one [`View::history`] read. Fails with
+    /// [`Error::UnknownAttribute`] or [`Error::UnknownEntity`], as
+    /// [`View::history`] does.
+    pub fn holds_during(
+        &self,
+        entity: EntityId,
+        attr: &str,
+        value: &Value,
+    ) -> Result<IntervalSet, Error> {
+        let (attr_id, _) = self.resolve(entity, attr)?;
+        let points: Vec<(Tick, Op)> = self
+            .changes(entity, attr_id)
+            .into_iter()
+            .filter(|c| &c.value == value)
+            .map(|c| (c.tick, c.op))
+            .collect();
+        Ok(IntervalSet::from_changes(&points))
     }
 
     /// [`View::history`] of a resolved attribute.
@@ -4783,10 +4979,11 @@ fn for_each_holding<V>(
     index: &BTreeMap<Vec<u8>, V>,
     attr_prefix: &[u8],
     history_end: impl Fn(&[u8]) -> usize,
+    work: Work<'_>,
     mut holds_at: impl FnMut(&mut Vec<u8>) -> bool,
     mut f: impl FnMut(&[u8]),
 ) {
-    for_each_history(index, attr_prefix, history_end, |prefix| {
+    for_each_history(index, attr_prefix, history_end, work, |prefix| {
         if holds_at(prefix) {
             f(prefix);
         }
@@ -4796,10 +4993,12 @@ fn for_each_holding<V>(
 /// The walk of [`for_each_holding`] without the seek: calls `f` with the
 /// history prefix of every distinct history under `attr_prefix`, in key
 /// order (`f` may use it as a seek buffer, restoring it before returning).
+/// Charges `work` one key per round (the key that ends the walk included).
 fn for_each_history<V>(
     index: &BTreeMap<Vec<u8>, V>,
     attr_prefix: &[u8],
     history_end: impl Fn(&[u8]) -> usize,
+    work: Work<'_>,
     mut f: impl FnMut(&mut Vec<u8>),
 ) {
     let mut from = Bound::Included(attr_prefix.to_vec());
@@ -4808,6 +5007,7 @@ fn for_each_history<V>(
         .range::<[u8], _>((as_slice(&from), Bound::Unbounded))
         .next()
     {
+        work.add(1);
         if !k.starts_with(attr_prefix) {
             break;
         }
@@ -4829,13 +5029,15 @@ fn tick_after(k: &[u8], prefix_len: usize) -> Tick {
 }
 
 /// Every `(key, op)` of a latest-revision index under `prefix`, in key
-/// order.
+/// order. Charges `work` one per key examined.
 fn under<'i>(
     index: &'i LatestIndex,
     prefix: &'i [u8],
+    work: Work<'i>,
 ) -> impl Iterator<Item = (&'i [u8], &'i Op)> + 'i {
     index
         .range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded))
+        .inspect(move |_| work.add(1))
         .take_while(move |(k, _)| k.starts_with(prefix))
         .map(|(k, op)| (&k[..], op))
 }
@@ -4863,8 +5065,8 @@ fn set_latest(index: &mut LatestIndex, at_key: &[u8], mark: Mark) {
 /// keys aren't stored there and no entry is newer than the latest canon,
 /// so there is nothing to skip. Reuses `value_prefix` as the seek key
 /// buffer; it is restored before returning.
-fn holds_latest(index: &LatestIndex, value_prefix: &mut Vec<u8>, t: Tick) -> bool {
-    latest_seek(index, value_prefix, t).map(|(_, op)| op) == Some(Op::Assert)
+fn holds_latest(index: &LatestIndex, value_prefix: &mut Vec<u8>, t: Tick, work: Work<'_>) -> bool {
+    latest_seek(index, value_prefix, t, work).map(|(_, op)| op) == Some(Op::Assert)
 }
 
 /// The seek of [`holds_latest`]: the key and op of the current entry of the
@@ -4873,9 +5075,11 @@ fn latest_seek<'i>(
     index: &'i LatestIndex,
     value_prefix: &mut Vec<u8>,
     t: Tick,
+    work: Work<'_>,
 ) -> Option<(&'i [u8], Op)> {
     let len = value_prefix.len();
     key::push_seek_tick(value_prefix, t);
+    work.add(1);
     let found = index
         .range::<[u8], _>((Bound::Included(&value_prefix[..]), Bound::Unbounded))
         .next()
@@ -4885,19 +5089,32 @@ fn latest_seek<'i>(
     found
 }
 
-/// The current entry (newest tx `<= canon`) of every key under `prefix` in
-/// `index`, as `(full key, op)` in key order; keys whose current entry is a
-/// `DELETED` marker are left out. One pass over every entry under `prefix`:
-/// the entries of one key are adjacent, newest tx first, so the first
-/// visible one of each run is that key's current entry.
+/// [`current_entries_metered`], unmetered (white-box tests).
+#[cfg(test)]
 fn current_entries<'i>(
     index: &'i Index,
     prefix: &'i [u8],
     canon: TxId,
 ) -> impl Iterator<Item = (&'i [u8], Op)> + 'i {
+    current_entries_metered(index, prefix, canon, Work::NONE)
+}
+
+/// The current entry (newest tx `<= canon`) of every key under `prefix` in
+/// `index`, as `(full key, op)` in key order; keys whose current entry is a
+/// `DELETED` marker are left out. One pass over every entry under `prefix`:
+/// the entries of one key are adjacent, newest tx first, so the first
+/// visible one of each run is that key's current entry. Charges `work` one
+/// per entry examined (the one that ends the walk included).
+fn current_entries_metered<'i>(
+    index: &'i Index,
+    prefix: &'i [u8],
+    canon: TxId,
+    work: Work<'i>,
+) -> impl Iterator<Item = (&'i [u8], Op)> + 'i {
     let mut last_key: Option<&'i [u8]> = None;
     index
         .range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded))
+        .inspect(move |_| work.add(1))
         .take_while(move |(k, _)| k.starts_with(prefix))
         .filter(move |(k, _)| key::e_key_tx(k).is_some_and(|tx| tx <= canon))
         .filter(move |(k, _)| {
@@ -5066,7 +5283,7 @@ fn judge(
             tick: fact.tick,
         });
     }
-    let holds = holds(layers, &mut prefix, fact.tick, all);
+    let holds = holds(layers, &mut prefix, fact.tick, all, Work::NONE);
     let noop = match fact.op {
         Op::Assert => holds,
         Op::Retract => !holds,
@@ -5103,7 +5320,8 @@ fn op_at_tick(layers: &[&Index], value_prefix: &mut Vec<u8>, t: Tick, canon: TxI
     let len = value_prefix.len();
     key::push_seek_tick(value_prefix, t);
     // The prefix to match includes `^t`: only entries at exactly `t`.
-    let found = seek(layers, value_prefix, value_prefix, canon);
+    // Only the write path asks this: unmetered.
+    let found = seek(layers, value_prefix, value_prefix, canon, Work::NONE);
     value_prefix.truncate(len);
     found
 }
@@ -5112,10 +5330,16 @@ fn op_at_tick(layers: &[&Index], value_prefix: &mut Vec<u8>, t: Tick, canon: TxI
 /// tick `<= t` under `value_prefix` (`E|e|a|v|`) is an assert, ticks whose
 /// current entry is a `DELETED` marker skipped. Reuses `value_prefix` as
 /// the seek key buffer; it is restored before returning.
-fn holds(layers: &[&Index], value_prefix: &mut Vec<u8>, t: Tick, canon: TxId) -> bool {
+fn holds(
+    layers: &[&Index],
+    value_prefix: &mut Vec<u8>,
+    t: Tick,
+    canon: TxId,
+    work: Work<'_>,
+) -> bool {
     let len = value_prefix.len();
     key::push_seek_tick(value_prefix, t);
-    let found = seek(layers, value_prefix, &value_prefix[..len], canon);
+    let found = seek(layers, value_prefix, &value_prefix[..len], canon, work);
     value_prefix.truncate(len);
     found == Some(Op::Assert)
 }
@@ -5135,16 +5359,19 @@ fn holds(layers: &[&Index], value_prefix: &mut Vec<u8>, t: Tick, canon: TxId) ->
 /// same tick are not current, so the walk jumps past the tick instead of
 /// falling through to them. At the latest canon with no corrections nothing
 /// is skipped: still one seek.
-fn seek(layers: &[&Index], from: &[u8], prefix: &[u8], canon: TxId) -> Option<Op> {
-    seek_entry(layers, from, prefix, canon).map(|(_, op)| op)
+fn seek(layers: &[&Index], from: &[u8], prefix: &[u8], canon: TxId, work: Work<'_>) -> Option<Op> {
+    seek_entry(layers, from, prefix, canon, work).map(|(_, op)| op)
 }
 
-/// [`seek`], also returning the key of the entry found.
+/// [`seek`], also returning the key of the entry found. Charges `work`
+/// one per key examined: the one landed on, every newer-tx or deleted
+/// entry stepped over, and the one past the prefix that ends a miss.
 fn seek_entry<'i>(
     layers: &[&'i Index],
     from: &[u8],
     prefix: &[u8],
     canon: TxId,
+    work: Work<'_>,
 ) -> Option<(&'i [u8], Op)> {
     // Set once a deleted tick was skipped: seek exclusively past it.
     let mut past: Option<Vec<u8>> = None;
@@ -5153,15 +5380,19 @@ fn seek_entry<'i>(
             None => Bound::Included(from),
             Some(p) => Bound::Excluded(&p[..]),
         };
-        let (k, mark) = layers
+        let mut examined = 0u64;
+        let found = layers
             .iter()
             .filter_map(|index| {
                 index
                     .range::<[u8], _>((lower, Bound::Unbounded))
+                    .inspect(|_| examined += 1)
                     .take_while(|(k, _)| k.starts_with(prefix))
                     .find(|(k, _)| key::e_key_tx(k).is_some_and(|tx| tx <= canon))
             })
-            .min_by(|(a, _), (b, _)| a.cmp(b))?;
+            .min_by(|(a, _), (b, _)| a.cmp(b));
+        work.add(examined);
+        let (k, mark) = found?;
         match mark.op() {
             Some(op) => return Some((&k[..], op)),
             None => past = Some(key::past_tick(k)),

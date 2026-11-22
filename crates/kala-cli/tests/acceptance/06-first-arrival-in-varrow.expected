@@ -1,0 +1,12 @@
+query at tick 700, canon tx#12: 10 rows
+  ?c  (min ?t)
+  edwin  -300
+  greg  200
+  mara  -220
+  tomas  -350
+  hild  -270
+  osric  -400
+  v01  -395
+  v10  -50
+  v15  -325
+  v24  20

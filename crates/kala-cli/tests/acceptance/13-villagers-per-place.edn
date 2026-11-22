@@ -1,0 +1,11 @@
+; Story question: how many villagers are in each place at tick 0?
+; Derivation: villager N (1..24) is at home place (N-1) mod 14 and moves at tick
+; -100+5N to place (N+4) mod 14 (retract+assert at the same tick), so at 0 villagers
+; 1..20 have moved and 21..24 are still home. Places by list index:
+; 0 varrow, 1 ashford, 2 carnath, 3 eldoria, 4 dunmere, 5 highkeep, 6 saltmarsh,
+; 7 oakhollow, 8 redcliff, 9 stonebridge, 10 thornwick, 11 whitefall, 12 mistral,
+; 13 graymoor.
+; Moved N=1..20 -> index 5,6,7,8,9,10,11,12,13,0,1,2,3,4,5,6,7,8,9,10;
+; home N=21..24 -> 6,7,8,9. Counts: idx 0-4 one each; 5:2; 6:3; 7:3; 8:3; 9:3;
+; 10:2; 11,12,13: one each. Total 24.
+[:find ?p (count ?c) :at 0 :where [?c :label "Villager"] [?c :located_in ?p]]

@@ -179,7 +179,7 @@ proptest! {
                 let p = plan(&["v"], project(
                     expand(tr(e), attr, tv("v"), TickSource::Const(Tick(t)), Access::E), &["v"]));
                 for r in run_plan(&view, &p).rows {
-                    via_e.push(vec![Value::Ref(e), r[0].clone()]);
+                    via_e.push(vec![Value::Ref(e), r[0].as_value().unwrap().clone()]);
                 }
             }
             prop_assert_eq!(&sorted_rows(via_e), &expected, "E {} canon {} t {}", attr, canon, t);

@@ -39,7 +39,13 @@ impl fmt::Display for Quoted<'_> {
 /// Whether `c` must never be echoed raw to a terminal: every Unicode `Cc`
 /// (C0, DEL, C1), the bidi embeddings/overrides U+202A..U+202E and isolates
 /// U+2066..U+2069, the bidi marks U+061C (ALM), U+200E (LRM) and U+200F (RLM),
-/// the line/paragraph separators U+2028 and U+2029, and U+FEFF (BOM / ZWNBSP).
+/// the line/paragraph separators U+2028 and U+2029, U+FEFF (BOM / ZWNBSP),
+/// and the invisible format chars: U+200B (ZWSP), U+2060..U+2064 (word
+/// joiner, invisible operators), U+206A..U+206F (deprecated format
+/// controls), U+180E (Mongolian vowel separator), U+00AD (soft hyphen),
+/// U+FFF9..U+FFFB (interlinear annotation) and the tag characters
+/// U+E0000..U+E007F. ZWJ/ZWNJ (U+200C, U+200D) stay raw: emoji and many
+/// scripts need them.
 ///
 /// The non-`Cc` ones are format or separator chars that reorder, hide or
 /// break the text around them. This is the one predicate shared by
@@ -57,6 +63,13 @@ pub fn must_escape(c: char) -> bool {
                 | '\u{2028}'
                 | '\u{2029}'
                 | '\u{FEFF}'
+                | '\u{200B}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{206A}'..='\u{206F}'
+                | '\u{180E}'
+                | '\u{00AD}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{E0000}'..='\u{E007F}'
         )
 }
 

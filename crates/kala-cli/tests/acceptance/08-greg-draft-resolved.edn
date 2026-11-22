@@ -1,0 +1,4 @@
+; Story question: where is Greg at tick 601 once the author wrote his departure?
+; Derivation: tx9 (canon 10) retracts varrow @250, so from canon 10 on varrow is
+; [200,250) and only ashford (asserted @601) holds at 601. (carnath ended at 150.)
+[:find ?p :at 601 :canon 10 :where [:greg :located_in ?p]]

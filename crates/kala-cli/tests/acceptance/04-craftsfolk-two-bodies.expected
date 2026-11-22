@@ -1,0 +1,4 @@
+query at tick 700, canon tx#12: 2 rows
+  ?c  ?n
+  greg  "Greg"
+  hild  "Hild"

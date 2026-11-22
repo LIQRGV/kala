@@ -1,0 +1,6 @@
+; Story question: who were Edwin's allies at -195, as canon stood before the retcon?
+; Derivation at canon 11 (the retcon is tx11 = canon 12): tomas (-300, never ended),
+; greg (asserted -280, retract still written at -190, so he holds at -195), mara
+; (asserted -208, retracted -150). wren's -170 assertion exists but is after -195.
+; hild ended at -240. Entity-ID order: greg, mara, tomas.
+[:find ?a :at -195 :canon 11 :where [:edwin :ally_of ?a]]

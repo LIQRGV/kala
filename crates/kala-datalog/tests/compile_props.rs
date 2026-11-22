@@ -161,7 +161,8 @@ proptest! {
         let text = format!("[:find ?e ?v :in $ ?t :at ?t :where [?e :{attr} ?v]]");
         let p = prepare(w, &text).unwrap();
         let ps: Params = [("t".to_string(), Value::I64(t))].into();
-        let got: BTreeSet<Vec<Value>> = run(w, &p.plan, &ps, &Limits::default()).unwrap().rows.into_iter().collect();
+        let got: BTreeSet<Vec<Value>> = run(w, &p.plan, &ps, &Limits::default()).unwrap().rows.into_iter()
+            .map(|r| r.into_iter().map(|d| d.as_value().unwrap().clone()).collect()).collect();
         let native: BTreeSet<Vec<Value>> =
             w.attr_scan(attr, Tick(t)).unwrap().into_iter().map(|(e, v)| vec![Value::Ref(e), v]).collect();
         prop_assert_eq!(got, native);
@@ -178,7 +179,8 @@ proptest! {
         let text = format!("[:find ?v :in $ ?e ?t :at ?t :where [?e :{attr} ?v]]");
         let p = prepare(w, &text).unwrap();
         let ps: Params = [("e".to_string(), Value::Ref(e)), ("t".to_string(), Value::I64(t))].into();
-        let got: BTreeSet<Vec<Value>> = run(w, &p.plan, &ps, &Limits::default()).unwrap().rows.into_iter().collect();
+        let got: BTreeSet<Vec<Value>> = run(w, &p.plan, &ps, &Limits::default()).unwrap().rows.into_iter()
+            .map(|r| r.into_iter().map(|d| d.as_value().unwrap().clone()).collect()).collect();
         let native: BTreeSet<Vec<Value>> = w.as_of(e, attr, Tick(t)).unwrap().into_iter().map(|v| vec![v]).collect();
         prop_assert_eq!(got, native);
     }
@@ -192,7 +194,8 @@ proptest! {
         let text = "[:find ?x :in $ ?p ?t :at ?t :where [?x :located_in ?p]]";
         let p = prepare(w, text).unwrap();
         let ps: Params = [("p".to_string(), Value::Ref(pid)), ("t".to_string(), Value::I64(t))].into();
-        let got: BTreeSet<Vec<Value>> = run(w, &p.plan, &ps, &Limits::default()).unwrap().rows.into_iter().collect();
+        let got: BTreeSet<Vec<Value>> = run(w, &p.plan, &ps, &Limits::default()).unwrap().rows.into_iter()
+            .map(|r| r.into_iter().map(|d| d.as_value().unwrap().clone()).collect()).collect();
         let native: BTreeSet<Vec<Value>> = w.neighbors(pid, "located_in", Direction::In, Tick(t)).unwrap()
             .into_iter().map(|(e, _)| vec![Value::Ref(e)]).collect();
         prop_assert_eq!(got, native);

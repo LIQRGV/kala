@@ -1,19 +1,31 @@
 //! The planner: orders a query's resolved patterns greedily and picks the
 //! index each one reads.
 //!
-//! Repeatedly, among the patterns still to place, take the one with the best
-//! access given the variables bound so far: a bound entity reads `E`; else a
-//! bound `ref` value reads `R`; else a bound value of an indexed attribute
-//! reads `V`; a `:handle` pattern with either side bound reads the handle
-//! table; else (nothing bound) a full scan, the attribute with the fewest
-//! stored pairs first. Ties go to query order, so plans are deterministic.
-//! Patterns chain as nested `Expand`s over `Unit` (left-deep); a filter goes
-//! right after the step that binds its last variable; `Project` is on top.
+//! Repeatedly, among the patterns and rule calls still to place, take the one
+//! with the best access given the variables bound so far, in this order: a
+//! pattern with a bound entity reads `E`; a rule call with some argument
+//! bound (a constant, a param or a bound variable) reads its relation
+//! through a hash index on those positions; a pattern with a bound `ref`
+//! value reads `R`; else a bound value of an indexed attribute reads `V`; a
+//! `:handle` pattern with either side bound reads the handle table; a rule
+//! call with nothing bound joins its whole (already computed) relation;
+//! else (nothing bound) a full scan, the attribute with the fewest stored
+//! pairs first. A history pattern ranks as an `E` read with its entity
+//! bound (one entity's change points) and as a scan otherwise (the
+//! attribute's change points across every entity). Ties go to query order (patterns before calls), so plans
+//! are deterministic. The order never changes the results, only the work.
+//! Steps chain as nested `Expand`s / `Rel`s over `Unit` (left-deep); a
+//! filter goes right after the step that binds its last variable, and a
+//! negation (`Not`) right after the step that binds the last variable it
+//! shares with the body (filters first). A negation's own body is planned
+//! the same way, with those shared variables bound from the start (the
+//! executor seeds its `Unit` with the rows it tests) and no `Project`.
+//! `Project` is on top of a query's or rule's body.
 
 use std::collections::BTreeSet;
 
 use kala_core::{ValueType, World};
-use kala_query::{Access, AttrRef, Op, Predicate, Term, TickSource, Var};
+use kala_query::{Access, AttrRef, Func, Op, OpTerm, Predicate, Term, TickSource, Var};
 
 use crate::error::{DatalogError, ErrorKind, Span, show};
 
@@ -40,7 +52,25 @@ pub(crate) struct Pat {
     /// The tick variable of an `(at ?t ..)` clause: the pattern can only be
     /// placed once it is bound.
     pub tick_var: Option<(String, Span)>,
+    /// For a history pattern `[e a v t op]`: its tick and op positions (it
+    /// reads every tick, so `tick` above is unused).
+    pub history: Option<Hist>,
+    /// For `(during [e a v] ?s)`: the variable bound to the interval set
+    /// (it reads every tick, so `tick` above is unused).
+    pub during: Option<Var>,
     pub span: Span,
+}
+
+/// The tick and op positions of a history pattern.
+pub(crate) struct Hist {
+    pub tick: Term,
+    pub op: OpTerm,
+}
+
+/// A resolved rule call: its relation's name and one term per column.
+pub(crate) struct Call {
+    pub name: String,
+    pub args: Vec<Term>,
 }
 
 /// A resolved predicate and the variables it reads.
@@ -49,9 +79,40 @@ pub(crate) struct Filt {
     pub vars: Vec<String>,
 }
 
+/// A resolved interval-set function clause: placed (as an `Apply`) once
+/// the variables among its arguments are bound; it binds `out`.
+pub(crate) struct App {
+    pub func: Func,
+    pub args: Vec<Term>,
+    pub out: Option<Var>,
+    /// The variables among `args`.
+    pub vars: Vec<String>,
+    pub span: Span,
+}
+
+/// A resolved body: its patterns, filters, function clauses and calls
+/// (each in query order) and its negations.
+#[derive(Default)]
+pub(crate) struct Body {
+    pub pats: Vec<Pat>,
+    pub calls: Vec<Call>,
+    pub filts: Vec<Filt>,
+    pub apps: Vec<App>,
+    pub nots: Vec<Neg>,
+}
+
+/// A resolved `(not ..)`.
+pub(crate) struct Neg {
+    pub body: Body,
+    /// The plan variables it shares with the enclosing body (bound there by
+    /// a positive clause): it is placed once they are all bound, and only
+    /// they are bound when its body starts.
+    pub uses: Vec<String>,
+}
+
 fn is_bound(t: &Term, bound: &BTreeSet<String>) -> bool {
     match t {
-        Term::Const(_) | Term::Param(_) => true,
+        Term::Const(_) | Term::Op(_) | Term::Param(_) => true,
         Term::Var(v) => bound.contains(&v.0),
         Term::Any => false,
     }
@@ -67,32 +128,75 @@ fn access(p: &Pat, bound: &BTreeSet<String>) -> Option<(u8, Access)> {
     }
     let e = is_bound(&p.entity, bound);
     let v = is_bound(&p.value, bound);
+    if p.history.is_some() || p.during.is_some() {
+        // Entity bound: one entity's history (like an `E` read); else the
+        // attribute's history across every entity (like a scan).
+        return Some(if e {
+            (RANK_E, Access::E)
+        } else {
+            (RANK_SCAN, Access::Scan)
+        });
+    }
     match &p.info {
-        PatAttr::Handle => (e || v).then_some((3, Access::Handle)),
+        PatAttr::Handle => (e || v).then_some((RANK_HANDLE, Access::Handle)),
         PatAttr::Named {
             value_type,
             indexed,
             ..
         } => Some(if e {
-            (0, Access::E)
+            (RANK_E, Access::E)
         } else if v && *value_type == ValueType::Ref {
-            (1, Access::R)
+            (RANK_R, Access::R)
         } else if v && *indexed {
-            (2, Access::V)
+            (RANK_V, Access::V)
         } else {
-            (4, Access::Scan)
+            (RANK_SCAN, Access::Scan)
         }),
     }
 }
 
-/// Plans `pats` and `filts` (both in query order) into an operator tree
-/// projecting `find`.
+// Candidate ranks, best first (see the module docs).
+const RANK_E: u8 = 0;
+const RANK_REL_BOUND: u8 = 1;
+const RANK_R: u8 = 2;
+const RANK_V: u8 = 3;
+const RANK_HANDLE: u8 = 4;
+const RANK_REL_FREE: u8 = 5;
+const RANK_SCAN: u8 = 6;
+
+/// A rule call's rank: it can always be placed.
+fn call_rank(c: &Call, bound: &BTreeSet<String>) -> u8 {
+    if c.args.iter().any(|a| is_bound(a, bound)) {
+        RANK_REL_BOUND
+    } else {
+        RANK_REL_FREE
+    }
+}
+
+/// What the planner places next.
+#[derive(Clone, Copy)]
+enum Pick {
+    Pat(usize, Access),
+    Call(usize),
+}
+
+/// Plans `body` into an operator tree over `Unit`, starting with `bound`
+/// bound, projecting `find` if given (a negation's body has none: its
+/// rows keep every variable). Recursion only follows `not` nesting, which
+/// the parser bounded.
 pub(crate) fn plan(
     world: &World,
-    pats: Vec<Pat>,
-    filts: Vec<Filt>,
-    find: &[Var],
+    body: Body,
+    mut bound: BTreeSet<String>,
+    find: Option<&[Var]>,
 ) -> Result<Op, DatalogError> {
+    let Body {
+        pats,
+        calls,
+        filts,
+        apps,
+        nots,
+    } = body;
     // Scan sizes, looked up once per pattern.
     let mut pairs = Vec::with_capacity(pats.len());
     for p in &pats {
@@ -113,61 +217,202 @@ pub(crate) fn plan(
         });
     }
 
-    let mut bound = BTreeSet::new();
     let mut placed_filts = vec![false; filts.len()];
-    let mut op = place_filters(Op::Unit, &filts, &mut placed_filts, &bound);
+    let mut apps: Vec<Option<App>> = apps.into_iter().map(Some).collect();
+    let mut nots: Vec<Option<Neg>> = nots.into_iter().map(Some).collect();
+    let mut op = place_filters(Op::Unit, &filts, &mut placed_filts, &mut apps, &mut bound);
+    op = place_nots(world, op, &mut nots, &bound)?;
     let mut left: Vec<usize> = (0..pats.len()).collect();
-    while !left.is_empty() {
-        // (rank, scan size, position in `left`) of the best candidate.
-        let mut best: Option<(u8, usize, usize, Access)> = None;
+    let mut calls_left: Vec<Option<Call>> = calls.into_iter().map(Some).collect();
+    let mut n_calls = calls_left.len();
+    while !left.is_empty() || n_calls > 0 {
+        // (rank, scan size, what) of the best candidate.
+        let mut best: Option<(u8, usize, Pick)> = None;
         for (pos, &i) in left.iter().enumerate() {
             let Some((rank, acc)) = access(&pats[i], &bound) else {
                 continue;
             };
             let size = if acc == Access::Scan { pairs[i] } else { 0 };
-            if best.is_none_or(|(r, s, _, _)| (rank, size) < (r, s)) {
-                best = Some((rank, size, pos, acc));
+            if best.is_none_or(|(r, s, _)| (rank, size) < (r, s)) {
+                best = Some((rank, size, Pick::Pat(pos, acc)));
             }
         }
-        let Some((_, _, pos, acc)) = best else {
+        for (i, c) in calls_left.iter().enumerate() {
+            let Some(c) = c else { continue };
+            let rank = call_rank(c, &bound);
+            if best.is_none_or(|(r, s, _)| (rank, 0) < (r, s)) {
+                best = Some((rank, 0, Pick::Call(i)));
+            }
+        }
+        let Some((_, _, pick)) = best else {
             return Err(stuck(&pats[left[0]], &bound));
         };
-        let i = left.remove(pos);
-        let p = &pats[i];
-        for t in [&p.entity, &p.value] {
-            if let Term::Var(v) = t {
-                bound.insert(v.0.clone());
+        op = match pick {
+            Pick::Pat(pos, acc) => {
+                let i = left.remove(pos);
+                let p = &pats[i];
+                for t in [&p.entity, &p.value] {
+                    if let Term::Var(v) = t {
+                        bound.insert(v.0.clone());
+                    }
+                }
+                match (&p.history, &p.attr) {
+                    (None, AttrRef::Named(name)) if p.during.is_some() => {
+                        let out = p
+                            .during
+                            .clone()
+                            .expect("invariant: checked by the match guard");
+                        bound.insert(out.0.clone());
+                        Op::During {
+                            input: Box::new(op),
+                            entity: p.entity.clone(),
+                            attr: name.clone(),
+                            value: p.value.clone(),
+                            out,
+                        }
+                    }
+                    (Some(h), AttrRef::Named(name)) => {
+                        if let Term::Var(v) = &h.tick {
+                            bound.insert(v.0.clone());
+                        }
+                        if let OpTerm::Var(v) = &h.op {
+                            bound.insert(v.0.clone());
+                        }
+                        Op::History {
+                            input: Box::new(op),
+                            entity: p.entity.clone(),
+                            attr: name.clone(),
+                            value: p.value.clone(),
+                            tick: h.tick.clone(),
+                            op: h.op.clone(),
+                        }
+                    }
+                    (Some(_), AttrRef::Handle) => {
+                        unreachable!("invariant: the parser refuses `:handle` history patterns")
+                    }
+                    (None, _) => Op::Expand {
+                        input: Box::new(op),
+                        entity: p.entity.clone(),
+                        attr: p.attr.clone(),
+                        value: p.value.clone(),
+                        tick: p.tick.clone(),
+                        access: acc,
+                    },
+                }
             }
-        }
-        op = Op::Expand {
-            input: Box::new(op),
-            entity: p.entity.clone(),
-            attr: p.attr.clone(),
-            value: p.value.clone(),
-            tick: p.tick.clone(),
-            access: acc,
+            Pick::Call(i) => {
+                let c = calls_left[i]
+                    .take()
+                    .expect("invariant: only unplaced calls are picked");
+                n_calls -= 1;
+                for t in &c.args {
+                    if let Term::Var(v) = t {
+                        bound.insert(v.0.clone());
+                    }
+                }
+                Op::Rel {
+                    input: Box::new(op),
+                    name: c.name,
+                    args: c.args,
+                }
+            }
         };
-        op = place_filters(op, &filts, &mut placed_filts, &bound);
+        op = place_filters(op, &filts, &mut placed_filts, &mut apps, &mut bound);
+        op = place_nots(world, op, &mut nots, &bound)?;
     }
-    Ok(Op::Project {
-        input: Box::new(op),
-        vars: find.to_vec(),
+    if let Some(a) = apps.iter().flatten().next() {
+        // The compiler checked every argument is bound, so only functions
+        // whose outputs feed each other's arguments are left.
+        return Err(DatalogError::new(
+            ErrorKind::UnboundVariable,
+            Some(a.span),
+            format!(
+                "the arguments of `{}` are only bound by functions that need its output",
+                a.func.name()
+            ),
+        ));
+    }
+    assert!(
+        nots.iter().all(Option::is_none),
+        "invariant: a not's shared variables are bound by its body's positive clauses"
+    );
+    Ok(match find {
+        Some(find) => Op::Project {
+            input: Box::new(op),
+            vars: find.to_vec(),
+        },
+        None => op,
     })
 }
 
-/// Wraps `op` in every not-yet-placed filter whose variables are all bound,
-/// in query order.
-fn place_filters(mut op: Op, filts: &[Filt], placed: &mut [bool], bound: &BTreeSet<String>) -> Op {
-    for (f, done) in filts.iter().zip(placed.iter_mut()) {
-        if !*done && f.vars.iter().all(|v| bound.contains(v)) {
-            *done = true;
-            op = Op::Filter {
+/// Wraps `op` in a `Not` for every not-yet-placed negation whose shared
+/// variables are all bound, in query order.
+fn place_nots(
+    world: &World,
+    mut op: Op,
+    nots: &mut [Option<Neg>],
+    bound: &BTreeSet<String>,
+) -> Result<Op, DatalogError> {
+    for slot in nots.iter_mut() {
+        if slot
+            .as_ref()
+            .is_some_and(|n| n.uses.iter().all(|v| bound.contains(v)))
+        {
+            let n = slot.take().expect("invariant: checked just above");
+            let body = plan(world, n.body, n.uses.into_iter().collect(), None)?;
+            op = Op::Not {
                 input: Box::new(op),
-                pred: f.pred.clone(),
+                body: Box::new(body),
             };
         }
     }
-    op
+    Ok(op)
+}
+
+/// Wraps `op` in every not-yet-placed filter and function application
+/// whose variables are all bound, in query order (filters first), until
+/// none is left to place: an application binds its output, which may let
+/// more of them be placed.
+fn place_filters(
+    mut op: Op,
+    filts: &[Filt],
+    placed: &mut [bool],
+    apps: &mut [Option<App>],
+    bound: &mut BTreeSet<String>,
+) -> Op {
+    loop {
+        for (f, done) in filts.iter().zip(placed.iter_mut()) {
+            if !*done && f.vars.iter().all(|v| bound.contains(v)) {
+                *done = true;
+                op = Op::Filter {
+                    input: Box::new(op),
+                    pred: f.pred.clone(),
+                };
+            }
+        }
+        let mut progress = false;
+        for slot in apps.iter_mut() {
+            if slot
+                .as_ref()
+                .is_some_and(|a| a.vars.iter().all(|v| bound.contains(v)))
+            {
+                let a = slot.take().expect("invariant: checked just above");
+                if let Some(o) = &a.out {
+                    bound.insert(o.0.clone());
+                }
+                op = Op::Apply {
+                    input: Box::new(op),
+                    func: a.func,
+                    args: a.args,
+                    out: a.out,
+                };
+                progress = true;
+            }
+        }
+        if !progress {
+            return op;
+        }
+    }
 }
 
 /// Why no remaining pattern can be placed, reported on the first of them.

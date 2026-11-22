@@ -1,0 +1,4 @@
+; Story question: who bought what, and when?
+; Derivation: `bought` is an event attribute, never retracted. edwin bought the
+; sword at -208 and tomas the crown at -190 (tx4). Entity-ID order: edwin, tomas.
+[:find ?c ?i ?t :where [?c :bought ?i ?t]]

@@ -95,7 +95,7 @@ fn as_of_value_with_a_ref_to_an_entity_defined_after_the_canon_is_false() {
 #[test]
 fn must_escape_pins_nbsp_zwsp_and_noncharacters() {
     assert!(!must_escape('\u{00A0}'), "NBSP is visible spacing");
-    assert!(!must_escape('\u{200B}'), "pinned: ZWSP is not escaped");
+    assert!(must_escape('\u{200B}'), "ZWSP is escaped (slice 7)");
     // pinned: U+FFFE is a Unicode noncharacter, not `Cc`, not in the list
     assert!(!must_escape('\u{FFFE}'));
     assert!(!must_escape('\u{FFFF}'));

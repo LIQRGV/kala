@@ -1,0 +1,9 @@
+; Story question: when did each character first arrive in Varrow?
+; Derivation: the located_in assertions for varrow are
+;   osric -400, tomas -350, v01 -395 (home), v15 -325 (home), edwin -300,
+;   hild -270, mara -220, v10 -50 (moves at -100+5*10), greg 200, v24 20 (moves at
+;   -100+5*24). Nobody has two varrow arrivals, so min is that tick.
+; (villager N's home is place (N-1) mod 14, varrow is place 0, so N=1,15; moves to
+; place (N+4) mod 14 = 0 for N=10,24; arrival is -400+5N.)
+; Entity-ID order: edwin, greg, mara, tomas, hild, osric, v01, v10, v15, v24.
+[:find ?c (min ?t) :where [?c :located_in :varrow ?t :assert]]

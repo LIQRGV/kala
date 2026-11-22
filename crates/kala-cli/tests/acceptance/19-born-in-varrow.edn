@@ -1,0 +1,5 @@
+; Story question: who had been born in Varrow by tick -300?
+; Derivation: born_in is an event. Villager N is born in its home place at
+; -420+5N: v01 (varrow, -415) and v15 (varrow, -345). Edwin's birth in varrow is
+; the prequel at -240, after -300, so he is not included. Entity-ID order: v01, v15.
+[:find ?c :at -300 :where [?c :born_in :varrow]]

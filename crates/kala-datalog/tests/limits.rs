@@ -75,6 +75,7 @@ fn three_unrelated_scans_error_promptly_in_steps() {
     let lim = Limits {
         max_rows: 100_000,
         max_steps: 1_000_000,
+        ..Limits::default()
     };
     assert!(matches!(
         go(&w, THREE, &lim),

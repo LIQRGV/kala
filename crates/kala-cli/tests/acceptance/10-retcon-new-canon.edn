@@ -1,0 +1,4 @@
+; Story question: who are Edwin's allies at -195 after the retcon (canon 12)?
+; Derivation: the retcon moved greg's end from -190 to -200, so at -195 greg is no
+; longer an ally. tomas and mara are as in 09-retcon-old-canon.
+[:find ?a :at -195 :canon 12 :where [:edwin :ally_of ?a]]

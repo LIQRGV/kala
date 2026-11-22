@@ -5,22 +5,98 @@
 //! it came from, so later errors can point at it.
 
 pub use crate::error::Span;
-pub use kala_query::CmpOp;
+pub use kala_query::{AggFn, CmpOp, Func};
 
-/// A whole query: `[:find .. :in .. :at .. :canon .. :where ..]`.
+/// A whole query: `[:find .. :in .. :at .. :canon .. :rules .. :where ..]`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Query {
-    /// Variables returned, in order (`:find ?a ?b`). Never empty.
-    pub find: Vec<Sym>,
+    /// The columns returned, in order (`:find ?a (count ?b)`): variables
+    /// and aggregates. Never empty.
+    pub find: Vec<Find>,
     /// Inputs in order (`:in $ ?who`); may be empty.
     pub inputs: Vec<Input>,
     /// Query default tick (`:at T`); `None` means the world's latest tick.
     pub at: Option<TickExpr>,
     /// Canon to read (`:canon C`, i.e. `tx <= C`); `None` means the latest.
     pub canon: Option<CanonExpr>,
-    /// The `:where` clauses in query order. Never empty.
+    /// The `:rules` definitions in text order; empty without a `:rules`
+    /// section.
+    pub rules: Vec<Rule>,
+    /// The `:where` clauses other than rule calls, in query order.
     pub clauses: Vec<Clause>,
+    /// The `:where` rule calls, in query order. Clause order doesn't matter
+    /// (the planner orders them), so calls are kept in their own list.
+    pub calls: Vec<Call>,
+    /// The `:where` negations `(not ..)`, in query order (kept apart for
+    /// the same reason). `clauses`, `calls`, `nots`, `durings` and `fns`
+    /// are never all empty.
+    pub nots: Vec<Not>,
+    /// The `:where` interval-set reads `(during ..)`, in query order.
+    pub durings: Vec<During>,
+    /// The `:where` interval-set function clauses, in query order.
+    pub fns: Vec<FnClause>,
     /// The whole outer vector, `[` to `]`.
+    pub span: Span,
+}
+
+/// One rule definition `[(name ?v ..) clause+]`. Several definitions of one
+/// name are a union of their bodies.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Rule {
+    /// The rule's name (a bare symbol, not a reserved one).
+    pub name: String,
+    /// The name token.
+    pub name_span: Span,
+    /// The head variables: at least one, all distinct. Local to this
+    /// definition, like every variable of its body.
+    pub head: Vec<Sym>,
+    /// The body's clauses other than rule calls, in text order.
+    pub clauses: Vec<Clause>,
+    /// The body's rule calls, in text order.
+    pub calls: Vec<Call>,
+    /// The body's negations, in text order. `clauses`, `calls`, `nots`,
+    /// `durings` and `fns` are never all empty.
+    pub nots: Vec<Not>,
+    /// The body's `(during ..)` reads, in text order.
+    pub durings: Vec<During>,
+    /// The body's interval-set function clauses, in text order.
+    pub fns: Vec<FnClause>,
+    /// The whole definition vector, `[` to `]`.
+    pub span: Span,
+}
+
+/// A negation `(not clause+)`: keeps a row iff no way satisfies all its
+/// clauses under the row's bindings. Variables bound outside (by a positive
+/// clause of the enclosing body) are constraints; the others are local to
+/// it. Its clauses are split by kind like a body's.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Not {
+    /// Patterns, `(at ..)` clauses and predicates, in text order.
+    pub clauses: Vec<Clause>,
+    /// Rule calls, in text order.
+    pub calls: Vec<Call>,
+    /// Nested negations, in text order. `clauses`, `calls`, `nots`,
+    /// `durings` and `fns` are never all empty.
+    pub nots: Vec<Not>,
+    /// `(during ..)` reads, in text order.
+    pub durings: Vec<During>,
+    /// Interval-set function clauses, in text order.
+    pub fns: Vec<FnClause>,
+    /// The whole list, `(` to `)`.
+    pub span: Span,
+}
+
+/// A rule call `(name arg ..)` in `:where` or a rule body.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Call {
+    /// The called rule's name.
+    pub name: String,
+    /// The name token.
+    pub name_span: Span,
+    /// The arguments in order: variables, `_` or constants (possibly none;
+    /// the compiler checks the arity).
+    pub args: Vec<Item>,
+    /// The whole list, `(` to `)`.
     pub span: Span,
 }
 
@@ -31,6 +107,28 @@ pub struct Sym {
     pub name: String,
     /// The token, including the `?`.
     pub span: Span,
+}
+
+/// One `:find` element: a variable `?a` or an aggregate `(count ?b)`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Find {
+    /// The column's name: a variable's name without the `?`, or an
+    /// aggregate's normalized text (`(count ?b)`: one space between the
+    /// function and its variable, none inside the parentheses).
+    pub name: String,
+    /// The element as written: the variable token, or the whole list.
+    pub span: Span,
+    /// The aggregate, if this element is one (`None` for a variable).
+    pub agg: Option<FindAgg>,
+}
+
+/// An aggregate in `:find`: `(func ?var)`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FindAgg {
+    /// The aggregate function.
+    pub func: AggFn,
+    /// The aggregated variable.
+    pub var: Sym,
 }
 
 /// One entry of the `:in` section.
@@ -78,7 +176,39 @@ pub enum Clause {
     Pred(Pred),
 }
 
-/// A three-element pattern `[e a v]`.
+/// `(during [e a v] ?s)`: binds `?s` to the interval set where `(e, a, v)`
+/// holds, over every tick at the query's canon.
+#[derive(Clone, Debug, PartialEq)]
+pub struct During {
+    /// The 3-element pattern (never a history pattern, never `:handle`).
+    pub pattern: Pattern,
+    /// The variable bound to the set.
+    pub out: Sym,
+    /// The whole list, `(` to `)`.
+    pub span: Span,
+}
+
+/// An interval-set function clause: `[(intersect ?a ?b) ?c]`,
+/// `[(union ?a ?b) ?c]`, `[(difference ?a ?b) ?c]` (with an output), or
+/// the filters `[(not-empty ?s)]` and `[(contains ?s T)]`. The parser
+/// checks the arity and whether there is an output.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FnClause {
+    /// The function.
+    pub func: Func,
+    /// The function name token.
+    pub name_span: Span,
+    /// The arguments in order.
+    pub args: Vec<Item>,
+    /// The output variable (set functions only).
+    pub out: Option<Sym>,
+    /// The whole outer vector, `[` to `]`.
+    pub span: Span,
+}
+
+/// A pattern: three elements `[e a v]` (read at one tick), or a history
+/// pattern `[e a v t]` / `[e a v t op]` (the change points of `(e, a, v)`
+/// over every tick).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pattern {
     /// Entity position.
@@ -87,8 +217,33 @@ pub struct Pattern {
     pub a: Attr,
     /// Value position.
     pub v: Item,
+    /// The tick and op positions of a history pattern; `None` for `[e a v]`.
+    pub history: Option<HistoryPos>,
     /// The whole vector, `[` to `]`.
     pub span: Span,
+}
+
+/// The extra positions of a history pattern `[e a v t op?]`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoryPos {
+    /// The change point's tick: a variable, an integer or `_` (the parser
+    /// refuses anything else).
+    pub tick: Item,
+    /// The change point's op; `None` for the 4-element form (any op).
+    pub op: Option<OpItem>,
+}
+
+/// The op position of a history pattern.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OpItem {
+    /// `?op`: bound to the change point's op.
+    Var(Sym),
+    /// `_`: any op.
+    Any(Span),
+    /// `:assert`.
+    Assert(Span),
+    /// `:retract`.
+    Retract(Span),
 }
 
 /// An attribute name as written (`:ally_of` → `ally_of`). May be an inverse

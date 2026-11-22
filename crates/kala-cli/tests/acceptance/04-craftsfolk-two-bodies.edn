@@ -1,0 +1,8 @@
+; Story question: who is a healer or a soldier (a rule with two bodies, a union)?
+; Derivation at the latest tick (700): label "Healer" belongs to hild (from -300);
+; label "Soldier" belongs to greg (from 200). Nobody else has either label.
+; Their names are "Greg" and "Hild". Entity-ID order: greg, hild.
+[:find ?c ?n
+ :rules [[(craft ?c) [?c :label "Healer"]]
+         [(craft ?c) [?c :label "Soldier"]]]
+ :where (craft ?c) [?c :name ?n]]

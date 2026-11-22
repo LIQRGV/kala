@@ -111,7 +111,15 @@ fn exec(w: &World, text: &str, params: &[(&str, Value)]) -> ResultSet {
     }
 }
 fn rows(w: &World, text: &str, params: &[(&str, Value)]) -> BTreeSet<Vec<Value>> {
-    exec(w, text, params).rows.into_iter().collect()
+    exec(w, text, params)
+        .rows
+        .into_iter()
+        .map(|r| {
+            r.into_iter()
+                .map(|d| d.as_value().unwrap().clone())
+                .collect()
+        })
+        .collect()
 }
 fn set(v: impl IntoIterator<Item = Vec<Value>>) -> BTreeSet<Vec<Value>> {
     v.into_iter().collect()
@@ -234,7 +242,10 @@ fn find_order_is_the_columns_order() {
     let rs = exec(w, "[:find ?n ?e :where [?e :name ?n]]", &[]);
     assert_eq!(rs.columns, vec![Var("n".into()), Var("e".into())]);
     assert_eq!(rs.rows[0].len(), 2);
-    assert!(matches!(rs.rows[0][0], Value::Str(_)) && matches!(rs.rows[0][1], Value::Ref(_)));
+    assert!(
+        matches!(rs.rows[0][0].as_value(), Some(Value::Str(_)))
+            && matches!(rs.rows[0][1].as_value(), Some(Value::Ref(_)))
+    );
 }
 
 #[test]

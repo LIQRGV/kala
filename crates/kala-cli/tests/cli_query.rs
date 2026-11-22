@@ -683,8 +683,9 @@ fn query_unknown_attribute_and_unsupported_exit_1() {
     let fx = varrow();
     let o = fx.q(&["[:find ?a :where [:edwin :no_such_attr ?a]]"]);
     assert_query_error(&o, "unknown attribute");
-    let o = fx.q(&["[:find ?a :where [:edwin :ally_of ?a] (not [?a :name \"x\"])]"]);
-    assert_query_error(&o, "unsupported not");
+    let o =
+        fx.q(&["[:find ?a :where [:edwin :ally_of ?a] (or [?a :name \"x\"] [?a :name \"y\"])]"]);
+    assert_query_error(&o, "unsupported or");
     let o = fx.q(&["[:find ?z :where [:edwin :ally_of ?a]]"]);
     assert_query_error(&o, "unbound find var");
 }
@@ -801,4 +802,38 @@ fn query_does_not_modify_the_world_file() {
     let _ = fx.q(&[ALLIES, "--param", "who=edwin"]);
     let _ = fx.run("explain", &[ALLIES, "--param", "who=edwin"]);
     assert_eq!(std::fs::read(&fx.path).unwrap(), before);
+}
+
+// ---------------------------------------------------------------------------
+// history patterns (slice 7, item 5)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_history_pattern_prints_ops_in_the_op_column() {
+    let fx = varrow();
+    // Greg's location change points on varrow.yaml (see kala-datalog's
+    // history_patterns.rs for the derivation): -100/150 carnath, 200/250
+    // varrow, 601 ashford.
+    let o = fx.q(&["[:find ?t ?op :where [:greg :located_in ?p ?t ?op]]"]);
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+    let (_, cols, rows) = text_parts(&stdout(&o));
+    assert_eq!(cols.split_whitespace().collect::<Vec<_>>(), ["?t", "?op"]);
+    let cells: Vec<Vec<String>> = sorted_rows(&rows)
+        .iter()
+        .map(|r| r.split_whitespace().map(str::to_string).collect())
+        .collect();
+    let mut want: Vec<Vec<String>> = [
+        ("-100", ":assert"),
+        ("150", ":retract"),
+        ("200", ":assert"),
+        ("250", ":retract"),
+        ("601", ":assert"),
+    ]
+    .iter()
+    .map(|(t, op)| vec![t.to_string(), op.to_string()])
+    .collect();
+    want.sort();
+    let mut got = cells;
+    got.sort();
+    assert_eq!(got, want);
 }

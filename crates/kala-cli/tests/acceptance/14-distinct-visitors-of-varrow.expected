@@ -1,0 +1,3 @@
+query at tick 700, canon tx#12: 1 row
+  (count-distinct ?c)
+  10

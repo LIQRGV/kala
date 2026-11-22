@@ -128,7 +128,22 @@ pub fn one_col(var: &str, root: Op) -> Plan {
 
 /// The rows of a one-column result, as values.
 pub fn col0(rs: &ResultSet) -> Vec<Value> {
-    rs.rows.iter().map(|r| r[0].clone()).collect()
+    rs.rows
+        .iter()
+        .map(|r| r[0].as_value().expect("a plain value").clone())
+        .collect()
+}
+
+/// All rows of a result as plain values (every cell must be a `Value`).
+pub fn value_rows(rs: &ResultSet) -> Vec<Vec<Value>> {
+    rs.rows
+        .iter()
+        .map(|r| {
+            r.iter()
+                .map(|d| d.as_value().expect("a plain value").clone())
+                .collect()
+        })
+        .collect()
 }
 
 /// Entities as the sorted, deduplicated `Value::Ref` rows a one-column

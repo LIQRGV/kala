@@ -1,0 +1,4 @@
+; Story question: the same as 16-prequel, read at canon 8 (before tx8 existed).
+; Derivation: canon tx#8 predates the prequel (YAML tx8 = canon 9); Edwin's first
+; written fact about location is varrow @-300, so nothing holds at -310.
+[:find ?p ?a :at -310 :canon 8 :where [:edwin :located_in ?p] [:edwin :ally_of ?a]]

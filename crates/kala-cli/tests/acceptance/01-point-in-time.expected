@@ -1,0 +1,3 @@
+query at tick -260, canon tx#12: 1 row
+  ?p  ?n
+  varrow  "Edwin"

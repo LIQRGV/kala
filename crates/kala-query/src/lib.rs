@@ -8,8 +8,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod datum;
 pub mod exec;
 pub mod ir;
 
+pub use datum::Datum;
 pub use exec::{Limits, MAX_PLAN_DEPTH, Params, QueryError, ResultSet, execute, run};
-pub use ir::{Access, AttrRef, CanonSource, CmpOp, Op, Plan, Predicate, Term, TickSource, Var};
+pub use ir::{
+    Access, Agg, AggFn, AttrRef, CanonSource, CmpOp, Func, MAX_EXPLAIN_BYTES, Op, OpTerm, Plan,
+    Predicate, RelDef, Term, TickSource, Var,
+};

@@ -1,0 +1,6 @@
+query at tick 700, canon tx#12: 4 rows
+  ?d  ?t  ?op
+  false  -220  :assert
+  false  -190  :assert
+  true  -250  :assert
+  true  -220  :retract

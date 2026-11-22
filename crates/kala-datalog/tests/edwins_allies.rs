@@ -36,6 +36,11 @@ fn dl(w: &World, text: &str, params: &[(&str, Value)]) -> Rows {
         .unwrap_or_else(|e| panic!("run failed for {text}\n{}\n  {e}", p.plan.explain(w)))
         .rows
         .into_iter()
+        .map(|r| {
+            r.into_iter()
+                .map(|d| d.as_value().unwrap().clone())
+                .collect()
+        })
         .collect()
 }
 
@@ -303,6 +308,11 @@ fn sweep_every_tick_in_a_range_datalog_equals_native() {
                 .unwrap_or_else(|e| panic!("tick {t} canon {canon}: {e}"))
                 .rows
                 .into_iter()
+                .map(|r| {
+                    r.into_iter()
+                        .map(|d| d.as_value().unwrap().clone())
+                        .collect()
+                })
                 .collect();
             assert_eq!(got, native(&v, edwin(w), t), "tick {t} canon {canon}");
         }

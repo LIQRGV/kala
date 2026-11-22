@@ -1,0 +1,16 @@
+query at tick 0, canon tx#12: 14 rows
+  ?p  (count ?c)
+  varrow  1
+  ashford  1
+  carnath  1
+  eldoria  1
+  dunmere  1
+  highkeep  2
+  saltmarsh  3
+  oakhollow  3
+  redcliff  3
+  stonebridge  3
+  thornwick  2
+  whitefall  1
+  mistral  1
+  graymoor  1

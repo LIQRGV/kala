@@ -53,12 +53,10 @@ fn ordinary_text_does_not_need_escaping() {
         'ß',
         '漢',
         '\u{1F600}',
-        '\u{200B}',
         '\u{200D}',
         '\u{2027}',
         '\u{202F}',
         '\u{2065}',
-        '\u{206A}',
         '\u{061B}',
         '\u{FEFE}',
         '\u{FF00}',
@@ -72,5 +70,5 @@ fn the_boundaries_of_each_range_are_exact() {
     assert!(!must_escape('\u{20}') && must_escape('\u{1f}'));
     assert!(must_escape('\u{7f}') && !must_escape('\u{7e}'));
     assert!(must_escape('\u{9f}') && !must_escape('\u{a0}'));
-    assert!(!must_escape('\u{202F}') && !must_escape('\u{2065}') && !must_escape('\u{206A}'));
+    assert!(!must_escape('\u{202F}') && !must_escape('\u{2065}'));
 }

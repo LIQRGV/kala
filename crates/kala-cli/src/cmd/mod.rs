@@ -103,8 +103,19 @@ pub fn dispatch(cmd: &Command) -> Result<Done, CliError> {
             world,
             canon,
             since,
+            checks,
             json,
-        } => return doctor::run(world, *canon, *since, *json),
+        } => {
+            return doctor::run(
+                world,
+                doctor::Options {
+                    canon: *canon,
+                    since: *since,
+                    checks: checks.as_deref(),
+                    json: *json,
+                },
+            );
+        }
     };
     text.map(Done::from)
 }

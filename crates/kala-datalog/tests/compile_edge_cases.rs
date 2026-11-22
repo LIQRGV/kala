@@ -49,6 +49,11 @@ fn rows_p(w: &World, text: &str, params: &[(&str, Value)]) -> BTreeSet<Vec<Value
         .unwrap_or_else(|e| panic!("run {text}: {e}"))
         .rows
         .into_iter()
+        .map(|r| {
+            r.into_iter()
+                .map(|d| d.as_value().unwrap().clone())
+                .collect()
+        })
         .collect()
 }
 fn rows(w: &World, text: &str) -> BTreeSet<Vec<Value>> {
@@ -138,6 +143,7 @@ fn expand_ticks(op: &Op, out: &mut Vec<TickSource>) {
             expand_ticks(right, out);
         }
         Op::Union { inputs } => inputs.iter().for_each(|i| expand_ticks(i, out)),
+        _ => {}
     }
 }
 fn ticks_of(p: &Plan) -> Vec<TickSource> {

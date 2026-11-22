@@ -23,7 +23,7 @@ use crate::world::{Change, Op};
 
 /// A half-open stretch of story time `[from, until)`; `until: None` is
 /// open-ended (holds forever after `from`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Interval {
     /// First tick inside the interval.
     pub from: Tick,

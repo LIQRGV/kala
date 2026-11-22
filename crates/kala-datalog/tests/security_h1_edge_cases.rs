@@ -112,6 +112,7 @@ fn non_i64_tick_with_tight_budget_reports_which_error_wins() {
             &Limits {
                 max_rows: 100,
                 max_steps,
+                ..Limits::default()
             },
         )
     };
@@ -273,6 +274,7 @@ fn limits_inside_the_grouped_path_error_and_never_truncate() {
         &Limits {
             max_rows: n - 1,
             max_steps: 10_000_000,
+            ..Limits::default()
         },
     );
     assert!(matches!(r, Err(QueryError::RowLimit { .. })), "got {r:?}");
@@ -282,6 +284,7 @@ fn limits_inside_the_grouped_path_error_and_never_truncate() {
         &Limits {
             max_rows: n,
             max_steps: 10_000_000,
+            ..Limits::default()
         },
     )
     .unwrap();
@@ -295,6 +298,7 @@ fn limits_inside_the_grouped_path_error_and_never_truncate() {
             &Limits {
                 max_rows: 100_000,
                 max_steps: steps,
+                ..Limits::default()
             },
         ) {
             Err(QueryError::StepBudget { .. }) => {}
@@ -312,6 +316,7 @@ fn limits_inside_the_grouped_path_error_and_never_truncate() {
         &Limits {
             max_rows: 100_000,
             max_steps: (n as u64) + 6,
+            ..Limits::default()
         },
     );
     assert!(matches!(r, Err(QueryError::StepBudget { .. })), "got {r:?}");

@@ -1,0 +1,5 @@
+; Story question: where and with whom was Edwin at tick -310?
+; Derivation: both facts are a PREQUEL written in tx8 (canon 9), after the rest of
+; his story: located_in oakhollow [-340,-300) and an early alliance with greg
+; [-320,-300). tomas only becomes an ally at -300, and the varrow stay starts at -300.
+[:find ?p ?a :at -310 :where [:edwin :located_in ?p] [:edwin :ally_of ?a]]

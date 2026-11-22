@@ -1,0 +1,5 @@
+; Story question: who rules Varrow at tick -190, and what is the ruler's name?
+; Derivation: tomas ruled from -350 and was retracted at -190; hild is asserted at
+; the same tick -190. The intervals touch ([-350,-190), [-190,inf)), so at -190 only
+; hild holds. Hild's name is "Hild".
+[:find ?r ?n :at -190 :where [:varrow :ruled_by ?r] [?r :name ?n]]

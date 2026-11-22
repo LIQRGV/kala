@@ -42,7 +42,7 @@ fn exec_latest(w: &World, p: &Plan) -> Result<ResultSet, QueryError> {
 }
 
 fn ok_rows(w: &World, p: &Plan) -> Vec<Vec<Value>> {
-    exec_latest(w, p).expect("query runs").rows
+    value_rows(&exec_latest(w, p).expect("query runs"))
 }
 
 fn eid(w: &World, handle: &str) -> EntityId {
@@ -1378,6 +1378,7 @@ fn row_limit_and_step_budget_are_errors_not_truncation() {
     let big = Limits {
         max_rows: 1_000_000,
         max_steps: 100_000_000,
+        ..Limits::default()
     };
     assert_eq!(
         execute(&view, &all_chars, &no_params(), &big)

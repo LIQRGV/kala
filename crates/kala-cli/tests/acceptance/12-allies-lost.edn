@@ -1,0 +1,5 @@
+; Story question: whose alliance with Edwin held at -210 but not at -200?
+; Derivation: allies(-210) = {greg, tomas} (see 02-edwins-allies: mara starts at
+; -208). allies(-200) = {tomas, mara}: greg's retract is at -200 (after the retcon),
+; so it already applies at -200; mara has held since -208. Difference = {greg}.
+[:find ?a :at -210 :where [:edwin :ally_of ?a] (not (at -200 [:edwin :ally_of ?a]))]

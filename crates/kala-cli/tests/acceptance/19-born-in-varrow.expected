@@ -1,0 +1,4 @@
+query at tick -300, canon tx#12: 2 rows
+  ?c
+  v01
+  v15

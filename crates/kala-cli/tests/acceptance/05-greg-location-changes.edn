@@ -1,0 +1,5 @@
+; Story question: every tick at which Greg's location changed, with the change.
+; Derivation (latest canon): carnath asserted -100 and retracted 150 (prequel, tx8);
+; varrow asserted 200 and retracted 250 (tx5, tx9); ashford asserted 601 (tx7).
+; Five change points, ordered by tick.
+[:find ?t ?p ?op :where [:greg :located_in ?p ?t ?op]]

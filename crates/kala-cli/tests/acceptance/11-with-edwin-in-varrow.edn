@@ -1,0 +1,13 @@
+; Story question: who was ever in Varrow at the same time as Edwin, and when?
+; Derivation: Edwin is in varrow only [-300,-250) (asserted -300, retracted -250;
+; his childhood stay was oakhollow). Intersect with everyone else's varrow intervals:
+;   osric [-400,inf), tomas [-350,inf), v01 [-395,-95), v15 [-325,-25) -> [-300,-250)
+;   hild [-270,-230)                                                    -> [-270,-250)
+;   mara [-220,-190), greg [200,250), v10 [-50,inf), v24 [20,inf)       -> disjoint
+; (Edwin himself is excluded.) Entity-ID order: tomas, hild, osric, v01, v15.
+[:find ?c ?both
+ :where (during [:edwin :located_in :varrow] ?ie)
+        (during [?c :located_in :varrow] ?ic)
+        [(!= ?c :edwin)]
+        [(intersect ?ie ?ic) ?both]
+        [(not-empty ?both)]]

@@ -1,0 +1,7 @@
+; Story question: where was Edwin at tick -260, and what was he called then?
+; Derivation (varrow.yaml, tx4/tx8): located_in varrow is asserted at -300 and
+; retracted at -250, so it holds at -260. His prequel stay in oakhollow ends at -300
+; (retract), and carnath starts at -250. Name "Edwin" is asserted at -300 and only
+; retracted at -180, so at -260 it holds ("the Grey King" comes at -180).
+; One row: varrow, "Edwin".
+[:find ?p ?n :at -260 :where [:edwin :located_in ?p] [:edwin :name ?n]]

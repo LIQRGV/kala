@@ -1,0 +1,4 @@
+; Story question: how many different characters have ever been in Varrow?
+; Derivation: the arrivals in varrow (see 06-first-arrival-in-varrow) come from ten
+; distinct characters: edwin, greg, mara, tomas, hild, osric, v01, v10, v15, v24.
+[:find (count-distinct ?c) :where [?c :located_in :varrow ?t :assert]]

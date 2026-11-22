@@ -39,6 +39,15 @@ pub enum ErrorKind {
     TypeMismatch,
     /// In the grammar's future but not implemented yet.
     Unsupported,
+    /// A rule called with the wrong number of arguments, or definitions of
+    /// one rule name with different head lengths.
+    Arity,
+    /// A call of a rule no `:rules` definition names.
+    UnknownRule,
+    /// A `(not ..)` reaches, through its calls, a rule of the recursive
+    /// component of the rule containing it: negation through recursion has
+    /// no stratified meaning.
+    Stratification,
 }
 
 /// A Datalog parse or compile error.
@@ -80,6 +89,23 @@ impl DatalogError {
 
     pub(crate) fn unsupported(span: Span, message: impl Into<String>) -> DatalogError {
         DatalogError::new(ErrorKind::Unsupported, Some(span), message)
+    }
+
+    /// The same error with its span moved `offset` bytes later, for when the
+    /// text it was produced from sits at `offset` inside a larger text (a
+    /// check's query inside its checks file). Any location is dropped, since
+    /// it described the smaller text; call [`DatalogError::locate`] with the
+    /// larger text afterwards. A shift that would overflow leaves the span
+    /// unset rather than panicking.
+    pub fn offset_by(mut self, offset: usize) -> DatalogError {
+        self.span = self.span.and_then(|s| {
+            Some(Span::new(
+                s.start.checked_add(offset)?,
+                s.end.checked_add(offset)?,
+            ))
+        });
+        self.line_col = None;
+        self
     }
 
     /// Compute the line and column of the span in `text` (the text the span

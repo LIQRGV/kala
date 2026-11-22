@@ -384,17 +384,14 @@ fn unknown_section_refused() {
     err_kind("[:find ?a :limit 3 :where [?a :x 1]]", ErrorKind::Syntax);
 }
 
+// `rules_section_unsupported` was deleted: `:rules` is supported now, and
+// rules_parse.rs covers `:rules` after `:where` (Syntax), section order and shapes.
 #[test]
-fn rules_section_unsupported() {
-    let e = err_kind(
-        "[:find ?a :where [?a :x 1] :rules [[(r ?a) [?a :x 1]]]]",
-        ErrorKind::Unsupported,
-    );
-    assert!(e.message.contains("slice 7"), "{}", e.message);
-    err_kind(
-        "[:find ?a :rules [] :where [?a :x 1]]",
-        ErrorKind::Unsupported,
-    );
+fn rules_section_parses_into_the_ast() {
+    let qq = ok("[:find ?a :rules [[(r ?a) [?a :x 1]]] :where (r ?a)]");
+    assert_eq!(qq.rules.len(), 1);
+    assert_eq!(qq.rules[0].name, "r");
+    assert_eq!(qq.calls.len(), 1);
 }
 
 #[test]
@@ -406,13 +403,18 @@ fn bad_find_items() {
 }
 
 #[test]
-fn aggregates_in_find_unsupported() {
-    for agg in ["(count ?c)", "(sum ?c)", "(max ?c)"] {
-        let e = err_kind(
-            &format!("[:find {agg} :where [?c :x 1]]"),
-            ErrorKind::Unsupported,
-        );
-        assert!(e.message.contains("slice 7"), "{}", e.message);
+fn aggregates_in_find_now_parse() {
+    // Slice 7 item 7: aggregates are supported. Their meaning, malformed
+    // forms (Syntax) and type errors are covered by tests/aggregates.rs; here
+    // only the parser contract: they are accepted, never "Unsupported".
+    for agg in [
+        "(count ?c)",
+        "(count-distinct ?c)",
+        "(sum ?c)",
+        "(max ?c)",
+        "(min ?c)",
+    ] {
+        ok(&format!("[:find ?p {agg} :where [?c :x ?p]]"));
     }
 }
 
@@ -500,10 +502,11 @@ fn predicate_errors() {
 
 #[test]
 fn wrong_arity_patterns() {
-    for extra in ["[?e :a ?v ?t]", "[?e :a ?v ?t ?x]", "[?e :a ?v 1 2]"] {
-        let e = err_kind(&q(extra), ErrorKind::Unsupported);
-        assert!(e.message.contains("slice 7"), "{}", e.message);
-    }
+    // 4 and 5 elements are history patterns now (item 5).
+    ok(&q("[?e :a ?v ?t]"));
+    ok(&q("[?e :a ?v ?t ?x]"));
+    // an integer in op position has no meaning
+    err_kind(&q("[?e :a ?v 1 2]"), ErrorKind::Syntax);
     err_kind(&q("[?e :a]"), ErrorKind::Syntax);
     err_kind(&q("[?e]"), ErrorKind::Syntax);
     err_kind(&q("[]"), ErrorKind::Syntax);
@@ -512,24 +515,21 @@ fn wrong_arity_patterns() {
 }
 
 #[test]
-fn four_element_pattern_inside_at_also_unsupported() {
-    err_kind(
-        "[:find ?a :where (at 1 [?a :x ?v ?t])]",
-        ErrorKind::Unsupported,
-    );
+fn four_element_pattern_inside_at_is_a_syntax_error() {
+    err_kind("[:find ?a :where (at 1 [?a :x ?v ?t])]", ErrorKind::Syntax);
 }
 
 #[test]
 fn rules_and_not_unsupported() {
-    for c in [
-        "(ancestor ?a ?d)",
-        "(not [?e :x 1])",
-        "(not-join [?e] [?e :x 1])",
-        "(or [?e :x 1] [?e :y 1])",
-    ] {
+    for c in ["(not-join [?e] [?e :x 1])", "(or [?e :x 1] [?e :y 1])"] {
         let e = err_kind(&q(c), ErrorKind::Unsupported);
         assert!(e.message.contains("slice 7"), "{c}: {}", e.message);
     }
+    // A plain `(name arg..)` is a rule call now: it parses (the compiler reports
+    // UnknownRule when no `:rules` definition names it).
+    let qq = ok(&q("(ancestor ?a ?d)"));
+    assert_eq!(qq.calls.len(), 1);
+    assert_eq!(qq.calls[0].name, "ancestor");
 }
 
 #[test]
@@ -604,8 +604,8 @@ fn errors_always_carry_a_span_for_syntax_and_unsupported() {
         "[",
         "[:find ?a :where [?a :x 1]",
         "[:find ?a :where [?a :x 1]] x",
-        "[:find ?a :where [?a :x 1 2]]",
-        "[:find ?a :where (not [?a :x 1])]",
+        "[:find ?a :where [?a :x 1 :foo]]",
+        "[:find ?a :where (or [?a :x 1] [?a :y 1])]",
         "[:find ?a :at :where [?a :x 1]]",
     ] {
         let e = err(t);

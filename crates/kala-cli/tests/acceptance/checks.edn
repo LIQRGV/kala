@@ -1,0 +1,18 @@
+; Story checks for varrow.yaml (kala doctor <world> --checks checks.edn).
+; Derivation, at the latest tick (700) and latest canon (tx#12; the world is
+; doctor-clean, so only hints are printed):
+;  :steward-ally-of-warlord  FIRES, 1 row: tomas is labelled Steward (from -350),
+;     lisa Warlord (from 480), and tomas ally_of lisa since 590 -> `tomas  lisa`.
+;  :two-rulers  SILENT: varrow is ruled by hild only (tomas retracted at -190),
+;     ashford by lisa, eldoria by edwin; no place has two different rulers.
+;  :villagers-away-from-birth  FIRES, 24 rows: every villager N was born in
+;     place (N-1) mod 14 and lives at 700 in place (N+4) mod 14, never the same
+;     place. Text shows the first 5 (v01..v05, entity-ID order) and "... (19 more)".
+[
+ [:steward-ally-of-warlord
+  [:find ?s ?w :where [?s :label "Steward"] [?w :label "Warlord"] [?s :ally_of ?w]]]
+ [:two-rulers
+  [:find ?p ?a ?b :where [?p :ruled_by ?a] [?p :ruled_by ?b] [(!= ?a ?b)]]]
+ [:villagers-away-from-birth
+  [:find ?c :where [?c :label "Villager"] [?c :born_in ?b] [?c :located_in ?p] [(!= ?b ?p)]]]
+]

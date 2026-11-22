@@ -109,6 +109,7 @@ fn row_limit_error_is_prompt_measured_in_steps_not_time() {
     let lim = Limits {
         max_rows: 100_000,
         max_steps: 200_000,
+        ..Limits::default()
     };
     assert!(matches!(
         go(&w, &p, &lim),
@@ -233,6 +234,7 @@ fn row_limit_error_is_prompt_before_the_product_is_built() {
     let lim = Limits {
         max_rows: 1_000,
         max_steps: 10_000,
+        ..Limits::default()
     };
     assert!(matches!(
         go(&w, &product(), &lim),
@@ -246,6 +248,7 @@ fn two_2000_entity_scans_with_row_limit_1000_error_within_100k_steps() {
     let lim = Limits {
         max_rows: 1_000,
         max_steps: 100_000,
+        ..Limits::default()
     };
     assert!(matches!(
         go(&w, &product(), &lim),
@@ -375,6 +378,7 @@ fn both_limits_zero_never_panics() {
     let lim = Limits {
         max_rows: 0,
         max_steps: 0,
+        ..Limits::default()
     };
     assert!(go(&w, &all_chars(), &lim).is_err());
 }
@@ -385,6 +389,7 @@ fn max_rows_usize_max_and_max_steps_u64_max_do_not_overflow() {
     let lim = Limits {
         max_rows: usize::MAX,
         max_steps: u64::MAX,
+        ..Limits::default()
     };
     assert_eq!(go(&w, &all_chars(), &lim).unwrap().rows.len(), 10);
 }

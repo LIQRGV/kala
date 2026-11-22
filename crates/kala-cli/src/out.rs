@@ -7,7 +7,8 @@
 
 use std::io;
 
-use kala_core::{EntityId, Precision, Tick, TxId, Value, View, World};
+use kala_core::{EntityId, Interval, IntervalSet, Op, Precision, Tick, TxId, Value, View, World};
+use kala_query::Datum;
 use serde::Serialize;
 
 use crate::escape;
@@ -68,6 +69,31 @@ impl JValue {
         };
         JValue { ty, value }
     }
+
+    /// A query answer's cell: a value as [`JValue::new`] shows it, an op as
+    /// `{"type": "op", "value": "assert"}`, an interval set as
+    /// `{"type": "intervals", "value": [[from, until or null], ...]}`.
+    pub fn datum(d: &Datum, entity: impl Fn(EntityId) -> JEntity) -> JValue {
+        match d {
+            Datum::Value(v) => JValue::new(v, entity),
+            Datum::Op(op) => JValue {
+                ty: "op",
+                value: JInner::Op(match op {
+                    Op::Assert => "assert",
+                    Op::Retract => "retract",
+                }),
+            },
+            Datum::Intervals(set) => JValue {
+                ty: "intervals",
+                value: JInner::Intervals(
+                    set.intervals()
+                        .iter()
+                        .map(|i| (i.from.0, i.until.map(|u| u.0)))
+                        .collect(),
+                ),
+            },
+        }
+    }
 }
 
 /// The payload of a [`JValue`].
@@ -81,6 +107,10 @@ pub enum JInner {
     F64Special(&'static str),
     Str(String),
     Ref(JEntity),
+    /// A change point's op (`assert`, `retract`).
+    Op(&'static str),
+    /// An interval set's half-open intervals, `None` (`null`) for no end.
+    Intervals(Vec<(i64, Option<i64>)>),
 }
 
 /// A tick with its precision.
@@ -161,6 +191,11 @@ impl<'w> Labeler<'w> {
 
     pub fn value(&self, v: &Value) -> JValue {
         JValue::new(v, |e| self.entity(e))
+    }
+
+    /// A query answer's cell ([`JValue::datum`]).
+    pub fn datum(&self, d: &Datum) -> JValue {
+        JValue::datum(d, |e| self.entity(e))
     }
 
     /// The values of `entity.attr` holding at the tick.
@@ -268,6 +303,14 @@ pub fn value_text(v: &JValue) -> String {
         JInner::F64Special(s) => (*s).to_string(),
         JInner::Str(s) => escape::quoted(s),
         JInner::Ref(e) => entity_text(e),
+        JInner::Op(op) => format!(":{op}"),
+        JInner::Intervals(ivs) => {
+            IntervalSet::from_intervals(ivs.iter().map(|&(from, until)| Interval {
+                from: Tick(from),
+                until: until.map(Tick),
+            }))
+            .to_string()
+        }
     }
 }
 

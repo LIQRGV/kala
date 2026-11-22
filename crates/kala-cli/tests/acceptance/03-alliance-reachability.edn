@@ -1,0 +1,13 @@
+; Story question: whom can Edwin reach through chains of alliances at tick 600?
+; Rule: allied(a,b) is a direct ally_of, or an ally_of to x who is allied to b.
+; Derivation of the alliances holding at 600 (ally_of is bidirectional):
+;   edwin-tomas (asserted -300, never retracted); edwin-mara (asserted -208,
+;   retracted -150, asserted again -60); tomas-lisa (asserted 590).
+;   greg ended at -200 and hild at -240, so neither holds.
+; From edwin: tomas and mara; from tomas: edwin and lisa; from mara: edwin;
+; from lisa: tomas. Fixed point {tomas, mara, edwin (the cycle), lisa}.
+; Lisa is only reachable in two hops. Entity-ID order: edwin, mara, lisa, tomas.
+[:find ?b :at 600
+ :rules [[(allied ?a ?b) [?a :ally_of ?b]]
+         [(allied ?a ?b) [?a :ally_of ?x] (allied ?x ?b)]]
+ :where (allied :edwin ?b)]

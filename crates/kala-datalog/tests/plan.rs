@@ -142,7 +142,15 @@ fn run_q(w: &World, text: &str, params: &[(&str, Value)]) -> ResultSet {
         .unwrap_or_else(|e| panic!("run failed for {text}\n{}\n  {e}", p.explain(w)))
 }
 fn rows(w: &World, text: &str, params: &[(&str, Value)]) -> BTreeSet<Vec<Value>> {
-    run_q(w, text, params).rows.into_iter().collect()
+    run_q(w, text, params)
+        .rows
+        .into_iter()
+        .map(|r| {
+            r.into_iter()
+                .map(|d| d.as_value().unwrap().clone())
+                .collect()
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------- access per pattern

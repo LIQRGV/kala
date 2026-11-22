@@ -1,0 +1,7 @@
+; Story question: where is Greg at tick 601 in the draft canon (tx#8)?
+; Derivation: YAML transaction n is canon tx#(n+1) (tx#1 holds the schema and the
+; entities). tx5 (canon 6) puts Greg in varrow @200 with no retract; tx7 (canon 8)
+; adds ashford @601. The varrow retract @250 is only written in tx9 (canon 10).
+; So at canon 8 Greg is in varrow AND ashford at 601: the overlap draft of CLAUDE.md.
+; Entity-ID order (places): varrow, ashford.
+[:find ?p :at 601 :canon 8 :where [:greg :located_in ?p]]

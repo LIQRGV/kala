@@ -1,0 +1,10 @@
+; Story question: who are Edwin's allies at tick -210?
+; Derivation (ally_of is bidirectional, so either side of the edge counts):
+;   tomas  asserted -300, never retracted                       -> ally
+;   greg   [-320,-300) prequel, then asserted -280; its retract was moved to -200
+;          by the retcon (canon 12), so it holds at -210        -> ally
+;   hild   asserted -260, retracted -240                        -> not an ally
+;   mara   asserted -208 (after -210)                           -> not yet
+;   wren   the -170 assertion was deleted by the retcon         -> never
+; Rows are in entity-ID order (the order of the YAML entity list): greg, tomas.
+[:find ?a :at -210 :where [:edwin :ally_of ?a]]

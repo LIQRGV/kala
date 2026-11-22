@@ -9,7 +9,8 @@ mod common;
 use common::*;
 use kala_core::{AttrDef, Cardinality, EntityId, Kind, Schema, Tick, Value, ValueType, World};
 use kala_query::{
-    Access, Limits, MAX_PLAN_DEPTH, Op, Params, Plan, QueryError, ResultSet, execute,
+    Access, Limits, MAX_EXPLAIN_BYTES, MAX_PLAN_DEPTH, Op, Params, Plan, QueryError, ResultSet,
+    execute,
 };
 
 fn on_small_stack<F: FnOnce() + Send + 'static>(f: F) {
@@ -159,9 +160,9 @@ fn explain_of_a_plan_deeper_than_the_limit_works() {
         let nodes = MAX_PLAN_DEPTH * 3;
         let p = plan(&["x"], expand_chain(e, nodes));
         let text = p.explain(&w);
-        assert_eq!(text.lines().count(), nodes + 1);
+        assert!(text.len() <= MAX_EXPLAIN_BYTES + 64, "{} bytes", text.len());
         assert!(text.starts_with("Find ?x"));
-        assert!(text.lines().last().unwrap().trim() == "Unit");
+        assert!(text.ends_with("  ... (plan truncated)\n"));
     });
 }
 
