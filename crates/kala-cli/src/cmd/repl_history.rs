@@ -84,10 +84,23 @@ impl History {
             return Err(io("history exceeds 1 MiB"));
         }
         let text = String::from_utf8(contents).map_err(io)?;
-        for line in text.lines() {
+        // A save cut short (a full disk) leaves an unterminated last line.
+        // Only that line may fail to parse; it is dropped. Every
+        // newline-terminated line is parsed strictly.
+        let (complete, tail) = match text.rfind('\n') {
+            Some(i) if i + 1 < text.len() => (&text[..=i], Some(&text[i + 1..])),
+            None if !text.is_empty() => ("", Some(text.as_str())),
+            _ => (text.as_str(), None),
+        };
+        let tail = tail.and_then(|t| serde_json::from_str::<String>(t).ok());
+        let parsed = complete
+            .lines()
+            .map(|line| serde_json::from_str::<String>(line).map_err(io))
+            .chain(tail.map(Ok));
+        for entry in parsed {
             // One JSON string per line preserves multiline queries without
             // granting history files any command-execution semantics.
-            let entry: String = serde_json::from_str(line).map_err(io)?;
+            let entry = entry?;
             if entry.len() > MAX_QUERY_BYTES {
                 return Err(io("history entry exceeds the query limit"));
             }
@@ -133,8 +146,9 @@ impl History {
                 return Err(io("history acquired a hard link or was removed"));
             }
         }
-        // Encode everything first, so a failure can't leave a half-written
-        // file; then replace the contents in one write.
+        // Encode everything first, then replace the contents in one write. A
+        // write that fails midway (a full disk) can still leave a cut-off
+        // last line; `open` drops such a line.
         let mut buf = Vec::with_capacity(self.bytes + 4 * self.entries.len());
         for entry in &self.entries {
             serde_json::to_writer(&mut buf, entry).map_err(io)?;
@@ -143,6 +157,6 @@ impl History {
         self.file.seek(SeekFrom::Start(0)).map_err(io)?;
         self.file.set_len(0).map_err(io)?;
         self.file.write_all(&buf).map_err(io)?;
-        self.file.flush().map_err(io)
+        self.file.sync_data().map_err(io)
     }
 }

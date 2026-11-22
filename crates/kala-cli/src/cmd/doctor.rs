@@ -188,9 +188,10 @@ fn whose(c: &kala_datalog::Check) -> String {
     format!("check :{}", escape::value(&c.name))
 }
 
-/// Prepares every check, then shares one steps/bytes budget across all runs.
-/// Peak live bytes from each completed run are conservatively deducted from
-/// the batch budget. Exhaustion is one hint covering this and later checks.
+/// Prepares every check, then runs them one after another. The step budget
+/// is shared by all checks: running out of it is one hint covering this and
+/// every later check. Memory is released between checks, so each check gets
+/// the full byte limit, and running out of it only stops that check.
 fn run_checks(
     path: &Path,
     (text, checks): &(String, Vec<kala_datalog::Check>),
@@ -227,6 +228,22 @@ fn run_checks(
         };
         let (mut rs, usage) = match result {
             Ok(result) => result,
+            Err(e @ (QueryError::StepBudget { .. } | QueryError::MemoryBudget { .. }))
+                if !stops_later_checks(&e) =>
+            {
+                hints.push(JHint {
+                    kind: "memory_exhausted",
+                    message: Some(format!(
+                        "story check :{} skipped: it exceeded the memory budget",
+                        escape::value(&c.name)
+                    )),
+                    check: c.name.clone(),
+                    rows_total: 0,
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                });
+                continue;
+            }
             Err(QueryError::StepBudget { .. } | QueryError::MemoryBudget { .. }) => {
                 hints.push(JHint {
                     kind: "budget_exhausted",
@@ -261,6 +278,12 @@ fn run_checks(
         });
     }
     Ok(hints)
+}
+
+/// Whether running out of a budget stops every later story check: only the
+/// shared step budget does; memory is per check.
+fn stops_later_checks(e: &QueryError) -> bool {
+    matches!(e, QueryError::StepBudget { .. })
 }
 
 /// The budget left for the next story check: steps are shared by all checks
@@ -428,5 +451,19 @@ mod budget_tests {
         assert_eq!(next.max_steps, full.max_steps - 1_000);
         assert_eq!(next.max_bytes, full.max_bytes);
         assert_eq!(next.max_rows, full.max_rows);
+    }
+}
+
+#[cfg(test)]
+mod budget_flow_tests {
+    use super::stops_later_checks;
+    use kala_query::QueryError;
+
+    // Review round 2: memory is per check, so running out of it only stops
+    // that check; running out of the shared steps stops every later check.
+    #[test]
+    fn only_the_shared_step_budget_stops_later_checks() {
+        assert!(stops_later_checks(&QueryError::StepBudget { limit: 1 }));
+        assert!(!stops_later_checks(&QueryError::MemoryBudget { limit: 1 }));
     }
 }

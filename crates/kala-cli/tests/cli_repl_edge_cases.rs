@@ -267,3 +267,33 @@ fn history_is_saved_when_stdout_fails() {
     let saved = std::fs::read_to_string(&history).unwrap();
     assert!(saved.contains(":edwin :ally_of"), "history: {saved:?}");
 }
+
+// Review round 2: a save cut short (e.g. a full disk) leaves an unterminated
+// last line; the next start drops that line instead of refusing to start.
+#[test]
+fn history_with_a_cut_off_last_line_still_opens() {
+    let fx = varrow();
+    let history = fx.dir.path().join("history");
+    std::fs::write(
+        &history,
+        "\"[:find ?a :where [:edwin :ally_of ?a]]\"\n\"[:find ?b",
+    )
+    .unwrap();
+    let o = repl(&fx, b".quit\n", &["--history", history.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let saved = std::fs::read_to_string(&history).unwrap();
+    assert_eq!(
+        saved,
+        "\"[:find ?a :where [:edwin :ally_of ?a]]\"\n\".quit\"\n"
+    );
+}
+
+// A complete (newline-terminated) bad line is still refused.
+#[test]
+fn history_with_a_bad_complete_line_is_refused() {
+    let fx = varrow();
+    let history = fx.dir.path().join("history");
+    std::fs::write(&history, "\"ok\"\nnot json\n").unwrap();
+    let o = repl(&fx, b".quit\n", &["--history", history.to_str().unwrap()]);
+    assert_ne!(code(&o), 0);
+}

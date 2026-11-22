@@ -480,9 +480,16 @@ pub fn run(
     // session itself wins over one from saving.
     let result = drive(world, at, canon, ctx, interactive, &mut history);
     if let Some(h) = &mut history {
-        let saved = h.save();
-        if result.is_ok() {
-            saved?;
+        match (h.save(), &result) {
+            (Err(e), Ok(_)) => return Err(e),
+            (Err(e), Err(_)) => {
+                // The session error is returned; still say the history was lost.
+                let _ = output(
+                    &mut io::stderr().lock(),
+                    &format!("warning: {}\n", escape::line(e.message())),
+                );
+            }
+            (Ok(()), _) => {}
         }
     }
     result
