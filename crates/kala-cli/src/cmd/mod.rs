@@ -11,6 +11,7 @@ pub mod list;
 pub mod load;
 pub mod log;
 pub mod neighbors;
+pub mod query;
 mod read;
 
 use crate::cli::Command;
@@ -96,6 +97,8 @@ pub fn dispatch(cmd: &Command) -> Result<Done, CliError> {
             json,
         } => log::run(world, *from, *limit, *json),
         Command::Info { world, json } => info::run(world, *json),
+        Command::Query { world, query, json } => query::run(world, query, *json),
+        Command::Explain { world, query } => query::explain(world, query),
         Command::Doctor {
             world,
             canon,

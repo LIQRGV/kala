@@ -288,6 +288,8 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "kala-core",
+ "kala-datalog",
+ "kala-query",
  "serde",
  "serde_json",
  "tempfile",
@@ -305,6 +307,25 @@ dependencies = [
  "serde-saphyr",
  "tempfile",
  "unicode-normalization",
+]
+
+[[package]]
+name = "kala-datalog"
+version = "0.1.0"
+dependencies = [
+ "kala-core",
+ "kala-query",
+ "proptest",
+ "tempfile",
+]
+
+[[package]]
+name = "kala-query"
+version = "0.1.0"
+dependencies = [
+ "kala-core",
+ "proptest",
+ "tempfile",
 ]
 
 [[package]]

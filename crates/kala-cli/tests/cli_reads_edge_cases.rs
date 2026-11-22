@@ -5,6 +5,7 @@
 //! - `edge` takes `edge#N [@T]` or `SRC ATTR TGT [@T]`; other arity is exit 2;
 //! - `--at +5` and `@+5` are accepted and mean 5 (i64 parse semantics);
 //! - an edge defined after the chosen canon does not exist at that canon (exit 1);
+//! - an entity defined after the chosen canon does not exist there either (exit 1; slice 6);
 //! - handles are shown escaped, with the backslash escaped too (`\\`), so a
 //!   literal `\u{1b}` text and a real ESC are distinguishable;
 //! - long string values are shown in full in text and JSON.
@@ -195,36 +196,27 @@ fn list_of_a_declared_type_with_no_entities_is_empty_and_ok() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn asof_at_canon_zero_holds_nothing_and_reports_tick_zero() {
+fn asof_at_canon_zero_is_unknown_entity_exit_1() {
+    // Slice 6: an entity is not readable at a canon before it was defined.
     let fx = varrow();
-    let o = fx.run("asof", &["edwin", "--canon", "0", "--json"]);
-    if code(&o) == 0 {
-        let j = parse_one_json(&stdout(&o));
-        assert_eq!(j["canon"], json!(0));
-        assert_eq!(j["tick"], json!(0));
-        assert_eq!(j["attributes"], json!([]));
-    } else {
-        panic!(
-            "asof at genesis must read (nothing holds), got stderr: {}",
-            stderr(&o)
-        );
-    }
+    fx.fails(1, "asof", &["edwin", "--canon", "0"]);
 }
 
 #[test]
-fn history_at_canon_zero_is_empty() {
+fn history_at_canon_zero_is_unknown_entity_exit_1() {
     let fx = varrow();
-    let j = fx.json("history", &["edwin", "ally_of", "--canon", "0"]);
-    assert_eq!(j["canon"], json!(0));
-    assert_eq!(j["changes"], json!([]));
+    fx.fails(1, "history", &["edwin", "ally_of", "--canon", "0"]);
 }
 
 #[test]
-fn neighbors_and_list_at_canon_zero_are_empty() {
+fn neighbors_at_canon_zero_is_unknown_entity_and_list_is_empty() {
     let fx = varrow();
-    let n = fx.json("neighbors", &["edwin", "ally_of", "--both", "--canon", "0"]);
-    assert_eq!(n["tick"], json!(0));
-    assert_eq!(n["neighbors"], json!([]));
+    fx.fails(
+        1,
+        "neighbors",
+        &["edwin", "ally_of", "--both", "--canon", "0"],
+    );
+    // `list` is a node scan: it never errors, it is just empty.
     let l = fx.json("list", &["CHARACTER", "--canon", "0"]);
     assert_eq!(l["entities"], json!([]));
 }

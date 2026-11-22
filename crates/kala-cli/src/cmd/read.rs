@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use kala_core::{EntityId, Tick, TxId, View, World};
+use kala_core::{EntityId, Tick, TxId, Value, ValueType, View, World};
 
 use crate::cli::Canon;
 use crate::error::CliError;
@@ -92,6 +92,30 @@ impl Ctx {
         Labeler::new(&self.world, self.canon, tick)
     }
 
+    /// [`Ctx::entity`], but an ID that this world never defined is an
+    /// error (kala-core's `UnknownEntity`, exit 1) here rather than left to
+    /// a read: for query parameters, whose reads find nothing for an
+    /// undefined ID instead of reporting it. Linear in the entity's node
+    /// type; one call per argument.
+    pub fn defined_entity(&self, arg: &str) -> Result<EntityId, CliError> {
+        let id = self.entity(arg)?;
+        let w = &self.world;
+        let defined = match id.as_edge() {
+            Some(edge) => w.edge(edge).is_some(),
+            // Node type IDs are their position in the schema's node types.
+            None => w
+                .node_types()
+                .nth(usize::from(id.node_type().0))
+                .and_then(|t| w.entities_of_type(t).ok())
+                .is_some_and(|mut it| it.any(|e| e == id)),
+        };
+        if defined {
+            Ok(id)
+        } else {
+            Err(entity_err(arg)(kala_core::Error::UnknownEntity(id)))
+        }
+    }
+
     /// An entity argument: an ID (`CHARACTER#1`, `edge#9`) if it parses as
     /// one (whether it is defined is left to the read, which reports an
     /// unknown entity), else a handle.
@@ -106,4 +130,31 @@ impl Ctx {
             ))
         })
     }
+}
+
+/// A value argument read as type `ty`, a ref by entity syntax
+/// ([`Ctx::entity`]). `whose` names what has that type, already escaped
+/// (``attribute `name` ``); an error reads "`s` is not an i64 (the type of
+/// <whose>)".
+pub fn parse_value(ctx: &Ctx, ty: ValueType, s: &str, whose: &str) -> Result<Value, CliError> {
+    let bad = |what: &str| {
+        CliError::User(format!(
+            "`{}` is not {what} (the type of {whose})",
+            escape::value(s)
+        ))
+    };
+    Ok(match ty {
+        ValueType::Bool => match s {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
+            _ => return Err(bad("a bool (`true` or `false`)")),
+        },
+        ValueType::I64 => Value::I64(s.parse().map_err(|_| bad("an i64"))?),
+        ValueType::F64 => {
+            let x: f64 = s.parse().map_err(|_| bad("an f64"))?;
+            Value::f64(x).map_err(|_| bad("an f64 (NaN is never stored)"))?
+        }
+        ValueType::Str => Value::Str(s.to_string()),
+        ValueType::Ref => Value::Ref(ctx.entity(s)?),
+    })
 }

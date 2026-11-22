@@ -433,19 +433,20 @@ fn pinned_canon_does_not_see_later_prequel_or_retract() {
 }
 
 #[test]
-fn canon_zero_sees_nothing() {
+fn canon_zero_has_no_entities_so_reads_are_unknown_entity() {
     let mut f = fx();
     f.w.assert(f.greg, "located_in", Value::Ref(f.varrow), tk(0))
         .unwrap();
     let v = f.w.at_canon(TxId(0));
     for d in [Direction::Out, Direction::In, Direction::Both] {
+        // neither entity is defined at canon 0
         assert_eq!(
-            v.neighbors(f.greg, "located_in", d, Tick(0)).unwrap(),
-            vec![]
+            v.neighbors(f.greg, "located_in", d, Tick(0)),
+            Err(Error::UnknownEntity(f.greg))
         );
         assert_eq!(
-            v.neighbors(f.varrow, "located_in", d, Tick(0)).unwrap(),
-            vec![]
+            v.neighbors(f.varrow, "located_in", d, Tick(0)),
+            Err(Error::UnknownEntity(f.varrow))
         );
     }
 }

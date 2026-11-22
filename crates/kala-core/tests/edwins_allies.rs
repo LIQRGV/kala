@@ -326,8 +326,12 @@ fn check_canons(w: &World, s: &Story) {
     assert_eq!(allies_at(tx_of(4), c.edwin, 100), vec![c.mara]);
     // re-formation w6
     assert_eq!(allies_at(tx_of(5), c.edwin, 100), vec![c.mara, c.lisa]);
-    // before anything: empty
-    assert!(allies_at(TxId(0), c.edwin, -208).is_empty());
+    // before the cast was defined: the entity doesn't exist yet
+    assert_eq!(
+        w.at_canon(TxId(0))
+            .neighbors(c.edwin, "ally_of", Direction::Both, Tick(-208)),
+        Err(Error::UnknownEntity(c.edwin))
+    );
     // the mara~lisa prequel
     assert!(allies_at(tx_of(6), c.lisa, -260).is_empty());
     assert_eq!(allies_at(tx_of(7), c.lisa, -260), vec![c.mara]);

@@ -1162,8 +1162,12 @@ fn delete_at_canon_boundaries_for_in_neighbors() {
     assert!(inn(&w.at_canon(after)).is_empty());
     // canon far in the future behaves like latest
     assert!(inn(&w.at_canon(TxId(after.0 + 100))).is_empty());
-    // canon 0 (genesis): nothing, as before any write
-    assert!(inn(&w.at_canon(TxId(0))).is_empty());
+    // canon 0 (genesis): varrow is not defined yet, so reading it is an error
+    assert_eq!(
+        w.at_canon(TxId(0))
+            .neighbors(e.varrow, "located_in", Direction::In, Tick(0)),
+        Err(Error::UnknownEntity(e.varrow))
+    );
     // the R side of Greg's Out too
     assert!(
         w.at_canon(after)
@@ -1234,20 +1238,18 @@ fn probe(w: &World, e: &Ents, canon: TxId) -> String {
     for tk in [i64::MIN, -300, -250, -208, -207, 0, i64::MAX] {
         out += &format!(
             "{tk}: loc={:?} name={:?} ally={:?} n_out={:?} n_in={:?}\n",
-            v.as_of(e.greg, "located_in", Tick(tk)).unwrap(),
-            v.as_of(e.greg, "name", Tick(tk)).unwrap(),
-            v.as_of(e.mara, "ally_of", Tick(tk)).unwrap(),
-            v.neighbors(e.greg, "located_in", Direction::Out, Tick(tk))
-                .unwrap(),
-            v.neighbors(e.varrow, "located_in", Direction::In, Tick(tk))
-                .unwrap(),
+            v.as_of(e.greg, "located_in", Tick(tk)),
+            v.as_of(e.greg, "name", Tick(tk)),
+            v.as_of(e.mara, "ally_of", Tick(tk)),
+            v.neighbors(e.greg, "located_in", Direction::Out, Tick(tk)),
+            v.neighbors(e.varrow, "located_in", Direction::In, Tick(tk)),
         );
     }
     out += &format!(
         "{:?}\n{:?}\n{:?}\n",
-        v.history(e.greg, "located_in").unwrap(),
-        v.history(e.greg, "name").unwrap(),
-        v.history(e.edwin, "ally_of").unwrap()
+        v.history(e.greg, "located_in"),
+        v.history(e.greg, "name"),
+        v.history(e.edwin, "ally_of")
     );
     out
 }

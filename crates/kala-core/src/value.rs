@@ -17,7 +17,9 @@
 //! and [`Value::decode`] accepts only that encoding, so equal values always
 //! have equal bytes.
 
+use std::cmp::Ordering;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 use caseless::Caseless;
 use unicode_normalization::UnicodeNormalization;
@@ -46,7 +48,21 @@ pub enum ValueType {
 ///
 /// Build floats with [`Value::f64`], which rejects NaN and normalizes `-0.0`.
 /// The `F64` variant is public, so [`Value::encode`] re-checks both.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// # Equality and order
+///
+/// `Value` is totally ordered, and the order is the byte order of
+/// [`Value::encode`]: the type tag first (`Bool < I64 < F64 < Str < Ref`),
+/// then the payload's natural order (numbers numerically, strings by UTF-8
+/// bytes, refs by ID). Two values are equal exactly when their canonical
+/// encodings are equal, so `F64(-0.0) == F64(0.0)` and they hash alike, and
+/// `I64(3) != F64(3.0)`. Comparing never allocates or encodes.
+///
+/// NaN can't be stored, but a hand-built `F64(NaN)` still compares without
+/// panicking: every NaN (whatever its sign or payload bits) is equal to every
+/// other NaN and sorts after `F64(+inf)` and before every `Str`, so `Eq`
+/// stays reflexive and the order stays total.
+#[derive(Clone, Debug)]
 pub enum Value {
     /// A boolean.
     Bool(bool),
@@ -58,6 +74,77 @@ pub enum Value {
     Str(String),
     /// A reference to an entity.
     Ref(EntityId),
+}
+
+impl Value {
+    /// The type tag byte of this value's encoding.
+    #[inline]
+    fn tag(&self) -> u8 {
+        match self {
+            Value::Bool(_) => TAG_BOOL,
+            Value::I64(_) => TAG_I64,
+            Value::F64(_) => TAG_F64,
+            Value::Str(_) => TAG_STR,
+            Value::Ref(_) => TAG_REF,
+        }
+    }
+}
+
+/// The order key of a float: its encoded payload for a storable float
+/// (`-0.0` folded into `0.0`), and `u64::MAX` for any NaN. No non-NaN float
+/// encodes to `u64::MAX` (+inf is `0xFFF0…`), so NaNs form one class above
+/// every number.
+#[inline]
+fn f64_order_key(x: f64) -> u64 {
+    match normalize_f64(x) {
+        Ok(x) => f64_to_key(x),
+        Err(_) => u64::MAX,
+    }
+}
+
+impl Ord for Value {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Each arm compares exactly what the encoding's payload bytes
+        // compare: sign-flipped i64 bytes sort like i64, the escaped string
+        // encoding sorts like the raw UTF-8 bytes, ref bytes are the
+        // big-endian ID.
+        match (self, other) {
+            (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+            (Value::I64(a), Value::I64(b)) => a.cmp(b),
+            (Value::F64(a), Value::F64(b)) => f64_order_key(*a).cmp(&f64_order_key(*b)),
+            (Value::Str(a), Value::Str(b)) => a.as_bytes().cmp(b.as_bytes()),
+            (Value::Ref(a), Value::Ref(b)) => a.raw().cmp(&b.raw()),
+            _ => self.tag().cmp(&other.tag()),
+        }
+    }
+}
+
+impl PartialOrd for Value {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Value {}
+
+impl Hash for Value {
+    // Hashes the same key `cmp` compares, so equal values hash alike.
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.tag().hash(state);
+        match self {
+            Value::Bool(b) => b.hash(state),
+            Value::I64(n) => n.hash(state),
+            Value::F64(x) => f64_order_key(*x).hash(state),
+            Value::Str(s) => s.as_bytes().hash(state),
+            Value::Ref(id) => id.raw().hash(state),
+        }
+    }
 }
 
 /// Why a value can't be encoded, decoded or indexed.

@@ -20,6 +20,7 @@ pub mod world;
 #[doc(hidden)]
 pub use doctor::Tamper;
 pub use doctor::{DoctorOptions, Finding, IndexName, Report, Severity, doctor, doctor_log};
+pub use echo::must_escape;
 pub use error::Error;
 pub use fixture::{FixtureError, FixtureErrorKind, OpRef, load_fixture, load_fixture_to};
 pub use id::{AttrId, EdgeId, EntityId, IdError, NodeTypeId};
@@ -32,6 +33,6 @@ pub use schema::{AttrDef, Cardinality, Kind, RefDirection, Schema};
 pub use tick::{Precision, Tick};
 pub use value::{MAX_INDEXED_STRING_BYTES, Value, ValueError, ValueType, fold_for_search};
 pub use world::{
-    Change, CommitResult, Correction, CutCause, Direction, EntryInfo, IndexDump, Mark, Op,
-    RecoveryReport, TxId, Txn, View, World, WriteResult,
+    AttrStats, Change, CommitResult, Correction, CutCause, Direction, EntryInfo, IndexDump, Mark,
+    Op, RecoveryReport, TxId, Txn, View, World, WriteResult,
 };

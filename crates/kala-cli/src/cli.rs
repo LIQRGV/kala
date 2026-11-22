@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 
 /// Kala: a temporal graph database for story and game worlds.
 #[derive(Debug, Parser)]
@@ -21,7 +21,7 @@ pub struct Cli {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Canon(pub u64);
 
-fn parse_canon(s: &str) -> Result<Canon, String> {
+pub(crate) fn parse_canon(s: &str) -> Result<Canon, String> {
     let digits = s.strip_prefix("tx#").unwrap_or(s);
     digits
         .parse::<u64>()
@@ -41,6 +41,28 @@ pub struct ReadAt {
     /// Print one JSON document instead of text.
     #[arg(long)]
     pub json: bool,
+}
+
+/// A Datalog query's text (inline or from a file) and its parameters.
+#[derive(Debug, Args)]
+#[command(group(ArgGroup::new("source").required(true).args(["query", "file"])))]
+pub struct QueryArgs {
+    /// The Datalog query text.
+    pub query: Option<String>,
+    /// Read the query text from this file (a regular file, UTF-8).
+    #[arg(short = 'f', value_name = "FILE")]
+    pub file: Option<PathBuf>,
+    /// A query parameter, `name=value` (`name` with or without `?`).
+    #[arg(long = "param", value_name = "NAME=VALUE", value_parser = parse_param)]
+    pub params: Vec<(String, String)>,
+}
+
+/// `name=value`, split at the first `=`; the name may start with `?`.
+fn parse_param(s: &str) -> Result<(String, String), String> {
+    let (name, value) = s
+        .split_once('=')
+        .ok_or_else(|| "expected `name=value`".to_string())?;
+    Ok((name.to_string(), value.to_string()))
 }
 
 #[derive(Debug, Subcommand)]
@@ -182,5 +204,22 @@ pub enum Command {
         /// Print one JSON document instead of text.
         #[arg(long)]
         json: bool,
+    },
+    /// Run a Datalog query.
+    Query {
+        /// The world file.
+        world: PathBuf,
+        #[command(flatten)]
+        query: QueryArgs,
+        /// Print one JSON document instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a Datalog query's plan without running it.
+    Explain {
+        /// The world file.
+        world: PathBuf,
+        #[command(flatten)]
+        query: QueryArgs,
     },
 }

@@ -1133,7 +1133,10 @@ fn model(w: &World, tx: TxId, who: &[EntityId], attr: &str, v: &Value, at: i64) 
     let mut out: Vec<EntityId> = who
         .iter()
         .copied()
-        .filter(|&x| w.at_canon(tx).as_of(x, attr, Tick(at)).unwrap().contains(v))
+        .filter(|&x| {
+            // An entity not yet defined at this canon holds nothing.
+            matches!(w.at_canon(tx).as_of(x, attr, Tick(at)), Ok(vals) if vals.contains(v))
+        })
         .collect();
     out.sort();
     out

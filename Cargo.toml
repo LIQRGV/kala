@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/kala-core", "crates/kala-cli"]
+members = ["crates/kala-core", "crates/kala-cli", "crates/kala-query", "crates/kala-datalog"]
 
 [workspace.package]
 edition = "2024"

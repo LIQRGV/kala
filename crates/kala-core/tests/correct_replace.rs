@@ -1296,22 +1296,20 @@ fn probe(w: &World, e: &Ents, canon: TxId) -> String {
     ] {
         out += &format!(
             "{tk}: loc={:?} ally_e={:?} ally_m={:?} name={:?} out={:?} in={:?}\n",
-            v.as_of(e.greg, "located_in", Tick(tk)).unwrap(),
-            v.as_of(e.edwin, "ally_of", Tick(tk)).unwrap(),
-            v.as_of(e.mara, "ally_of", Tick(tk)).unwrap(),
-            v.as_of(e.greg, "name", Tick(tk)).unwrap(),
-            v.neighbors(e.greg, "located_in", Direction::Out, Tick(tk))
-                .unwrap(),
-            v.neighbors(e.varrow, "located_in", Direction::In, Tick(tk))
-                .unwrap(),
+            v.as_of(e.greg, "located_in", Tick(tk)),
+            v.as_of(e.edwin, "ally_of", Tick(tk)),
+            v.as_of(e.mara, "ally_of", Tick(tk)),
+            v.as_of(e.greg, "name", Tick(tk)),
+            v.neighbors(e.greg, "located_in", Direction::Out, Tick(tk)),
+            v.neighbors(e.varrow, "located_in", Direction::In, Tick(tk)),
         );
     }
     out += &format!(
         "{:?}\n{:?}\n{:?}\n{:?}\n",
-        v.history(e.greg, "located_in").unwrap(),
-        v.history(e.greg, "name").unwrap(),
-        v.history(e.edwin, "ally_of").unwrap(),
-        v.history(e.greg, "ally_of").unwrap()
+        v.history(e.greg, "located_in"),
+        v.history(e.greg, "name"),
+        v.history(e.edwin, "ally_of"),
+        v.history(e.greg, "ally_of")
     );
     out
 }

@@ -493,16 +493,20 @@ fn an_old_canon_answers_as_before_later_commits() {
 }
 
 #[test]
-fn canon_zero_sees_nothing() {
+fn canon_zero_has_no_entities_so_reads_are_unknown_entity() {
     let mut f = fx();
     let (greg, varrow) = (f.greg, f.varrow);
     f.w.assert(greg, "located_in", r(varrow), t(1)).unwrap();
     let v = f.w.at_canon(TxId(0));
-    assert!(
-        !v.as_of_value(greg, "located_in", &r(varrow), Tick(1))
-            .unwrap()
+    // greg isn't defined at canon 0, so reading him there is an error
+    assert_eq!(
+        v.as_of_value(greg, "located_in", &r(varrow), Tick(1)),
+        Err(kala_core::Error::UnknownEntity(greg))
     );
-    assert!(v.as_of(greg, "located_in", Tick(1)).unwrap().is_empty());
+    assert_eq!(
+        v.as_of(greg, "located_in", Tick(1)),
+        Err(kala_core::Error::UnknownEntity(greg))
+    );
 }
 
 #[test]

@@ -225,7 +225,7 @@ fn as_of_value_of_a_never_stored_unindexed_value_is_false_at_every_canon() {
                     "{v:?}@{at}"
                 );
                 assert!(!w.as_of_value(b, "notes", &s(v), Tick(at)).unwrap());
-                for canon in [TxId(0), tx1, w.latest_tx()] {
+                for canon in [tx1, w.latest_tx()] {
                     assert!(
                         !w.at_canon(canon)
                             .as_of_value(a, "bio", &s(v), Tick(at))
@@ -245,10 +245,11 @@ fn as_of_value_of_a_never_stored_unindexed_value_is_false_at_every_canon() {
         assert!(!w.as_of_value(a, "notes", &s("real"), Tick(0)).unwrap());
         // the real one holds (and not before the first canon that has it)
         assert!(w.as_of_value(a, "bio", &s("real"), Tick(0)).unwrap());
-        assert!(
-            !w.at_canon(TxId(0))
-                .as_of_value(a, "bio", &s("real"), Tick(0))
-                .unwrap()
+        // `a` isn't defined at canon 0, so reading it there is an error
+        assert_eq!(
+            w.at_canon(TxId(0))
+                .as_of_value(a, "bio", &s("real"), Tick(0)),
+            Err(kala_core::Error::UnknownEntity(a))
         );
         clean(&w);
     }

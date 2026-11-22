@@ -12,9 +12,9 @@ use std::fmt::{self, Write};
 /// The most chars of an input shown; longer input is cut and gets `...`.
 pub(crate) const MAX_ECHO_CHARS: usize = 64;
 
-/// Shows `self.0` with control characters (Unicode `Cc`) and bidi controls
-/// escaped like `char::escape_debug` (`\u{1b}`, `\n`), cut to its first
-/// [`MAX_ECHO_CHARS`] chars (counted in the original string) plus `...`.
+/// Shows `self.0` with every [`must_escape`] char escaped (`Cc` as
+/// `char::escape_debug` does: `\u{1b}`, `\n`; the rest as `\u{202e}`), cut to
+/// its first [`MAX_ECHO_CHARS`] chars (counted in the original string) plus `...`.
 /// Printable text, non-ASCII included, is shown as is.
 pub(crate) struct Echo<'a>(pub(crate) &'a str);
 
@@ -36,10 +36,28 @@ impl fmt::Display for Quoted<'_> {
     }
 }
 
-/// The bidi embedding/override (U+202A..U+202E) and isolate (U+2066..U+2069)
-/// controls: format chars (`Cf`), not `Cc`, but they reorder displayed text.
-fn is_bidi_control(c: char) -> bool {
-    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+/// Whether `c` must never be echoed raw to a terminal: every Unicode `Cc`
+/// (C0, DEL, C1), the bidi embeddings/overrides U+202A..U+202E and isolates
+/// U+2066..U+2069, the bidi marks U+061C (ALM), U+200E (LRM) and U+200F (RLM),
+/// the line/paragraph separators U+2028 and U+2029, and U+FEFF (BOM / ZWNBSP).
+///
+/// The non-`Cc` ones are format or separator chars that reorder, hide or
+/// break the text around them. This is the one predicate shared by
+/// kala-core's error messages and every front-end (the CLI) that prints
+/// input or world data; escape a char it accepts as `\u{..}`.
+pub fn must_escape(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{061C}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{FEFF}'
+        )
 }
 
 fn write_echo(f: &mut fmt::Formatter<'_>, s: &str, quoted: bool) -> fmt::Result {
@@ -47,7 +65,7 @@ fn write_echo(f: &mut fmt::Formatter<'_>, s: &str, quoted: bool) -> fmt::Result 
     for c in chars.by_ref().take(MAX_ECHO_CHARS) {
         if c.is_control() {
             write!(f, "{}", c.escape_debug())?;
-        } else if is_bidi_control(c) {
+        } else if must_escape(c) {
             write!(f, "\\u{{{:x}}}", u32::from(c))?;
         } else if quoted && matches!(c, '"' | '\\') {
             write!(f, "\\{c}")?;

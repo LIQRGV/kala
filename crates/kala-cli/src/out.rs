@@ -195,8 +195,9 @@ impl<'w> Labeler<'w> {
 
 // ---- JSON ---------------------------------------------------------------------
 
-/// serde_json's compact output, plus `\u` escapes for C1 controls, DEL and
-/// bidi controls inside strings (serde_json writes those raw).
+/// serde_json's compact output, plus `\u` escapes for every
+/// [`kala_core::must_escape`] char inside strings (serde_json writes C1
+/// controls, DEL, bidi controls, U+2028/2029 and U+FEFF raw).
 struct SafeFormatter;
 
 impl serde_json::ser::Formatter for SafeFormatter {

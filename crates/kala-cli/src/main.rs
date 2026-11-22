@@ -1,6 +1,7 @@
 //! The `kala` command line: a thin layer over the public kala-core API.
 //!
-//! Exit codes: 0 ok; 1 user error or findings; 2 usage error; 3 store error.
+//! Exit codes: 0 ok; 1 user error or findings; 2 usage error; 3 store error
+//! or a failed write to stdout/stderr (a closed pipe is not a failure).
 //! Every human-readable line goes through [`escape`] before it is printed.
 
 mod cli;
@@ -26,20 +27,18 @@ fn main() -> ExitCode {
     };
     match cmd::dispatch(&cli.command) {
         Ok(done) => {
-            print_to(&mut std::io::stdout(), &escape::text(&done.text));
-            if done.findings {
+            let code = if done.findings {
                 ExitCode::from(1)
             } else {
                 ExitCode::SUCCESS
-            }
+            };
+            emit(Stream::Stdout, &escape::text(&done.text), code)
         }
-        Err(e) => {
-            print_to(
-                &mut std::io::stderr(),
-                &format!("kala: error: {}\n", escape::text(e.message())),
-            );
-            e.exit_code()
-        }
+        Err(e) => emit(
+            Stream::Stderr,
+            &format!("kala: error: {}\n", escape::text(e.message())),
+            e.exit_code(),
+        ),
     }
 }
 
@@ -47,15 +46,14 @@ fn main() -> ExitCode {
 /// other error to stderr with exit 2. Never `err.exit()`.
 fn usage(e: clap::Error, args: &[OsString]) -> ExitCode {
     if !e.use_stderr() {
-        print_to(
-            &mut std::io::stdout(),
+        return emit(
+            Stream::Stdout,
             &escape::text(&e.render().to_string()),
+            ExitCode::SUCCESS,
         );
-        return ExitCode::SUCCESS;
     }
     let rendered = echo_safe_render(e, args);
-    print_to(&mut std::io::stderr(), &escape::text(&rendered));
-    ExitCode::from(2)
+    emit(Stream::Stderr, &escape::text(&rendered), ExitCode::from(2))
 }
 
 /// Renders a usage error so that every argument it echoes is escaped as a
@@ -91,8 +89,42 @@ fn echo_safe_render(e: clap::Error, args: &[OsString]) -> String {
     e.render().to_string()
 }
 
-/// Writes `s` to `w`, ignoring a closed pipe (`kala ... | head`).
-fn print_to(w: &mut dyn Write, s: &str) {
-    let _ = w.write_all(s.as_bytes());
-    let _ = w.flush();
+#[derive(Clone, Copy)]
+enum Stream {
+    Stdout,
+    Stderr,
+}
+
+/// Writes `s` to `stream` and returns `code`, or exit 3 if the write failed
+/// for any reason other than a closed pipe (`kala ... | head` is the
+/// reader's choice and keeps `code`). A full disk or a dead terminal must
+/// not look like success to a script. A failed stdout write is reported on
+/// stderr if possible; a failed stderr write has nowhere to be reported.
+fn emit(stream: Stream, s: &str, code: ExitCode) -> ExitCode {
+    let written = match stream {
+        Stream::Stdout => print_to(&mut std::io::stdout().lock(), s),
+        Stream::Stderr => print_to(&mut std::io::stderr().lock(), s),
+    };
+    match written {
+        Ok(()) => code,
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => code,
+        Err(e) => {
+            if let Stream::Stdout = stream {
+                let _ = print_to(
+                    &mut std::io::stderr().lock(),
+                    &format!(
+                        "kala: error: writing output: {}\n",
+                        escape::line(&e.to_string())
+                    ),
+                );
+            }
+            ExitCode::from(3)
+        }
+    }
+}
+
+/// Writes all of `s` to `w` and flushes it.
+fn print_to(w: &mut dyn Write, s: &str) -> std::io::Result<()> {
+    w.write_all(s.as_bytes())?;
+    w.flush()
 }

@@ -1,0 +1,15 @@
+[package]
+name = "kala-datalog"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "kala_datalog"
+
+[dependencies]
+kala-core = { path = "../kala-core" }
+kala-query = { path = "../kala-query" }
+
+[dev-dependencies]
+proptest = "1.12.0"
+tempfile = "3.27.0"

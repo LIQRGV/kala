@@ -315,9 +315,97 @@ pub struct LogEntry {
 /// returned and not an error; it is left in the file (only
 /// [`World::open`](crate::World::open) cuts it). Takes no lock, so it can
 /// read a log while a [`World`](crate::World) has it open.
+///
+/// Only a regular file (or a symlink to one) is read: a directory, FIFO,
+/// device or socket is refused with [`Error::Io`] of kind `InvalidInput`
+/// before anything is read (see [`read_log_file`]).
 pub fn read_log(path: &Path) -> Result<Vec<LogEntry>, Error> {
-    let bytes = std::fs::read(path)?;
+    let bytes = read_log_file(path)?;
     Ok(scan(&bytes)?.entries)
+}
+
+/// Reads the bytes of the log file at `path`, for the readers that take no
+/// lock ([`read_log`], [`World::open_read_only`](crate::World::open_read_only),
+/// doctor). Refuses anything but a regular file as [`open_regular`] does,
+/// and reads at most the length the opened file had (a snapshot: bytes a
+/// writer appends meanwhile are left for the next read).
+pub(crate) fn read_log_file(path: &Path) -> Result<Vec<u8>, Error> {
+    let mut file = open_regular(path, OpenOptions::new().read(true))?;
+    read_to_len(&mut file)
+}
+
+/// Opens `path` with `opts`, refusing anything but a regular file (after
+/// following symlinks) with [`Error::Io`] of kind `InvalidInput`.
+///
+/// Two checks, because a log reader must never hang or read without bound:
+/// - Before opening, the path's metadata: opening a FIFO for reading
+///   blocks until a writer shows up, so a FIFO (or a device such as
+///   `/dev/zero`, which never ends) must be turned away before `open`.
+/// - After opening, the handle's own metadata (`fstat`): that is the file
+///   actually read, so a path swapped between the two calls is still
+///   refused. (Only a swap to a FIFO in that window could still make the
+///   `open` itself wait; that needs write access to the directory.)
+fn open_regular(path: &Path, opts: &OpenOptions) -> Result<File, Error> {
+    refuse_non_regular(&std::fs::metadata(path)?)?;
+    let file = opts.open(path)?;
+    refuse_non_regular(&file.metadata()?)?;
+    Ok(file)
+}
+
+/// `Err(Io { kind: InvalidInput })` unless `meta` is a regular file's.
+fn refuse_non_regular(meta: &std::fs::Metadata) -> Result<(), Error> {
+    let ft = meta.file_type();
+    if ft.is_file() {
+        return Ok(());
+    }
+    let what = if ft.is_dir() {
+        "a directory"
+    } else if ft.is_symlink() {
+        "a symlink"
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            if ft.is_fifo() {
+                "a FIFO"
+            } else if ft.is_char_device() || ft.is_block_device() {
+                "a device"
+            } else if ft.is_socket() {
+                "a socket"
+            } else {
+                "not a regular file"
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            "not a regular file"
+        }
+    };
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("not a regular file ({what})"),
+    )
+    .into())
+}
+
+/// Reads `file` from its current position up to the length its metadata
+/// gives now, never more: a file that grows while being read (or claims an
+/// endless length) can't make this read without bound. The buffer is
+/// reserved fallibly, so a length too big for memory is an error, not an
+/// abort.
+fn read_to_len(file: &mut File) -> Result<Vec<u8>, Error> {
+    let len = file.metadata()?.len();
+    let too_big = || {
+        Error::from(std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            format!("log file of {len} bytes doesn't fit in memory"),
+        ))
+    };
+    let cap = usize::try_from(len).map_err(|_| too_big())?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(cap).map_err(|_| too_big())?;
+    file.take(len).read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// The committed part of a log file, as found by [`scan`].
@@ -1478,10 +1566,11 @@ impl LogWriter {
         // One handle for reading, cutting and appending, so the bytes
         // replayed are the bytes appended after. `append` without `create`
         // never creates the file.
-        let mut file = OpenOptions::new().read(true).append(true).open(path)?;
+        // Only a regular file: see `open_regular`.
+        let mut file = open_regular(path, OpenOptions::new().read(true).append(true))?;
         lock(&file)?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
+        // The length is taken under the lock, so no writer appends past it.
+        let bytes = read_to_len(&mut file)?;
         let Scan {
             entries,
             valid_len,
@@ -1532,7 +1621,7 @@ impl LogWriter {
         path: &Path,
         replay: impl FnOnce(&[LogEntry]) -> Result<T, Error>,
     ) -> Result<(T, RecoveryReport), Error> {
-        let bytes = std::fs::read(path)?;
+        let bytes = read_log_file(path)?;
         let Scan {
             entries,
             valid_len,

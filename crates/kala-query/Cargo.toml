@@ -1,0 +1,14 @@
+[package]
+name = "kala-query"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "kala_query"
+
+[dependencies]
+kala-core = { path = "../kala-core" }
+
+[dev-dependencies]
+proptest = "1.12.0"
+tempfile = "3.27.0"

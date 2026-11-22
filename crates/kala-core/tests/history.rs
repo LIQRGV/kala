@@ -436,9 +436,10 @@ fn at_canon_zero_history_is_empty_and_beyond_latest_is_latest() {
     let mut f = fx();
     let (greg, v) = (f.greg, f.varrow);
     f.w.assert(greg, "located_in", r(v), t(1)).unwrap();
+    // greg is not defined at canon 0
     assert_eq!(
-        f.w.at_canon(TxId(0)).history(greg, "located_in").unwrap(),
-        vec![]
+        f.w.at_canon(TxId(0)).history(greg, "located_in"),
+        Err(Error::UnknownEntity(greg))
     );
     assert_eq!(
         f.w.at_canon(TxId(u64::MAX))
@@ -517,10 +518,13 @@ fn history_agrees_with_as_of_at_every_change_point() {
 }
 
 #[test]
-fn at_canon_before_an_entity_existed_gives_empty_history() {
+fn at_canon_before_an_entity_existed_is_unknown_entity() {
     let mut f = fx();
     let old = f.w.latest_tx();
     let late = f.w.create_entity("CHARACTER", Some("late")).unwrap();
     f.w.assert(late, "located_in", r(f.varrow), t(5)).unwrap();
-    assert_eq!(f.w.at_canon(old).history(late, "located_in"), Ok(vec![]));
+    assert_eq!(
+        f.w.at_canon(old).history(late, "located_in"),
+        Err(Error::UnknownEntity(late))
+    );
 }

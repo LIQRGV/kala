@@ -512,6 +512,56 @@ pub struct IndexDump {
     pub v_fold: Vec<(AttrId, String, Value, EntityId, Tick, TxId, Mark)>,
 }
 
+/// Size estimates of one attribute, for a query planner (see
+/// [`World::attr_stats`]). Counted over every fact entry ever committed for
+/// the attribute, so they never shrink.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AttrStats {
+    /// Distinct entities (or edges) that have had a value.
+    pub entities: usize,
+    /// Distinct values (by encoding) any entity has had.
+    pub values: usize,
+    /// Distinct `(entity, value)` pairs: the number of `E` histories.
+    pub pairs: usize,
+}
+
+/// The distinct entities, values and pairs behind one attribute's
+/// [`AttrStats`]. Each distinct value is numbered once (by its `E`-key
+/// value part, which is one-to-one with the value: a value reference for an
+/// unindexed string, so long strings aren't copied), and pairs hold the
+/// number, not the bytes.
+#[derive(Debug, Default)]
+struct AttrCounts {
+    entities: HashSet<EntityId>,
+    values: HashMap<Box<[u8]>, usize>,
+    pairs: HashSet<(EntityId, usize)>,
+}
+
+impl AttrCounts {
+    /// Counts one stored fact entry of `entity` with `E`-key value part
+    /// `value`.
+    fn add(&mut self, entity: EntityId, value: &[u8]) {
+        let next = self.values.len();
+        let n = match self.values.get(value) {
+            Some(&n) => n,
+            None => {
+                self.values.insert(value.into(), next);
+                next
+            }
+        };
+        self.entities.insert(entity);
+        self.pairs.insert((entity, n));
+    }
+
+    fn stats(&self) -> AttrStats {
+        AttrStats {
+            entities: self.entities.len(),
+            values: self.values.len(),
+            pairs: self.pairs.len(),
+        }
+    }
+}
+
 /// A world: schema, entities and (later) their facts over story time.
 #[derive(Debug)]
 pub struct World {
@@ -594,6 +644,10 @@ pub struct World {
     /// counted. The last tick is the world's latest tick. Derived from the
     /// indexes; maintained by [`World::index_entry`] on commit and replay.
     tick_counts: BTreeMap<Tick, u64>,
+    /// The planner's per-attribute estimates behind [`World::attr_stats`].
+    /// Derived from the log like the indexes (never written to it):
+    /// maintained by [`World::index_entry`] on commit and replay.
+    attr_counts: HashMap<AttrId, AttrCounts>,
     /// The correction state of every revision chain a correction touched,
     /// by base entry. Derived from the log; maintained on commit and replay.
     chains: HashMap<EntryId, Chain>,
@@ -716,6 +770,7 @@ impl World {
             values: ValueTable::default(),
             content_hash: fnv1a64,
             tick_counts: BTreeMap::new(),
+            attr_counts: HashMap::new(),
             chains: HashMap::new(),
             entries: Vec::new(),
             log: None,
@@ -836,7 +891,9 @@ impl World {
     /// commits are appended to the same file. A clean log is not modified.
     ///
     /// Fails with [`Error::Io`] if the file can't be opened (`NotFound` if
-    /// it doesn't exist; it is never created), [`Error::BadMagic`] or
+    /// it doesn't exist; it is never created; `InvalidInput` for anything
+    /// but a regular file, such as a directory, FIFO or device, refused
+    /// before any read), [`Error::BadMagic`] or
     /// [`Error::UnsupportedVersion`] for a foreign header, or
     /// [`Error::Corrupt`] if the log has no committed genesis transaction or
     /// a committed transaction that a live write could not have produced
@@ -895,7 +952,9 @@ impl World {
     ///
     /// Fails as [`World::open`] does short of locking and cutting:
     /// [`Error::Io`] if the file can't be read (`NotFound` if it doesn't
-    /// exist; it is never created), [`Error::BadMagic`] or
+    /// exist; it is never created; `InvalidInput` for anything but a
+    /// regular file, such as a directory, FIFO or device, refused before
+    /// any read), [`Error::BadMagic`] or
     /// [`Error::UnsupportedVersion`] for a foreign header, or
     /// [`Error::Corrupt`] for any damage other than a torn or damaged tail.
     pub fn open_read_only(path: &Path) -> Result<World, Error> {
@@ -1477,6 +1536,14 @@ impl World {
                 }
             }
             _ => {}
+        }
+        if mark.op().is_some() {
+            // A fact or revised entry (DELETED markers add nothing), in the
+            // stored orientation `fact` already has.
+            self.attr_counts
+                .entry(fact.attr)
+                .or_default()
+                .add(fact.entity, fact.key_value());
         }
         self.e_index.insert(k, mark);
         if let Some(target) = fact.target {
@@ -2332,6 +2399,33 @@ impl World {
         t: Tick,
     ) -> Result<Vec<Change>, Error> {
         self.at_canon(self.latest_tx).as_of_detail(entity, attr, t)
+    }
+
+    /// Every `(entity, value)` pair of `attr` holding at tick `t` (latest
+    /// canon). Same as [`View::attr_scan`] on `at_canon(latest_tx())`.
+    pub fn attr_scan(&self, attr: &str, t: Tick) -> Result<Vec<(EntityId, Value)>, Error> {
+        self.at_canon(self.latest_tx).attr_scan(attr, t)
+    }
+
+    /// Size estimates of attribute `attr` for a query planner, over every
+    /// fact entry ever committed for it (base facts and revised entries, any
+    /// op, every canon; `DELETED` markers ignored), counted in stored
+    /// orientation (a bidirectional pair once, under its smaller ID). They
+    /// never shrink: a retract or a correction can only add. An inverse
+    /// name reports its base attribute's stats.
+    ///
+    /// Cost: one hash lookup. Fails with [`Error::UnknownAttribute`] for a
+    /// name that is neither an attribute nor an inverse name.
+    pub fn attr_stats(&self, attr: &str) -> Result<AttrStats, Error> {
+        let attr_id = self
+            .attr_by_name
+            .get(attr)
+            .or_else(|| self.inverse_by_name.get(attr))
+            .ok_or_else(|| Error::UnknownAttribute(attr.to_owned()))?;
+        Ok(self
+            .attr_counts
+            .get(attr_id)
+            .map_or_else(AttrStats::default, AttrCounts::stats))
     }
 
     /// The change points of `entity.attr` (latest canon).
@@ -3570,10 +3664,14 @@ impl Txn<'_> {
 /// [`World::at_canon`]: it reads only facts written by transactions `<=`
 /// that tx, so it never sees half a transaction or anything committed later.
 ///
-/// Entity existence is not pinned: an entity created after the view's canon
-/// is still a valid subject (with no facts visible), and one that doesn't
-/// exist in the current world is [`Error::UnknownEntity`]. Only facts are
-/// filtered by canon.
+/// Entity existence is pinned too: an entity or edge whose `DEFINE` is in a
+/// transaction after the view's canon doesn't exist there, so reading it
+/// (as a subject of [`View::as_of`], [`View::as_of_value`],
+/// [`View::as_of_detail`], [`View::history`] or [`View::neighbors`]) is
+/// [`Error::UnknownEntity`], exactly as for an ID the world never defined.
+/// At or after its defining tx it reads normally (with no facts until some
+/// are written). Scans ([`View::attr_scan`], [`View::entities_of_type`])
+/// simply leave such IDs out.
 #[derive(Clone, Copy, Debug)]
 pub struct View<'w> {
     world: &'w World,
@@ -3585,6 +3683,11 @@ pub struct View<'w> {
 }
 
 impl<'w> View<'w> {
+    /// The world this view reads.
+    pub fn world(&self) -> &'w World {
+        self.world
+    }
+
     /// Every entity of node type `node_type` defined in this canon (its
     /// `DEFINE` in a transaction `<=` the view's canon), ascending by
     /// sequence number (so by [`EntityId`]): `NodeScan` by type. Never an
@@ -3619,6 +3722,38 @@ impl View<'_> {
     /// The canon tx this view reads at.
     pub fn canon(&self) -> TxId {
         self.canon
+    }
+
+    /// Whether the entity or edge `id` was defined at this view's canon (its
+    /// `DEFINE` is in a transaction `<=` the canon).
+    fn id_visible(&self, id: EntityId) -> bool {
+        if let Some(edge) = id.as_edge() {
+            return self.edge_visible(edge);
+        }
+        if id.is_edge() {
+            return false;
+        }
+        id.seq()
+            .checked_sub(1)
+            .and_then(|i| usize::try_from(i).ok())
+            .and_then(|i| {
+                self.world
+                    .node_types
+                    .get(usize::from(id.node_type().0))?
+                    .defined_in
+                    .get(i)
+            })
+            .is_some_and(|&tx| tx <= self.canon)
+    }
+
+    /// [`World::resolve`] for a read at this canon: a known attribute, and
+    /// `entity` defined at the canon (else [`Error::UnknownEntity`]).
+    fn resolve(&self, entity: EntityId, attr: &str) -> Result<(AttrId, &AttrDef), Error> {
+        let resolved = self.world.resolve(&StagedIds::default(), entity, attr)?;
+        if !self.id_visible(entity) {
+            return Err(Error::UnknownEntity(entity));
+        }
+        Ok(resolved)
     }
 
     /// Whether the edge with ID `id` was defined at this view's canon (its
@@ -3704,7 +3839,7 @@ impl View<'_> {
         t: Tick,
     ) -> Result<bool, Error> {
         let world = self.world;
-        let (attr_id, def) = world.resolve(&StagedIds::default(), entity, attr)?;
+        let (attr_id, def) = self.resolve(entity, attr)?;
         check_type(attr, def, v)?;
         // A bidirectional pair is stored once, normalised: look it up there.
         let mut prefix = match v {
@@ -3749,8 +3884,16 @@ impl View<'_> {
     /// canon). Fails with [`Error::UnknownAttribute`] or
     /// [`Error::UnknownEntity`].
     pub fn as_of(&self, entity: EntityId, attr: &str, t: Tick) -> Result<Vec<Value>, Error> {
+        let (attr_id, _) = self.resolve(entity, attr)?;
+        Ok(self.values_holding(entity, attr_id, t))
+    }
+
+    /// The body of [`View::as_of`] for a resolved attribute: every value of
+    /// `entity.attr` holding at `t`, sorted by value encoding (bidirectional
+    /// partners from either side, each once). Shared with
+    /// [`View::attr_scan`], so the two can't disagree.
+    fn values_holding(&self, entity: EntityId, attr_id: AttrId, t: Tick) -> Vec<Value> {
         let world = self.world;
-        let (attr_id, _) = world.resolve(&StagedIds::default(), entity, attr)?;
         if world.is_bidirectional(attr_id) {
             // Ref encoding order is entity ID order, so sorting the IDs
             // sorts by value encoding.
@@ -3758,7 +3901,7 @@ impl View<'_> {
             self.for_each_partner_holding(entity, attr_id, true, true, t, |p| partners.push(p));
             partners.sort_unstable();
             partners.dedup();
-            return Ok(partners.into_iter().map(Value::Ref).collect());
+            return partners.into_iter().map(Value::Ref).collect();
         }
         let mut out = Vec::new();
         self.for_each_e_value_holding(entity, attr_id, t, |value| {
@@ -3769,8 +3912,59 @@ impl View<'_> {
         });
         if world.keys_by_ref(attr_id) {
             // Value references sort by hash, not by value: restore the
-            // value-encoding order every other attribute has by key order.
-            out.sort_by_cached_key(|v| v.encode().ok());
+            // value-encoding order every other attribute has by key order
+            // (`Ord for Value` is that order).
+            out.sort_unstable();
+        }
+        out
+    }
+
+    /// Every `(entity, value)` pair of `attr` that holds at tick `t` in this
+    /// canon: the pairs whose latest op with tick `<= t` is an assert, with
+    /// corrections honoured exactly as in [`View::as_of`] (it is the same
+    /// code, run for every ID). Entities include edges (edge properties).
+    /// Sorted ascending by `(entity, value)` ([`Value`]'s order), no
+    /// duplicates.
+    ///
+    /// - A bidirectional attribute lists each pair in both orientations,
+    ///   `(a, b)` and `(b, a)`; a self pair once.
+    /// - An inverse name (`child_of` for `parent_of`) lists the base
+    ///   attribute's pairs swapped, `(child, parent)`, read through `R`.
+    /// - Unindexed string attributes return their full values.
+    ///
+    /// Cost: one `E` (or `R`) prefix seek per defined entity and edge ID,
+    /// plus one seek per distinct value each has ever had for `attr`: linear
+    /// in the world's ID count even for a rare attribute. Fine for
+    /// milestone 0's small worlds; an attribute-first index would make it
+    /// proportional to the attribute's own histories.
+    ///
+    /// Fails with [`Error::UnknownAttribute`] for a name that is neither an
+    /// attribute nor an inverse name.
+    pub fn attr_scan(&self, attr: &str, t: Tick) -> Result<Vec<(EntityId, Value)>, Error> {
+        let world = self.world;
+        let mut out = Vec::new();
+        if let Some(&attr_id) = world.attr_by_name.get(attr) {
+            // IDs ascend and each entity's values come sorted, so `out` is
+            // sorted and duplicate-free as built.
+            for id in world.defined_ids() {
+                for v in self.values_holding(id, attr_id, t) {
+                    out.push((id, v));
+                }
+            }
+            return Ok(out);
+        }
+        let &attr_id = world
+            .inverse_by_name
+            .get(attr)
+            .ok_or_else(|| Error::UnknownAttribute(attr.to_owned()))?;
+        // Inverse names belong to directed attributes only, so each stored
+        // pair `source -> id` is read once, from `R|id|attr|`.
+        for id in world.defined_ids() {
+            let start = out.len();
+            self.for_each_partner_holding(id, attr_id, false, true, t, |source| {
+                out.push((id, Value::Ref(source)));
+            });
+            out[start..].sort_unstable();
         }
         Ok(out)
     }
@@ -3792,7 +3986,7 @@ impl View<'_> {
         t: Tick,
     ) -> Result<Vec<Change>, Error> {
         let world = self.world;
-        let (attr_id, _) = world.resolve(&StagedIds::default(), entity, attr)?;
+        let (attr_id, _) = self.resolve(entity, attr)?;
         // (value encoding, change), sorted by the encoding at the end.
         let mut out: Vec<(Vec<u8>, Change)> = Vec::new();
         self.for_each_e_history(entity, attr_id, |p| {
@@ -4240,7 +4434,7 @@ impl View<'_> {
     ) -> Result<Vec<(EntityId, EdgeId)>, Error> {
         let world = self.world;
         let (attr_id, dir) = world.resolve_neighbor_attr(attr, dir)?;
-        if !world.is_defined(&StagedIds::default(), entity) {
+        if !self.id_visible(entity) {
             return Err(Error::UnknownEntity(entity));
         }
         if world.attributes[attr_id.0 as usize].value_type != ValueType::Ref {
@@ -4291,7 +4485,7 @@ impl View<'_> {
     /// attribute has ever had. Fails with [`Error::UnknownAttribute`] or
     /// [`Error::UnknownEntity`].
     pub fn history(&self, entity: EntityId, attr: &str) -> Result<Vec<Change>, Error> {
-        let (attr_id, _) = self.world.resolve(&StagedIds::default(), entity, attr)?;
+        let (attr_id, _) = self.resolve(entity, attr)?;
         Ok(self.changes(entity, attr_id))
     }
 

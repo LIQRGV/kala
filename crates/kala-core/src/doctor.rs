@@ -354,10 +354,7 @@ pub enum Tamper {
 pub fn doctor(world: &World, opts: &DoctorOptions) -> Report {
     let mut found = Vec::new();
     let txns = match world.log_path() {
-        Some(path) => match std::fs::read(path)
-            .map_err(Error::from)
-            .and_then(|bytes| log::survey(&bytes))
-        {
+        Some(path) => match log::read_log_file(path).and_then(|bytes| log::survey(&bytes)) {
             Ok((txns, scanned)) => {
                 found.extend(scanned);
                 Some(txns)
@@ -387,10 +384,11 @@ pub fn doctor(world: &World, opts: &DoctorOptions) -> Report {
 /// modifies the file or its directory.
 ///
 /// Fails only if the file can't be scanned at all: [`Error::Io`] if it
-/// can't be read, [`Error::BadMagic`], [`Error::UnsupportedVersion`], or
+/// can't be read (kind `InvalidInput` for anything but a regular file: a
+/// directory, FIFO or device is refused unread), [`Error::BadMagic`], [`Error::UnsupportedVersion`], or
 /// [`Error::Corrupt`] for a truncated header. Everything else is a finding.
 pub fn doctor_log(path: &Path, opts: &DoctorOptions) -> Result<Report, Error> {
-    let bytes = std::fs::read(path)?;
+    let bytes = log::read_log_file(path)?;
     let (txns, mut found) = log::survey(&bytes)?;
     if let Some(rebuilt) = rebuild(txns, fnv1a64, &mut found) {
         schema_rules(&rebuilt, opts, &mut found);

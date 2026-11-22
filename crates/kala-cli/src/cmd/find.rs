@@ -3,10 +3,10 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use kala_core::{Value, ValueType};
+use kala_core::Value;
 use serde::Serialize;
 
-use super::read::{Ctx, core_err, tick_arg};
+use super::read::{Ctx, core_err, parse_value, tick_arg};
 use crate::cli::ReadAt;
 use crate::error::CliError;
 use crate::escape;
@@ -72,7 +72,12 @@ pub fn run(
             .attribute(attr)
             .map(|a| a.value_type)
             .ok_or_else(|| core_err(kala_core::Error::UnknownAttribute(attr.to_string())))?;
-        let v = parse_value(&ctx, ty, attr, value)?;
+        let v = parse_value(
+            &ctx,
+            ty,
+            value,
+            &format!("attribute `{}`", escape::value(attr)),
+        )?;
         let ids = view.lookup(attr, &v, tick).map_err(core_err)?;
         (v, ids)
     };
@@ -88,29 +93,4 @@ pub fn run(
         entities: ids.iter().map(|i| l.entity(*i)).collect(),
     };
     Ok(render(&out, read.json))
-}
-
-/// The value argument read as the attribute's type; a ref by entity syntax.
-fn parse_value(ctx: &Ctx, ty: ValueType, attr: &str, s: &str) -> Result<Value, CliError> {
-    let bad = |what: &str| {
-        CliError::User(format!(
-            "`{}` is not {what} (the type of attribute `{}`)",
-            escape::value(s),
-            escape::value(attr)
-        ))
-    };
-    Ok(match ty {
-        ValueType::Bool => match s {
-            "true" => Value::Bool(true),
-            "false" => Value::Bool(false),
-            _ => return Err(bad("a bool (`true` or `false`)")),
-        },
-        ValueType::I64 => Value::I64(s.parse().map_err(|_| bad("an i64"))?),
-        ValueType::F64 => {
-            let x: f64 = s.parse().map_err(|_| bad("an f64"))?;
-            Value::f64(x).map_err(|_| bad("an f64 (NaN is never stored)"))?
-        }
-        ValueType::Str => Value::Str(s.to_string()),
-        ValueType::Ref => Value::Ref(ctx.entity(s)?),
-    })
 }
