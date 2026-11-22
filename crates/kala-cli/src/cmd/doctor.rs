@@ -16,7 +16,7 @@ use std::path::Path;
 
 use kala_core::{DoctorOptions, Finding, IndexName, Severity, TxId, ValueType, doctor_log};
 use kala_datalog::{MAX_CHECKS_BYTES, Prepared};
-use kala_query::{CanonSource, Limits, Params};
+use kala_query::{CanonSource, Limits, Params, QueryError};
 use serde::Serialize;
 
 use super::Done;
@@ -52,8 +52,10 @@ struct JFinding {
 /// A story check that returned rows.
 #[derive(Serialize)]
 struct JHint {
-    /// Always `story_check`.
+    /// `story_check` or `budget_exhausted`.
     kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
     /// The check's name, without the `:`.
     check: String,
     /// How many rows the check returned.
@@ -97,6 +99,10 @@ impl Text for Doctor {
         } else if !self.hints.is_empty() {
             let _ = writeln!(s, "hints ({}):", self.hints.len());
             for h in &self.hints {
+                if let Some(message) = &h.message {
+                    let _ = writeln!(s, "  {message}");
+                    continue;
+                }
                 let k = h.rows_total;
                 let _ = writeln!(
                     s,
@@ -154,7 +160,7 @@ pub fn run(world: &Path, o: Options<'_>) -> Result<Done, CliError> {
     }
     if let Some(checks) = checks {
         if out.errors.is_empty() {
-            out.hints = run_checks(world, &checks, o.canon)?;
+            out.hints = run_checks(world, &checks, o.canon, o.json)?;
             out.clean &= out.hints.is_empty();
         } else {
             out.checks_skipped = true;
@@ -182,12 +188,14 @@ fn whose(c: &kala_datalog::Check) -> String {
     format!("check :{}", escape::value(&c.name))
 }
 
-/// Prepares every check, then runs each (default limits; at `canon` if
-/// given, else at the query's own canon). A check with rows is a hint.
+/// Prepares every check, then shares one steps/bytes budget across all runs.
+/// Peak live bytes from each completed run are conservatively deducted from
+/// the batch budget. Exhaustion is one hint covering this and later checks.
 fn run_checks(
     path: &Path,
     (text, checks): &(String, Vec<kala_datalog::Check>),
     canon: Option<Canon>,
+    json: bool,
 ) -> Result<Vec<JHint>, CliError> {
     let world = open_world(path)?;
     let mut prepared: Vec<Prepared> = Vec::with_capacity(checks.len());
@@ -210,18 +218,45 @@ fn run_checks(
         prepared.push(p);
     }
     let mut hints = Vec::new();
+    let mut remaining = Limits::default();
     for (c, p) in checks.iter().zip(&prepared) {
-        let rs = kala_query::run(&world, &p.plan, &Params::new(), &Limits::default())
-            .map_err(|e| query_err(e, &whose(c)))?;
+        let result = if remaining.max_steps == 0 || remaining.max_bytes == 0 {
+            Err(QueryError::StepBudget { limit: 0 })
+        } else {
+            kala_query::run_with_usage(&world, &p.plan, &Params::new(), &remaining)
+        };
+        let (mut rs, usage) = match result {
+            Ok(result) => result,
+            Err(QueryError::StepBudget { .. } | QueryError::MemoryBudget { .. }) => {
+                hints.push(JHint {
+                    kind: "budget_exhausted",
+                    message: Some(format!(
+                        "story checks stopped: budget exhausted at :{}",
+                        escape::value(&c.name)
+                    )),
+                    check: c.name.clone(),
+                    rows_total: 0,
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                });
+                break;
+            }
+            Err(e) => return Err(query_err(e, &whose(c))),
+        };
+        remaining.max_steps = remaining.max_steps.saturating_sub(usage.steps);
+        remaining.max_bytes = remaining.max_bytes.saturating_sub(usage.peak_bytes);
         if rs.rows.is_empty() {
             continue;
         }
-        let (columns, mut rows) = table(&world, &rs);
-        rows.truncate(JSON_ROWS);
+        let rows_total = rs.rows.len();
+        // Cut before label resolution/rendering, including in text mode.
+        rs.rows.truncate(if json { JSON_ROWS } else { TEXT_ROWS });
+        let (columns, rows) = table(&world, &rs);
         hints.push(JHint {
             kind: "story_check",
+            message: None,
             check: c.name.clone(),
-            rows_total: rs.rows.len(),
+            rows_total,
             columns,
             rows,
         });
