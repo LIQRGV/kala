@@ -1517,6 +1517,37 @@ impl LogWriter {
         ))
     }
 
+    /// The read-only counterpart of [`LogWriter::open`]: reads the log file
+    /// at `path` (never creating it) without taking the lock, passes the
+    /// entries of its committed transactions to `replay`, and returns
+    /// `replay`'s result with the [`RecoveryReport`] that `open` would
+    /// produce for the same bytes, minus the quarantine: `bytes_cut` and
+    /// `cause` say what `open` would cut, `quarantine` is `None`. Nothing is
+    /// written, cut or created.
+    ///
+    /// Fails exactly as `open` does before it would modify the file (as
+    /// [`read_log`] does, or with `replay`'s error); never with
+    /// [`Error::WorldLocked`].
+    pub(crate) fn read_committed<T>(
+        path: &Path,
+        replay: impl FnOnce(&[LogEntry]) -> Result<T, Error>,
+    ) -> Result<(T, RecoveryReport), Error> {
+        let bytes = std::fs::read(path)?;
+        let Scan {
+            entries,
+            valid_len,
+            cause,
+        } = scan(&bytes)?;
+        let replayed = replay(&entries)?;
+        let mut report = RecoveryReport::default();
+        if valid_len != bytes.len() {
+            // As in `open`: a `usize` length of an in-memory buffer fits a u64.
+            report.bytes_cut = (bytes.len() - valid_len) as u64;
+            report.cause = cause;
+        }
+        Ok((replayed, report))
+    }
+
     /// The path the log file was created or opened at.
     pub(crate) fn path(&self) -> &Path {
         &self.path

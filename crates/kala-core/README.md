@@ -181,6 +181,9 @@ assert_eq!(world.format_id(greg), "CHARACTER#3");
   `.unindexed()`).
 - `World::in_memory`, `World::create`, `World::open`: a world in memory or
   in a log file (reopening replays the log and recovers from a torn tail).
+  `World::open_read_only`: the same replay as a snapshot, with no lock and
+  no change to the file (`recovery()` reports what `open` would cut); every
+  write fails with `Error::ReadOnly`.
 - Writes: `World::create_entity`, `World::assert`, `World::retract` (and the
   `_with_precision` forms), `World::correct` with `Correction::{Delete,
   Replace}`; `World::begin` returns a `Txn` grouping writes into one
@@ -190,7 +193,8 @@ assert_eq!(world.format_id(greg), "CHARACTER#3");
   (`Direction::Out | In | Both`), `history`, `lookup`, `lookup_ci`,
   `entities_of_type`, `overlaps`; `edge_id` / `edge` for edges,
   `entity_by_handle` / `format_id` for IDs.
-- `World::at_canon(tx)`: a `View` with the same reads at an older canon.
+- `World::at_canon(tx)`: a `View` with the same reads at an older canon;
+  `View::edge` / `View::edge_id` see only edges defined up to that canon.
 - `load_fixture`, `load_fixture_to`: build a world from YAML.
 - `doctor`, `doctor_log`: the read-only integrity checker (`Report`,
   `Finding`, `Severity`).

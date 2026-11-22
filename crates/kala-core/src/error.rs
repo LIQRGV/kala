@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use crate::echo::Quoted;
 use crate::id::{EntityId, IdError};
 use crate::log::EntryId;
 use crate::tick::Tick;
@@ -137,29 +138,39 @@ pub enum Error {
     /// until [`World::acknowledge_recovery`](crate::World::acknowledge_recovery)
     /// is called, so new writes don't silently land on top of lost canon.
     RecoveryUnacknowledged,
+    /// The world was opened with
+    /// [`World::open_read_only`](crate::World::open_read_only): every write
+    /// (a no-op included) is refused and nothing is appended to the log.
+    /// Open the world with [`World::open`](crate::World::open) to write.
+    ReadOnly,
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::UnknownNodeType(name) => write!(f, "unknown node type {name:?}"),
-            Error::DuplicateHandle(h) => write!(f, "handle {h:?} is already in use"),
+            Error::UnknownNodeType(name) => write!(f, "unknown node type {}", Quoted(name)),
+            Error::DuplicateHandle(h) => write!(f, "handle {} is already in use", Quoted(h)),
             Error::DuplicateName(name) => {
-                write!(f, "name {name:?} is declared twice in the schema")
+                write!(f, "name {} is declared twice in the schema", Quoted(name))
             }
-            Error::InvalidHandle(h) => write!(f, "invalid handle {h:?}"),
-            Error::InvalidName(name) => write!(f, "invalid schema name {name:?}"),
+            Error::InvalidHandle(h) => write!(f, "invalid handle {}", Quoted(h)),
+            Error::InvalidName(name) => write!(f, "invalid schema name {}", Quoted(name)),
             Error::InvalidDirection(a) => {
-                write!(f, "attribute {a:?} has an invalid direction or inverse")
+                write!(
+                    f,
+                    "attribute {} has an invalid direction or inverse",
+                    Quoted(a)
+                )
             }
-            Error::UnknownAttribute(a) => write!(f, "unknown attribute {a:?}"),
+            Error::UnknownAttribute(a) => write!(f, "unknown attribute {}", Quoted(a)),
             Error::NotIndexed(a) => {
                 write!(
                     f,
-                    "attribute {a:?} is not indexed, so it can't be looked up by value"
+                    "attribute {} is not indexed, so it can't be looked up by value",
+                    Quoted(a)
                 )
             }
-            Error::NotARef(a) => write!(f, "attribute {a:?} is not a ref attribute"),
+            Error::NotARef(a) => write!(f, "attribute {} is not a ref attribute", Quoted(a)),
             Error::UnknownEntity(e) => write!(f, "unknown entity {e:?}"),
             Error::WrongValueType {
                 attr,
@@ -167,21 +178,25 @@ impl fmt::Display for Error {
                 got,
             } => write!(
                 f,
-                "attribute {attr:?} holds {expected:?} values, got a {got:?} value"
+                "attribute {} holds {expected:?} values, got a {got:?} value",
+                Quoted(attr)
             ),
             Error::Value(e) => write!(f, "invalid value: {e}"),
             Error::EntryTooLarge { attr, len, max } => write!(
                 f,
-                "a value of attribute {attr:?} needs a {len}-byte log entry, over the \
-                 {max}-byte limit"
+                "a value of attribute {} needs a {len}-byte log entry, over the \
+                 {max}-byte limit",
+                Quoted(attr)
             ),
             Error::RetractEvent(a) => write!(
                 f,
-                "attribute {a:?} is an event and can't be retracted (use a correction)"
+                "attribute {} is an event and can't be retracted (use a correction)",
+                Quoted(a)
             ),
             Error::SameTickConflict { entity, attr, tick } => write!(
                 f,
-                "the opposite op is already stored for {entity:?} {attr:?} at tick {}",
+                "the opposite op is already stored for {entity:?} {} at tick {}",
+                Quoted(attr),
                 tick.0
             ),
             Error::UnknownEntry(id) => write!(f, "no committed log entry#{}", id.0),
@@ -191,7 +206,8 @@ impl fmt::Display for Error {
             }
             Error::TxnKeyConflict { entity, attr, tick } => write!(
                 f,
-                "the transaction already wrote an entry for {entity:?} {attr:?} at tick {}",
+                "the transaction already wrote an entry for {entity:?} {} at tick {}",
+                Quoted(attr),
                 tick.0
             ),
             Error::TooManyRevisions(id) => write!(
@@ -213,6 +229,7 @@ impl fmt::Display for Error {
                 "opening the log cut off a damaged transaction; acknowledge the recovery \
                  (World::acknowledge_recovery) before writing",
             ),
+            Error::ReadOnly => f.write_str("world is open read-only; writes are refused"),
         }
     }
 }

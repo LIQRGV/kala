@@ -456,12 +456,15 @@ pub enum CutCause {
 /// What [`World::open`] did to recover the log: how many bytes of a torn or
 /// damaged tail it cut off, why, and where it saved them. A clean open, a
 /// new world ([`World::create`]) and an in-memory world report the default:
-/// nothing cut, no quarantine file, no cause.
+/// nothing cut, no quarantine file, no cause. A world from
+/// [`World::open_read_only`] reports what `World::open` would cut, with no
+/// quarantine file (nothing is written).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RecoveryReport {
     /// Bytes cut off the end of the log (0 if the log was clean).
     pub bytes_cut: u64,
-    /// The quarantine file holding exactly the cut bytes, if any were cut.
+    /// The quarantine file holding exactly the cut bytes, if any were cut
+    /// (always `None` for [`World::open_read_only`]).
     pub quarantine: Option<PathBuf>,
     /// Why the bytes were cut; `None` if nothing was.
     pub cause: Option<CutCause>,
@@ -516,6 +519,8 @@ pub struct World {
     node_types: Vec<NodeType>,
     node_type_by_name: HashMap<String, NodeTypeId>,
     entity_by_handle: HashMap<String, EntityId>,
+    /// The reverse of `entity_by_handle`, for [`World::handle_of`].
+    handle_by_entity: HashMap<EntityId, String>,
     /// Indexed by `AttrId.0`.
     attributes: Vec<AttrDef>,
     attr_by_name: HashMap<String, AttrId>,
@@ -526,6 +531,9 @@ pub struct World {
     /// Interned edges: entry `i` is the triple of the edge with seq `i + 1`
     /// (edge sequences are assigned without gaps).
     edges: Vec<Triple>,
+    /// The transaction that defined each edge, parallel to `edges` (so
+    /// ascending): what [`View::edge`] checks against its canon.
+    edges_defined_in: Vec<TxId>,
     edge_by_triple: HashMap<Triple, EdgeId>,
     /// The last committed transaction (0 = none yet).
     latest_tx: TxId,
@@ -603,6 +611,9 @@ pub struct World {
     /// cut a damaged tail and [`World::acknowledge_recovery`] hasn't been
     /// called yet. Never set for a torn cut, a clean open or a new world.
     recovery_unacknowledged: bool,
+    /// Opened by [`World::open_read_only`]: every write is refused with
+    /// [`Error::ReadOnly`]. Such a world has no `log`.
+    read_only: bool,
 }
 
 impl World {
@@ -684,10 +695,12 @@ impl World {
             node_types,
             node_type_by_name,
             entity_by_handle: HashMap::new(),
+            handle_by_entity: HashMap::new(),
             attributes: defs.to_vec(),
             attr_by_name,
             inverse_by_name,
             edges: Vec::new(),
+            edges_defined_in: Vec::new(),
             edge_by_triple: HashMap::new(),
             latest_tx: TxId(0),
             e_index: BTreeMap::new(),
@@ -708,6 +721,7 @@ impl World {
             log: None,
             recovery: RecoveryReport::default(),
             recovery_unacknowledged: false,
+            read_only: false,
         };
         let node_types = world
             .node_types
@@ -861,6 +875,36 @@ impl World {
         Ok(world)
     }
 
+    /// Opens the world in the existing log file at `path` for reading only:
+    /// a snapshot of its committed transactions at the moment of the call,
+    /// replayed exactly as [`World::open`] replays them, so every read
+    /// answers as a `World::open` of the same bytes would. Commits appended
+    /// to the file afterwards (by a writer world) are not seen; open again
+    /// to see them.
+    ///
+    /// Takes no lock, so it succeeds while another world (from
+    /// [`World::open`] or [`World::create`]) holds the file, and it never
+    /// keeps a writer out. It never modifies the file system: a torn or
+    /// damaged tail is left in the file and only left out in memory, and
+    /// [`World::recovery`] reports what `World::open` would cut
+    /// (`bytes_cut`, `cause`) with `quarantine: None`.
+    ///
+    /// Every write (create, assert, retract, correct, a [`Txn`] op or
+    /// commit, a no-op included) fails with [`Error::ReadOnly`] and appends
+    /// nothing; [`World::acknowledge_recovery`] has no effect on that.
+    ///
+    /// Fails as [`World::open`] does short of locking and cutting:
+    /// [`Error::Io`] if the file can't be read (`NotFound` if it doesn't
+    /// exist; it is never created), [`Error::BadMagic`] or
+    /// [`Error::UnsupportedVersion`] for a foreign header, or
+    /// [`Error::Corrupt`] for any damage other than a torn or damaged tail.
+    pub fn open_read_only(path: &Path) -> Result<World, Error> {
+        let (mut world, recovery) = LogWriter::read_committed(path, World::replay)?;
+        world.read_only = true;
+        world.recovery = recovery;
+        Ok(world)
+    }
+
     /// Rebuilds a world from the entries of a log's committed transactions.
     fn replay(entries: &[LogEntry]) -> Result<World, Error> {
         World::replay_with_hash(entries, fnv1a64)
@@ -947,10 +991,12 @@ impl World {
         let log = self.log.take();
         let recovery = std::mem::take(&mut self.recovery);
         let unacknowledged = self.recovery_unacknowledged;
+        let read_only = self.read_only;
         *self = rebuilt;
         self.log = log;
         self.recovery = recovery;
         self.recovery_unacknowledged = unacknowledged;
+        self.read_only = read_only;
     }
 
     /// Applies one entry of a transaction after the genesis. Facts are
@@ -1126,12 +1172,16 @@ impl World {
                     return Err(corrupt(&format!("{id:?} out of sequence")));
                 }
                 txn.unasserted_edges.insert(triple, *id);
-                self.apply_edge(EdgeDef {
-                    id: *id,
-                    source: *source,
-                    attr: *attr,
-                    target: *target,
-                });
+                let tx = self.next_tx();
+                self.apply_edge(
+                    EdgeDef {
+                        id: *id,
+                        source: *source,
+                        attr: *attr,
+                        target: *target,
+                    },
+                    tx,
+                );
                 Ok(())
             }
             EntryBody::Fact {
@@ -1752,16 +1802,21 @@ impl World {
         }
     }
 
-    /// `Err` if the world refuses writes: an unacknowledged damaged-tail
-    /// recovery (checked first), or a log append that failed earlier.
+    /// `Err` if the world refuses writes: a read-only world or an
+    /// unacknowledged damaged-tail recovery (checked first, see
+    /// [`World::accepts_writes`]), or a log append that failed earlier.
     fn writable(&self) -> Result<(), Error> {
-        self.acknowledged()?;
+        self.accepts_writes()?;
         self.log.as_ref().map_or(Ok(()), LogWriter::check)
     }
 
+    /// `Err(ReadOnly)` for a world from [`World::open_read_only`], else
     /// `Err(RecoveryUnacknowledged)` until a damaged-tail cut is
     /// acknowledged (see [`World::acknowledge_recovery`]).
-    fn acknowledged(&self) -> Result<(), Error> {
+    fn accepts_writes(&self) -> Result<(), Error> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
         if self.recovery_unacknowledged {
             return Err(Error::RecoveryUnacknowledged);
         }
@@ -1778,7 +1833,8 @@ impl World {
     /// means before writing on top of it. [`World::recovery`] keeps
     /// reporting the cut afterwards. On any other world (torn cut, clean
     /// open, [`World::create`], [`World::in_memory`]) and when called again
-    /// this does nothing.
+    /// this does nothing. On a world from [`World::open_read_only`] it does
+    /// nothing either: writes stay refused with [`Error::ReadOnly`].
     pub fn acknowledge_recovery(&mut self) {
         self.recovery_unacknowledged = false;
     }
@@ -2521,7 +2577,9 @@ impl World {
             .collect()
     }
 
-    fn apply_edge(&mut self, def: EdgeDef) {
+    /// Interns edge `def`, defined by (committed or replayed) transaction
+    /// `tx`. Infallible.
+    fn apply_edge(&mut self, def: EdgeDef, tx: TxId) {
         debug_assert_eq!(
             def.id.seq(),
             self.edges.len() as u64 + 1,
@@ -2529,6 +2587,7 @@ impl World {
         );
         self.edge_by_triple.insert(def.triple(), def.id);
         self.edges.push(def.triple());
+        self.edges_defined_in.push(tx);
     }
 
     /// The edge interned for `(source, attr, target)`, if any: the ID the
@@ -2621,6 +2680,7 @@ impl World {
         );
         nt.defined_in.push(tx);
         if let Some(h) = def.handle {
+            self.handle_by_entity.insert(def.id, h.clone());
             self.entity_by_handle.insert(h, def.id);
         }
     }
@@ -2628,6 +2688,82 @@ impl World {
     /// The entity with this handle, if any. Handles are matched exactly.
     pub fn entity_by_handle(&self, handle: &str) -> Option<EntityId> {
         self.entity_by_handle.get(handle).copied()
+    }
+
+    /// The handle of entity `id`, if it was created with one: the inverse
+    /// of [`World::entity_by_handle`]. `None` for an entity without a
+    /// handle, an edge or an ID that isn't defined in this world.
+    pub fn handle_of(&self, id: EntityId) -> Option<&str> {
+        self.handle_by_entity.get(&id).map(String::as_str)
+    }
+
+    /// Parses an ID in the form [`World::format_id`] writes: `TYPE#seq` for
+    /// a node type this schema declares (matched exactly, case-sensitive),
+    /// or `edge#seq` for an edge (the edge's ID in the entity space, see
+    /// [`EntityId::from`]).
+    ///
+    /// `seq` is plain decimal: ASCII digits only, no sign, no leading zero,
+    /// at least 1 and within the sequence range ([`MAX_SEQ`](crate::id::MAX_SEQ)
+    /// for entities, [`MAX_EDGE_SEQ`](crate::id::MAX_EDGE_SEQ) for edges).
+    /// Anything else is `None`: surrounding whitespace, an unknown type, a
+    /// sequence that overflows, and the `#<type id>#seq` form `format_id`
+    /// uses for a type the schema doesn't declare. Checks syntax and the
+    /// declared type only, not whether the ID is defined yet: use it with
+    /// [`World::entity_by_handle`] to resolve what a user typed.
+    pub fn parse_id(&self, s: &str) -> Option<EntityId> {
+        // The last `#` splits, so a type name containing `#` still parses;
+        // anything with an extra `#` leaves a prefix no type has.
+        let (prefix, digits) = s.rsplit_once('#')?;
+        if digits.is_empty()
+            || digits.starts_with('0')
+            || !digits.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        // Digits only, so the only parse failure is overflow.
+        let seq: u64 = digits.parse().ok()?;
+        // `edge` is what `format_id` writes for every edge, so it wins over
+        // a node type of that name.
+        if prefix == "edge" {
+            return EdgeId::new(seq).ok().map(EntityId::from);
+        }
+        let t = *self.node_type_by_name.get(prefix)?;
+        EntityId::new(t, seq).ok()
+    }
+
+    /// Every declared attribute, in ID (= declaration) order. Inverse names
+    /// aren't attributes and aren't listed (they are on their attribute's
+    /// [`AttrDef::inverse`]).
+    pub fn attributes(&self) -> impl Iterator<Item = &AttrDef> {
+        self.attributes.iter()
+    }
+
+    /// The declaration of attribute `name`, matched exactly. `None` for an
+    /// unknown name and for an inverse name (see [`World::attributes`]).
+    pub fn attribute(&self, name: &str) -> Option<&AttrDef> {
+        let id = self.attr_by_name.get(name)?;
+        self.attributes.get(id.0 as usize)
+    }
+
+    /// The name of attribute `id` (as stored in a log entry), or `None` if
+    /// the schema declares no attribute with that ID.
+    pub fn attr_name(&self, id: AttrId) -> Option<&str> {
+        let i = usize::try_from(id.0).ok()?;
+        self.attributes.get(i).map(|a| a.name.as_str())
+    }
+
+    /// Every declared node type name, in ID (= declaration) order.
+    pub fn node_types(&self) -> impl Iterator<Item = &str> {
+        self.node_types.iter().map(|nt| nt.name.as_str())
+    }
+
+    /// Every committed log entry, in entry-ID order: the same items
+    /// [`World::entry`] returns for each ID, genesis included, `DEFINE`s
+    /// and `Commit`s included. Entries of a transaction that was dropped or
+    /// failed to commit are never listed. Not limited by canon (filter on
+    /// [`EntryInfo::tx`] for that). Each item is cloned as it is yielded.
+    pub fn entries(&self) -> impl Iterator<Item = EntryInfo> + '_ {
+        self.entries.iter().cloned()
     }
 
     /// Formats an ID as `TYPE#seq` (`CHARACTER#1`), or an edge ID as
@@ -3292,9 +3428,9 @@ impl Txn<'_> {
             return Err(Error::TransactionAborted);
         }
         let world = self.world;
-        // Before anything else, an empty transaction included: an
-        // unacknowledged recovery refuses every write.
-        world.acknowledged()?;
+        // Before anything else, an empty transaction included: a read-only
+        // world or an unacknowledged recovery refuses every write.
+        world.accepts_writes()?;
         let changed = self.entries.len();
         if changed == 0 && self.ids.is_empty() {
             return Ok(CommitResult {
@@ -3373,7 +3509,7 @@ impl Txn<'_> {
         }
         let edges = self.ids.edges.iter().map(|d| d.id).collect();
         for def in self.ids.edges {
-            world.apply_edge(def);
+            world.apply_edge(def, self.tx);
         }
         // The staged index holds exactly these entries' E keys (it exists so
         // judging can see them); applying them rewrites those keys and adds
@@ -3483,6 +3619,72 @@ impl View<'_> {
     /// The canon tx this view reads at.
     pub fn canon(&self) -> TxId {
         self.canon
+    }
+
+    /// Whether the edge with ID `id` was defined at this view's canon (its
+    /// `DEFINE` is in a transaction `<=` the canon).
+    fn edge_visible(&self, id: EdgeId) -> bool {
+        id.seq()
+            .checked_sub(1)
+            .and_then(|i| usize::try_from(i).ok())
+            .and_then(|i| self.world.edges_defined_in.get(i))
+            .is_some_and(|&tx| tx <= self.canon)
+    }
+
+    /// The triple `(source, attribute name, target)` of edge `id`, as
+    /// [`World::edge`], but `None` if the edge's `DEFINE` is in a
+    /// transaction after this view's canon.
+    pub fn edge(&self, id: EdgeId) -> Option<(EntityId, String, EntityId)> {
+        self.edge_visible(id).then(|| self.world.edge(id))?
+    }
+
+    /// The edge interned for `(source, attr, target)`, as [`World::edge_id`]
+    /// (a bidirectional pair in either order), but `None` if the edge's
+    /// `DEFINE` is in a transaction after this view's canon.
+    pub fn edge_id(&self, source: EntityId, attr: &str, target: EntityId) -> Option<EdgeId> {
+        self.world
+            .edge_id(source, attr, target)
+            .filter(|&id| self.edge_visible(id))
+    }
+
+    /// The latest tick at this canon: the highest tick of any fact (assert
+    /// or retract) visible here, or `Tick(0)` if there is none. A fact that
+    /// a correction visible here deleted (or moved away) doesn't count; one
+    /// deleted only by a later correction does. At the latest canon this is
+    /// [`World::latest_tick`].
+    ///
+    /// Cost: at the latest canon, one lookup in the world's per-tick counts.
+    /// At an older canon, a walk over the whole `E` index (every stored
+    /// entry), so linear in the size of the world: fine for milestone 0's
+    /// in-memory worlds, not for a hot path.
+    pub fn latest_tick(&self) -> Tick {
+        if self.latest {
+            return self.world.latest_tick();
+        }
+        let canon = self.canon;
+        let mut best: Option<Tick> = None;
+        // The key (history and tick) whose current entry at the canon was
+        // already found: its older entries are skipped.
+        let mut done: Option<&[u8]> = None;
+        for (k, mark) in &self.world.e_index {
+            let at_key = key::without_tx(k);
+            if done == Some(at_key) {
+                continue;
+            }
+            // Within one key, entries are newest tx first, so the first
+            // with `tx <= canon` is the key's current entry at the canon.
+            let Some((tick, tx)) = key::e_key_tick_and_tx(k) else {
+                continue;
+            };
+            if tx > canon {
+                continue;
+            }
+            done = Some(at_key);
+            if mark.op().is_some() && best.is_none_or(|b| tick > b) {
+                best = Some(tick);
+            }
+        }
+        best.unwrap_or(Tick(0))
     }
 
     /// Whether value `v` of `entity.attr` holds at tick `t` in this canon.

@@ -1,0 +1,186 @@
+//! The command line's shape (clap derive). Only argument shapes live here;
+//! what each command does is in `cmd/`.
+//!
+//! Security conditions (slice 5): no argfile expansion, no env-var arguments,
+//! no `allow_hyphen_values` / `trailing_var_arg`; negative ticks go through
+//! `--at` with `allow_negative_numbers`.
+
+use std::path::PathBuf;
+
+use clap::{Args, Parser, Subcommand};
+
+/// Kala: a temporal graph database for story and game worlds.
+#[derive(Debug, Parser)]
+#[command(name = "kala", version, propagate_version = true)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+/// A canon (author-timeline position): `tx#N` or `N`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Canon(pub u64);
+
+fn parse_canon(s: &str) -> Result<Canon, String> {
+    let digits = s.strip_prefix("tx#").unwrap_or(s);
+    digits
+        .parse::<u64>()
+        .map(Canon)
+        .map_err(|_| "expected `tx#N` or `N` (N a non-negative integer)".to_string())
+}
+
+/// The tick and canon options shared by point-in-time reads.
+#[derive(Debug, Args)]
+pub struct ReadAt {
+    /// Read at this story tick (default: the latest tick); same as `@T`.
+    #[arg(long = "at", value_name = "T", value_parser = clap::value_parser!(i64), allow_negative_numbers = true)]
+    pub at: Option<i64>,
+    /// Read at this canon: `tx#N` or `N` (default: the latest).
+    #[arg(long, value_name = "C", value_parser = parse_canon)]
+    pub canon: Option<Canon>,
+    /// Print one JSON document instead of text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Build a world file from a YAML fixture.
+    Load {
+        /// The YAML fixture to load.
+        fixture: PathBuf,
+        /// The world file to create.
+        world: PathBuf,
+        /// Replace the world file if it exists.
+        #[arg(long)]
+        force: bool,
+    },
+    /// An entity's values at a tick (every attribute, or one).
+    Asof {
+        /// The world file.
+        world: PathBuf,
+        /// A handle (`edwin`), an ID (`CHARACTER#1`) or an edge (`edge#9`).
+        entity: String,
+        /// The attribute (default: every attribute holding a value).
+        attr: Option<String>,
+        /// The tick, as `@T`.
+        #[arg(value_name = "@T")]
+        tick: Option<String>,
+        #[command(flatten)]
+        read: ReadAt,
+    },
+    /// An entity's neighbors through a ref attribute at a tick.
+    Neighbors {
+        /// The world file.
+        world: PathBuf,
+        /// A handle (`edwin`), an ID (`CHARACTER#1`) or an edge (`edge#9`).
+        entity: String,
+        /// The attribute.
+        attr: String,
+        /// The tick, as `@T`.
+        #[arg(value_name = "@T")]
+        tick: Option<String>,
+        /// Follow incoming edges.
+        #[arg(long = "in", conflicts_with_all = ["out", "both"])]
+        incoming: bool,
+        /// Follow outgoing edges.
+        #[arg(long, conflicts_with = "both")]
+        out: bool,
+        /// Follow edges both ways.
+        #[arg(long)]
+        both: bool,
+        #[command(flatten)]
+        read: ReadAt,
+    },
+    /// Every change point of an entity's attribute.
+    History {
+        /// The world file.
+        world: PathBuf,
+        /// A handle (`edwin`), an ID (`CHARACTER#1`) or an edge (`edge#9`).
+        entity: String,
+        /// The attribute.
+        attr: String,
+        /// Read at this canon: `tx#N` or `N` (default: the latest).
+        #[arg(long, value_name = "C", value_parser = parse_canon)]
+        canon: Option<Canon>,
+        /// Print one JSON document instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Entities whose attribute holds a value at a tick.
+    Find {
+        /// The world file.
+        world: PathBuf,
+        /// The attribute.
+        attr: String,
+        /// The value to look for.
+        value: String,
+        /// The tick, as `@T`.
+        #[arg(value_name = "@T")]
+        tick: Option<String>,
+        /// Case-insensitive match.
+        #[arg(short = 'i')]
+        ignore_case: bool,
+        #[command(flatten)]
+        read: ReadAt,
+    },
+    /// Every entity of a node type at a tick.
+    List {
+        /// The world file.
+        world: PathBuf,
+        /// The node type (`CHARACTER`).
+        #[arg(value_name = "NODE_TYPE")]
+        node_type: String,
+        /// The tick, as `@T`.
+        #[arg(value_name = "@T")]
+        tick: Option<String>,
+        #[command(flatten)]
+        read: ReadAt,
+    },
+    /// An edge's triple and its properties at a tick.
+    Edge {
+        /// The world file.
+        world: PathBuf,
+        /// `edge#N`, or `SOURCE ATTR TARGET`, optionally followed by `@T`.
+        #[arg(value_name = "EDGE", required = true, num_args = 1..=4)]
+        edge: Vec<String>,
+        #[command(flatten)]
+        read: ReadAt,
+    },
+    /// Check the world's integrity (read-only).
+    Doctor {
+        /// The world file.
+        world: PathBuf,
+        /// Check schema rules at this canon: `tx#N` or `N`.
+        #[arg(long, value_name = "C", value_parser = parse_canon)]
+        canon: Option<Canon>,
+        /// Check only what changed since this canon: `tx#N` or `N`.
+        #[arg(long, value_name = "C", value_parser = parse_canon)]
+        since: Option<Canon>,
+        /// Print one JSON document instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// The log's transactions in order.
+    Log {
+        /// The world file.
+        world: PathBuf,
+        /// Start at this transaction: `tx#N` or `N`.
+        #[arg(long, value_name = "C", value_parser = parse_canon)]
+        from: Option<Canon>,
+        /// Show at most N transactions.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64))]
+        limit: Option<u64>,
+        /// Print one JSON document instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Format version, latest tx and tick, counts, recovery report.
+    Info {
+        /// The world file.
+        world: PathBuf,
+        /// Print one JSON document instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+}

@@ -3017,6 +3017,23 @@ fn the_generator_exercises_corrections_overlaps_and_doctor_findings() {
         prop::collection::vec(any::<u64>(), 0..=4),
     );
     run_with(correction_script(), vec![], vec![1, 5, 9]);
+    // The script resolves its reverse-side overlap before the doctor runs, so
+    // run its overlap-creating prefix on its own and leave the overlap standing
+    // (deterministic; does not rely on random cases or on other tests' counters).
+    let rev = |ent, val, tick| TxnSpec {
+        mode: Mode::Commit,
+        default: None,
+        ops: vec![OpSpec::Write {
+            assert: true,
+            ent,
+            attr: 12, // ruled_by (reverse one)
+            val,
+            tick: Some(tick),
+            defect: 0,
+        }],
+        check: true,
+    };
+    run_with(vec![rev(3, 0, 1), rev(4, 0, 2)], vec![], vec![]);
     for _ in 0..48 {
         let (b1, b2, c) = strat.new_tree(&mut runner).unwrap().current();
         run_with(b1, b2, c);

@@ -158,6 +158,7 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_saphyr::options::{DuplicateKeyPolicy, MergeKeyPolicy, NonFiniteFloatPolicy};
 
+use crate::echo::Echo;
 use crate::error::Error;
 use crate::id::EntityId;
 use crate::log::EntryId;
@@ -238,10 +239,10 @@ impl fmt::Display for FixtureErrorKind {
         match self {
             FixtureErrorKind::Yaml(m) => write!(f, "YAML error: {m}"),
             FixtureErrorKind::Invalid(m) => write!(f, "invalid fixture: {m}"),
-            FixtureErrorKind::UnknownHandle(h) => write!(f, "unknown handle `{h}`"),
-            FixtureErrorKind::UnknownEdge(t) => write!(f, "no edge {t}"),
-            FixtureErrorKind::UnknownLabel(l) => write!(f, "unknown label `{l}`"),
-            FixtureErrorKind::DuplicateLabel(l) => write!(f, "label `{l}` is used twice"),
+            FixtureErrorKind::UnknownHandle(h) => write!(f, "unknown handle `{}`", Echo(h)),
+            FixtureErrorKind::UnknownEdge(t) => write!(f, "no edge {}", Echo(t)),
+            FixtureErrorKind::UnknownLabel(l) => write!(f, "unknown label `{}`", Echo(l)),
+            FixtureErrorKind::DuplicateLabel(l) => write!(f, "label `{}` is used twice", Echo(l)),
             FixtureErrorKind::Store(e) => write!(f, "{e}"),
         }
     }
@@ -252,7 +253,7 @@ impl fmt::Display for FixtureError {
         if let Some(at) = &self.at {
             write!(f, "transaction {}, op {}", at.txn, at.op)?;
             if let Some(l) = &at.label {
-                write!(f, " (label {l})")?;
+                write!(f, " (label {})", Echo(l))?;
             }
             write!(f, ": ")?;
         }
@@ -330,6 +331,11 @@ fn yaml_options() -> serde_saphyr::Options {
         strict_booleans: true,
         merge_keys: MergeKeyPolicy::Error,
         reject_unsupported_tags: true,
+        // A tag on a struct field name (`!!binary YXNzZXJ0:`) is refused
+        // instead of acting as the untagged key (slice-4 finding M1). The
+        // parser lets `!!str` through; `UntaggedKeys` refuses every tag on
+        // every key.
+        reject_tagged_field_names: true,
         legacy_octal_numbers: false,
         // `.nan` reaches the visitor, so it is refused by the store as a value
         // (`Store(Value(NaN))`), like a NaN written through the native API.
@@ -351,12 +357,43 @@ fn parse(yaml: &str) -> Result<Option<RawDoc>, FixtureError> {
     }
     // First pass, shape-free: everything that fails here is the YAML itself
     // (syntax, duplicate keys, tags, budgets), whatever the fixture types
-    // expect. The second pass can then only fail on the fixture's shape.
+    // expect. The later passes can then only fail on the fixture's shape: a
+    // tagged key anywhere (`UntaggedKeys`), then the fixture types.
     serde_saphyr::from_str_with_options::<IgnoredAny>(yaml, yaml_options())
         .map_err(|e| err(None, FixtureErrorKind::Yaml(e.to_string())))?;
+    serde_saphyr::from_str_with_options::<Option<UntaggedKeys>>(yaml, yaml_options())
+        .map_err(|e| invalid(None, shape_message(&e)))?;
     serde_saphyr::from_str_with_options::<Option<NoTag<RawDoc>>>(yaml, yaml_options())
         .map(|d| d.map(|d| d.0))
-        .map_err(|e| invalid(None, e.to_string()))
+        .map_err(|e| invalid(None, shape_message(&e)))
+}
+
+/// The message of a shape error from the parser. An unknown field echoes
+/// the key as written, so it is rebuilt with the key through [`Echo`]
+/// (escaped and bounded) and without the parser's source snippet.
+fn shape_message(e: &serde_saphyr::Error) -> String {
+    let mut inner = e;
+    while let serde_saphyr::Error::WithSnippet { error, .. }
+    | serde_saphyr::Error::AliasError { error, .. } = inner
+    {
+        inner = error;
+    }
+    match inner {
+        serde_saphyr::Error::SerdeUnknownField {
+            field, expected, ..
+        } => {
+            let at = match e.location() {
+                Some(l) if l.line() > 0 => format!("line {} column {}: ", l.line(), l.column()),
+                _ => String::new(),
+            };
+            format!(
+                "{at}unknown field `{}`, expected one of {}",
+                Echo(field),
+                expected.join(", ")
+            )
+        }
+        _ => e.to_string(),
+    }
 }
 
 /// Deserializes a field that is present (so an explicit `null` is a value,
@@ -479,6 +516,45 @@ fn drain_seq<'de, A: SeqAccess<'de>>(mut seq: A) -> Result<(), A::Error> {
 fn drain_map<'de, A: MapAccess<'de>>(mut map: A) -> Result<(), A::Error> {
     while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
     Ok(())
+}
+
+/// The whole document, walked only to refuse an explicit tag on any mapping
+/// key (`!!str assert:`, `!!binary YXNzZXJ0:`): a tagged key would otherwise
+/// match the untagged field, and the parser's `reject_tagged_field_names`
+/// lets `!!str` through and covers struct fields only.
+struct UntaggedKeys;
+
+impl<'de> Deserialize<'de> for UntaggedKeys {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<UntaggedKeys, D::Error> {
+        d.deserialize_any(UntaggedKeysVisitor)
+    }
+}
+
+struct UntaggedKeysVisitor;
+
+impl<'de> Visitor<'de> for UntaggedKeysVisitor {
+    type Value = UntaggedKeys;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a YAML value")
+    }
+    scalar_visits!(|_: Scalar| UntaggedKeys);
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<UntaggedKeys, A::Error> {
+        while seq.next_element::<UntaggedKeys>()?.is_some() {}
+        Ok(UntaggedKeys)
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<UntaggedKeys, A::Error> {
+        while let Some(serde_saphyr::Tagged(UntaggedKeys, tag)) =
+            map.next_key::<serde_saphyr::Tagged<UntaggedKeys>>()?
+        {
+            if tag.is_some() {
+                return Err(de::Error::custom(
+                    "explicit YAML tags are not allowed on a key in a fixture",
+                ));
+            }
+            map.next_value::<UntaggedKeys>()?;
+        }
+        Ok(UntaggedKeys)
+    }
 }
 
 struct ScalarVisitor;
@@ -1021,7 +1097,7 @@ fn plan_entities(
     for (key, item) in &raw {
         let ty = to_name(key, "a node type name").map_err(bad)?;
         let Item::List(handles) = item else {
-            return Err(bad(format!("`{ty}` must be a list of handles")));
+            return Err(bad(format!("`{}` must be a list of handles", Echo(&ty))));
         };
         total = total.saturating_add(handles.len());
         if total > MAX_ENTITIES {
@@ -1035,7 +1111,7 @@ fn plan_entities(
             .collect::<Result<Vec<_>, _>>()
             .map_err(bad)?;
         if by_type.insert(ty.clone(), handles).is_some() {
-            return Err(bad(format!("`{ty}` is listed twice")));
+            return Err(bad(format!("`{}` is listed twice", Echo(&ty))));
         }
     }
     // A type the schema doesn't declare is the store's refusal, as a create
@@ -1377,14 +1453,18 @@ impl Runner<'_> {
                     Some(Labelled::Nothing) => {
                         return Err(invalid(
                             pos(),
-                            format!("label `{label}` names an op that stored nothing (0 changed)"),
+                            format!(
+                                "label `{}` names an op that stored nothing (0 changed)",
+                                Echo(label)
+                            ),
                         ));
                     }
                     None if self.plan.labels.contains(label) => {
                         return Err(invalid(
                             pos(),
                             format!(
-                                "label `{label}` is corrected before its transaction committed"
+                                "label `{}` is corrected before its transaction committed",
+                                Echo(label)
                             ),
                         ));
                     }
@@ -1463,7 +1543,7 @@ impl Runner<'_> {
         let bad = |want: &str, got: &str| {
             invalid(
                 Some(at.clone()),
-                format!("the value of `{attr}` must be {want}, not {got}"),
+                format!("the value of `{}` must be {want}, not {got}", Echo(attr)),
             )
         };
         let s = match item {

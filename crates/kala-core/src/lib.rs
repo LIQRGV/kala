@@ -3,6 +3,7 @@
 #![doc = include_str!("../README.md")]
 
 pub mod doctor;
+mod echo;
 pub mod error;
 pub mod fixture;
 pub mod id;

@@ -207,6 +207,15 @@ pub(crate) fn e_key_tx(key: &[u8]) -> Option<TxId> {
     Some(TxId(!u64::from_be_bytes(bytes)))
 }
 
+/// The tick and tx of a full `E` or `R` key (its trailing `^tick|^tx`),
+/// or `None` if the key is too short to have them. Reads only the fixed
+/// suffix, so it needs no value decoding.
+pub(crate) fn e_key_tick_and_tx(key: &[u8]) -> Option<(Tick, TxId)> {
+    let start = key.len().checked_sub(16)?;
+    let tick: [u8; 8] = key.get(start..start + 8)?.try_into().ok()?;
+    Some((Tick::decode_inverted(tick), e_key_tx(key)?))
+}
+
 /// The largest possible key under `value_prefix`; seek *exclusively* past
 /// it to reach the next distinct value.
 ///

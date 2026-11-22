@@ -1,0 +1,107 @@
+//! One module per subcommand. Each returns the text for stdout, or a
+//! [`CliError`](crate::error::CliError); `main` prints and picks the exit code.
+
+pub mod asof;
+pub mod doctor;
+pub mod edge;
+pub mod find;
+pub mod history;
+pub mod info;
+pub mod list;
+pub mod load;
+pub mod log;
+pub mod neighbors;
+mod read;
+
+use crate::cli::Command;
+use crate::error::CliError;
+
+/// What a command that ran prints on stdout, and whether it found
+/// error-severity findings (`kala doctor`: exit 1 with its report).
+pub struct Done {
+    pub text: String,
+    pub findings: bool,
+}
+
+impl From<String> for Done {
+    fn from(text: String) -> Done {
+        Done {
+            text,
+            findings: false,
+        }
+    }
+}
+
+/// Runs a parsed command.
+pub fn dispatch(cmd: &Command) -> Result<Done, CliError> {
+    let text = match cmd {
+        Command::Load {
+            fixture,
+            world,
+            force,
+        } => load::run(fixture, world, *force),
+        Command::Asof {
+            world,
+            entity,
+            attr,
+            tick,
+            read,
+        } => asof::run(world, entity, attr.as_deref(), tick.as_deref(), read),
+        Command::Neighbors {
+            world,
+            entity,
+            attr,
+            tick,
+            incoming,
+            out: _,
+            both,
+            read,
+        } => neighbors::run(
+            world,
+            entity,
+            attr,
+            tick.as_deref(),
+            neighbors::Flags {
+                incoming: *incoming,
+                both: *both,
+            },
+            read,
+        ),
+        Command::History {
+            world,
+            entity,
+            attr,
+            canon,
+            json,
+        } => history::run(world, entity, attr, *canon, *json),
+        Command::Find {
+            world,
+            attr,
+            value,
+            tick,
+            ignore_case,
+            read,
+        } => find::run(world, attr, value, tick.as_deref(), *ignore_case, read),
+        Command::List {
+            world,
+            node_type,
+            tick,
+            read,
+        } => list::run(world, node_type, tick.as_deref(), read),
+        Command::Edge { world, edge, read } => edge::run(world, edge, read),
+        Command::Log {
+            world,
+            from,
+            limit,
+            json,
+        } => log::run(world, *from, *limit, *json),
+        Command::Info { world, json } => info::run(world, *json),
+        Command::Doctor {
+            world,
+            canon,
+            since,
+            json,
+        } => return doctor::run(world, *canon, *since, *json),
+    };
+    text.map(Done::from)
+}
