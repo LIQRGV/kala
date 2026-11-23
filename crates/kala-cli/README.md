@@ -506,3 +506,21 @@ Values use `kala query --json`'s `{type,value}` representation: bool, i64, f64,
 string or ref. A ref's value is an entity object. Infinite floats are the strings
 `"inf"` / `"-inf"`. Ordering is deterministic. JSON snapshots are for external
 tools, not for restoring history; this slice provides no JSON import.
+
+## Cypher reads
+
+`kala query WORLD --lang cypher QUERY` and `kala explain WORLD --lang cypher QUERY`
+use the [Cypher read subset](../kala-cypher/README.md). `--lang datalog` is the
+default, preserving scripts and the Datalog-only REPL. `-f`, `--param NAME=VALUE`
+and `query --json` work with either language. Parameters are typed by usage;
+unconstrained scalar parameters infer bool/integer/float, otherwise string.
+Cypher also accepts JSON lists and `null` in `--param`; quote a JSON string to
+distinguish the string `"null"` from NULL. List input order is preserved.
+JSON keeps the existing document/column/row shape; NULL cells are
+`{"type":"null","value":null}` and lists are `{"type":"list","value":[...]}`
+containing typed cells. Output preserves ORDER BY and duplicate Cypher rows.
+
+```sh
+kala query varrow.kala --lang cypher 'MATCH (c:CHARACTER) RETURN c.name ORDER BY c.name LIMIT 3'
+kala explain varrow.kala --lang cypher "MATCH (e {kala_handle: 'edwin'})-[:ally_of]->(a) AT TICK -210 RETURN DISTINCT a"
+```

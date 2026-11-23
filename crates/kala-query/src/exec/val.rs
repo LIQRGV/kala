@@ -33,6 +33,8 @@ use super::{QueryError, type_name};
 /// order, which is the encoding's tag order; then ops; then interval sets).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum ValKind {
+    Null,
+    List,
     Value(ValueType),
     Op,
     Intervals,
@@ -43,6 +45,8 @@ impl ValKind {
     /// The kind's name in error messages.
     pub(super) fn name(self) -> &'static str {
         match self {
+            ValKind::Null => "null",
+            ValKind::List => "list",
             ValKind::Value(t) => type_name(t),
             ValKind::Op => "op",
             ValKind::Precision => "precision",
@@ -68,6 +72,8 @@ pub(super) struct Id(u32);
 /// [`cmp_real`], which charges long comparisons to the step budget.
 #[derive(Clone, Debug)]
 pub(super) enum Val {
+    Null,
+    List(Id, Rc<Vec<Val>>),
     Bool(bool),
     I64(i64),
     F64(f64),
@@ -89,13 +95,17 @@ impl Val {
             Val::F64(x) => Value::F64(*x),
             Val::Str(_, s) => Value::Str(s.to_string()),
             Val::Ref(e) => Value::Ref(*e),
-            Val::Op(_) | Val::Precision(_) | Val::Intervals(..) => return None,
+            Val::Null | Val::List(..) | Val::Op(_) | Val::Precision(_) | Val::Intervals(..) => {
+                return None;
+            }
         })
     }
 
     /// The answer's datum (a string or interval set is copied).
     pub(super) fn to_datum(&self) -> Datum {
         match self {
+            Val::Null => Datum::Null,
+            Val::List(_, xs) => Datum::List(xs.iter().map(Val::to_datum).collect()),
             Val::Op(op) => Datum::Op(*op),
             Val::Precision(p) => Datum::Precision(*p),
             Val::Intervals(_, s) => Datum::Intervals(IntervalSet::clone(s)),
@@ -105,6 +115,8 @@ impl Val {
 
     pub(super) fn kind(&self) -> ValKind {
         match self {
+            Val::Null => ValKind::Null,
+            Val::List(..) => ValKind::List,
             Val::Bool(_) => ValKind::Value(ValueType::Bool),
             Val::I64(_) => ValKind::Value(ValueType::I64),
             Val::F64(_) => ValKind::Value(ValueType::F64),
@@ -123,6 +135,7 @@ impl Ord for Val {
     /// interval sets by [`Id`] (O(1), not their contents' order).
     fn cmp(&self, other: &Val) -> Ordering {
         match (self, other) {
+            (Val::List(a, _), Val::List(b, _)) => a.cmp(b),
             (Val::Bool(a), Val::Bool(b)) => a.cmp(b),
             (Val::I64(a), Val::I64(b)) => a.cmp(b),
             (Val::F64(a), Val::F64(b)) => Value::F64(*a).cmp(&Value::F64(*b)),
@@ -154,6 +167,8 @@ impl Hash for Val {
     /// Hashes what `cmp` compares, so equal values hash alike.
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
+            Val::Null => ValKind::Null.hash(state),
+            Val::List(id, _) => (ValKind::List, id).hash(state),
             Val::Str(id, _) => (ValueType::Str, id).hash(state),
             Val::F64(x) => Value::F64(*x).hash(state),
             Val::Bool(b) => (ValueType::Bool, b).hash(state),
@@ -211,6 +226,15 @@ fn common_prefix<T: PartialEq>(a: &[T], b: &[T], chunk: usize) -> usize {
 /// the prefix compared is added to `work`.
 pub(super) fn cmp_real(a: &Val, b: &Val, work: &mut CmpWork) -> Ordering {
     match (a, b) {
+        (Val::List(x, a), Val::List(y, b)) => {
+            if x == y {
+                return Ordering::Equal;
+            }
+            work.bytes = work
+                .bytes
+                .saturating_add((a.len().min(b.len()) as u64).saturating_mul(64));
+            cmp_real_rows(a, b, work)
+        }
         (Val::Str(x, s), Val::Str(y, t)) => {
             if x == y || Rc::ptr_eq(s, t) {
                 return Ordering::Equal;
@@ -252,6 +276,7 @@ pub(super) fn cmp_real_rows(a: &[Val], b: &[Val], work: &mut CmpWork) -> Orderin
 /// from then on rows share it and compare it by id.
 #[derive(Default)]
 pub(super) struct Interner {
+    lists: HashMap<Rc<Vec<Val>>, Id>,
     /// Each string, its id, and whether it is charged to the byte budget
     /// (plan constants aren't: the front-end bounds the plan's size; a
     /// string read from the world is charged once, on first read).
@@ -261,6 +286,15 @@ pub(super) struct Interner {
 }
 
 impl Interner {
+    pub(super) fn list(&mut self, values: Vec<Val>) -> Result<(Val, bool), QueryError> {
+        if let Some((v, id)) = self.lists.get_key_value(&values) {
+            return Ok((Val::List(*id, v.clone()), false));
+        }
+        let id = Self::next_id(self.lists.len())?;
+        let values = Rc::new(values);
+        self.lists.insert(values.clone(), id);
+        Ok((Val::List(id, values), true))
+    }
     /// The next id for a table of `len` entries. Ids run out only past
     /// `u32::MAX` distinct values, beyond any sane byte budget, but limits
     /// are caller-chosen, so running out is an error, never a panic.
@@ -384,6 +418,7 @@ pub(super) fn result_row_bytes(row: &[Val]) -> usize {
         .map(|v| match v {
             Val::Str(_, s) => s.len(),
             Val::Intervals(_, s) => s.len().saturating_mul(size_of::<Interval>()),
+            Val::List(_, xs) => result_row_bytes(xs),
             _ => 0,
         })
         .sum();

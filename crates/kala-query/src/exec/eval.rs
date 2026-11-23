@@ -21,6 +21,8 @@ use fixpoint::{Frame, Read};
 
 mod fixpoint;
 mod read;
+mod rows;
+pub(super) use rows::order;
 
 pub(super) struct Exec<'a, 'w> {
     pub(super) world: &'a World,
@@ -48,6 +50,7 @@ pub(super) struct Exec<'a, 'w> {
     /// Types whose visibility lookup has paid its historical one-step
     /// charge. Individual IDs can be checked in constant time.
     pub(super) checked_types: HashSet<u16>,
+    pub(super) node_types: Option<HashSet<String>>,
     /// Every relation of the plan, by id (empty outside its `Fixpoint`).
     pub(super) rels: Vec<Relation>,
 }
@@ -391,6 +394,7 @@ impl Exec<'_, '_> {
     ) -> Result<BTreeSet<Row>, QueryError> {
         let mut out = BTreeSet::new();
         match step {
+            Step::Row(action) => return self.eval_row(action, rows),
             Step::NodeScan {
                 slot,
                 bound,

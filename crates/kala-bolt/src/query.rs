@@ -1,12 +1,12 @@
-//! Datalog dispatch and bounded result enrichment at the pinned tick and canon.
-use crate::error::{EXECUTION, FORBIDDEN, Failure, MISSING, SYNTAX, TYPE};
+//! Language dispatch and bounded result enrichment at the pinned tick and canon.
+use crate::error::{EXECUTION, FORBIDDEN, Failure, MISSING, TYPE};
 use crate::message::Map;
 use crate::packstream::{self, Value};
 use kala_core::{
     Cardinality, EntityId, MeteredView, Tick, Value as CoreValue, ValueType, WorkMeter, World,
 };
 use kala_datalog::ParamKind;
-use kala_query::{Datum, Limits, Params, QueryError};
+use kala_query::{Datum, Limits, QueryError, QueryParams};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::AtomicBool;
 
@@ -22,43 +22,28 @@ pub(crate) fn run(
     max_message: usize,
     max_depth: usize,
 ) -> Result<Output, Failure> {
-    let (prefix, rest) = text.split_once('\n').unwrap_or((text, ""));
-    if prefix.trim_end_matches([' ', '\r']) != "// kala:datalog" {
-        return Err(Failure::new(SYNTAX, "query language is not supported yet"));
-    }
-    // Keep the prefix's line as an empty line, so error positions count the
-    // lines of the text the client sent.
-    let text = format!("\n{rest}");
-    let syntax = |e: kala_datalog::DatalogError| Failure::new(SYNTAX, e.to_string());
-    let query = kala_datalog::parse(&text).map_err(syntax)?;
+    let source = crate::language::detect(text)?;
+    let front_end = source.front_end;
     let system = crate::system::is_system(world);
-    // On `system`, refuse before compiling or running: output redaction
-    // alone can't stop `<`, `=`, `min` or `not` from revealing a hash, so
-    // the secret must never enter evaluation. The AST covers what the plan
-    // drops (rules no clause calls); the plan check covers whatever the
-    // compiler resolves.
-    if system
-        && query
-            .attributes()
-            .iter()
-            .any(|a| crate::system::is_secret_attribute(world, &a.name))
-    {
+    // On `system`, refuse before evaluation: output redaction alone can't
+    // stop `<`, `=`, `min` or `IS NULL` from revealing a hash. The front-end
+    // checks its AST; the plan check covers whatever the compiler resolves.
+    let secret = |name: &str| system && crate::system::is_secret_attribute(world, name);
+    let prepared = front_end.prepare(world, &source.text, &secret)?;
+    if prepared.plan.attribute_names().into_iter().any(secret) {
         return Err(protected());
     }
-    let prepared = kala_datalog::prepare_parsed(world, &text, &query).map_err(syntax)?;
-    if system
-        && prepared
-            .plan
-            .attribute_names()
-            .into_iter()
-            .any(|a| crate::system::is_secret_attribute(world, a))
-    {
-        return Err(protected());
-    }
-    let params = parameters(world, &prepared.params, given)?;
+    eprintln!(
+        "event=query_prepared language={} columns={} parameters={}",
+        front_end.name(),
+        prepared.plan.find.len(),
+        prepared.params.len()
+    );
+    let params = parameters(world, &prepared.params, given, front_end.nullable_params())?;
     let limits = Limits::default();
-    let result = kala_query::run_with_cancel(world, &prepared.plan, &params, &limits, stop)
-        .map_err(query_error)?;
+    let result =
+        kala_query::run_with_values_and_cancel(world, &prepared.plan, &params, &limits, stop)
+            .map_err(query_error)?;
     let meter = WorkMeter::bounded(limits.max_steps, Some(stop));
     let view = world.at_canon(result.canon).metered(&meter);
     let mut budget = Budget {
@@ -88,7 +73,7 @@ pub(crate) fn run(
     })
 }
 /// Generic on purpose: says what is refused, nothing about stored values.
-fn protected() -> Failure {
+pub(crate) fn protected() -> Failure {
     Failure::new(
         FORBIDDEN,
         "queries on the system database may not read the protected attribute password_hash",
@@ -98,44 +83,90 @@ fn parameters(
     world: &World,
     kinds: &[(String, ParamKind)],
     given: &Map,
-) -> Result<Params, Failure> {
-    let mut params = Params::new();
+    nullable: bool,
+) -> Result<QueryParams, Failure> {
+    let mut params = QueryParams::new();
     for (name, kind) in kinds {
         let raw = given
             .get(name)
             .ok_or_else(|| Failure::new(MISSING, format!("missing parameter {name}")))?;
-        let bad = || Failure::new(TYPE, format!("wrong type for parameter {name}"));
-        let value = match (kind, raw) {
-            (ParamKind::Tick | ParamKind::Value(ValueType::I64), Value::Integer(n)) => {
-                CoreValue::I64(*n)
-            }
-            (ParamKind::Canon, Value::Integer(n)) if *n >= 0 => CoreValue::I64(*n),
-            (ParamKind::Canon, Value::String(s)) => CoreValue::I64(
-                s.strip_prefix("tx#")
-                    .unwrap_or(s)
-                    .parse::<i64>()
-                    .ok()
-                    .filter(|n| *n >= 0)
-                    .ok_or_else(bad)?,
-            ),
-            (ParamKind::Value(ValueType::F64), Value::Float(n)) => {
-                CoreValue::f64(*n).map_err(|_| bad())?
-            }
-            (ParamKind::Value(ValueType::Bool), Value::Bool(v)) => CoreValue::Bool(*v),
-            (ParamKind::Value(ValueType::Str), Value::String(v)) => CoreValue::Str(v.clone()),
-            (ParamKind::Entity | ParamKind::Value(ValueType::Ref), Value::String(s)) => {
-                let id = world
-                    .entity_by_handle(s)
-                    .or_else(|| world.parse_id(s))
-                    .filter(|id| world.is_defined(*id))
-                    .ok_or_else(bad)?;
-                CoreValue::Ref(id)
-            }
-            _ => return Err(bad()),
-        };
-        params.insert(name.clone(), value);
+        params.insert(
+            name.clone(),
+            parameter_value(world, kind, raw, nullable, 0)?,
+        );
     }
     Ok(params)
+}
+/// The largest magnitude an `i64` can have and still convert to `f64`
+/// exactly (2^53).
+const F64_EXACT_INT_MAX: u64 = 1 << 53;
+
+fn parameter_value(
+    world: &World,
+    kind: &ParamKind,
+    raw: &Value,
+    nullable: bool,
+    depth: usize,
+) -> Result<Datum, Failure> {
+    let bad = || Failure::new(TYPE, "wrong type for query parameter");
+    if depth > 32 {
+        return Err(bad());
+    }
+    if nullable && !matches!(kind, ParamKind::Tick | ParamKind::Canon) {
+        match raw {
+            Value::Null => return Ok(Datum::Null),
+            Value::List(values) => {
+                return values
+                    .iter()
+                    .map(|v| parameter_value(world, kind, v, true, depth + 1))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(Datum::List);
+            }
+            _ => {}
+        }
+    }
+    let value = match (kind, raw) {
+        (ParamKind::Scalar, Value::Bool(v)) => CoreValue::Bool(*v),
+        (ParamKind::Scalar, Value::Integer(v)) => CoreValue::I64(*v),
+        (ParamKind::Scalar, Value::Float(v)) => CoreValue::f64(*v).map_err(|_| bad())?,
+        (ParamKind::Scalar, Value::String(v)) => CoreValue::Str(v.clone()),
+        (ParamKind::Tick | ParamKind::Value(ValueType::I64), Value::Integer(n)) => {
+            CoreValue::I64(*n)
+        }
+        (ParamKind::Canon, Value::Integer(n)) if *n >= 0 => CoreValue::I64(*n),
+        (ParamKind::Canon, Value::String(s)) => CoreValue::I64(
+            s.strip_prefix("tx#")
+                .unwrap_or(s)
+                .parse::<i64>()
+                .ok()
+                .filter(|n| *n >= 0)
+                .ok_or_else(bad)?,
+        ),
+        (ParamKind::Value(ValueType::F64), Value::Float(n)) => {
+            CoreValue::f64(*n).map_err(|_| bad())?
+        }
+        // Drivers send integral numbers as Integer. Accept one for a float
+        // parameter only when the conversion is exact (|n| <= 2^53), so a
+        // parameter never silently becomes a different number.
+        (ParamKind::Value(ValueType::F64), Value::Integer(n))
+            if n.unsigned_abs() <= F64_EXACT_INT_MAX =>
+        {
+            #[allow(clippy::cast_precision_loss)] // exact: |n| <= 2^53
+            CoreValue::f64(*n as f64).map_err(|_| bad())?
+        }
+        (ParamKind::Value(ValueType::Bool), Value::Bool(v)) => CoreValue::Bool(*v),
+        (ParamKind::Value(ValueType::Str), Value::String(v)) => CoreValue::Str(v.clone()),
+        (ParamKind::Entity | ParamKind::Value(ValueType::Ref), Value::String(s)) => {
+            let id = world
+                .entity_by_handle(s)
+                .or_else(|| world.parse_id(s))
+                .filter(|id| world.is_defined(*id))
+                .ok_or_else(bad)?;
+            CoreValue::Ref(id)
+        }
+        _ => return Err(bad()),
+    };
+    Ok(Datum::Value(value))
 }
 fn query_error(error: QueryError) -> Failure {
     match error {
@@ -210,6 +241,12 @@ fn datum_value(
 ) -> Result<Value, Failure> {
     budget.charge(64)?;
     match d {
+        Datum::Null => Ok(Value::Null),
+        Datum::List(values) => values
+            .into_iter()
+            .map(|v| datum_value(v, view, tick, meter, budget))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::List),
         Datum::Value(CoreValue::Ref(id)) => entity_value(id, view, tick, meter, budget),
         Datum::Value(v) => scalar(v, budget),
         Datum::Op(op) => budget.string(

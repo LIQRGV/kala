@@ -1,0 +1,16 @@
+[package]
+name = "kala-cypher"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+kala-core = { path = "../kala-core" }
+kala-query = { path = "../kala-query" }
+
+[dev-dependencies]
+kala-datalog = { path = "../kala-datalog" }
+proptest = "1.12.0"
+tempfile = "3.27.0"

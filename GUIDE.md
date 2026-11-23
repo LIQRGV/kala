@@ -384,3 +384,21 @@ To find an entity by its permanent handle text, use
 is separate and has ordinary fact history. Schema names beginning with `kala_`
 are reserved, as are new `_KALA_` names. `edge` is reserved only for node types,
 so attributes and inverse names may use `edge`.
+
+## Ask with Cypher
+
+The terminal also accepts a Cypher read subset. The REPL remains Datalog;
+select Cypher with `--lang cypher` for `query` or `explain`:
+
+```sh
+kala query varrow.kala --lang cypher "MATCH (e {kala_handle: 'edwin'})-[:ally_of]->(a) AT TICK -210 RETURN DISTINCT a"
+kala query varrow.kala --lang cypher 'MATCH (c:CHARACTER) RETURN c.name ORDER BY c.name LIMIT 3'
+```
+
+The first query returns Greg and Tomas (`greg`, `tomas`), just like Datalog.
+The second returns "Edwin", "Greg", "Hild" in that order; here "Edwin" is Kael's
+latest name. `AT TICK $t CANON $c` accepts `--param t=-210 --param c=10`.
+Missing properties return NULL; WHERE keeps only true, and duplicates remain
+unless RETURN DISTINCT is specified. Neo4j drivers use Cypher by default over
+Bolt; prefix Datalog text with `// kala:datalog` and a newline. See the
+[subset and known differences](crates/kala-cypher/README.md).

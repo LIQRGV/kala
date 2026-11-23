@@ -1,6 +1,6 @@
 # kala-bolt
 
-A read-only Bolt 5.0–5.4 server over Kala's existing Datalog front-end
+A read-only Bolt 5.0–5.4 server over Kala's Cypher and Datalog front-ends
 and shared query executor. `kala serve DIR` exposes each regular
 `DIR/<name>.kala` file as a database (`[a-z0-9_-]+` names only). Symlinks and
 invalid names are skipped with a startup diagnostic. Files are discovered at
@@ -38,9 +38,10 @@ with a matched host and grants. `NoAuth` accepts all well-formed tokens with a `
 development mode, not an administrator). Credentials format as
 `<redacted>` and are dropped after the authentication callback.
 
-Query text must start with exactly `// kala:datalog` followed by a newline;
-trailing ASCII spaces on that line are allowed. Unprefixed Cypher and
-`// kala:gremlin` receive SyntaxError. Cypher is the next slice.
+Unprefixed query text is Cypher; an explicit first line `// kala:cypher` also
+selects Cypher. `// kala:datalog` followed by a newline selects Datalog; trailing
+ASCII spaces on that line are allowed. `// kala:gremlin` reports that Gremlin is
+not supported yet. See the [Cypher subset](../kala-cypher/README.md).
 
 ## Accounts and privileges
 
@@ -79,7 +80,7 @@ read and write; `write` is stored for future Bolt writes and does not imply read
 Denied queries return `Neo.ClientError.Security.Forbidden`. `system` requires
 `admin:system` or `admin:*`, even if the account has a read grant on it.
 
-The reserved system database is queryable with Datalog by an admin. Password
+The reserved system database is queryable with Cypher or Datalog by an admin. Password
 hash values and node properties are redacted in Bolt results and CLI reads,
 including history. Account changes are native append-only retract/assert
 transactions on increasing logical ticks, so their audit history is retained.
@@ -137,6 +138,8 @@ bookmark required.
 
 | Kala value | Bolt / Python driver |
 | --- | --- |
+| NULL | PackStream null / Python None |
+| Property list | Bolt List / Python list |
 | i64, f64, bool, string | Integer, Float, Boolean, String |
 | Entity reference | Bolt 5 Node: raw integer ID, labels, properties, readable element_id |
 | Edge reference | Bolt 5 Relationship: negative tagged ID, endpoints, type, properties and all three element IDs |
@@ -151,20 +154,22 @@ under `kala_handle`. A user attribute named `handle` is an ordinary property and
 can coexist with `kala_handle`. The `kala_` schema-name prefix is reserved.
 Cardinality-many attributes are sorted lists. A cardinality-one overlap is also
 returned as a list so neither asserted value is lost. Reference attributes are
-relationships, not properties. Graph data is returned verbatim; diagnostics are
+relationships in graph structures; explicit Cypher `v.ref_attribute` returns
+the referenced node(s). Graph data is returned verbatim; diagnostics are
 escaped with `kala_core::must_escape` rules.
 
-RUN parameters use their declared Datalog kinds: integers for ticks/i64,
+RUN parameters use the front-end's inferred kinds: integers for ticks/i64,
 floats for f64, booleans, strings for strings, handles or readable IDs for
 entities, and a nonnegative integer or `tx#N`/`N` string for canon. No numeric
-coercion; null, NaN, byte arrays and other mismatched types are TypeError. Undeclared params are
+coercion; NaN, byte arrays and other mismatched types are TypeError. Cypher
+value parameters also accept NULL and lists, while ticks/canon remain integers. Undeclared params are
 ignored. Fields omit the variable's `?`; aggregate names retain their text.
 
 ## Errors and limits
 
 | Condition | Bolt code |
 | --- | --- |
-| Datalog parse/compile or unsupported language | `Neo.ClientError.Statement.SyntaxError` (located when available) |
+| Cypher/Datalog syntax or unsupported language | `Neo.ClientError.Statement.SyntaxError` (located when available) |
 | Missing parameter | `Neo.ClientError.Statement.ParameterMissing` |
 | Parameter type mismatch | `Neo.ClientError.Statement.TypeError` |
 | Query/enrichment limits or cancellation | `Neo.ClientError.Statement.ExecutionFailed` |
@@ -199,3 +204,24 @@ Implementation references: [handshake](https://neo4j.com/docs/bolt/current/bolt/
 [messages](https://neo4j.com/docs/bolt/current/bolt/message/),
 [server states](https://neo4j.com/docs/bolt/current/bolt/server-state/),
 [PackStream](https://neo4j.com/docs/bolt/current/packstream/).
+
+## NULL and Cypher differences
+
+| Behavior | Cypher | Datalog |
+| --- | --- | --- |
+| Missing property | NULL, preserving the row | No binding; row absent |
+| Comparison with NULL | NULL (three-valued logic) | No NULL |
+| Filtering | WHERE keeps only true | Boolean; negation via `not` |
+| NULL in RETURN | PackStream null | Not produced |
+
+Known differences from Neo4j: each attribute has one stored type; lists are
+sorted sets (no order or duplicates); labels consist of one node type plus
+`label` values. Cardinality-one overlaps also return lists. Ref properties
+return graph references or lists of them. Node/Relationship enrichment always
+uses the plan's default tick; explicit `v.key` uses its binding clause's tick.
+Cypher parameters support NULL and lists (with input order preserved). Native
+ref-to-edge targets remain edge references in unlabelled relationship endpoints;
+standalone node scans exclude edges.
+Every explicit system-world `password_hash` reference is refused before
+execution, including WHERE, maps, RETURN aliases, IS NULL and ORDER BY/LIMIT.
+Returning account nodes continues to redact hashes.

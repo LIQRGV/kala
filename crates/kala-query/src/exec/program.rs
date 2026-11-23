@@ -80,6 +80,7 @@ pub(super) struct Attr {
 /// left-deep chain).
 #[derive(Debug)]
 pub(super) enum Step {
+    Row(crate::RowAction<usize, Val>),
     Unit,
     NodeScan {
         slot: usize,

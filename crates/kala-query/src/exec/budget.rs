@@ -167,6 +167,8 @@ pub(super) struct Memo {
 /// One attribute name's memoized reads (see [`Memo`]).
 #[derive(Default)]
 pub(super) struct AttrMemo {
+    /// Optional property values, including NULL and interned sorted lists.
+    pub(super) property: HashMap<(EntityId, Tick), Val>,
     /// `View::as_of(entity, attr, tick)`, values interned.
     pub(super) as_of: HashMap<(EntityId, Tick), Rc<[Val]>>,
     /// `View::as_of_value(entity, attr, value, tick)`.

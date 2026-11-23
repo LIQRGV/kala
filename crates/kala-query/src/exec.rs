@@ -1,10 +1,11 @@
 //! The executor: runs a [`Plan`] against a [`View`] (a pinned canon) through
 //! kala-core's public reads only.
 //!
-//! Every operator produces a **set** of rows; the final rows are sorted
-//! ascending by [`Value`]'s order and duplicate-free. The executor is
-//! language-neutral: bag semantics, NULLs and the like are a front-end's
-//! business, decided before a plan reaches here.
+//! Relational operators retain a set of complete bindings. The opt-in `Output`
+//! operator projects bags or sets, orders and slices; `Row` evaluates nullable
+//! expressions and optional reads. Without `Output`, final rows keep the
+//! original sorted, duplicate-free semantics. Front-ends select these explicit
+//! language-neutral operators.
 //!
 //! Execution is two passes. `compile` checks the plan statically (attribute
 //! names, which variables each operator binds, access feasibility, params)
@@ -51,6 +52,7 @@ use std::sync::atomic::AtomicBool;
 
 use kala_core::{Error as CoreError, Tick, TxId, Value, ValueType, View, WorkMeter, World};
 
+use crate::ParameterInput;
 use crate::datum::Datum;
 use crate::ir::{CanonSource, Plan, TickSource, Var};
 
@@ -123,8 +125,8 @@ impl Default for Limits {
 pub struct ResultSet {
     /// The result columns: the plan's `find` variables, in order.
     pub columns: Vec<Var>,
-    /// The rows, one datum per column, sorted ascending ([`Datum`]'s order,
-    /// lexicographic) with no duplicates.
+    /// The rows, one datum per column. Set plans sort and deduplicate; an
+    /// `Output` root preserves its requested order and multiplicity.
     pub rows: Vec<Vec<Datum>>,
     /// The resolved default tick (what [`TickSource::Default`] read at).
     pub tick: Tick,
@@ -178,7 +180,7 @@ pub fn run(
 fn run_tracked(
     world: &World,
     plan: &Plan,
-    params: &Params,
+    params: &dyn ParameterInput,
     limits: &Limits,
     cancel: &AtomicBool,
 ) -> Result<(ResultSet, Usage), QueryError> {
@@ -187,10 +189,9 @@ fn run_tracked(
     let canon = match &plan.canon {
         CanonSource::Latest => latest,
         CanonSource::Const(n) => TxId(*n),
-        CanonSource::Param(name) => match params.get(name) {
-            None => return Err(QueryError::MissingParam(name.clone())),
-            Some(Value::I64(n)) if *n >= 0 => TxId(n.unsigned_abs()),
-            Some(_) => {
+        CanonSource::Param(name) => match params.scalar(name)? {
+            Value::I64(n) if *n >= 0 => TxId(n.unsigned_abs()),
+            _ => {
                 return Err(QueryError::ParamType {
                     name: name.clone(),
                     expected: "non-negative i64".into(),
@@ -232,7 +233,7 @@ fn execute_on(
     world: &World,
     view: &View,
     plan: &Plan,
-    params: &Params,
+    params: &dyn ParameterInput,
     limits: &Limits,
     cancel: &AtomicBool,
 ) -> Result<(ResultSet, Usage), QueryError> {
@@ -252,7 +253,7 @@ fn execute_inner(
     world: &World,
     view: &View,
     plan: &Plan,
-    params: &Params,
+    params: &dyn ParameterInput,
     limits: &Limits,
     cancel: &AtomicBool,
     meter: &WorkMeter,
@@ -287,17 +288,32 @@ fn execute_inner(
     // Plan constants are interned first, uncharged; the rest of the query's
     // strings and interval sets join the same table.
     let mut interner = Interner::default();
+    let (root, output) = match &plan.root {
+        crate::Op::Output { input, spec } => (input.as_ref(), Some(spec)),
+        root => (root, None),
+    };
+    let mut budget = Budget {
+        cancel,
+        peak_bytes: 0,
+        steps: 0,
+        bytes: 0,
+        row_bytes: 0,
+        cmp: CmpWork::default(),
+        memo: Memo::default(),
+        limits: *limits,
+    };
     let prog = compile(
-        &plan.root,
+        root,
         world,
         view.canon(),
         params,
         default_tick,
         &mut slots,
         &mut interner,
+        &mut budget,
     )?;
     let mut find = Vec::with_capacity(plan.find.len());
-    for v in &plan.find {
+    for v in output.map_or(&plan.find, |spec| &spec.vars) {
         match slots.get(v) {
             Some(s) if prog.bound.contains(&s) => find.push(s),
             _ => {
@@ -310,26 +326,19 @@ fn execute_inner(
         }
     }
     let width = slots.len();
+    budget.row_bytes = row_bytes(width);
     let mut ex = Exec {
         world,
         view,
         meter,
         width,
-        budget: Budget {
-            cancel,
-            peak_bytes: 0,
-            steps: 0,
-            bytes: 0,
-            row_bytes: row_bytes(width),
-            cmp: CmpWork::default(),
-            memo: Memo::default(),
-            limits: *limits,
-        },
+        budget,
         interner,
         scans: HashMap::new(),
         history_scans: HashMap::new(),
         during_scans: HashMap::new(),
         checked_types: HashSet::new(),
+        node_types: None,
         rels: prog
             .rels
             .iter()
@@ -344,31 +353,26 @@ fn execute_inner(
     // The default tick's read (a walk of the E index at an older canon).
     ex.charge_index_work()?;
     let rows = ex.eval(&prog.steps)?;
-    let mut out = BTreeSet::new();
-    for row in &rows {
-        let r: Vec<Val> = find
-            .iter()
-            .map(|&s| {
-                row[s]
-                    .clone()
-                    .expect("invariant: compile checked every find var is bound")
-            })
-            .collect();
-        out.insert(r);
-    }
-    // The answer is charged at its real size (its strings are copies),
-    // while the root's rows are still held, before it is built.
-    let result_bytes = out.iter().map(|r| result_row_bytes(r)).sum();
-    ex.budget.charge_bytes(result_bytes)?;
-    drop(rows);
-    // `out` is duplicate-free but in the executor's id order: sort it once
-    // into the answer's order, charging long comparisons.
-    let out: Vec<Vec<Val>> = out.into_iter().collect();
-    let order = sort_real(&out, &mut ex.budget)?;
-    let rows = order
-        .into_iter()
-        .map(|i| out[i].iter().map(Val::to_datum).collect())
-        .collect();
+    let rows = if let Some(spec) = output {
+        output_rows(&rows, &find, spec, &slots, params, &mut ex.budget)?
+    } else {
+        let mut out = BTreeSet::new();
+        for row in &rows {
+            let r: Vec<Val> = find
+                .iter()
+                .map(|&s| row[s].clone().expect("checked find binding"))
+                .collect();
+            out.insert(r);
+        }
+        let result_bytes = out.iter().map(|r| result_row_bytes(r)).sum();
+        ex.budget.charge_bytes(result_bytes)?;
+        let out: Vec<Vec<Val>> = out.into_iter().collect();
+        let order = sort_real(&out, &mut ex.budget)?;
+        order
+            .into_iter()
+            .map(|i| out[i].iter().map(Val::to_datum).collect())
+            .collect()
+    };
     check_cancel(cancel)?;
     Ok((
         ResultSet {
@@ -423,11 +427,10 @@ fn sort_real(rows: &[Vec<Val>], budget: &mut Budget) -> Result<Vec<usize>, Query
     Ok(a)
 }
 
-fn tick_param(params: &Params, name: &str) -> Result<Tick, QueryError> {
-    match params.get(name) {
-        None => Err(QueryError::MissingParam(name.to_owned())),
-        Some(Value::I64(n)) => Ok(Tick(*n)),
-        Some(_) => Err(QueryError::ParamType {
+fn tick_param(params: &dyn ParameterInput, name: &str) -> Result<Tick, QueryError> {
+    match params.scalar(name)? {
+        Value::I64(n) => Ok(Tick(*n)),
+        _ => Err(QueryError::ParamType {
             name: name.to_owned(),
             expected: "i64".into(),
         }),
@@ -446,3 +449,170 @@ fn type_name(t: ValueType) -> &'static str {
 
 #[cfg(test)]
 mod scan_meter_tests;
+
+fn count_term(
+    term: Option<&crate::Term>,
+    params: &dyn ParameterInput,
+    default: usize,
+) -> Result<usize, QueryError> {
+    let Some(term) = term else { return Ok(default) };
+    let value = match term {
+        crate::Term::Const(v) => v,
+        crate::Term::Param(p) => params.scalar(p)?,
+        _ => {
+            return Err(QueryError::Plan(
+                "pagination needs an integer literal or parameter".into(),
+            ));
+        }
+    };
+    match value {
+        Value::I64(n) if *n >= 0 => Ok(usize::try_from(*n).unwrap_or(usize::MAX)),
+        _ => Err(QueryError::TypeMismatch(
+            "pagination needs a non-negative integer".into(),
+        )),
+    }
+}
+fn output_rows(
+    rows: &BTreeSet<val::Row>,
+    find: &[usize],
+    spec: &crate::OutputSpec,
+    slots: &Slots,
+    params: &dyn ParameterInput,
+    budget: &mut Budget,
+) -> Result<Vec<Vec<Datum>>, QueryError> {
+    let skip = count_term(spec.skip.as_ref(), params, 0)?;
+    let limit = count_term(spec.limit.as_ref(), params, usize::MAX)?;
+    let keys = spec
+        .order
+        .iter()
+        .map(|(v, desc)| {
+            slots
+                .get(v)
+                .map(|s| (s, *desc))
+                .ok_or_else(|| QueryError::Plan("unbound order key".into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut seen = HashSet::new();
+    let key_bytes = val::index_entry_bytes(find.len());
+    let mut seen_bytes = 0usize;
+    let mut out = Vec::new();
+    let mut orders = Vec::new();
+    for row in rows {
+        budget.step(1)?;
+        budget.charge_bytes(tuple_bytes(find.len()))?;
+        let value: Vec<_> = find
+            .iter()
+            .map(|&s| row[s].clone().expect("checked find binding"))
+            .collect();
+        if spec.distinct {
+            // The hash key and projected output retain separate tuples.
+            budget.charge_bytes(key_bytes)?;
+            if !seen.insert(value.clone()) {
+                budget.release_bytes(key_bytes.saturating_add(tuple_bytes(find.len())));
+                continue;
+            }
+            seen_bytes = seen_bytes.saturating_add(key_bytes);
+        }
+        budget.charge_bytes(result_row_bytes(&value).saturating_add(tuple_bytes(keys.len())))?;
+        orders.push(
+            keys.iter()
+                .map(|&(s, _)| {
+                    row[s]
+                        .clone()
+                        .ok_or_else(|| QueryError::Plan("unbound order key".into()))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        out.push(value);
+    }
+    drop(seen);
+    budget.release_bytes(seen_bytes);
+    let order = sort_by(out.len(), budget, |a, b, budget| {
+        for (k, (_, desc)) in keys.iter().enumerate() {
+            // Charge list traversal as well as string comparison prefixes.
+            budget.step(
+                (result_row_bytes(std::slice::from_ref(&orders[a][k]))
+                    .saturating_add(result_row_bytes(std::slice::from_ref(&orders[b][k])))
+                    / 64) as u64,
+            )?;
+            let cmp = eval::order(&orders[a][k], &orders[b][k], &mut budget.cmp);
+            budget.charge_cmp()?;
+            if !cmp.is_eq() {
+                return Ok(if *desc { cmp.reverse() } else { cmp });
+            }
+        }
+        Ok(std::cmp::Ordering::Equal)
+    })?;
+    Ok(order
+        .into_iter()
+        .skip(skip)
+        .take(limit)
+        .map(|i| out[i].iter().map(Val::to_datum).collect())
+        .collect())
+}
+fn sort_values(values: &[Val], budget: &mut Budget) -> Result<Vec<usize>, QueryError> {
+    sort_by(values.len(), budget, |a, b, budget| {
+        let cmp = val::cmp_real(&values[a], &values[b], &mut budget.cmp);
+        budget.charge_cmp()?;
+        Ok(cmp)
+    })
+}
+/// Fallible stable merge sort: temporary indices are charged before allocation,
+/// and every comparison checks cancellation and the work budget.
+fn sort_by(
+    n: usize,
+    budget: &mut Budget,
+    mut compare: impl FnMut(usize, usize, &mut Budget) -> Result<std::cmp::Ordering, QueryError>,
+) -> Result<Vec<usize>, QueryError> {
+    budget.charge_bytes(n.saturating_mul(2 * std::mem::size_of::<usize>()))?;
+    let mut a: Vec<_> = (0..n).collect();
+    let mut b = vec![0; n];
+    let mut width: usize = 1;
+    while width < n {
+        let mut lo = 0;
+        while lo < n {
+            let mid = lo.saturating_add(width).min(n);
+            let hi = mid.saturating_add(width).min(n);
+            let (mut i, mut j, mut k) = (lo, mid, lo);
+            while i < mid && j < hi {
+                budget.step(1)?;
+                if compare(a[i], a[j], budget)?.is_le() {
+                    b[k] = a[i];
+                    i += 1;
+                } else {
+                    b[k] = a[j];
+                    j += 1;
+                }
+                k += 1;
+            }
+            b[k..k + mid - i].copy_from_slice(&a[i..mid]);
+            k += mid - i;
+            b[k..hi].copy_from_slice(&a[j..hi]);
+            lo = hi;
+        }
+        std::mem::swap(&mut a, &mut b);
+        width = width.saturating_mul(2);
+    }
+    budget.release_bytes(n.saturating_mul(std::mem::size_of::<usize>()));
+    Ok(a)
+}
+
+/// Run with nullable/list parameters, leaving the original scalar API unchanged.
+pub fn run_with_values(
+    world: &World,
+    plan: &Plan,
+    params: &crate::QueryParams,
+    limits: &Limits,
+) -> Result<ResultSet, QueryError> {
+    run_with_values_and_cancel(world, plan, params, limits, &AtomicBool::new(false))
+}
+/// Run nullable/list parameters with caller-owned cancellation.
+pub fn run_with_values_and_cancel(
+    world: &World,
+    plan: &Plan,
+    params: &crate::QueryParams,
+    limits: &Limits,
+    cancel: &AtomicBool,
+) -> Result<ResultSet, QueryError> {
+    run_tracked(world, plan, params, limits, cancel).map(|(rows, _)| rows)
+}

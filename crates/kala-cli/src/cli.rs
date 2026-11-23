@@ -47,11 +47,18 @@ pub struct ReadAt {
     pub json: bool,
 }
 
-/// A Datalog query's text (inline or from a file) and its parameters.
+/// A query's text (inline or from a file) and its parameters.
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("source").required(true).args(["query", "file"])))]
 pub struct QueryArgs {
-    /// The Datalog query text.
+    /// Query language (the REPL remains Datalog-only).
+    #[arg(
+        long,
+        default_value = crate::cmd::language::NAMES[0],
+        value_parser = clap::builder::PossibleValuesParser::new(crate::cmd::language::NAMES)
+    )]
+    pub lang: String,
+    /// The query text.
     pub query: Option<String>,
     /// Read the query text from this file (a regular file, UTF-8).
     #[arg(short = 'f', value_name = "FILE")]
@@ -105,7 +112,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Serve read-only Datalog queries over Bolt 5 with account authentication.
+    /// Serve read-only Cypher and Datalog queries over Bolt 5.
     Serve {
         /// Directory containing <database>.kala world files.
         dir: PathBuf,

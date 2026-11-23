@@ -1,5 +1,7 @@
 //! The static pass: checks a plan and compiles it into a flat [`Program`].
 
+mod rows;
+
 use std::collections::{BTreeSet, HashMap};
 
 use kala_core::{Tick, TxId, Value, ValueType, World};
@@ -9,7 +11,7 @@ use crate::ir::{Access, Agg, AggFn, AttrRef, Func, Op, OpTerm, Predicate, Term, 
 use super::agg::{agg_takes, agg_wants};
 use super::program::{AggStep, Attr, Pos, Program, Slots, Step, TickPos, Variant, pop};
 use super::val::{CmpWork, Interner, Val, ValKind, compare};
-use super::{Params, QueryError, tick_param, type_name};
+use super::{ParameterInput, QueryError, tick_param, type_name};
 
 /// One item of a plan's walk, in execution order.
 enum Visit<'p> {
@@ -52,7 +54,9 @@ fn post_order(root: &Op) -> Vec<Visit<'_>> {
         // Pushed in reverse: the stack pops them in execution order.
         match op {
             Op::Unit => out.push(Visit::Op(op)),
-            Op::NodeScan { input, .. }
+            Op::Row { input, .. }
+            | Op::Output { input, .. }
+            | Op::NodeScan { input, .. }
             | Op::NodeSeek { input, .. }
             | Op::Expand { input, .. }
             | Op::Filter { input, .. }
@@ -123,14 +127,16 @@ pub(super) fn plan_depth(root: &Op) -> usize {
 
 /// Compiles `root` into a flat program. Errors come in the order a
 /// recursive walk (inputs first, left to right) would find them.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn compile(
     root: &Op,
     world: &World,
     canon: TxId,
-    params: &Params,
+    params: &dyn ParameterInput,
     default_tick: Tick,
     slots: &mut Slots,
     interner: &mut Interner,
+    budget: &mut super::budget::Budget,
 ) -> Result<Program, QueryError> {
     let walk = post_order(root);
     let mut c = Compiler {
@@ -140,6 +146,8 @@ pub(super) fn compile(
         default_tick,
         slots,
         interner,
+        budget,
+        parameter_constants: HashMap::new(),
         stack: Vec::new(),
         unions: Vec::new(),
         fixes: Vec::new(),
@@ -192,10 +200,12 @@ struct FixScope {
 
 /// Compile state: the slots bound by each pending operator's output, the
 /// open `Union`s and `Fixpoint`s, and every relation seen so far.
-struct Compiler<'c> {
+struct Compiler<'c, 'b> {
+    budget: &'c mut super::budget::Budget<'b>,
+    parameter_constants: HashMap<String, Val>,
     world: &'c World,
     canon: TxId,
-    params: &'c Params,
+    params: &'c dyn ParameterInput,
     default_tick: Tick,
     slots: &'c mut Slots,
     /// Interns the plan's string constants (uncharged).
@@ -232,7 +242,7 @@ fn note_kind(kinds: &mut HashMap<usize, Option<ValKind>>, pos: &Pos, kind: Optio
     }
 }
 
-impl Compiler<'_> {
+impl Compiler<'_, '_> {
     /// Compiles one walk item into its step, if it has one.
     fn visit(&mut self, v: Visit<'_>) -> Result<Option<Step>, QueryError> {
         Ok(Some(match v {
@@ -424,6 +434,10 @@ impl Compiler<'_> {
                 Some(seed) => (Step::Seed, seed.clone()),
                 None => (Step::Unit, BTreeSet::new()),
             },
+            Op::Row { action, .. } => self.op_row(action)?,
+            Op::Output { .. } => {
+                return Err(QueryError::Plan("Output must be the plan root".into()));
+            }
             Op::Not { .. } => self.op_not()?,
             Op::Difference { .. } | Op::Intersect { .. } => {
                 let rb = pop(stack);
@@ -1042,16 +1056,14 @@ fn var_pos(v: &Var, slots: &mut Slots, bound: &BTreeSet<usize>) -> Pos {
     }
 }
 
-fn param<'p>(params: &'p Params, name: &str) -> Result<&'p Value, QueryError> {
-    params
-        .get(name)
-        .ok_or_else(|| QueryError::MissingParam(name.to_owned()))
+fn param<'p>(params: &'p dyn ParameterInput, name: &str) -> Result<&'p Value, QueryError> {
+    params.scalar(name)
 }
 
 /// An entity position: constants and params must be refs.
 fn entity_pos(
     t: &Term,
-    params: &Params,
+    params: &dyn ParameterInput,
     slots: &mut Slots,
     bound: &BTreeSet<usize>,
     what: &str,
@@ -1087,7 +1099,7 @@ fn entity_pos(
 fn value_pos(
     t: &Term,
     ty: ValueType,
-    params: &Params,
+    params: &dyn ParameterInput,
     interner: &mut Interner,
     slots: &mut Slots,
     bound: &BTreeSet<usize>,
@@ -1124,7 +1136,7 @@ fn value_pos(
 /// A `History` tick position: an `i64` constant or param, a variable or `_`.
 fn tick_term_pos(
     t: &Term,
-    params: &Params,
+    params: &dyn ParameterInput,
     slots: &mut Slots,
     bound: &BTreeSet<usize>,
 ) -> Result<Pos, QueryError> {
@@ -1150,7 +1162,7 @@ fn tick_term_pos(
 /// A filter operand: a constant, a param or a bound variable.
 fn operand_pos(
     t: &Term,
-    params: &Params,
+    params: &dyn ParameterInput,
     interner: &mut Interner,
     slots: &mut Slots,
     bound: &BTreeSet<usize>,
@@ -1186,7 +1198,7 @@ fn func_signature(func: Func) -> (&'static [ValKind], bool) {
 fn apply_arg_pos(
     func: Func,
     t: &Term,
-    params: &Params,
+    params: &dyn ParameterInput,
     interner: &mut Interner,
     slots: &mut Slots,
     bound: &BTreeSet<usize>,

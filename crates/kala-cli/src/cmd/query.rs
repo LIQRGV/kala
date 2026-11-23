@@ -1,6 +1,6 @@
 //! `kala query <world> [QUERY] [-f FILE] [--param name=value].. [--json]` and
-//! `kala explain <world> [QUERY] [-f FILE] [--param ..]`: Datalog from the
-//! command line, through `kala_datalog::prepare` and `kala_query::run`.
+//! `kala explain <world> [QUERY] [-f FILE] [--param ..]`: Cypher or Datalog
+//! from the command line, through their front-ends and the shared executor.
 
 use std::fmt::Write as _;
 use std::io::Read as _;
@@ -9,7 +9,7 @@ use std::path::Path;
 use kala_core::World;
 use kala_core::{Value, ValueType};
 use kala_datalog::{MAX_QUERY_BYTES, ParamKind, Prepared};
-use kala_query::{Limits, Params, QueryError, ResultSet};
+use kala_query::{Datum, Limits, ParameterInput, Params, QueryError, QueryParams, ResultSet};
 use serde::Serialize;
 
 use super::read::{Ctx, parse_value};
@@ -77,7 +77,7 @@ pub(crate) fn table(world: &World, rs: &ResultSet) -> (Vec<String>, Vec<Vec<JVal
 /// (names, labels) at the query's resolved default tick and canon.
 pub fn run(world: &Path, q: &QueryArgs, json: bool) -> Result<String, CliError> {
     let (ctx, prepared, params) = prepare(world, q)?;
-    let rs = kala_query::run(&ctx.world, &prepared.plan, &params, &Limits::default())
+    let rs = kala_query::run_with_values(&ctx.world, &prepared.plan, &params, &Limits::default())
         .map_err(|e| query_err(e, "query"))?;
     Ok(render_result(&ctx.world, &rs, json))
 }
@@ -115,7 +115,7 @@ pub fn explain(world: &Path, q: &QueryArgs) -> Result<String, CliError> {
 
 /// Reads the query text, opens the world, prepares the query and parses
 /// its parameters.
-fn prepare(world: &Path, q: &QueryArgs) -> Result<(Ctx, Prepared, Params), CliError> {
+fn prepare(world: &Path, q: &QueryArgs) -> Result<(Ctx, Prepared, QueryParams), CliError> {
     let text = match (&q.query, &q.file) {
         (Some(t), None) => t.clone(),
         (None, Some(f)) => read_text_file(f, MAX_QUERY_BYTES, "the query")?,
@@ -127,11 +127,9 @@ fn prepare(world: &Path, q: &QueryArgs) -> Result<(Ctx, Prepared, Params), CliEr
         }
     };
     let ctx = Ctx::open(world, None)?;
-    // Datalog messages escape the input they echo; `main` escapes the
-    // whole line again.
-    let prepared = kala_datalog::prepare(&ctx.world, &text)
-        .map_err(|e| CliError::User(format!("query: {e}")))?;
-    let params = parse_params(&ctx, &prepared.params, &q.params)?;
+    let front_end = super::language::front_end(&q.lang)?;
+    let prepared = front_end.prepare(&ctx.world, &text)?;
+    let params = front_end.params(&ctx, &prepared.params, &q.params)?;
     Ok((ctx, prepared, params))
 }
 
@@ -177,6 +175,15 @@ pub(crate) fn parse_params(
 fn parse_param(ctx: &Ctx, name: &str, kind: &ParamKind, s: &str) -> Result<Value, CliError> {
     let whose = format!("parameter `?{}`", escape::value(name));
     match kind {
+        ParamKind::Scalar => Ok(if let Ok(n) = s.parse::<i64>() {
+            Value::I64(n)
+        } else if let Ok(b) = s.parse::<bool>() {
+            Value::Bool(b)
+        } else if let Some(f) = numeric_float(s) {
+            Value::f64(f).map_err(|_| CliError::User("invalid float parameter".into()))?
+        } else {
+            Value::Str(s.to_owned())
+        }),
         ParamKind::Entity | ParamKind::Value(ValueType::Ref) => {
             ctx.defined_entity(s).map(Value::Ref)
         }
@@ -199,6 +206,47 @@ fn parse_param(ctx: &Ctx, name: &str, kind: &ParamKind, s: &str) -> Result<Value
                 ))
             }),
     }
+}
+
+/// `s` as a float, only when it looks numeric:
+/// `^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$`. Rust's `f64` parser also
+/// takes `nan`, `inf` and `infinity`; those words stay strings here, since a
+/// scalar parameter is guessed from its text.
+fn numeric_float(s: &str) -> Option<f64> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let digits = |i: &mut usize| {
+        let start = *i;
+        while *i < b.len() && b[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        *i - start
+    };
+    if matches!(b.first(), Some(b'+' | b'-')) {
+        i += 1;
+    }
+    let int_digits = digits(&mut i);
+    let mut frac_digits = 0;
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        frac_digits = digits(&mut i);
+    }
+    if int_digits == 0 && frac_digits == 0 {
+        return None;
+    }
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(b.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        if digits(&mut i) == 0 {
+            return None;
+        }
+    }
+    if i != b.len() {
+        return None;
+    }
+    s.parse::<f64>().ok()
 }
 
 /// A query (or checks) file's text: a regular file only (a directory, FIFO
@@ -248,4 +296,95 @@ pub(crate) fn query_err(e: QueryError, whose: &str) -> CliError {
         )),
         e => CliError::User(format!("{whose}: {e}")),
     }
+}
+
+pub(crate) fn parse_cypher_params(
+    ctx: &Ctx,
+    kinds: &[(String, ParamKind)],
+    given: &[(String, String)],
+) -> Result<QueryParams, CliError> {
+    if given
+        .iter()
+        .try_fold(0usize, |n, (k, v)| {
+            n.checked_add(k.len())?.checked_add(v.len())
+        })
+        .is_none_or(|n| n > 1 << 20)
+    {
+        return Err(CliError::User("query parameters exceed 1 MiB".into()));
+    }
+    let mut params = QueryParams::new();
+    for (name, text) in given {
+        let name = name.strip_prefix(['?', '$']).unwrap_or(name);
+        let kind = kinds
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, k)| k)
+            .ok_or_else(|| CliError::User("unknown Cypher parameter".into()))?;
+        if params.contains_key(name) {
+            return Err(CliError::User("duplicate Cypher parameter".into()));
+        }
+        let nullable = !matches!(kind, ParamKind::Tick | ParamKind::Canon);
+        let value =
+            if nullable && (text == "null" || text.starts_with('[') || text.starts_with('"')) {
+                let value: serde_json::Value = serde_json::from_str(text)
+                    .map_err(|_| CliError::User("invalid JSON query parameter".into()))?;
+                json_parameter(ctx, kind, &value, 0)?
+            } else {
+                Datum::Value(parse_param(ctx, name, kind, text)?)
+            };
+        params.insert(name.into(), value);
+    }
+    for (name, _) in kinds {
+        if !params.contains_key(name) {
+            return Err(CliError::User(format!(
+                "missing parameter {}",
+                escape::value(name)
+            )));
+        }
+    }
+    Ok(params)
+}
+fn json_parameter(
+    ctx: &Ctx,
+    kind: &ParamKind,
+    value: &serde_json::Value,
+    depth: usize,
+) -> Result<Datum, CliError> {
+    use serde_json::Value as Json;
+    let bad = || CliError::User("wrong type for JSON query parameter".into());
+    if depth > 32 {
+        return Err(CliError::User(
+            "query parameter nesting limit exceeded".into(),
+        ));
+    }
+    let value = match value {
+        Json::Null => return Ok(Datum::Null),
+        Json::Array(values) => {
+            return values
+                .iter()
+                .map(|v| json_parameter(ctx, kind, v, depth + 1))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Datum::List);
+        }
+        Json::String(s) if matches!(kind, ParamKind::Scalar | ParamKind::Value(ValueType::Str)) => {
+            Value::Str(s.clone())
+        }
+        Json::String(s) if matches!(kind, ParamKind::Entity | ParamKind::Value(ValueType::Ref)) => {
+            ctx.defined_entity(s).map(Value::Ref)?
+        }
+        Json::Bool(b) if matches!(kind, ParamKind::Scalar | ParamKind::Value(ValueType::Bool)) => {
+            Value::Bool(*b)
+        }
+        Json::Number(n)
+            if matches!(kind, ParamKind::Scalar | ParamKind::Value(ValueType::I64))
+                && n.is_i64() =>
+        {
+            Value::I64(n.as_i64().ok_or_else(bad)?)
+        }
+        Json::Number(n) if matches!(kind, ParamKind::Scalar | ParamKind::Value(ValueType::F64)) => {
+            Value::f64(n.as_f64().ok_or_else(bad)?).map_err(|_| bad())?
+        }
+        _ => return Err(bad()),
+    };
+    Ok(Datum::Value(value))
 }

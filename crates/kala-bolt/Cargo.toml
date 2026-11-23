@@ -10,6 +10,7 @@ workspace = true
 kala-core = { path = "../kala-core" }
 kala-query = { path = "../kala-query" }
 kala-datalog = { path = "../kala-datalog" }
+kala-cypher = { path = "../kala-cypher" }
 
 # Security-consultant approved: Argon2id PHC hashing and OS-random salts.
 argon2 = { version = "=0.5.3", default-features = false, features = ["std", "password-hash", "rand"] }

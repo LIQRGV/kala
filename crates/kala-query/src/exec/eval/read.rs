@@ -506,7 +506,7 @@ impl Exec<'_, '_> {
     /// `View::attr_scan(attr, t)`, read once per query and cached for the
     /// rest of it (for constant, parameter and default ticks: one scan each).
     /// A cached scan stays charged to the byte budget until the query ends.
-    fn scan(&mut self, attr: &str, t: Tick) -> Result<Rc<Pairs>, QueryError> {
+    pub(super) fn scan(&mut self, attr: &str, t: Tick) -> Result<Rc<Pairs>, QueryError> {
         if let Some(s) = self.scans.get(attr).and_then(|m| m.get(&t)) {
             return Ok(Rc::clone(s));
         }

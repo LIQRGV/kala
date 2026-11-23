@@ -452,3 +452,167 @@ fn guard_non_admin_still_gets_forbidden_on_system_without_reading_anything() {
         map(&[]),
     );
 }
+
+// Cypher must refuse the property before execution in every supported position,
+// including empty matches and LIMIT 0 (no content-dependent error oracle).
+macro_rules! cypher_secret_test {
+    ($name:ident, $query:literal) => {
+        #[test]
+        fn $name() {
+            let server = server();
+            let mut root = Client::ready(&server);
+            assert_forbidden(&mut root, "system", $query, map(&[]));
+        }
+    };
+}
+cypher_secret_test!(cypher_secret_return, "MATCH (a) RETURN a.password_hash");
+cypher_secret_test!(
+    cypher_secret_backticks,
+    "MATCH (a) RETURN a.`password_hash`"
+);
+cypher_secret_test!(cypher_secret_alias, "MATCH (a) RETURN a.password_hash AS x");
+cypher_secret_test!(
+    cypher_secret_where_equals,
+    "MATCH (a) WHERE a.password_hash = 'x' RETURN a.user"
+);
+cypher_secret_test!(
+    cypher_secret_where_unequal,
+    "MATCH (a) WHERE a.password_hash <> 'x' RETURN a.user"
+);
+cypher_secret_test!(
+    cypher_secret_where_less,
+    "MATCH (a) WHERE a.password_hash < 'x' RETURN a.user"
+);
+cypher_secret_test!(
+    cypher_secret_where_less_equal,
+    "MATCH (a) WHERE a.password_hash <= 'x' RETURN a.user"
+);
+cypher_secret_test!(
+    cypher_secret_where_greater,
+    "MATCH (a) WHERE a.password_hash > 'x' RETURN a.user"
+);
+cypher_secret_test!(
+    cypher_secret_where_greater_equal,
+    "MATCH (a) WHERE a.password_hash >= 'x' RETURN a.user"
+);
+cypher_secret_test!(
+    cypher_secret_where_null,
+    "MATCH (a) WHERE a.password_hash IS NULL RETURN a.user"
+);
+cypher_secret_test!(
+    cypher_secret_where_not_null,
+    "MATCH (a) WHERE a.password_hash IS NOT NULL RETURN a.user"
+);
+cypher_secret_test!(
+    cypher_secret_where_negated,
+    "MATCH (a) WHERE NOT (a.password_hash = 'x') RETURN a.user"
+);
+cypher_secret_test!(
+    cypher_secret_where_false_branch,
+    "MATCH (a) WHERE false AND a.password_hash = 'x' RETURN a.user"
+);
+cypher_secret_test!(
+    cypher_secret_order,
+    "MATCH (a) RETURN a.user ORDER BY a.password_hash"
+);
+cypher_secret_test!(
+    cypher_secret_order_desc_limit,
+    "MATCH (a) RETURN a.user ORDER BY a.password_hash DESC LIMIT 1"
+);
+cypher_secret_test!(
+    cypher_secret_node_map,
+    "MATCH (a {password_hash: 'x'}) RETURN a"
+);
+cypher_secret_test!(
+    cypher_secret_node_map_backticks,
+    "MATCH (a {`password_hash`: 'x'}) RETURN a"
+);
+cypher_secret_test!(
+    cypher_secret_relationship_map,
+    "MATCH (a)-[r:no_such_rel {password_hash: 'x'}]->(b) RETURN a"
+);
+cypher_secret_test!(
+    cypher_secret_relationship_property,
+    "MATCH (a)-[r:no_such_rel]->(b) RETURN r.password_hash"
+);
+cypher_secret_test!(
+    cypher_secret_empty_match,
+    "MATCH (a {kala_handle: 'no-account'}) RETURN a.password_hash"
+);
+cypher_secret_test!(
+    cypher_secret_limit_zero,
+    "MATCH (a) RETURN a.password_hash LIMIT 0"
+);
+cypher_secret_test!(
+    cypher_secret_missing_parameter,
+    "MATCH (a) WHERE a.password_hash = $probe RETURN a.user"
+);
+
+#[test]
+fn cypher_system_public_properties_work_and_nodes_redact_hashes() {
+    let server = server();
+    let mut root = Client::ready(&server);
+    let names = rows(&mut root, "system", "MATCH (a:ACCOUNT) RETURN a.user");
+    assert!(names.contains(&vec![string("root")]));
+    let nodes = rows(&mut root, "system", "MATCH (a:ACCOUNT) RETURN a");
+    assert!(!nodes.is_empty());
+    for row in nodes {
+        let fields = client::structure(row[0].clone(), 0x4e);
+        let Value::Map(props) = &fields[2] else {
+            panic!("node properties")
+        };
+        if let Some(hash) = props.get("password_hash") {
+            assert_eq!(hash, &string("<redacted>"));
+        }
+        assert!(!format!("{props:?}").contains("$argon2"));
+    }
+}
+
+#[test]
+fn cypher_password_hash_is_an_ordinary_property_outside_system() {
+    let server = server();
+    let mut root = Client::ready(&server);
+    assert_eq!(
+        rows(
+            &mut root,
+            "users",
+            "MATCH (a {kala_handle: 'bob'}) RETURN a.password_hash"
+        ),
+        vec![vec![string("$argon2id$user-data")]]
+    );
+    assert_eq!(
+        rows(
+            &mut root,
+            "users",
+            "MATCH (a) WHERE a.password_hash IS NOT NULL RETURN a.name ORDER BY a.password_hash"
+        ),
+        vec![vec![string("Bob")]]
+    );
+}
+
+#[test]
+fn cypher_unsupported_dynamic_or_string_functions_cannot_evaluate_secrets() {
+    let server = server();
+    let mut root = Client::ready(&server);
+    for query in [
+        "MATCH (a) WHERE a.password_hash STARTS WITH 'x' RETURN a.user",
+        "MATCH (a) RETURN a[$key]",
+        "MATCH (a) RETURN properties(a)",
+        "MATCH (a) RETURN keys(a)",
+    ] {
+        root.send(
+            0x10,
+            vec![
+                string(query),
+                map(&[("key", string("password_hash"))]),
+                on("system"),
+            ],
+        );
+        let meta = client::metadata(root.recv(), 0x7f);
+        assert!(
+            matches!(meta.get("code"),Some(Value::String(code)) if code == FORBIDDEN || code == "Neo.ClientError.Statement.SyntaxError")
+        );
+        assert!(!format!("{meta:?}").contains("$argon2"));
+        root.reset();
+    }
+}
