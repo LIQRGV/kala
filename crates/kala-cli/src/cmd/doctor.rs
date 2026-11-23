@@ -86,7 +86,10 @@ struct JFinding {
 /// A story check that returned rows.
 #[derive(Serialize)]
 struct JHint {
-    /// `story_check` or `budget_exhausted`.
+    /// `story_check`, `budget_exhausted` (the shared step budget ran out;
+    /// this and later checks didn't run), `memory_exhausted` (this check
+    /// exceeded the memory budget and was skipped) or `output_truncated`
+    /// (rows were omitted from this check on by the total output cap).
     kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
@@ -96,7 +99,9 @@ struct JHint {
     rows_total: usize,
     /// As `kala query --json` names them.
     columns: Vec<String>,
-    /// The first [`JSON_ROWS`] rows, as `kala query --json` prints them.
+    /// Up to [`JSON_ROWS`] rows, as `kala query --json` prints them; fewer
+    /// when the total output cap ([`TOTAL_ROWS`], [`TOTAL_BYTES`]) omitted
+    /// some (an `output_truncated` hint then follows the first such check).
     rows: Vec<Vec<JValue>>,
     /// Text output retains only what it displays, never hidden reference
     /// names or other full JSON metadata behind a shortened label.
@@ -314,42 +319,36 @@ fn run_checks(
             .collect();
         let mut rows = Vec::new();
         let mut text_rows = Vec::new();
-        if !truncated {
+        // A row that doesn't fit what is left of the output allowance is
+        // skipped on its own; later (smaller) rows still print. Only the
+        // total row cap ends rendering for every later check.
+        let mut omitted = false;
+        if rendered_rows < TOTAL_ROWS {
             let labeler = Labeler::new(&world, rs.canon, rs.tick);
             for row in rs
                 .rows
                 .iter()
                 .take(if json { JSON_ROWS } else { TEXT_ROWS })
             {
-                let candidate = if rendered_rows == TOTAL_ROWS {
-                    None
-                } else {
-                    let row: Vec<JValue> = row.iter().map(|d| labeler.datum(d)).collect();
-                    let allowance = TOTAL_BYTES - rendered_bytes;
-                    let bytes = if json {
-                        // Include a separator per row, conservatively even
-                        // for the first row of a hint's array.
-                        allowance
-                            .checked_sub(1)
-                            .and_then(|n| json_size_within(&row, n))
-                            .map(|n| n + 1)
-                    } else {
-                        text_row_size(&row, allowance)
-                    };
-                    bytes.map(|n| (row, n))
-                };
-                let Some((row, bytes)) = candidate else {
-                    truncated = true;
-                    hints.push(JHint {
-                        kind: "output_truncated",
-                        message: Some(format!("output_truncated: story-check rows omitted from :{} onward (output cap)", escape::value(&c.name))),
-                        check: c.name.clone(),
-                        rows_total: 0,
-                        columns: Vec::new(),
-                        rows: Vec::new(),
-                    text_rows: Vec::new(),
-                    });
+                if rendered_rows == TOTAL_ROWS {
+                    omitted = true;
                     break;
+                }
+                let row: Vec<JValue> = row.iter().map(|d| labeler.datum(d)).collect();
+                let allowance = TOTAL_BYTES - rendered_bytes;
+                let bytes = if json {
+                    // Include a separator per row, conservatively even
+                    // for the first row of a hint's array.
+                    allowance
+                        .checked_sub(1)
+                        .and_then(|n| json_size_within(&row, n))
+                        .map(|n| n + 1)
+                } else {
+                    text_row_size(&row, allowance)
+                };
+                let Some(bytes) = bytes else {
+                    omitted = true;
+                    continue;
                 };
                 rendered_rows += 1;
                 rendered_bytes += bytes;
@@ -359,6 +358,8 @@ fn run_checks(
                     text_rows.push(row_text(&row));
                 }
             }
+        } else {
+            omitted = true;
         }
         hints.push(JHint {
             kind: "story_check",
@@ -369,6 +370,23 @@ fn run_checks(
             rows,
             text_rows,
         });
+        // One notice, after the first check that lost rows to the cap.
+        if omitted && !truncated {
+            truncated = true;
+            hints.push(JHint {
+                kind: "output_truncated",
+                message: Some(format!(
+                    "story-check rows omitted from :{} on (output cap: {TOTAL_ROWS} rows, {} MiB)",
+                    escape::value(&c.name),
+                    TOTAL_BYTES >> 20
+                )),
+                check: c.name.clone(),
+                rows_total: 0,
+                columns: Vec::new(),
+                rows: Vec::new(),
+                text_rows: Vec::new(),
+            });
+        }
     }
     Ok(hints)
 }

@@ -130,7 +130,7 @@ fn text_at_the_check_limit_preserves_all_rows_and_counts() {
     assert_eq!(rows.len(), 256 * 5);
     assert!(rows.len() <= ROW_CAP);
     assert_eq!(out.matches("  story_check:").count(), 256);
-    assert!(!out.contains("output_truncated"));
+    assert!(!out.contains("rows omitted from"));
     for i in 0..256 {
         assert!(out.contains(&format!("  story_check: :check{i}: 5 rows\n")));
     }
@@ -182,7 +182,7 @@ fn wide_rows_obey_the_total_byte_cap_in_text_and_json() {
             let bytes: usize = rows.iter().map(|line| line.len() + 1).sum();
             assert!(bytes <= BYTE_CAP, "rendered row text used {bytes} bytes");
             assert!(!rows.is_empty() && rows.len() < 30);
-            assert_eq!(output.matches("output_truncated").count(), 1);
+            assert_eq!(output.matches("rows omitted from").count(), 1);
         }
     }
 }
@@ -220,8 +220,77 @@ fn a_single_oversize_row_is_omitted_and_later_counts_stay_exact() {
             assert_eq!(truncated[0]["check"], "check0");
         } else {
             assert_eq!(output.matches("  story_check:").count(), 2);
-            assert_eq!(output.matches("output_truncated").count(), 1);
+            assert_eq!(output.matches("rows omitted from").count(), 1);
             assert!(output.contains("    ... (1 more)"));
         }
     }
+}
+
+// Review round 1: one row too big for the output cap is skipped on its own;
+// later checks' small rows still print while the allowance lasts, and the
+// single `output_truncated` notice comes after the check it describes.
+#[test]
+fn one_oversized_row_does_not_hide_later_small_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("w.kala");
+    let mut big = AttrDef::new("big", ValueType::Str, Kind::State, Cardinality::One);
+    big.indexed = false;
+    let schema = Schema::new()
+        .node_type("THING")
+        .attribute(big)
+        .attribute(AttrDef::new(
+            "n",
+            ValueType::I64,
+            Kind::State,
+            Cardinality::One,
+        ));
+    let mut world = World::create(&path, schema).unwrap();
+    let e = world.create_entity("THING", Some("e")).unwrap();
+    // 3M C1 controls: 6 MiB stored, 18 MiB once JSON-escaped (`\u0080`).
+    world
+        .assert(
+            e,
+            "big",
+            Value::Str("\u{80}".repeat(3 << 20)),
+            Some(Tick(0)),
+        )
+        .unwrap();
+    world.assert(e, "n", Value::I64(7), Some(Tick(0))).unwrap();
+    drop(world);
+    let checks = dir.path().join("checks.edn");
+    std::fs::write(
+        &checks,
+        "[[:huge [:find ?v :where [:e :big ?v]]]\n [:small1 [:find ?v :where [:e :n ?v]]]\n [:small2 [:find ?v :where [:e :n ?v]]]]\n",
+    )
+    .unwrap();
+    let out = kala([
+        "doctor",
+        path.to_str().unwrap(),
+        "--checks",
+        checks.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let json = parse_one_json(&stdout(&out));
+    let hints = json["hints"].as_array().unwrap();
+    let kinds: Vec<(&str, &str)> = hints
+        .iter()
+        .map(|h| (h["kind"].as_str().unwrap(), h["check"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("story_check", "huge"),
+            ("output_truncated", "huge"),
+            ("story_check", "small1"),
+            ("story_check", "small2"),
+        ]
+    );
+    assert_eq!(hints[0]["rows_total"], 1);
+    assert_eq!(hints[0]["rows"].as_array().unwrap().len(), 0);
+    for h in &hints[2..] {
+        assert_eq!(h["rows"].as_array().unwrap().len(), 1, "{h}");
+    }
+    let msg = hints[1]["message"].as_str().unwrap();
+    assert!(!msg.starts_with("output_truncated"), "{msg}");
 }
