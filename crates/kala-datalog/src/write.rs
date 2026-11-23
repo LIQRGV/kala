@@ -295,6 +295,12 @@ fn transaction(f: Form, restore: bool) -> Result<WriteTxn, DatalogError> {
         items.remove(0);
     }
     let single = matches!(items.first(),Some(Form::Atom{tok:Tok::Keyword(k),..}) if k!="at");
+    if single && genesis {
+        return Err(DatalogError::syntax(
+            span,
+            "genesis holds operation vectors: [:genesis [:node-type ...] [:attribute ...]]",
+        ));
+    }
     if single {
         return Ok(WriteTxn {
             genesis: false,
@@ -367,14 +373,8 @@ fn operation(items: Vec<Form>, span: Span) -> Result<WriteOp, DatalogError> {
     match kind.as_str() {
         "attribute" | "migrate" => {
             let (name, _) = named(it.next().ok_or_else(missing)?)?;
-            let mut rest: Vec<_> = it.collect();
-            let inferred = kind == "attribute"
-                && matches!(rest.last(), Some(Form::Atom { tok: Tok::Keyword(k), .. }) if k == "inferred");
-            if inferred {
-                rest.pop();
-            }
-            let (options, clear_reverse_cardinality) =
-                schema_options(rest.into_iter(), kind == "migrate", span)?;
+            let (options, clear_reverse_cardinality, inferred) =
+                schema_options(it, kind == "migrate", span)?;
             if kind == "migrate" {
                 return Ok(WriteOp::Migrate {
                     name,
@@ -593,9 +593,10 @@ fn schema_options(
     mut it: impl Iterator<Item = Form>,
     migrate: bool,
     span: Span,
-) -> Result<(MigrationOptions, bool), DatalogError> {
+) -> Result<(MigrationOptions, bool, bool), DatalogError> {
     let mut out = MigrationOptions::default();
     let mut clear_reverse = false;
+    let mut inferred = false;
     let mut seen = std::collections::BTreeSet::new();
     while let Some(form) = it.next() {
         let (name, s) = keyword(form)?;
@@ -654,6 +655,8 @@ fn schema_options(
                 }
             }
             "skip-unconvertible" if migrate => out.skip_unconvertible = true,
+            // A dump's inferred declaration; validated like live inference.
+            "inferred" if !migrate => inferred = true,
             _ => {
                 return Err(DatalogError::syntax(
                     s,
@@ -662,5 +665,5 @@ fn schema_options(
             }
         }
     }
-    Ok((out, clear_reverse))
+    Ok((out, clear_reverse, inferred))
 }

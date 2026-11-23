@@ -50,6 +50,11 @@ fn name(value: &str) -> String {
     }
 }
 fn reference(world: &World, id: kala_core::EntityId) -> String {
+    // Handles are permanent and unique, so they replay to the same ID and
+    // keep the script readable; IDs are the fallback.
+    if let Some(handle) = world.handle_of(id).filter(|h| bare_name(h)) {
+        return format!(":{handle}");
+    }
     let id = world.format_id(id);
     if id.rsplit_once('#').is_some_and(|(ty, _)| {
         ty.as_bytes()
@@ -309,7 +314,7 @@ pub(super) fn open(path: &Path) -> Result<World, CliError> {
         )
     })
 }
-fn recovery(world: &World) {
+pub(super) fn recovery(world: &World) {
     if world.recovery().bytes_cut != 0 {
         eprintln!(
             "event=dump_committed_prefix warning: omitted {} bytes of torn or damaged tail",
@@ -395,19 +400,27 @@ fn dump_all(directory: &Path, output: &Path) -> Result<String, CliError> {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(transfer::io(e)),
     }
-    let mut options = OpenOptions::new();
-    options.read(true);
+    // On Unix, open the directory itself (never through a symlink) and pin
+    // it, so swapping its pathname cannot redirect account hashes during the
+    // backup. Other platforms cannot open a directory as a file and rely on a
+    // trusted output parent.
     #[cfg(unix)]
-    {
+    let dir = {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
-    }
-    let dir = options.open(output).map_err(transfer::io)?;
-    if !dir.metadata().map_err(transfer::io)?.is_dir() {
+        let dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(output)
+            .map_err(transfer::io)?;
+        if !dir.metadata().map_err(transfer::io)?.is_dir() {
+            return Err(CliError::User("OUTDIR must be a directory".into()));
+        }
+        dir
+    };
+    #[cfg(not(unix))]
+    if !fs::symlink_metadata(output).map_err(transfer::io)?.is_dir() {
         return Err(CliError::User("OUTDIR must be a directory".into()));
     }
-    // Pin the opened directory, so swapping its pathname cannot redirect
-    // account hashes through a symlink during backup.
     #[cfg(target_os = "linux")]
     let stable = {
         use std::os::fd::AsRawFd;
@@ -449,6 +462,7 @@ fn dump_all(directory: &Path, output: &Path) -> Result<String, CliError> {
             escape::path(&output.join(format!("{name}.dump.edn")))
         );
     }
+    #[cfg(unix)]
     dir.sync_all().map_err(transfer::io)?;
     Ok(summary)
 }

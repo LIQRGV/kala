@@ -11,6 +11,9 @@ fn user(s: &str) -> CliError {
 }
 fn schema(ops: impl IntoIterator<Item = WriteOp>) -> Result<Schema, CliError> {
     let mut schema = Schema::new();
+    // Like a live `[:world-setting]`, a setting that changes nothing is a
+    // no-op, not a log entry (the default schema mode is infer).
+    let mut settings = std::collections::HashMap::from([("schema".to_owned(), "infer".to_owned())]);
     for op in ops {
         match op {
             WriteOp::NodeType {
@@ -41,7 +44,12 @@ fn schema(ops: impl IntoIterator<Item = WriteOp>) -> Result<Schema, CliError> {
                 def.reverse_cardinality = options.reverse_cardinality;
                 schema = schema.attribute(def);
             }
-            WriteOp::WorldSetting { key, value, .. } => schema = schema.setting(&key, &value),
+            WriteOp::WorldSetting { key, value, .. } => {
+                if settings.get(&key) != Some(&value) {
+                    schema = schema.setting(&key, &value);
+                    settings.insert(key, value);
+                }
+            }
             _ => {
                 return Err(user(
                     "genesis accepts only declared node types, attributes and world settings",
@@ -69,6 +77,21 @@ pub fn run(path: &Path, source: Option<&Path>) -> Result<String, CliError> {
             ops.extend(form.ops);
         }
     }
+    // Genesis may hold reserved names only when restoring a dump of a world
+    // Kala created (the accounts database); a user schema never may.
+    let reserved = |name: &str| name.starts_with(kala_core::RESERVED_NAME_PREFIX);
+    if ops.iter().any(|op| match op {
+        WriteOp::NodeType { name, .. } => reserved(name),
+        WriteOp::Attribute { name, options, .. } => {
+            reserved(name) || options.inverse.as_deref().is_some_and(reserved)
+        }
+        _ => false,
+    }) {
+        return Err(user(&format!(
+            "names starting with {} are reserved for Kala",
+            kala_core::RESERVED_NAME_PREFIX
+        )));
+    }
     let stage = transfer::Staging::new(path)?;
     let world =
         World::create(&stage.path, schema(ops)?).map_err(|e| CliError::at_path(path, &e))?;
@@ -79,7 +102,7 @@ pub fn run(path: &Path, source: Option<&Path>) -> Result<String, CliError> {
         ));
     }
     drop(world);
-    stage.place(path, false)?;
+    stage.place(path, false, false)?;
     eprintln!("event=world_created");
     Ok(format!("created {}\n", escape::path(path)))
 }
@@ -87,9 +110,11 @@ pub fn replay(path: &Path, source: &Path, as_json: bool) -> Result<String, CliEr
     transfer::absent(path)?;
     let text = transfer::input(source)?;
     let mut forms = kala_datalog::restore_forms(&text);
-    // Restore diagnostics never echo dump content: it may contain account
-    // hashes, even when a malicious input fails before declaring its marker.
-    let parse_error = |_: kala_datalog::DatalogError| {
+    // Diagnostics never echo the content of an accounts database dump (it
+    // holds password hashes). Until the genesis says what the dump is, a
+    // failure is reported without content, even for a malicious input that
+    // fails before declaring the system marker.
+    let withheld = || {
         user(
             "invalid restore form (content withheld); expected a valid genesis followed by write transactions",
         )
@@ -97,7 +122,7 @@ pub fn replay(path: &Path, source: &Path, as_json: bool) -> Result<String, CliEr
     let first = forms
         .next()
         .ok_or_else(|| user("dump must start with [:genesis ...]"))?
-        .map_err(parse_error)?;
+        .map_err(|_| withheld())?;
     if !first.genesis {
         return Err(user("dump must start with [:genesis ...]"));
     }
@@ -105,21 +130,28 @@ pub fn replay(path: &Path, source: &Path, as_json: bool) -> Result<String, CliEr
     let genesis =
         schema(first.ops).map_err(|_| user("invalid genesis schema (content withheld)"))?;
     let mut world = World::create(&stage.path, genesis).map_err(|_| user("cannot create restore world: invalid genesis or unavailable storage (content withheld)"))?;
+    let system = kala_bolt::system::is_system(&world);
+    // An ordinary world's dump holds no secrets: name the failing form and
+    // the reason, so an author can fix an edited dump.
+    let failed = |i: usize, e: &str| {
+        if system {
+            CliError::User(format!(
+                "restore transaction {i} failed validation or storage write (content withheld)"
+            ))
+        } else {
+            CliError::User(format!("restore transaction {i}: {e}"))
+        }
+    };
     for (i, form) in forms.enumerate() {
-        let form: WriteTxn = form.map_err(parse_error)?;
+        let form: WriteTxn = form.map_err(|e| failed(i + 1, &e.to_string()))?;
         if form.genesis {
             return Err(user("genesis must be the first and only genesis form"));
         }
-        transact::execute_restore(&mut world, &form, None).map_err(|_| {
-            CliError::User(format!(
-                "restore transaction {} failed validation or storage write (content withheld)",
-                i + 1
-            ))
-        })?;
+        transact::execute_restore(&mut world, &form, None)
+            .map_err(|e| failed(i + 1, e.message()))?;
     }
     let transactions = world.latest_tx().0;
     let entries = world.entries().count();
-    let system = kala_bolt::system::is_system(&world);
     if path.file_name().is_some_and(|n| n == "system.kala") && !system {
         return Err(user("system.kala requires an accounts database dump"));
     }
@@ -128,7 +160,15 @@ pub fn replay(path: &Path, source: &Path, as_json: bool) -> Result<String, CliEr
             .map_err(|_| user("invalid accounts database restore"))?;
     }
     drop(world);
-    stage.place(path, false)?;
+    // An accounts database is private from the start: the staging directory
+    // is 0700, so narrowing the file here leaves no wider-permission window.
+    #[cfg(unix)]
+    if system {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stage.path, std::fs::Permissions::from_mode(0o600))
+            .map_err(transfer::io)?;
+    }
+    stage.place(path, false, system)?;
     eprintln!("event=world_restored transactions={transactions} entries={entries} system={system}");
     if system {
         eprintln!("warning: restored an accounts database; protect it like the server directory");

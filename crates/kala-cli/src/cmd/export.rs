@@ -38,6 +38,7 @@ pub fn run(
             "export refuses the system accounts database".into(),
         ));
     }
+    dump::recovery(&world);
     let canon =
         kala_core::TxId(canon.map_or(world.latest_tx().0, |c| c.0.min(world.latest_tx().0)));
     let view = world.at_canon(canon);

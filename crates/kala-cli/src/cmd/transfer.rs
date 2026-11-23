@@ -67,23 +67,86 @@ impl Staging {
             "cannot allocate a private staging directory".into(),
         ))
     }
-    pub fn place(&self, target: &Path, force: bool) -> Result<(), CliError> {
+    /// Publish the staged file. `atomic_only` refuses the copy fallback:
+    /// an accounts database must never be visible half-written, since a
+    /// running server would read its committed prefix (whose first account
+    /// is the trust-authenticated bootstrap root).
+    pub fn place(&self, target: &Path, force: bool, atomic_only: bool) -> Result<(), CliError> {
         if force {
             fs::rename(&self.path, target).map_err(io)?;
         } else {
-            fs::hard_link(&self.path, target).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    CliError::Usage("destination already exists".into())
-                } else {
-                    io(e)
+            match fs::hard_link(&self.path, target) {
+                Ok(()) => fs::remove_file(&self.path).map_err(io)?,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(CliError::Usage("destination already exists".into()));
                 }
-            })?;
-            fs::remove_file(&self.path).map_err(io)?;
+                // Some file systems (FAT, exFAT, some network mounts) have no
+                // hard links: publish with an exclusive create and a copy,
+                // still never clobbering, and remove a partial copy on error.
+                Err(_) if atomic_only => {
+                    return Err(CliError::User(
+                        "restoring an accounts database needs a file system with hard links".into(),
+                    ));
+                }
+                Err(_) => copy_new(&self.path, target)?,
+            }
         }
+        sync_parent(target)
+    }
+}
+fn copy_new(from: &Path, target: &Path) -> Result<(), CliError> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mode = fs::metadata(from).map_err(io)?.permissions().mode() & 0o777;
+        opts.mode(mode).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut out = opts.open(target).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            CliError::Usage("destination already exists".into())
+        } else {
+            io(e)
+        }
+    })?;
+    let copied = File::open(from)
+        .and_then(|mut src| std::io::copy(&mut src, &mut out))
+        .and_then(|_| out.sync_all());
+    if let Err(e) = copied {
+        // Remove the partial copy only if the path still names our file.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let ours = out.metadata().ok().map(|m| (m.dev(), m.ino()));
+            let there = fs::symlink_metadata(target)
+                .ok()
+                .map(|m| (m.dev(), m.ino()));
+            if ours.is_some() && ours == there {
+                let _ = fs::remove_file(target);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            drop(out);
+            let _ = fs::remove_file(target);
+        }
+        return Err(io(e));
+    }
+    Ok(())
+}
+/// Make a publication durable. Directories can only be opened and synced on
+/// Unix; elsewhere the platform's own rename/link durability applies.
+fn sync_parent(target: &Path) -> Result<(), CliError> {
+    #[cfg(unix)]
+    {
         File::open(parent(target))
             .and_then(|d| d.sync_all())
-            .map_err(io)
+            .map_err(io)?;
     }
+    #[cfg(not(unix))]
+    let _ = target;
+    Ok(())
 }
 impl Drop for Staging {
     fn drop(&mut self) {
@@ -112,7 +175,7 @@ pub(super) fn output(path: Option<&Path>, text: &str, force: bool) -> Result<Str
     file.write_all(text.as_bytes())
         .and_then(|()| file.sync_all())
         .map_err(io)?;
-    stage.place(path, force)?;
+    stage.place(path, force, false)?;
     Ok(String::new())
 }
 /// Local restore inputs have no size cap, but must be finite regular files

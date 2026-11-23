@@ -1628,15 +1628,10 @@ impl LogWriter {
         buf.extend_from_slice(&LOG_MAGIC);
         buf.extend_from_slice(&LOG_FORMAT_VERSION.to_le_bytes());
         buf.extend_from_slice(&genesis.bytes);
-        let mut options = OpenOptions::new();
-        options.append(true).create_new(true);
-        // Restored account databases must never have a wider-permission window.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(path)?;
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create_new(true)
+            .open(path)?;
         lock(&file)?;
         file.write_all(&buf)?;
         file.sync_data()?;

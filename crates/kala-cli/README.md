@@ -352,9 +352,8 @@ schema. Execution rechecks the definition at the bound canon. For an attribute
 whose type or indexing changed while it was still empty, use a literal `:canon N`
 to prepare against that historical definition. Attributes with stored facts
 cannot change these fields in place, so their historical data is unaffected.
-The listed write grammar has `:unindexed` but no `:indexed` option; converting an
-unindexed attribute back to indexed is available through the native
-`MigrationOptions { indexed: Some(true), .. }` API.
+Declarations and migrations take `:indexed` or `:unindexed`; converting an
+unindexed attribute back to indexed is `[:migrate :bio :string :indexed]`.
 
 ## Creating, backing up, and exporting worlds
 
@@ -393,7 +392,11 @@ atomically without overwriting anything. Failure leaves no destination. The
 summary is one line: `replayed N transactions, M entries into NEW.kala`; N excludes
 genesis and M includes all committed entries, including commits. `--json` returns
 one object with `command`, `create`, `transactions`, `entries`, and `world`.
-Restore diagnostics withhold input content because it may contain account hashes.
+A failed restore of an ordinary world names the failing transaction form and its
+reason. An accounts database dump (and any input that fails before its genesis is
+known) gets diagnostics without content, because it may contain account hashes.
+Restored worlds get the default file mode, like `kala load`; a restored accounts
+database is always private (0600).
 `--create` conflicts with `--dry-run` and `--acknowledge-recovery`.
 Normal `transact` and the REPL reject genesis with a `--create` hint.
 
@@ -404,10 +407,12 @@ per transaction and 256 forms per file limits. Regular input files or explicit
 `-` for stdin are supported; device files and FIFOs are refused.
 
 Dumps spell all declaration options explicitly. `:reverse :none` on an attribute
-declaration removes its reverse cardinality label. `:inferred` at the end of a
-node-type or attribute declaration preserves inference origin, and is checked
+declaration removes its reverse cardinality label. `:inferred` (an option of
+a node-type or attribute declaration) preserves inference origin, and is checked
 against native inference rules (including strict mode and default definitions).
-Names outside the keyword alphabet are quoted in name positions;
+Entities are named by handle where they have one, else by ID; edges by `edge#N`.
+`[:genesis ...]` holds operation vectors only. Names outside the keyword alphabet
+are quoted in name positions;
 `[:id "A type#1"]` references an ID with such a type name. String escapes include
 `\"`, `\\`, `\n`, `\r`, `\t`, `\uXXXX`, and `\UXXXXXXXX` for non-BMP characters.
 `[:f64 :inf]` and `[:f64 :-inf]` preserve native infinities; finite floats use
@@ -433,8 +438,12 @@ symlinks and nonempty directories are refused. Each completed world gets one
 summary line; a failure can leave earlier completed dump files in OUTDIR.
 On Linux, writes are anchored to the opened OUTDIR descriptor. On other platforms,
 keep its parent directory trusted: a concurrent pathname replacement is not
-prevented there (new files still use private permissions).
-Each world is a committed snapshot at its own open time, not a cross-world
+prevented there. On Unix new files use private permissions; elsewhere files
+inherit OUTDIR's access control, so make OUTDIR private first.
+Publication never clobbers: a new file is hard-linked into place, or on file
+systems without hard links (FAT, exFAT, some network mounts) created exclusively
+and copied (except an accounts database restore, which needs hard links so it
+is never visible half-written). Each world is a committed snapshot at its own open time, not a cross-world
 transactional snapshot.
 
 The accounts dump starts with a password-hash warning. Protect it like the
