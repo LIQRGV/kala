@@ -1,0 +1,1156 @@
+//! The write path: validating a fact into a definition, judging it against
+//! what holds at its tick, and [`Txn`], which stages and commits writes.
+
+use super::*;
+
+/// One entry a transaction staged, in write order: the order of its log
+/// entries.
+#[derive(Debug)]
+pub(super) enum Staged {
+    /// A fact (assert or retract).
+    Fact(FactDef),
+    /// A `DELETED` marker: revision `rev` of the chain of base entry `of`,
+    /// at the key of `fact`, the chain's current fact.
+    Deleted {
+        of: EntryId,
+        rev: u32,
+        fact: FactDef,
+    },
+    /// A revised fact: revision `rev` of the chain of base entry `of`, its
+    /// new current fact.
+    Revised {
+        of: EntryId,
+        rev: u32,
+        fact: FactDef,
+    },
+}
+
+impl Staged {
+    /// The key the entry is stored at and what it says there.
+    pub(super) fn key_and_mark(&self) -> (&FactDef, Mark) {
+        match self {
+            Staged::Fact(fact) | Staged::Revised { fact, .. } => (fact, Mark::from(fact.op)),
+            Staged::Deleted { fact, .. } => (fact, Mark::Deleted),
+        }
+    }
+}
+
+/// The correction state of one revision chain (keyed by its base entry in
+/// [`World::chains`]). A chain no correction has touched has none: see
+/// [`Chain::untouched`].
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Chain {
+    /// The chain's last revision (0 = only the base entry).
+    pub(super) rev: u32,
+    /// The entry holding the chain's current fact (the base or its last
+    /// `Revised`), or `None` if the last correction deleted it.
+    pub(super) current: Option<EntryId>,
+}
+
+/// What a correction acts on (from [`World::correction_target`]).
+#[derive(Debug)]
+pub(super) struct Target {
+    /// The chain's base entry.
+    base: EntryId,
+    chain: Chain,
+    /// The chain's current fact, as stored.
+    pub(super) fact: FactDef,
+    /// Its value, decoded.
+    pub(super) value: Value,
+}
+
+impl Chain {
+    /// The state of the chain of base entry `base` before any correction.
+    fn untouched(base: EntryId) -> Chain {
+        Chain {
+            rev: 0,
+            current: Some(base),
+        }
+    }
+}
+
+/// Outcome of judging a valid write against the stored facts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    /// The write changes something: store it.
+    Store,
+    /// The write changes nothing ("0 changed").
+    Noop,
+}
+
+/// One `(entity, attr, side)` check a commit touches, with the values
+/// (encoded, ascending, deduplicated) whose intervals it may change there.
+#[derive(Debug)]
+struct TouchedSide {
+    side: (EntityId, AttrId, Side),
+    values: Vec<Vec<u8>>,
+}
+
+/// The result of committing a transaction.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommitResult {
+    /// Schema changes, in operation order.
+    pub schema: Vec<crate::schema::SchemaChange>,
+    /// The transaction's number. If nothing was written (every write was a
+    /// no-op and no entity was created), nothing is appended and this is
+    /// the unchanged latest tx.
+    pub tx: TxId,
+    /// Fact/correction entries plus reported schema actions (no-ops excluded).
+    /// A migration reports its rename, deprecation, declaration and copy action.
+    pub changed: usize,
+    /// IDs of the fact, `DELETED` and `Revised` entries the transaction appended, in
+    /// log order (`DEFINE`s and the `Commit` are not listed): one per stored
+    /// entry. Empty if nothing was appended.
+    pub entries: Vec<EntryId>,
+    /// Edges newly interned by the transaction, in interning order (the
+    /// order of their `DEFINE` entries). Re-asserting an already interned
+    /// triple interns nothing.
+    pub edges: Vec<EdgeId>,
+    /// The cardinality overlaps the transaction introduced and resolved:
+    /// its net effect, so an overlap made and resolved inside the
+    /// transaction isn't reported (see [`Warnings`]). Empty if nothing was
+    /// appended.
+    pub warnings: Warnings,
+}
+
+/// A write transaction on a [`World`], started with [`World::begin`].
+///
+/// Writes are judged as they are made, against the committed facts *and*
+/// the transaction's own earlier writes, then staged; [`Txn::commit`] makes
+/// them all visible under one new tx. Dropping a `Txn` without committing
+/// discards everything it staged, including created entities: their IDs and
+/// handles are free again.
+///
+/// The first write that fails returns its own error and poisons the
+/// transaction: every later write returns [`Error::TransactionAborted`], and
+/// so does [`Txn::commit`], which then applies nothing. A no-op is not a
+/// failure.
+#[derive(Debug)]
+pub struct Txn<'w> {
+    pub(super) world: &'w mut World,
+    /// The world's latest tick when the transaction began: the tick of a
+    /// write with no tick of its own and no transaction default.
+    base_tick: Tick,
+    default_tick: Option<Tick>,
+    /// The tx this transaction commits as. Fixed at begin: the `Txn` holds
+    /// the world mutably, so no other commit can take it first.
+    pub(super) tx: TxId,
+    /// Staged entries (facts, `DELETED` markers, revised facts), keyed exactly as they
+    /// will be in the `E` index (with `tx`), so judging seeks the committed
+    /// and staged entries the same way.
+    pub(super) staged: Index,
+    /// The staged entries in write order: the order of their log entries.
+    pub(super) entries: Vec<Staged>,
+    /// Entities created and edges interned by this transaction.
+    pub(super) ids: StagedIds,
+    /// Set by the first failed write; the transaction then applies nothing.
+    poisoned: bool,
+    pub(super) schema_before: Option<SchemaSnapshot>,
+    pub(super) schema_changes: Vec<SchemaChange>,
+    pub(super) order: Vec<OrderedEntry>,
+}
+
+impl Txn<'_> {
+    /// Sets the tick for this transaction's writes that don't give their
+    /// own (`AT TICK` for the transaction). It wins over the world's latest
+    /// tick; a write's own tick wins over it.
+    pub fn set_default_tick(&mut self, t: Tick) {
+        self.default_tick = Some(t);
+    }
+
+    /// Stages a new entity of the given node type, with an optional handle,
+    /// and returns its ID.
+    ///
+    /// The ID and handle are assigned as by [`World::create_entity`],
+    /// counting this transaction's earlier creates: sequences continue from
+    /// them and handles must differ from them. Later writes in this
+    /// transaction can use the entity as subject or `ref` value. It exists
+    /// for everyone else only after [`Txn::commit`]. Fails (poisoning the
+    /// transaction) with [`Error::UnknownNodeType`],
+    /// [`Error::InvalidHandle`], [`Error::DuplicateHandle`] or
+    /// [`Error::Id`].
+    pub fn create_entity(
+        &mut self,
+        node_type: &str,
+        handle: Option<&str>,
+    ) -> Result<EntityId, Error> {
+        self.guard(|txn| {
+            let def = txn.world.prepare_entity(&txn.ids, node_type, handle)?;
+            let id = def.id;
+            txn.order.push(OrderedEntry::Entity(txn.ids.defs.len()));
+            txn.ids.push(def);
+            Ok(id)
+        })
+    }
+
+    /// Runs one write: refused if the transaction is already poisoned or
+    /// the world refuses writes (failed log), and poisons it if the write
+    /// fails.
+    pub(super) fn guard<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        if self.poisoned {
+            return Err(Error::TransactionAborted);
+        }
+        let res = self.world.writable().and_then(|()| f(self));
+        self.poisoned = res.is_err();
+        res
+    }
+
+    /// Stages an assert of `v` for `entity.attr` from `tick` on.
+    ///
+    /// The tick is `tick`, else the transaction default, else the world's
+    /// latest tick captured at [`World::begin`]; the result reports it.
+    /// Validated and judged like [`World::assert`], with the transaction's
+    /// own earlier writes counted as stored. Nothing is visible until
+    /// [`Txn::commit`].
+    pub fn assert(
+        &mut self,
+        entity: EntityId,
+        attr: &str,
+        v: Value,
+        tick: Option<Tick>,
+    ) -> Result<WriteResult, Error> {
+        self.write(entity, attr, &v, tick, Op::Assert, Precision::Exact)
+    }
+
+    /// [`Txn::assert`] with the tick's precision: staged with `p`, judged
+    /// exactly like [`Txn::assert`] (see [`World::assert_with_precision`]).
+    pub fn assert_with_precision(
+        &mut self,
+        entity: EntityId,
+        attr: &str,
+        v: Value,
+        tick: Option<Tick>,
+        p: Precision,
+    ) -> Result<WriteResult, Error> {
+        self.write(entity, attr, &v, tick, Op::Assert, p)
+    }
+
+    /// [`Txn::retract`] with the tick's precision: staged with `p`, judged
+    /// exactly like [`Txn::retract`].
+    pub fn retract_with_precision(
+        &mut self,
+        entity: EntityId,
+        attr: &str,
+        v: Value,
+        tick: Option<Tick>,
+        p: Precision,
+    ) -> Result<WriteResult, Error> {
+        self.write(entity, attr, &v, tick, Op::Retract, p)
+    }
+
+    /// Stages a retract of `v` for `entity.attr` from `tick` on.
+    ///
+    /// Ticks default as for [`Txn::assert`]. Validated and judged like
+    /// [`World::retract`], with the transaction's own earlier writes
+    /// counted as stored.
+    pub fn retract(
+        &mut self,
+        entity: EntityId,
+        attr: &str,
+        v: Value,
+        tick: Option<Tick>,
+    ) -> Result<WriteResult, Error> {
+        self.write(entity, attr, &v, tick, Op::Retract, Precision::Exact)
+    }
+
+    /// The edge interned for `(source, attr, target)`, as
+    /// [`World::edge_id`] but also seeing edges interned earlier in this
+    /// transaction.
+    pub fn edge_id(&self, source: EntityId, attr: &str, target: EntityId) -> Option<EdgeId> {
+        let attr = *self.world.attr_by_name.get(attr)?;
+        self.world.edge_of(&self.ids, source, attr, target)
+    }
+
+    /// Resolves the tick, validates, judges against committed + staged
+    /// facts, and stages the fact unless it is a no-op.
+    fn write(
+        &mut self,
+        entity: EntityId,
+        attr: &str,
+        v: &Value,
+        tick: Option<Tick>,
+        op: Op,
+        precision: Precision,
+    ) -> Result<WriteResult, Error> {
+        self.guard(|txn| {
+            let tick = tick.or(txn.default_tick).unwrap_or(txn.base_tick);
+            let mut fact = txn
+                .world
+                .prepare_fact(&txn.ids, entity, attr, v, tick, op)?;
+            // A payload only: judged below exactly as an exact fact.
+            fact.precision = precision;
+            check_entry_size(attr, &fact)?;
+            if judge(&txn.world.e_index, &txn.staged, &fact, entity, attr)? == Verdict::Noop {
+                // Find-then-act: nothing to change, so nothing is staged.
+                return Ok(WriteResult {
+                    changed: 0,
+                    tick,
+                    entries: Vec::new(),
+                    edges: Vec::new(),
+                    warnings: Warnings::default(),
+                    schema: Vec::new(),
+                });
+            }
+            // A stored retract never needs an edge: it requires a stored
+            // assert, which interned it.
+            txn.intern_edge(&fact)?;
+            txn.stage(Staged::Fact(fact));
+            Ok(WriteResult {
+                changed: 1,
+                tick,
+                entries: Vec::new(),
+                edges: Vec::new(),
+                warnings: Warnings::default(),
+                schema: Vec::new(),
+            })
+        })
+    }
+
+    /// Stages a correction of the committed fact entry `entry`: see
+    /// [`World::correct`]. Nothing is visible until [`Txn::commit`], whose
+    /// result lists the correction's entry IDs (this result's `entries` is
+    /// empty).
+    ///
+    /// Fails (poisoning the transaction) as [`World::correct`] does, judged
+    /// against the committed world plus this transaction's staged entries,
+    /// and with [`Error::TxnKeyConflict`] if this transaction already staged
+    /// an entry at the corrected key (e.g. it corrected the same chain
+    /// before, even if this correction would be a no-op) or at a replaced
+    /// fact's new key.
+    pub fn correct(&mut self, entry: EntryId, c: Correction) -> Result<WriteResult, Error> {
+        self.guard(|txn| {
+            let Target {
+                base: of,
+                chain,
+                fact: current,
+                value: current_value,
+            } = txn.world.correction_target(entry)?;
+            let attr = txn.world.attributes[current.attr.0 as usize].name.clone();
+            if txn.world.attributes[current.attr.0 as usize].deprecated {
+                return Err(Error::DeprecatedAttribute(attr));
+            }
+            // Judged against the committed chain: if this transaction already
+            // corrected it, that state is stale, so refuse before anything
+            // else (a "no-op" against stale state could be a real change).
+            if has_key(&txn.staged, &current) {
+                return Err(Error::TxnKeyConflict {
+                    entity: current.entity,
+                    attr,
+                    tick: current.tick,
+                });
+            }
+            // Every correction entry carries the current value (a `DELETED`
+            // marker) or a value derived from it, so the current value must
+            // fit a correction entry before anything is staged. A value that
+            // fit only as a plain fact (a crafted log) is refused here with
+            // the typed error, not later by the log writer.
+            check_entry_size(&attr, &current)?;
+            let rev = || chain.rev.checked_add(1).ok_or(Error::TooManyRevisions(of));
+            let (value, tick, op, precision) = match c {
+                Correction::Delete => {
+                    let tick = current.tick;
+                    txn.stage(Staged::Deleted {
+                        of,
+                        rev: rev()?,
+                        fact: current,
+                    });
+                    return Ok(written(1, tick));
+                }
+                Correction::Replace {
+                    value,
+                    tick,
+                    op,
+                    precision,
+                } => (value, tick, op, precision),
+            };
+            // The new fact is the current one with the given fields
+            // replaced, validated like a write. The subject is the current
+            // fact's (stored) entity; a bidirectional pair is renormalised,
+            // which may swap it with the value.
+            let mut new = txn.world.prepare_fact(
+                &txn.ids,
+                current.entity,
+                &attr,
+                value.as_ref().unwrap_or(&current_value),
+                tick.unwrap_or(current.tick),
+                op.unwrap_or(current.op),
+            )?;
+            // Kept unless given, also when the key moves.
+            new.precision = precision.unwrap_or(current.precision);
+            check_entry_size(&attr, &new)?;
+            let tick = new.tick;
+            let same_key = (new.entity, &new.value, new.tick)
+                == (current.entity, &current.value, current.tick);
+            if same_key {
+                if (new.op, new.precision) == (current.op, current.precision) {
+                    // Nothing changed: find-then-act, nothing staged.
+                    return Ok(written(0, tick));
+                }
+                // The chain's own entry is the current one at its key, so
+                // changing the op or the precision there can't conflict
+                // with anything else.
+                txn.intern_edge(&new)?;
+                txn.stage(Staged::Revised {
+                    of,
+                    rev: rev()?,
+                    fact: new,
+                });
+                return Ok(written(1, tick));
+            }
+            // A moved key: the same-tick rule at the new key, judged at the
+            // latest canon plus the staged entries. The hold-based no-op
+            // rules don't apply: this changes what canon says, not the story.
+            let layers = [&txn.world.e_index, &txn.staged];
+            let mut prefix = key::e_value_prefix(new.entity, new.attr, new.key_value());
+            let there = op_at_tick(&layers, &mut prefix, new.tick, TxId(u64::MAX));
+            match there {
+                Some(stored) if stored != new.op => Err(Error::SameTickConflict {
+                    entity: new.entity,
+                    attr,
+                    tick,
+                }),
+                Some(_) => {
+                    // The new key already says this: only the old key goes.
+                    txn.stage(Staged::Deleted {
+                        of,
+                        rev: rev()?,
+                        fact: current,
+                    });
+                    Ok(written(1, tick))
+                }
+                None => {
+                    if has_key(&txn.staged, &new) {
+                        return Err(Error::TxnKeyConflict {
+                            entity: new.entity,
+                            attr,
+                            tick,
+                        });
+                    }
+                    let rev = rev()?;
+                    txn.intern_edge(&new)?;
+                    txn.stage(Staged::Deleted {
+                        of,
+                        rev,
+                        fact: current,
+                    });
+                    txn.stage(Staged::Revised { of, rev, fact: new });
+                    Ok(written(2, tick))
+                }
+            }
+        })
+    }
+
+    /// Stages the edge a stored assert of the `ref` fact `fact` interns, if
+    /// its triple has none yet (committed or staged). Retracts and non-ref
+    /// facts intern nothing.
+    fn intern_edge(&mut self, fact: &FactDef) -> Result<(), Error> {
+        if let (Some(target), Op::Assert) = (fact.target, fact.op)
+            && let Some(edge) =
+                self.world
+                    .prepare_edge(&self.ids, fact.entity, fact.attr, target)?
+        {
+            self.order.push(OrderedEntry::Edge(self.ids.edges.len()));
+            self.ids.push_edge(edge);
+        }
+        Ok(())
+    }
+
+    /// Stages one entry: its `E` key in the staged index (so later writes
+    /// in the transaction are judged against it) and the entry itself, in
+    /// write order.
+    pub(super) fn stage(&mut self, entry: Staged) {
+        let (fact, mark) = entry.key_and_mark();
+        // A value new to the world is held here until the commit applies it.
+        if let Some(r) = fact.value_ref()
+            && self.world.values.get(&fact.value).is_none()
+        {
+            self.ids.values.insert(&fact.value, r);
+        }
+        let k = key::e_fact_key(fact.entity, fact.attr, fact.key_value(), fact.tick, self.tx);
+        self.staged.insert(k, mark);
+        self.order.push(OrderedEntry::Fact(self.entries.len()));
+        self.entries.push(entry);
+    }
+
+    /// Makes every staged entity, write and correction visible as one new
+    /// transaction and returns its tx and the number of entries stored.
+    ///
+    /// With nothing staged (only no-ops), nothing is appended and the tx
+    /// doesn't advance; a transaction that only creates entities does
+    /// advance it. Fails with [`Error::TransactionAborted`], applying
+    /// nothing, if a write in the transaction failed.
+    ///
+    /// In a file-backed world entries are appended in operation order, with
+    /// every ID defined before use and the `COMMIT` last, in one write and
+    /// fsynced, and only then applied in memory. If that fails, the commit
+    /// returns [`Error::Io`], nothing is applied, and the world refuses
+    /// further writes.
+    pub fn commit(self) -> Result<CommitResult, Error> {
+        self.commit_with(true)
+    }
+
+    /// [`Txn::commit`] without the write warnings: the returned
+    /// [`CommitResult::warnings`] is always empty. Everything stored (log
+    /// bytes, entry and edge IDs, tx numbering) is identical to `commit`.
+    ///
+    /// For the fixture loader, which discards warnings: computing them
+    /// rescans each touched cardinality-one side's whole history and is
+    /// quadratic in the overlapping values one transaction touches
+    /// (security review H1/H2).
+    pub(crate) fn commit_quiet(self) -> Result<CommitResult, Error> {
+        self.commit_with(false)
+    }
+
+    /// The body of [`Txn::commit`]; `warn` selects whether the overlap
+    /// warnings diff is computed. Nothing else depends on it.
+    fn commit_with(mut self, warn: bool) -> Result<CommitResult, Error> {
+        if self.poisoned {
+            return Err(Error::TransactionAborted);
+        }
+        self.world.accepts_writes()?;
+        if self.order.is_empty() {
+            return Ok(CommitResult {
+                tx: self.world.latest_tx,
+                changed: 0,
+                entries: Vec::new(),
+                edges: Vec::new(),
+                warnings: Warnings::default(),
+                schema: Vec::new(),
+            });
+        }
+        let encoded = self.encode_ordered()?;
+        // Only a schema edit that can change overlaps on sides no staged fact
+        // touches (a relabel, rename or migration) needs the whole-world scan;
+        // new declarations, node types, deprecations and settings keep the
+        // touched-sides diff, which costs what the transaction wrote.
+        let schema_changed = self.schema_before.as_ref().is_some_and(|before| {
+            before.changes_overlaps(self.world)
+                || self
+                    .order
+                    .iter()
+                    .any(|e| matches!(e, OrderedEntry::Schema(SchemaEdit::Migration { .. })))
+        });
+        // Touched sides are named and oriented with this transaction's schema
+        // applied, so facts on an attribute it declares can be sorted; that
+        // schema is the one `after` reads.
+        let touched = if warn && !schema_changed {
+            self.world
+                .touched_side_values(self.entries.iter().map(|e| e.key_and_mark().0))
+        } else {
+            Vec::new()
+        };
+        if let Some(before) = self.schema_before.take() {
+            before.restore(self.world);
+        }
+        let old_names = if schema_changed {
+            self.world.attr_by_name.clone()
+        } else {
+            HashMap::new()
+        };
+        let mut before = if !warn {
+            Vec::new()
+        } else if schema_changed {
+            vec![self.world.all_overlaps()]
+        } else {
+            self.world.overlaps_of_sides(&touched)
+        };
+        if let Some(log) = self.world.log.as_mut() {
+            log.append(&encoded)?;
+        }
+        let mut entries = Vec::new();
+        let edges = self.ids.edges.iter().map(|d| d.id).collect();
+        let mut migrating = false;
+        for (ordered, logged) in self.order.iter().zip(&encoded.entries) {
+            match ordered {
+                OrderedEntry::Schema(SchemaEdit::Migration { .. }) => {
+                    migrating = true;
+                }
+                OrderedEntry::Schema(edit) => {
+                    self.world
+                        .apply_schema_edit(edit, self.tx, migrating)
+                        .expect("invariant: staged schema edit was validated in operation order");
+                }
+                OrderedEntry::Entity(i) => {
+                    let d = &self.ids.defs[*i];
+                    self.world.apply_entity(
+                        EntityDef {
+                            id: d.id,
+                            handle: d.handle.clone(),
+                        },
+                        self.tx,
+                    );
+                }
+                OrderedEntry::Edge(i) => {
+                    let d = &self.ids.edges[*i];
+                    self.world.apply_edge(
+                        EdgeDef {
+                            id: d.id,
+                            source: d.source,
+                            attr: d.attr,
+                            target: d.target,
+                        },
+                        self.tx,
+                    );
+                }
+                OrderedEntry::Fact(i) => {
+                    let entry = &self.entries[*i];
+                    let (fact, mark) = entry.key_and_mark();
+                    self.world.index_entry(fact, mark, self.tx);
+                    match entry {
+                        Staged::Fact(_) => {}
+                        Staged::Deleted { of, rev, .. } => {
+                            self.world.chains.insert(
+                                *of,
+                                Chain {
+                                    rev: *rev,
+                                    current: None,
+                                },
+                            );
+                        }
+                        Staged::Revised { of, rev, .. } => {
+                            self.world.chains.insert(
+                                *of,
+                                Chain {
+                                    rev: *rev,
+                                    current: Some(logged.id),
+                                },
+                            );
+                        }
+                    }
+                    entries.push(logged.id);
+                }
+            }
+        }
+        self.world.latest_tx = self.tx;
+        self.world.record(encoded.entries, self.tx);
+        let after = if !warn {
+            Vec::new()
+        } else if schema_changed {
+            vec![self.world.all_overlaps()]
+        } else {
+            self.world.overlaps_of_sides(&touched)
+        };
+        let warnings = if warn && schema_changed {
+            for overlap in before.iter_mut().flatten() {
+                if let Some(id) = old_names.get(&overlap.attr) {
+                    overlap.attr = self
+                        .world
+                        .attr_name(*id)
+                        .unwrap_or(&overlap.attr)
+                        .to_owned();
+                }
+            }
+            schema_ops::schema_warnings(before, after)
+        } else if warn {
+            overlap_diff(before, after)
+        } else {
+            Warnings::default()
+        };
+        Ok(CommitResult {
+            tx: self.tx,
+            changed: self.entries.len() + self.schema_changes.len(),
+            entries,
+            edges,
+            warnings,
+            schema: std::mem::take(&mut self.schema_changes),
+        })
+    }
+}
+
+/// The result of a [`Txn`] write that stored `changed` entries at `tick`
+/// (entry IDs and edges are only known at commit).
+/// The write warnings from the overlaps of the same checks before and after
+/// a commit (lists in the same order, as [`World::overlaps_of_sides`]
+/// returns them): `introduced` = after − before, `resolved` = before −
+/// after, by exact equality. The order of the checks and of each list is
+/// kept, which gives the reported sort order.
+///
+/// Each list is sorted by `(a, b, during.from)` (value encodings), and that
+/// key is unique within a list (one pair's maximal stretches are
+/// disjoint), so the two lists are compared in one sort-merge: an overlap
+/// at the same key with another `until` is the old one resolved and the
+/// new one introduced.
+pub(super) fn overlap_diff(before: Vec<Vec<Overlap>>, after: Vec<Vec<Overlap>>) -> Warnings {
+    fn sort_key(o: &Overlap) -> (Option<Vec<u8>>, Option<Vec<u8>>, Tick) {
+        (o.a.encode().ok(), o.b.encode().ok(), o.during.from)
+    }
+    let mut w = Warnings::default();
+    for (old, new) in before.into_iter().zip(after) {
+        let mut old = old.into_iter().map(|o| (sort_key(&o), o)).peekable();
+        let mut new = new.into_iter().map(|o| (sort_key(&o), o)).peekable();
+        loop {
+            let order = match (old.peek(), new.peek()) {
+                (None, None) => break,
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (Some((ko, _)), Some((kn, _))) => ko.cmp(kn),
+            };
+            match order {
+                Ordering::Less => w.resolved.extend(old.next().map(|(_, o)| o)),
+                Ordering::Greater => w.introduced.extend(new.next().map(|(_, o)| o)),
+                Ordering::Equal => {
+                    let (o, n) = match (old.next(), new.next()) {
+                        (Some((_, o)), Some((_, n))) => (o, n),
+                        _ => unreachable!("invariant: both lists were peeked non-empty"),
+                    };
+                    if o != n {
+                        w.resolved.push(o);
+                        w.introduced.push(n);
+                    }
+                }
+            }
+        }
+    }
+    w
+}
+
+/// Refuses a live write of `fact` with [`Error::EntryTooLarge`] if a
+/// `Revised` entry carrying its value would exceed
+/// [`MAX_ENTRY_BYTES`](log::MAX_ENTRY_BYTES): every value is judged by the
+/// largest entry it may ever need, so any accepted value can later be
+/// deleted or replaced in place. Checked before anything is staged, so the
+/// log never gets a frame a reader refuses. Replay doesn't check: its
+/// entries already fit their frames.
+pub(super) fn check_entry_size(attr: &str, fact: &FactDef) -> Result<(), Error> {
+    let len = log::revised_payload_len(fact.value.len());
+    if len > log::MAX_ENTRY_BYTES {
+        return Err(Error::EntryTooLarge {
+            attr: attr.to_owned(),
+            len,
+            max: log::MAX_ENTRY_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn written(changed: usize, tick: Tick) -> WriteResult {
+    WriteResult {
+        changed,
+        tick,
+        entries: Vec::new(),
+        edges: Vec::new(),
+        warnings: Warnings::default(),
+        schema: Vec::new(),
+    }
+}
+
+/// Judges a validated fact against the committed `E` index plus a
+/// transaction's `staged` entries, at the fact's own tick (never the latest
+/// tick, so out-of-order writes are kept). A key whose current entry is a
+/// `DELETED` marker holds nothing.
+///
+/// First the same-tick rule: if the opposite op is current for the same
+/// `(entity, attr, value)` at exactly this tick, the write fails with
+/// [`Error::SameTickConflict`] (tick order can't decide between them, and
+/// letting tx order decide would break "truth follows tick order"). Then
+/// the no-op rule: an assert of a value that already holds there, or a
+/// retract of one that doesn't, changes nothing. Last, a write that would be
+/// stored at a key the transaction already staged an entry at (only a
+/// `DELETED` marker can get there) fails with [`Error::TxnKeyConflict`]: a
+/// transaction stores at most one entry per key. `written` (the subject as
+/// the caller wrote it, before any bidirectional normalisation) and `attr`
+/// (the attribute's name) are for the errors.
+fn judge(
+    committed: &Index,
+    staged: &Index,
+    fact: &FactDef,
+    written: EntityId,
+    attr: &str,
+) -> Result<Verdict, Error> {
+    let layers = [committed, staged];
+    let layers = &layers[..];
+    let mut prefix = key::e_value_prefix(fact.entity, fact.attr, fact.key_value());
+    // Writes are judged at the latest canon plus the transaction's own
+    // staged facts, so every entry is visible.
+    let all = TxId(u64::MAX);
+    if let Some(stored) = op_at_tick(layers, &mut prefix, fact.tick, all)
+        && stored != fact.op
+    {
+        return Err(Error::SameTickConflict {
+            entity: written,
+            attr: attr.to_owned(),
+            tick: fact.tick,
+        });
+    }
+    let holds = holds(layers, &mut prefix, fact.tick, all, Work::NONE);
+    let noop = match fact.op {
+        Op::Assert => holds,
+        Op::Retract => !holds,
+    };
+    if noop {
+        return Ok(Verdict::Noop);
+    }
+    if has_key(staged, fact) {
+        return Err(Error::TxnKeyConflict {
+            entity: fact.entity,
+            attr: attr.to_owned(),
+            tick: fact.tick,
+        });
+    }
+    Ok(Verdict::Store)
+}
+
+impl World {
+    /// Resolves the target of a correction of `entry` (a base `Fact` or any
+    /// `Revised` entry of its chain): the chain's base entry, its state and
+    /// its current fact (as stored, encoded). Changes nothing.
+    pub(super) fn correction_target(&self, entry: EntryId) -> Result<Target, Error> {
+        let info = self.kept_entry(entry).ok_or(Error::UnknownEntry(entry))?;
+        let base = match info.body {
+            EntryBody::Fact { .. } => entry,
+            // A Revised entry always names its chain's base (replay checks it).
+            EntryBody::Revised { of, .. } => of,
+            _ => return Err(Error::NotAFact(entry)),
+        };
+        let chain = self.chain(base);
+        let current = chain.current.ok_or(Error::AlreadyDeleted(entry))?;
+        let (entity, attr, value, tick, op, precision) = self
+            .kept_entry(current)
+            .and_then(|info| as_fact(&info.body))
+            .expect("invariant: a chain's current entry is a committed Fact or Revised entry");
+        // A committed fact's value was encoded once before; it encodes.
+        let mut fact = self.stored_fact_def(entity, attr, value, tick, op)?;
+        fact.precision = precision;
+        Ok(Target {
+            base,
+            chain,
+            fact,
+            value: value.clone(),
+        })
+    }
+
+    /// The correction state of the chain of base entry `base`.
+    pub(super) fn chain(&self, base: EntryId) -> Chain {
+        self.chains
+            .get(&base)
+            .copied()
+            .unwrap_or(Chain::untouched(base))
+    }
+
+    /// Replay: the op and precision of the committed fact entry `current`
+    /// (a chain's current fact) if `fact` is at its key, else `None`.
+    /// Values compare by encoding: exact bytes.
+    pub(super) fn op_if_at_key(&self, current: EntryId, fact: &FactDef) -> Option<(Op, Precision)> {
+        let (entity, attr, value, tick, op, precision) = self
+            .kept_entry(current)
+            .and_then(|info| as_fact(&info.body))
+            .expect("invariant: a chain's current entry is a committed Fact or Revised entry");
+        // Committed values were encoded once before, so they encode.
+        let same = (entity, attr, tick) == (fact.entity, fact.attr, fact.tick)
+            && value.encode().is_ok_and(|v| v == fact.value);
+        same.then_some((op, precision))
+    }
+
+    /// One auto-committed write: a transaction holding just this write.
+    /// A no-op stages nothing, so its commit consumes no tx.
+    pub(super) fn write(
+        &mut self,
+        entity: EntityId,
+        attr: &str,
+        v: &Value,
+        tick: Option<Tick>,
+        op: Op,
+        precision: Precision,
+    ) -> Result<WriteResult, Error> {
+        let mut txn = self.begin();
+        let mut res = txn.write(entity, attr, v, tick, op, precision)?;
+        let commit = txn.commit()?;
+        res.entries = commit.entries;
+        res.edges = commit.edges;
+        res.warnings = commit.warnings;
+        Ok(res)
+    }
+
+    /// Validates a fact against the schema and the defined entities without
+    /// changing the world.
+    ///
+    /// Entities staged by the writing transaction (`staged`) count as
+    /// defined, both as the subject and as a `ref` value. A fact on a
+    /// bidirectional attribute comes back normalised (see
+    /// [`World::stored_pair`]), so both spellings judge and store as one.
+    ///
+    pub(super) fn prepare_fact(
+        &self,
+        staged: &StagedIds,
+        entity: EntityId,
+        attr: &str,
+        v: &Value,
+        tick: Tick,
+        op: Op,
+    ) -> Result<FactDef, Error> {
+        self.prepare_fact_as(staged, entity, attr, v, tick, op, DeprecatedWrites::Refuse)
+    }
+
+    /// [`World::prepare_fact`] with an explicit deprecation rule. Only a
+    /// migration's own copy (and replay of exactly the copy sequence it
+    /// regenerates) passes [`DeprecatedWrites::MigrationCopy`].
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prepare_fact_as(
+        &self,
+        staged: &StagedIds,
+        entity: EntityId,
+        attr: &str,
+        v: &Value,
+        tick: Tick,
+        op: Op,
+        deprecated: DeprecatedWrites,
+    ) -> Result<FactDef, Error> {
+        let (attr_id, def) = self.resolve(staged, entity, attr)?;
+        if def.deprecated && deprecated == DeprecatedWrites::Refuse {
+            return Err(Error::DeprecatedAttribute(attr.to_owned()));
+        }
+        check_type(attr, def, v)?;
+        // Length check before encoding, so an oversized string isn't copied.
+        if def.indexed {
+            v.check_indexed()?;
+        }
+        let mut value = v.encode()?;
+        if let Value::Ref(target) = v
+            && !self.is_defined_staged(staged, *target)
+        {
+            return Err(Error::UnknownEntity(*target));
+        }
+        // Events are never retracted in story time, whatever is stored, so
+        // this is a schema error: judged after input validation but before
+        // the same-tick and no-op rules, which look at stored facts.
+        if op == Op::Retract && def.kind == Kind::Event {
+            return Err(Error::RetractEvent(attr.to_owned()));
+        }
+        let (entity, target) = match v {
+            Value::Ref(target) => {
+                let (source, target) = self.stored_pair(attr_id, entity, *target);
+                if source != entity {
+                    // Swapped: the value is now the caller's entity.
+                    value = Value::Ref(target).encode()?;
+                }
+                (source, Some(target))
+            }
+            _ => (entity, None),
+        };
+        let vref = self.value_ref(staged, def, v, &value)?;
+        Ok(FactDef {
+            entity,
+            attr: attr_id,
+            value,
+            tick,
+            op,
+            precision: Precision::Exact,
+            target,
+            vref,
+        })
+    }
+
+    /// The value reference the `E` keys of value `v` (encoded as
+    /// `encoding`) of attribute `def` carry: `None` unless `def` is an
+    /// unindexed string attribute. A value the world's table (or the
+    /// writing transaction, `staged`) already holds keeps its reference; a
+    /// new one gets the next ordinal of its content hash, counting the
+    /// values `staged` adds, which is exactly what it gets when its entry
+    /// is applied (commit and replay assign in log order). A new value has
+    /// no stored history, so judging it under that reference finds nothing,
+    /// as it should.
+    ///
+    /// Fails with [`Error::Id`] only if every ordinal of the hash is spent
+    /// (`u32::MAX + 1` distinct values sharing one content hash).
+    fn value_ref(
+        &self,
+        staged: &StagedIds,
+        def: &AttrDef,
+        v: &Value,
+        encoding: &[u8],
+    ) -> Result<Option<[u8; key::VALUE_REF_LEN]>, Error> {
+        let Value::Str(text) = v else {
+            return Ok(None);
+        };
+        if def.indexed || def.value_type != ValueType::Str {
+            return Ok(None);
+        }
+        if let Some(r) = self
+            .values
+            .get(encoding)
+            .or_else(|| staged.values.get(encoding))
+        {
+            return Ok(Some(r.to_key_bytes()));
+        }
+        let hash = (self.content_hash)(text.as_bytes());
+        // Staged values of a hash continue the committed ordinals.
+        let next = self
+            .values
+            .next_ordinal(hash)
+            .max(staged.values.next_ordinal(hash));
+        let ordinal = u32::try_from(next).map_err(|_| IdError::SeqOutOfRange(next))?;
+        Ok(Some(ValueRef { hash, ordinal }.to_key_bytes()))
+    }
+
+    /// The [`FactDef`] (keys and op) of a stored entry, from its decoded
+    /// fields: its value reference is the one the world's table holds.
+    pub(super) fn stored_fact_def(
+        &self,
+        entity: EntityId,
+        attr: AttrId,
+        value: &Value,
+        tick: Tick,
+        op: Op,
+    ) -> Result<FactDef, Error> {
+        let encoded = value.encode()?;
+        let vref = match self.attributes.get(attr.0 as usize) {
+            Some(def) => self.value_ref(&StagedIds::default(), def, value, &encoded)?,
+            None => None,
+        };
+        Ok(FactDef {
+            entity,
+            attr,
+            value: encoded,
+            tick,
+            op,
+            precision: Precision::Exact,
+            target: match value {
+                Value::Ref(target) => Some(*target),
+                _ => None,
+            },
+            vref,
+        })
+    }
+
+    /// Applies an edge definition (its `DefineEdge` entry) as part of a
+    /// commit or a replay. Infallible.
+    /// The `(entity, attr, side)` overlap checks the stored entries at the
+    /// keys `facts` can change (write warnings): the fact's entity
+    /// (Forward), for a `ref` fact its target (Reverse), and for a
+    /// bidirectional one also the target's Forward side (its partners
+    /// include the entity). A value-moving correction lists both its old
+    /// and its new key, so both targets are covered. Sorted by `(entity,
+    /// attr name, side)` with Forward first, deduplicated: the order the
+    /// warnings are reported in. Cost: proportional to the entries, not the
+    /// world.
+    pub(super) fn touched_sides<'f>(
+        &self,
+        facts: impl Iterator<Item = &'f FactDef>,
+    ) -> Vec<(EntityId, AttrId, Side)> {
+        let mut touched = Vec::new();
+        for f in facts {
+            self.sides_of(f, |side, _| touched.push(side));
+        }
+        self.sort_sides(&mut touched, |s| *s);
+        touched.dedup();
+        touched
+    }
+
+    /// [`World::touched_sides`], each side with the values the entries
+    /// change on it (their encodings, ascending and deduplicated): on the
+    /// entity's Forward side the fact's value, on the target's Reverse (and
+    /// bidirectional Forward) side `Ref(entity)`. Only those values'
+    /// intervals can differ before and after the commit.
+    fn touched_side_values<'f>(
+        &self,
+        facts: impl Iterator<Item = &'f FactDef>,
+    ) -> Vec<TouchedSide> {
+        let mut pairs: Vec<((EntityId, AttrId, Side), Vec<u8>)> = Vec::new();
+        for f in facts {
+            self.sides_of(f, |side, value| pairs.push((side, value)));
+        }
+        self.sort_sides(&mut pairs, |p| p.0);
+        let mut out: Vec<TouchedSide> = Vec::new();
+        for (side, value) in pairs {
+            match out.last_mut() {
+                Some(last) if last.side == side => last.values.push(value),
+                _ => out.push(TouchedSide {
+                    side,
+                    values: vec![value],
+                }),
+            }
+        }
+        for t in &mut out {
+            t.values.sort_unstable();
+            t.values.dedup();
+        }
+        out
+    }
+
+    /// Calls `push` with each `(entity, attr, side)` check the stored entry
+    /// at `f`'s key can change and the value (encoded) it changes there.
+    fn sides_of(&self, f: &FactDef, mut push: impl FnMut((EntityId, AttrId, Side), Vec<u8>)) {
+        push((f.entity, f.attr, Side::Forward), f.value.clone());
+        if let Some(target) = f.target {
+            let source = || {
+                Value::Ref(f.entity)
+                    .encode()
+                    .expect("invariant: a ref value always encodes")
+            };
+            push((target, f.attr, Side::Reverse), source());
+            if self.is_bidirectional(f.attr) {
+                push((target, f.attr, Side::Forward), source());
+            }
+        }
+    }
+
+    /// Sorts by `(entity, attr name, side)` with Forward first (stable, so
+    /// equal sides keep their order): the order warnings are reported in.
+    fn sort_sides<T>(&self, items: &mut [T], side: impl Fn(&T) -> (EntityId, AttrId, Side)) {
+        let rank = |s: Side| match s {
+            Side::Forward => 0u8,
+            Side::Reverse => 1,
+        };
+        let name = |a: AttrId| self.attributes[a.0 as usize].name.as_str();
+        items.sort_by(|x, y| {
+            let (x, y) = (side(x), side(y));
+            (x.0.raw(), name(x.1), rank(x.2)).cmp(&(y.0.raw(), name(y.1), rank(y.2)))
+        });
+    }
+
+    /// The overlaps at the latest canon of each touched side in `sides`
+    /// that involve one of its touched values, one list per entry (see
+    /// [`View::overlaps_of_touching`]).
+    fn overlaps_of_sides(&self, sides: &[TouchedSide]) -> Vec<Vec<Overlap>> {
+        let view = self.at_canon(self.latest_tx);
+        sides
+            .iter()
+            .map(|t| {
+                let (entity, attr, side) = t.side;
+                view.overlaps_of_touching(entity, attr, side, Some(&t.values))
+            })
+            .collect()
+    }
+
+    /// The current fact in an entry's correction chain, at the latest canon.
+    /// Accepts the same entry IDs as [`World::correct`] and returns the same
+    /// target errors (including a chain already deleted). This is a read only;
+    /// it does not validate or stage a proposed replacement.
+    pub fn current_change(&self, entry: EntryId) -> Result<Change, Error> {
+        let target = self.correction_target(entry)?;
+        Ok(Change {
+            tick: target.fact.tick,
+            op: target.fact.op,
+            precision: target.fact.precision,
+            value: target.value,
+        })
+    }
+
+    /// Starts a write transaction.
+    ///
+    /// The world's [`latest tick`](World::latest_tick) is captured now: a
+    /// write in the transaction with no tick of its own and no
+    /// [`default`](Txn::set_default_tick) lands on it, so ticks written
+    /// earlier in the same transaction don't move it. Nothing is visible
+    /// until [`Txn::commit`]; dropping the transaction discards it.
+    pub fn begin(&mut self) -> Txn<'_> {
+        let base_tick = self.latest_tick();
+        let tx = self.next_tx();
+        Txn {
+            world: self,
+            base_tick,
+            default_tick: None,
+            tx,
+            staged: OrderedMap::new(),
+            entries: Vec::new(),
+            ids: StagedIds::default(),
+            poisoned: false,
+            schema_before: None,
+            schema_changes: Vec::new(),
+            order: Vec::new(),
+        }
+    }
+}
