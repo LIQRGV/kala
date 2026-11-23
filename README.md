@@ -7,7 +7,7 @@ before last week's retcon?
 
 The name means "time" in Sanskrit, Javanese and Indonesian.
 
-> **Status: early.** The storage engine, a read-only CLI and Datalog work.
+> **Status: early.** The storage engine, terminal writes, the REPL and Datalog work.
 > Bolt (Neo4j driver compatibility), Cypher and Gremlin are not built yet. The
 > on-disk format may still change without migration.
 
@@ -103,7 +103,10 @@ states") as hints. Kala ships no story rules of its own.
 
 ### Writing a world
 
-For now, worlds are written as YAML fixtures and loaded with `kala load`:
+Follow the [story-author guide](GUIDE.md) to write scenes, ask questions and
+correct earlier canon. Open `kala repl w.kala --write` for interactive writes,
+or run `kala transact w.kala scene.edn` for scripts. Schema definitions still
+come from YAML fixtures loaded with `kala load`:
 
 ```yaml
 schema:
@@ -143,9 +146,9 @@ The native Rust API (`kala-core`) can also write directly. See
 
 - [x] Storage engine and native API
 - [x] Read-only CLI
-- [x] Datalog: joins, rules, recursion, negation, history, interval sets, aggregates
-- [ ] Read-only REPL (`kala repl`), in review
-- [ ] Writes from the CLI and REPL
+- [x] Datalog: joins, rules, recursion, negation, disjunction, history with precision, interval sets, aggregates
+- [x] REPL (`kala repl`)
+- [x] Writes from the CLI and REPL
 - [ ] `kala serve`: the Bolt protocol, so Neo4j drivers and Neo4j Browser can connect
 - [ ] Cypher (a subset first), then Gremlin
 - [ ] On-disk indexes with checkpoints, authentication

@@ -113,3 +113,56 @@ later checks. Hints do not change doctor's exit code. Output renders only the
 first five rows in text or 100 in JSON, while retaining the exact total row count.
 
 Doctor story-check output is capped across hints at 10,000 rendered rows and 16 MiB of row text or JSON; exact row counts remain available with an `output_truncated` hint.
+
+## Writing from the terminal
+
+See the [story-author guide](../../GUIDE.md) for a tested tutorial.
+`kala transact WORLD FILE` (or `-` for stdin) reads one or more EDN write forms.
+A single op is one transaction; a vector of ops commits atomically:
+
+```clojure
+[:at 800
+ [:create :CHARACTER :kael]
+ [:assert :kael :name "Kael"]
+ [:assert :kael :located_in :varrow :precision :year]]
+```
+
+The first failed form stops the command (exit 1), preserving earlier commits.
+Each successful form prints its number, transaction, changed count, per-op tick,
+precision and entry IDs, new edge IDs, and introduced/resolved overlap warnings.
+A correction that moves a key appends two entries (so reports 2 changed); entity
+creation reports its entity ID and 0 fact entries changed. Use printed entry IDs
+with `[:correct N :delete]` or `[:correct N :replace :at 830]`. Replacement also
+accepts `:value`, `:op` and `:precision`. A no-op prints 0 changed.
+
+`--json` prints one document per successful form, with fields `form`, `dry_run`,
+`tx`, `changed`, `entries`, `edges`, `ops` and `warnings`. Each op has `position`,
+`kind`, `tick`, `precision`, `changed`, `entries` and `entity` (null unless created).
+Entry IDs are integers; new edges are `edge#N` strings. Warnings have `introduced`
+and `resolved` arrays of the same messages as `kala load`. Errors stay on stderr.
+
+`--dry-run` previews each form independently against the original committed
+world, including native overlap warnings. It discards each in-memory simulation;
+later forms cannot use entities created by earlier previews. IDs and tx numbers
+are provisional. It opens a read-only snapshot, takes no writer lock, and never
+changes the log, even if it has an incomplete recovery tail. A damaged tail that requires
+recovery acknowledgement is refused, also without changing the file.
+
+`kala repl WORLD --write` holds the exclusive writer lock until exit and queries
+see each successful commit immediately. Another writer gets exit 3 with a locked
+world message. Without `--write`, write forms are refused. `.at` supplies the
+write default: an op's `:at` wins over the transaction's `:at`, then session `.at`,
+then the latest tick captured when the transaction began. `.canon` and `.reload`
+are refused in write mode; an explicit query `:canon` still reads an older draft.
+`.json` applies to writes too, and `.load FILE` accepts one write transaction.
+
+Write input uses the query lexer (strings, escapes, comments, commas). Input is
+capped at 65,536 bytes, nesting at 32 levels, ops per transaction at 256 and forms
+per file at 256. File input must be regular UTF-8 text. `or` branches count against
+the ordinary query limits, with an additional 4,096-node expansion budget.
+
+`(or clause (and clause ...))` requires the same variable set in each branch and
+returns a set union. `or-join` and `not-join` remain unsupported. A sixth history
+position, `[?e :attribute ?v ?tick ?op ?precision]`, binds precision keywords such
+as `:year` and `:exact` (JSON cells have type `precision`). Precision annotates the
+stored tick; it does not turn it into a range.
