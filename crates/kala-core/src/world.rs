@@ -941,7 +941,23 @@ impl World {
     /// Any other damage, in any transaction, is [`Error::Corrupt`] instead,
     /// with the file untouched.
     pub fn open(path: &Path) -> Result<World, Error> {
-        let (mut world, writer, recovery) = LogWriter::open(path, World::replay)?;
+        Self::open_with(path, true)
+    }
+
+    /// Like [`World::open`], but a *damaged* last transaction (see
+    /// [`CutCause::Damaged`]) is not cut: the open fails with
+    /// [`Error::RecoveryRequired`] and the file is left untouched (no cut,
+    /// no quarantine file). The check runs under the writer lock, so no
+    /// other open can change the tail in between. Use it where a damaged
+    /// tail must be reviewed before it is cut (it may hold an acknowledged
+    /// write); then [`World::open`] and [`World::acknowledge_recovery`].
+    /// Clean logs and torn tails open exactly as with [`World::open`].
+    pub fn open_refusing_damaged(path: &Path) -> Result<World, Error> {
+        Self::open_with(path, false)
+    }
+
+    fn open_with(path: &Path, cut_damaged: bool) -> Result<World, Error> {
+        let (mut world, writer, recovery) = LogWriter::open(path, World::replay, cut_damaged)?;
         world.log = Some(writer);
         world.recovery_unacknowledged = recovery.cause == Some(CutCause::Damaged);
         world.recovery = recovery;

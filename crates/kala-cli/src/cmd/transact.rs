@@ -42,34 +42,28 @@ pub struct Report {
 
 /// Opens `path` for writing. A damaged last transaction (fully present,
 /// checksum fails) may have been acknowledged to a writer, so it is never
-/// cut without `acknowledge`: the log is checked read-only first and left
-/// untouched (no cut, no quarantine), so retrying can't get past it.
+/// cut without `acknowledge`: kala-core refuses it under the writer lock,
+/// before anything is cut or quarantined, so retrying can't get past it.
 pub fn open_write(path: &Path, acknowledge: bool) -> Result<World, CliError> {
-    let damaged = |bytes: u64| {
-        CliError::Store(format!(
+    let opened = if acknowledge {
+        World::open(path)
+    } else {
+        World::open_refusing_damaged(path)
+    };
+    let mut w = opened.map_err(|e| match e {
+        kala_core::Error::WorldLocked => CliError::Store(format!(
+            "{}: world is locked by another writer",
+            escape::path(path)
+        )),
+        kala_core::Error::RecoveryRequired { bytes } => CliError::Store(format!(
             "{}: the last transaction is damaged ({bytes} bytes); opening the world \
              for writing would cut it to a quarantine file. Inspect it with \
              `kala info`, then rerun with --acknowledge-recovery",
-            escape::path(path)
-        ))
-    };
-    let probe = World::open_read_only(path).map_err(|e| CliError::at_path(path, &e))?;
-    if probe.recovery().cause == Some(kala_core::CutCause::Damaged) && !acknowledge {
-        return Err(damaged(probe.recovery().bytes_cut));
-    }
-    drop(probe);
-    let mut w = World::open(path).map_err(|e| match e {
-        kala_core::Error::WorldLocked => CliError::Store(format!(
-            "{}: world is locked by another writer",
             escape::path(path)
         )),
         e => CliError::at_path(path, &e),
     })?;
     if w.recovery().cause == Some(kala_core::CutCause::Damaged) {
-        // Damaged between the probe and the open: same rule.
-        if !acknowledge {
-            return Err(damaged(w.recovery().bytes_cut));
-        }
         w.acknowledge_recovery();
     }
     Ok(w)

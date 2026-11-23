@@ -1559,9 +1559,16 @@ impl LogWriter {
     /// with [`Error::Io`] and the log is not cut. On any error the log is
     /// untouched. A clean log is never modified, so opening is idempotent.
     /// The returned [`RecoveryReport`] says what was cut and where it went.
+    ///
+    /// With `cut_damaged` false, a *damaged* tail (see
+    /// [`CutCause::Damaged`]) is not cut: the open fails with
+    /// [`Error::RecoveryRequired`] under the lock, before anything is
+    /// quarantined or cut, and the file is untouched. Torn tails are cut
+    /// either way.
     pub(crate) fn open<T>(
         path: &Path,
         replay: impl FnOnce(&[LogEntry]) -> Result<T, Error>,
+        cut_damaged: bool,
     ) -> Result<(T, LogWriter, RecoveryReport), Error> {
         // One handle for reading, cutting and appending, so the bytes
         // replayed are the bytes appended after. `append` without `create`
@@ -1576,6 +1583,11 @@ impl LogWriter {
             valid_len,
             cause,
         } = scan(&bytes)?;
+        if !cut_damaged && valid_len != bytes.len() && cause == Some(CutCause::Damaged) {
+            return Err(Error::RecoveryRequired {
+                bytes: (bytes.len() - valid_len) as u64,
+            });
+        }
         let replayed = replay(&entries)?;
         let mut report = RecoveryReport::default();
         if valid_len != bytes.len() {
