@@ -1,6 +1,7 @@
 //! Copy-forward migrations use a logged marker and exact, replay-verified copies.
-use super::schema_ops::{OrderedEntry, type_name};
+use super::schema_ops::OrderedEntry;
 use super::*;
+use crate::error::{ErrorEntity, UnconvertibleValue};
 
 fn convert(value: &Value, def: &AttrDef) -> Option<Value> {
     let v = match (value, def.value_type) {
@@ -44,6 +45,14 @@ fn convert(value: &Value, def: &AttrDef) -> Option<Value> {
 }
 
 impl Txn<'_> {
+    /// `entity` for an error message: its ID and `TYPE#n` (node types this
+    /// transaction declared included, as they're applied to the world).
+    fn error_entity(&self, entity: EntityId) -> ErrorEntity {
+        ErrorEntity {
+            id: entity,
+            formatted: self.world.format_id(entity),
+        }
+    }
     /// Current history including earlier staged writes, in canonical orientation.
     fn copy_history(&self, attr: AttrId) -> Vec<(EntityId, Change)> {
         self.copy_history_subjects(attr, None)
@@ -145,11 +154,27 @@ impl Txn<'_> {
             if let Some(v) = options.indexed {
                 def.indexed = v;
             }
+            let inverse_given = options.inverse.is_some();
             if let Some(v) = options.inverse {
                 def.inverse = Some(v);
             }
             if let Some(v) = options.reverse_cardinality {
                 def.reverse_cardinality = Some(v);
+            }
+            // A bidirectional attribute has no inverse or reverse side, so a
+            // directed source's labels are dropped unless the caller restated
+            // them (then `check_direction` refuses the contradiction). Replay
+            // passes the marker's definition, where both are already `None`,
+            // so it regenerates the same drop.
+            let mut dropped_inverse = None;
+            let mut dropped_reverse_cardinality = None;
+            if def.direction == Some(RefDirection::Bidirectional) {
+                if !inverse_given {
+                    dropped_inverse = def.inverse.take();
+                }
+                if options.reverse_cardinality.is_none() {
+                    dropped_reverse_cardinality = def.reverse_cardinality.take();
+                }
             }
             if (old.value_type == ValueType::Ref) != (def.value_type == ValueType::Ref) {
                 return Err(Error::Schema(
@@ -193,10 +218,15 @@ impl Txn<'_> {
                     .collect();
                 both.sort_unstable();
                 if !both.is_empty() {
-                    return Err(Error::Schema(format!(
-                        "cannot migrate :{name}: pairs have history in both directions: {:?}",
-                        &both[..both.len().min(5)]
-                    )));
+                    let entity = |id| txn.error_entity(id);
+                    return Err(Error::PairsBothWays {
+                        attr: name.into(),
+                        pairs: both
+                            .iter()
+                            .take(5)
+                            .map(|(a, b)| (entity(*a), entity(*b)))
+                            .collect(),
+                    });
                 }
             }
             let converted: Vec<_> = history
@@ -226,25 +256,30 @@ impl Txn<'_> {
                 })
                 .collect();
             if !invalid.is_empty() && !options.skip_unconvertible {
-                let examples: Vec<_> = invalid
+                let examples = invalid
                     .iter()
                     .take(5)
                     .map(|i| {
                         let (e, c) = &history[*i];
-                        format!("({:?}, {}, {:?})", e, c.tick.0, c.value)
+                        UnconvertibleValue {
+                            entity: txn.error_entity(*e),
+                            tick: c.tick,
+                            value: c.value.clone(),
+                        }
                     })
                     .collect();
-                return Err(Error::Schema(format!(
-                    "{} unconvertible change points migrating :{} ({} -> {}): {}",
-                    invalid.len(),
-                    name,
-                    type_name(old.value_type),
-                    type_name(def.value_type),
-                    examples.join(", ")
-                )));
+                return Err(Error::Unconvertible {
+                    attr: name.into(),
+                    from: old.value_type,
+                    to: def.value_type,
+                    count: invalid.len(),
+                    examples,
+                });
             }
             let mut report = MigrationReport {
                 skipped: invalid.len(),
+                dropped_inverse,
+                dropped_reverse_cardinality,
                 ..MigrationReport::default()
             };
             // The marker authorizes only the exact copy sequence replay regenerates.
@@ -382,9 +417,17 @@ impl Txn<'_> {
         value: &Value,
         c: &Change,
     ) -> Result<Option<EdgeId>, Error> {
-        let mut fact = self
-            .world
-            .prepare_fact(&self.ids, entity, name, value, c.tick, c.op)?;
+        // Edge properties of deprecated attributes (e.g. `x@old` from an
+        // earlier migration) are history too and must follow their edges.
+        let mut fact = self.world.prepare_fact_as(
+            &self.ids,
+            entity,
+            name,
+            value,
+            c.tick,
+            c.op,
+            DeprecatedWrites::MigrationCopy,
+        )?;
         fact.precision = c.precision;
         check_entry_size(name, &fact)?;
         let edge = if let Some(target) = fact.target {

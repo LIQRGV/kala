@@ -208,8 +208,14 @@ pub fn execute(w: &mut World, form: &WriteTxn, default: Option<Tick>) -> Result<
     for (index, op) in form.ops.iter().enumerate() {
         let mut run = || -> Result<(usize, Tick, Option<Precision>, Option<EntityId>), CliError> {
             match op {
-                WriteOp::Attribute { def, .. } => {
-                    tx.declare_attribute(def.clone()).map_err(core_err)?;
+                WriteOp::Attribute {
+                    name,
+                    value_type,
+                    options,
+                    ..
+                } => {
+                    tx.declare_attribute_with(name, *value_type, options)
+                        .map_err(core_err)?;
                     Ok((0, fallback, None, None))
                 }
                 WriteOp::NodeType { name, .. } => {
@@ -237,7 +243,7 @@ pub fn execute(w: &mut World, form: &WriteTxn, default: Option<Tick>) -> Result<
                 WriteOp::Migrate { name, options, .. } => {
                     let report = tx
                         .migrate_attribute(name, options.clone())
-                        .map_err(core_err)?;
+                        .map_err(|e| migrate_err(&tx, e))?;
                     Ok((
                         report.change_points + report.edge_properties,
                         fallback,
@@ -522,6 +528,73 @@ pub fn run(
         return Err(user("expected at least one write transaction"));
     }
     Ok(String::new().into())
+}
+
+/// [`core_err`], with a migration refusal's entities shown by handle (else
+/// `TYPE#n`) and its values as `kala asof` prints them (strings quoted and
+/// escaped, cut like any echoed value). kala-core's own message has only IDs.
+fn migrate_err(tx: &Txn, e: kala_core::Error) -> CliError {
+    use kala_core::{Error as E, ErrorEntity};
+    let entity = |e: &ErrorEntity| escape::label(tx.handle_of(e.id).unwrap_or(&e.formatted));
+    let msg = match &e {
+        E::Unconvertible {
+            attr,
+            from,
+            to,
+            count,
+            examples,
+        } => {
+            let examples: Vec<String> = examples
+                .iter()
+                .map(|x| {
+                    let value = message_value(&x.value, |id| {
+                        entity(&ErrorEntity {
+                            id,
+                            formatted: tx.format_id(id),
+                        })
+                    });
+                    format!("{} @{} {value}", entity(&x.entity), x.tick.0)
+                })
+                .collect();
+            format!(
+                "{count} unconvertible change points migrating :{} ({} -> {}): {}",
+                escape::value(attr),
+                super::schema::type_name(*from),
+                super::schema::type_name(*to),
+                examples.join(", ")
+            )
+        }
+        E::PairsBothWays { attr, pairs } => {
+            let pairs: Vec<String> = pairs
+                .iter()
+                .map(|(a, b)| format!("{} and {}", entity(a), entity(b)))
+                .collect();
+            format!(
+                "cannot migrate :{}: pairs have history in both directions: {}",
+                escape::value(attr),
+                pairs.join(", ")
+            )
+        }
+        _ => return core_err(e),
+    };
+    CliError::core(&e, msg)
+}
+
+/// A value for a one-line message, as `kala asof` shows it (refs by
+/// `entity`); a string over [`escape::MAX_VALUE_CHARS`] chars is cut and
+/// gets `...`.
+fn message_value(v: &Value, entity: impl Fn(EntityId) -> String) -> String {
+    match v {
+        Value::Str(s) => match s.char_indices().nth(escape::MAX_VALUE_CHARS) {
+            Some((cut, _)) => format!("{}...", escape::quoted(&s[..cut])),
+            None => escape::quoted(s),
+        },
+        Value::Ref(id) => entity(*id),
+        Value::F64(f) if f.is_infinite() => (if *f > 0.0 { "inf" } else { "-inf" }).into(),
+        Value::F64(f) => f.to_string(),
+        Value::I64(i) => i.to_string(),
+        Value::Bool(b) => b.to_string(),
+    }
 }
 
 fn core_err(e: kala_core::Error) -> CliError {

@@ -26,6 +26,18 @@ pub(super) fn check_name(name: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// [`check_name`] for a name a schema edit after the genesis introduces:
+/// the [`RESERVED_NAME_PREFIX`](crate::RESERVED_NAME_PREFIX) is refused too.
+/// Live edits and replay both validate through [`World::apply_schema_edit`],
+/// so a log introducing a reserved name opens as corrupt.
+pub(super) fn check_new_name(name: &str) -> Result<(), Error> {
+    check_name(name)?;
+    if name.starts_with(crate::RESERVED_NAME_PREFIX) {
+        return Err(Error::ReservedName(name.to_owned()));
+    }
+    Ok(())
+}
+
 impl SchemaSnapshot {
     fn capture(world: &World) -> Self {
         Self {
@@ -35,6 +47,30 @@ impl SchemaSnapshot {
             settings: world.settings.clone(),
             node_count: world.node_types.len(),
         }
+    }
+    /// Whether the schema edits since this snapshot (now applied to `world`)
+    /// can change overlap warnings beyond the sides the transaction's facts
+    /// touch: any change to an existing attribute other than its inferred or
+    /// deprecated flag (cardinality and reverse labels decide which sides are
+    /// checked, and names label every warning). A migration always renames
+    /// its source, and the caller also treats any migration as such. New
+    /// attributes and node types, deprecations and settings can't: a new
+    /// attribute has no stored facts, so only its staged ones (touched
+    /// sides) can overlap.
+    pub(super) fn changes_overlaps(&self, world: &World) -> bool {
+        self.attributes
+            .iter()
+            .zip(&world.attributes)
+            .any(|(old, new)| {
+                old.name != new.name
+                    || old.value_type != new.value_type
+                    || old.kind != new.kind
+                    || old.cardinality != new.cardinality
+                    || old.indexed != new.indexed
+                    || old.direction != new.direction
+                    || old.inverse != new.inverse
+                    || old.reverse_cardinality != new.reverse_cardinality
+            })
     }
     pub(super) fn restore(self, world: &mut World) {
         world.attributes = self.attributes;
@@ -86,7 +122,7 @@ impl World {
         let old = self.attributes.get(index);
         let same_name = old.is_some_and(|old| old.name == def.name);
         if !same_name && !migration {
-            check_name(&def.name)?;
+            check_new_name(&def.name)?;
         }
         if def.name.is_empty() {
             return Err(Error::InvalidName(def.name.clone()));
@@ -101,7 +137,11 @@ impl World {
             return Err(Error::DuplicateName(def.name.clone()));
         }
         if let Some(inverse) = &def.inverse {
-            check_name(inverse)?;
+            if old.is_some_and(|old| old.inverse.as_ref() == Some(inverse)) {
+                check_name(inverse)?;
+            } else {
+                check_new_name(inverse)?;
+            }
             if inverse == &def.name
                 || self.attr_by_name.contains_key(inverse)
                 || self
@@ -206,7 +246,10 @@ impl World {
                 self.rebuild_schema_names();
             }
             SchemaEdit::NodeType { id, name, inferred } => {
-                check_name(name)?;
+                // Genesis node types are declared, so they never reach the
+                // redefinition branch: every edit here is a new name or an
+                // inferred one being confirmed.
+                check_new_name(name)?;
                 let i = usize::from(id.0);
                 if id.0 > MAX_NODE_TYPE || i > self.node_types.len() {
                     return Err(Error::Schema(
@@ -330,6 +373,21 @@ impl Txn<'_> {
             .map(|d| d.id)
             .or_else(|| self.world.entity_by_handle(name))
     }
+    /// The entity's handle, including entities created earlier in this
+    /// transaction (the reverse of [`Txn::entity_by_handle`]).
+    pub fn handle_of(&self, id: EntityId) -> Option<&str> {
+        self.ids
+            .defs
+            .iter()
+            .find(|d| d.id == id)
+            .and_then(|d| d.handle.as_deref())
+            .or_else(|| self.world.handle_of(id))
+    }
+    /// `CHARACTER#1`, `edge#9`, as [`World::format_id`] formats it, with
+    /// node types this transaction declared.
+    pub fn format_id(&self, id: EntityId) -> String {
+        self.world.format_id(id)
+    }
     /// Parses an entity ID using the staged node type namespace.
     pub fn parse_id(&self, name: &str) -> Option<EntityId> {
         self.world.parse_id(name)
@@ -338,7 +396,7 @@ impl Txn<'_> {
     pub fn infer_attribute(&mut self, name: &str, value: &Value) -> Result<(), Error> {
         self.guard(|txn| {
             if txn.world.attribute(name).is_some() { return Ok(()); }
-            check_name(name)?;
+            check_new_name(name)?;
             let ty = value.value_type();
             if txn.world.world_setting("schema") == Some("strict") { return Err(Error::Schema(format!("attribute {:?} is not in the schema; declare it first: [:attribute :{} :{}]", name,name,type_name(ty)))); }
             if let Value::Str(value) = value && value.len() > crate::MAX_INDEXED_STRING_BYTES { return Err(Error::Schema(format!("string over 256 bytes for an indexed attribute; declare it first: [:attribute :{} :string :unindexed]", name))); }
@@ -353,6 +411,7 @@ impl Txn<'_> {
             if txn.world.node_type_by_name.contains_key(name) {
                 return Ok(());
             }
+            check_new_name(name)?;
             if txn.world.world_setting("schema") == Some("strict") {
                 return Err(Error::Schema(format!(
                     "node type {:?} is not in the schema; declare it first: [:node-type :{}]",
@@ -374,8 +433,62 @@ impl Txn<'_> {
             txn.declare_attr_inner(def)
         })
     }
+    /// Declares `name` as `value_type` with only the labels `options` names
+    /// (the `[:attribute NAME TYPE OPTION*]` form). An existing attribute of
+    /// the same type keeps every label the options leave out, so confirming
+    /// an inferred attribute marks it declared and changes nothing else; a
+    /// new attribute, or a type change (allowed only while the attribute has
+    /// no facts), starts from the [`AttrDef::new`] defaults. The result is
+    /// validated like [`Txn::declare_attribute`].
+    pub fn declare_attribute_with(
+        &mut self,
+        name: &str,
+        value_type: ValueType,
+        options: &AttributeOptions,
+    ) -> Result<(), Error> {
+        self.guard(|txn| {
+            let existing = txn
+                .world
+                .attr_by_name
+                .get(name)
+                .map(|id| &txn.world.attributes[id.0 as usize])
+                .filter(|old| old.value_type == value_type);
+            let mut def = match existing {
+                Some(old) => {
+                    let mut def = old.clone();
+                    // Origin and deprecation are the store's: a deprecated
+                    // attribute is refused by `declare_attr_inner`.
+                    def.inferred = false;
+                    def.deprecated = false;
+                    def
+                }
+                None => AttrDef::new(name, value_type, Kind::State, Cardinality::One),
+            };
+            if let Some(kind) = options.kind {
+                def.kind = kind;
+            }
+            if let Some(cardinality) = options.cardinality {
+                def.cardinality = cardinality;
+            }
+            if let Some(direction) = options.direction {
+                def.direction = Some(direction);
+            }
+            if let Some(indexed) = options.indexed {
+                def.indexed = indexed;
+            }
+            if let Some(inverse) = &options.inverse {
+                def.inverse = Some(inverse.clone());
+            }
+            if let Some(reverse) = options.reverse_cardinality {
+                def.reverse_cardinality = Some(reverse);
+            }
+            txn.declare_attr_inner(def)
+        })
+    }
     fn declare_attr_inner(&mut self, def: AttrDef) -> Result<(), Error> {
-        check_name(&def.name)?;
+        // The previous definition's cardinality and whether anything but the
+        // cardinality changes, for the report.
+        let mut cardinality_from = None;
         let id = match self.world.attr_by_name.get(&def.name) {
             Some(id) => {
                 let old = &self.world.attributes[id.0 as usize];
@@ -385,19 +498,53 @@ impl Txn<'_> {
                 if old == &def {
                     return Ok(());
                 }
+                // A type change (allowed only while the attribute has no
+                // facts) is one redefinition, so its cardinality is part of
+                // that entry, not a separate relabel.
+                if old.value_type == def.value_type && old.cardinality != def.cardinality {
+                    let mut same = def.clone();
+                    same.cardinality = old.cardinality;
+                    cardinality_from = Some((old.cardinality, &same == old));
+                }
                 *id
             }
-            None => AttrId(
-                u32::try_from(self.world.attributes.len())
-                    .map_err(|_| Error::InvalidName(def.name.clone()))?,
-            ),
+            None => {
+                check_new_name(&def.name)?;
+                AttrId(
+                    u32::try_from(self.world.attributes.len())
+                        .map_err(|_| Error::InvalidName(def.name.clone()))?,
+                )
+            }
         };
+        let name = def.name.clone();
+        let to = def.cardinality;
         let report = SchemaChange::Attribute {
-            name: def.name.clone(),
+            name: name.clone(),
             value_type: def.value_type,
             inferred: def.inferred,
         };
-        self.schema_edit(SchemaEdit::Attribute { id, def }, report, false)
+        match cardinality_from {
+            // A pure cardinality relabel reports exactly like `[:cardinality]`.
+            Some((from, true)) => self.schema_edit(
+                SchemaEdit::Attribute { id, def },
+                SchemaChange::Cardinality { name, from, to },
+                false,
+            ),
+            // Other changes as well: two edits (so every report line is one
+            // log entry), the declaration with the old cardinality, then the
+            // relabel exactly like `[:cardinality]`.
+            Some((from, false)) => {
+                let mut first = def.clone();
+                first.cardinality = from;
+                self.schema_edit(SchemaEdit::Attribute { id, def: first }, report, false)?;
+                self.schema_edit(
+                    SchemaEdit::Attribute { id, def },
+                    SchemaChange::Cardinality { name, from, to },
+                    false,
+                )
+            }
+            None => self.schema_edit(SchemaEdit::Attribute { id, def }, report, false),
+        }
     }
     /// Declares a node type, or confirms an inferred one.
     pub fn declare_node_type(&mut self, name: &str) -> Result<(), Error> {
@@ -414,6 +561,7 @@ impl Txn<'_> {
             }
             *id
         } else {
+            check_new_name(name)?;
             if self.world.node_types.len() > usize::from(MAX_NODE_TYPE) {
                 return Err(IdError::NodeTypeOutOfRange(MAX_NODE_TYPE + 1).into());
             }
@@ -435,7 +583,7 @@ impl Txn<'_> {
     /// Changes the name at every canon, preserving the attribute ID.
     pub fn rename_attribute(&mut self, old: &str, new: &str) -> Result<(), Error> {
         self.guard(|txn| {
-            check_name(new)?;
+            check_new_name(new)?;
             let id = txn.attr_id(old)?;
             if old == new {
                 return Ok(());

@@ -336,8 +336,13 @@ pub enum WriteValue {
 /// One write; validation of store rules is left to kala-core's transaction.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WriteOp {
+    /// `[:attribute NAME TYPE OPTION*]`. Options left out are `None`, so an
+    /// existing attribute keeps its labels (resolved by the transaction, see
+    /// `kala_core::Txn::declare_attribute_with`).
     Attribute {
-        def: kala_core::AttrDef,
+        name: String,
+        value_type: kala_core::ValueType,
+        options: kala_core::AttributeOptions,
         span: Span,
     },
     NodeType {

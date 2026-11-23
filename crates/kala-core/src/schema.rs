@@ -203,6 +203,28 @@ pub enum SchemaChange {
     },
 }
 
+/// The labels an explicit attribute declaration (`[:attribute NAME TYPE
+/// OPTION*]`) names. `None` means "not given": an existing attribute of the
+/// same type keeps its current value, and a new one (or one whose type
+/// changes) gets the [`AttrDef::new`] default (state, one, directed for
+/// `ref`, indexed, no inverse or reverse cardinality). See
+/// [`Txn::declare_attribute_with`](crate::Txn::declare_attribute_with).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AttributeOptions {
+    /// State or event.
+    pub kind: Option<Kind>,
+    /// Forward cardinality label.
+    pub cardinality: Option<Cardinality>,
+    /// Reference direction (`ref` only).
+    pub direction: Option<RefDirection>,
+    /// Whether values get `V` index entries.
+    pub indexed: Option<bool>,
+    /// Inverse name (directed `ref` only).
+    pub inverse: Option<String>,
+    /// Reverse cardinality label (directed `ref` only).
+    pub reverse_cardinality: Option<Cardinality>,
+}
+
 /// Options omitted from a migration keep the old definition's value.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MigrationOptions {
@@ -224,6 +246,12 @@ pub struct MigrationOptions {
     pub skip_unconvertible: bool,
 }
 
+/// Node type and attribute names starting with this prefix are reserved for
+/// Kala's own worlds: a genesis [`Schema`] may use them (the `system` world
+/// does), but no later schema edit (inference, an explicit declaration or a
+/// rename) may introduce one, and replay refuses a log where one does.
+pub const RESERVED_NAME_PREFIX: &str = "_KALA_";
+
 /// Counts of history copied by a migration.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MigrationReport {
@@ -235,6 +263,12 @@ pub struct MigrationReport {
     pub edge_properties: usize,
     /// Unconvertible or colliding source change points skipped.
     pub skipped: usize,
+    /// The inverse name the source had and a bidirectional target can't
+    /// keep: dropped (and freed) by the migration.
+    pub dropped_inverse: Option<String>,
+    /// The reverse cardinality label the source had and a bidirectional
+    /// target can't keep: dropped by the migration.
+    pub dropped_reverse_cardinality: Option<Cardinality>,
 }
 
 /// The payload of a schema log entry. IDs are assigned consecutively; an

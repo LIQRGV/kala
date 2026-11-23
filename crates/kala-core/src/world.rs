@@ -44,7 +44,10 @@
 mod migration;
 mod schema_ops;
 
-use crate::schema::{MigrationOptions, MigrationReport, SchemaChange, SchemaEdit};
+use crate::schema::{
+    AttributeOptions, MigrationOptions, MigrationReport, SchemaChange, SchemaEdit,
+};
+pub(crate) use schema_ops::type_name as value_type_name;
 use schema_ops::{OrderedEntry, SchemaSnapshot};
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -1344,8 +1347,24 @@ impl World {
                 {
                     return Err(corrupt(&"bidirectional fact with entity > value"));
                 }
+                // A migration copies edge properties of deprecated
+                // attributes too; only entries matching the regenerated copy
+                // sequence (`copied`) may write them.
+                let deprecated = if copied {
+                    DeprecatedWrites::MigrationCopy
+                } else {
+                    DeprecatedWrites::Refuse
+                };
                 let mut fact = self
-                    .prepare_fact(&StagedIds::default(), *entity, &def.name, value, *tick, *op)
+                    .prepare_fact_as(
+                        &StagedIds::default(),
+                        *entity,
+                        &def.name,
+                        value,
+                        *tick,
+                        *op,
+                        deprecated,
+                    )
                     .map_err(ReplayFault::from_write)?;
                 fact.precision = *precision;
                 // A live write logs a ref fact's DefineEdge ahead of its
@@ -2272,8 +2291,25 @@ impl World {
         tick: Tick,
         op: Op,
     ) -> Result<FactDef, Error> {
+        self.prepare_fact_as(staged, entity, attr, v, tick, op, DeprecatedWrites::Refuse)
+    }
+
+    /// [`World::prepare_fact`] with an explicit deprecation rule. Only a
+    /// migration's own copy (and replay of exactly the copy sequence it
+    /// regenerates) passes [`DeprecatedWrites::MigrationCopy`].
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_fact_as(
+        &self,
+        staged: &StagedIds,
+        entity: EntityId,
+        attr: &str,
+        v: &Value,
+        tick: Tick,
+        op: Op,
+        deprecated: DeprecatedWrites,
+    ) -> Result<FactDef, Error> {
         let (attr_id, def) = self.resolve(staged, entity, attr)?;
-        if def.deprecated {
+        if def.deprecated && deprecated == DeprecatedWrites::Refuse {
             return Err(Error::DeprecatedAttribute(attr.to_owned()));
         }
         check_type(attr, def, v)?;
@@ -3012,6 +3048,17 @@ struct TouchedSide {
     values: Vec<Vec<u8>>,
 }
 
+/// Whether a prepared fact may target a deprecated attribute. Every user
+/// write refuses; only the internal copy of a migration (live, and replay of
+/// the exact copy sequence regenerated from the migration marker) may write
+/// the history of a deprecated edge property onto the new edges. Private to
+/// the world module, so no public API or flag can select it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeprecatedWrites {
+    Refuse,
+    MigrationCopy,
+}
+
 /// Replay state spanning one transaction after the genesis, for the rules a
 /// single entry can't check on its own.
 #[derive(Debug, Default)]
@@ -3675,16 +3722,29 @@ impl Txn<'_> {
             });
         }
         let encoded = self.encode_ordered()?;
-        let schema_changed = self.schema_before.is_some();
-        if let Some(before) = self.schema_before.take() {
-            before.restore(self.world);
-        }
+        // Only a schema edit that can change overlaps on sides no staged fact
+        // touches (a relabel, rename or migration) needs the whole-world scan;
+        // new declarations, node types, deprecations and settings keep the
+        // touched-sides diff, which costs what the transaction wrote.
+        let schema_changed = self.schema_before.as_ref().is_some_and(|before| {
+            before.changes_overlaps(self.world)
+                || self
+                    .order
+                    .iter()
+                    .any(|e| matches!(e, OrderedEntry::Schema(SchemaEdit::Migration { .. })))
+        });
+        // Touched sides are named and oriented with this transaction's schema
+        // applied, so facts on an attribute it declares can be sorted; that
+        // schema is the one `after` reads.
         let touched = if warn && !schema_changed {
             self.world
                 .touched_side_values(self.entries.iter().map(|e| e.key_and_mark().0))
         } else {
             Vec::new()
         };
+        if let Some(before) = self.schema_before.take() {
+            before.restore(self.world);
+        }
         let old_names = if schema_changed {
             self.world.attr_by_name.clone()
         } else {
@@ -3766,14 +3826,6 @@ impl Txn<'_> {
         }
         self.world.latest_tx = self.tx;
         self.world.record(encoded.entries, self.tx);
-        if !self.schema_changes.is_empty() && self.world.log.is_some() {
-            eprintln!(
-                "event=schema_committed tx={} schema_changes={} fact_entries={}",
-                self.tx.0,
-                self.schema_changes.len(),
-                entries.len()
-            );
-        }
         let after = if !warn {
             Vec::new()
         } else if schema_changed {

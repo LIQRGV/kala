@@ -267,9 +267,13 @@ These forms work alone or inside a transaction vector, through `transact` and
 ```
 
 Attribute options are `:one|:many`, `:state|:event`, `:directed|:bidirectional`,
-`:unindexed`, `:inverse :NAME` and `:reverse :one|:many`. Defaults are state, one,
-indexed, and directed for refs; inverse/reverse options require a directed ref.
-Redeclaring an inferred definition makes it declared. Repeating an identical
+`:unindexed`, `:inverse :NAME` and `:reverse :one|:many`. For a new attribute the
+defaults are state, one, indexed, and directed for refs; inverse/reverse options
+require a directed ref. For an existing attribute of the same type, options left
+out keep the current labels: `[:attribute :owns :ref]` on an inferred `owns`
+(ref, many) only marks it declared. A named label change is reported, e.g.
+`cardinality of :owns: many -> one` for `[:attribute :owns :ref :one]`. Naming a
+different type starts from the new-attribute defaults. Repeating an identical
 explicit definition or deprecation is a no-op. Cardinality labels can change
 with overlap warnings; doctor uses the label at its requested canon. Structural
 changes (type, kind, direction, indexing) in place require no fact entry ever
@@ -309,8 +313,12 @@ whole migration fails with a count and examples. With it, those change points
 are skipped and counted. A state with any logged retract cannot become an event.
 Directed → bidirectional refuses pairs with histories in both directions.
 Bidirectional → directed copies both orientations (self-pairs once). Ref copies
-create new edge IDs and copy edge-property histories to the corresponding edges.
-A deprecated edge-property attribute still refuses copied writes.
+create new edge IDs and copy edge-property histories to the corresponding edges,
+including the histories of deprecated edge-property attributes (such as
+`disguised@old` from an earlier migration); users still cannot write to those.
+Directed → bidirectional drops the source's inverse name (freeing it) and its
+reverse cardinality, since a bidirectional attribute has neither; the report
+line ends with e.g. `; dropped inverse :child_of and reverse cardinality one`.
 
 Use `kala transact WORLD FILE --dry-run` first: it reports the same schema actions
 and counts on a discarded copy. Migration reports include change points copied,
@@ -318,13 +326,25 @@ edges created, edge-property facts copied and skipped change points. Each form's
 JSON `schema` array is ordered, with `kind` equal to `attribute`, `node_type`,
 `rename`, `deprecate`, `cardinality`, `world_setting` or `migrate`. Records include
 names/types and `inferred`; migration records add `from`, `to`, `change_points`,
-`edges`, `edge_properties`, `skipped`. `changed` counts fact/correction entries and
+`edges`, `edge_properties`, `skipped`, `dropped_inverse` (the inverse name or
+`null`) and `dropped_reverse_cardinality` (`"one"`, `"many"` or `null`). `changed` counts fact/correction entries and
 reported schema actions; per-op `changed` still counts fact entries.
 
 This release writes **log format 5**. Format-4 and older worlds are refused with
 an older-Kala message and must be recreated from their source fixtures/scripts.
 There is no old-file migration before 1.0. `kala info` reports the format version;
 `kala log` includes schema revisions and world settings in operation order.
+In `kala log --json` a schema entry is `{"entry": N, "kind": "schema", "change":
+{...}}`, where `change` uses the write report's field names: `kind` is
+`attribute`, `node_type`, `world_setting` or `migrate`, with `name`, `type` and
+`inferred`. Attribute and migrate records carry the full definition the entry
+logs (`id` for attributes, `attribute_kind` = `state`/`event`, `cardinality`,
+`direction`, `inverse`, `reverse_cardinality`, `indexed`, `deprecated`); a
+rename or deprecation is logged as an `attribute` record with the new name or
+`deprecated: true`. Migrate records add `source` (the source attribute's latest
+name, e.g. `age@old`), `from`, `to` and `skip_unconvertible`; world settings
+have `key` and `value`. Text `kala log` prints the same with names, e.g.
+`schema attribute :age i64 state one indexed (inferred)`.
 
 Preparation of a query with `:canon ?parameter` happens before parameter values
 are bound, so static schema-dependent typing and access planning use the latest

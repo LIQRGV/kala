@@ -5,8 +5,8 @@ use crate::lex::{Bracket, Lexer, Tok};
 use crate::parse::{Form, item, read_form};
 use crate::{MAX_QUERY_BYTES, MAX_WRITE_FORMS, MAX_WRITE_OPS};
 use kala_core::{
-    AttrDef, Cardinality, EntryId, Kind, MigrationOptions, Op, Precision, RefDirection, Tick,
-    ValueType,
+    AttributeOptions, Cardinality, EntryId, Kind, MigrationOptions, Op, Precision, RefDirection,
+    Tick, ValueType,
 };
 
 /// The first element of a form selects its language operation.
@@ -281,24 +281,22 @@ fn operation(items: Vec<Form>, span: Span) -> Result<WriteOp, DatalogError> {
                     span,
                 });
             }
-            let ty = options
+            let value_type = options
                 .value_type
                 .ok_or_else(|| DatalogError::syntax(span, ":attribute needs a value type"))?;
-            let mut def = AttrDef::new(
-                &name,
-                ty,
-                options.kind.unwrap_or(Kind::State),
-                options.cardinality.unwrap_or(Cardinality::One),
-            );
-            if let Some(v) = options.direction {
-                def.direction = Some(v);
-            }
-            if let Some(v) = options.indexed {
-                def.indexed = v;
-            }
-            def.inverse = options.inverse;
-            def.reverse_cardinality = options.reverse_cardinality;
-            Ok(WriteOp::Attribute { def, span })
+            Ok(WriteOp::Attribute {
+                name,
+                value_type,
+                options: AttributeOptions {
+                    kind: options.kind,
+                    cardinality: options.cardinality,
+                    direction: options.direction,
+                    indexed: options.indexed,
+                    inverse: options.inverse,
+                    reverse_cardinality: options.reverse_cardinality,
+                },
+                span,
+            })
         }
         "node-type" | "deprecate" | "rename" | "cardinality" | "world-setting" => {
             let (name, _) = keyword(it.next().ok_or_else(missing)?)?;

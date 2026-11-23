@@ -2,11 +2,11 @@
 
 use std::fmt;
 
-use crate::echo::Quoted;
+use crate::echo::{Echo, Quoted};
 use crate::id::{EntityId, IdError};
 use crate::log::EntryId;
 use crate::tick::Tick;
-use crate::value::{ValueError, ValueType};
+use crate::value::{Value, ValueError, ValueType};
 
 /// Why a metered read was interrupted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,6 +15,29 @@ pub enum WorkInterruptReason {
     Limit,
     /// The caller requested a stop.
     Stopped,
+}
+
+/// An entity named in an error: its ID, and the ID as the world formats it
+/// (`CHARACTER#5`, see [`World::format_id`](crate::World::format_id)),
+/// captured when the error is made because `Display` has no world. Front-ends
+/// with a world show the handle instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ErrorEntity {
+    /// The entity.
+    pub id: EntityId,
+    /// `TYPE#n` (or `edge#n`).
+    pub formatted: String,
+}
+
+/// One change point a migration can't convert, in [`Error::Unconvertible`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnconvertibleValue {
+    /// The entity the change point belongs to.
+    pub entity: ErrorEntity,
+    /// Its tick.
+    pub tick: Tick,
+    /// The old value.
+    pub value: Value,
 }
 
 /// Why a world operation failed.
@@ -41,6 +64,34 @@ pub enum Error {
     InvalidHandle(String),
     /// A node type or attribute name in the schema isn't valid (e.g. empty).
     InvalidName(String),
+    /// A schema edit after the genesis names a node type or attribute with
+    /// the [`RESERVED_NAME_PREFIX`](crate::RESERVED_NAME_PREFIX) prefix,
+    /// which belongs to Kala's own worlds (e.g. the `system` world). Holds
+    /// the name.
+    ReservedName(String),
+    /// A migration found change points whose value doesn't convert to the
+    /// new type (or collides with another value of the same entity) and
+    /// wasn't asked to skip them.
+    Unconvertible {
+        /// The migrated attribute.
+        attr: String,
+        /// Its old value type.
+        from: ValueType,
+        /// The new value type.
+        to: ValueType,
+        /// How many change points don't convert.
+        count: usize,
+        /// The first few of them, in history order.
+        examples: Vec<UnconvertibleValue>,
+    },
+    /// A `directed -> bidirectional` migration found pairs stored both ways
+    /// (A to B and B to A), which would read as duplicates.
+    PairsBothWays {
+        /// The migrated attribute.
+        attr: String,
+        /// The first few pairs, each ordered by entity ID.
+        pairs: Vec<(ErrorEntity, ErrorEntity)>,
+    },
     /// An attribute's direction, inverse or reverse cardinality doesn't fit
     /// its declaration: a non-ref attribute with a direction, an inverse or
     /// a reverse cardinality, a ref attribute without a direction, or an
@@ -201,6 +252,49 @@ impl fmt::Display for Error {
             }
             Error::InvalidHandle(h) => write!(f, "invalid handle {}", Quoted(h)),
             Error::InvalidName(name) => write!(f, "invalid schema name {}", Quoted(name)),
+            Error::Unconvertible {
+                attr,
+                from,
+                to,
+                count,
+                examples,
+            } => {
+                write!(
+                    f,
+                    "{count} unconvertible change points migrating :{} ({} -> {}): ",
+                    Echo(attr),
+                    crate::world::value_type_name(*from),
+                    crate::world::value_type_name(*to)
+                )?;
+                for (i, e) in examples.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{} @{} ", Echo(&e.entity.formatted), e.tick.0)?;
+                    write_value(f, &e.value)?;
+                }
+                Ok(())
+            }
+            Error::PairsBothWays { attr, pairs } => {
+                write!(
+                    f,
+                    "cannot migrate :{}: pairs have history in both directions: ",
+                    Echo(attr)
+                )?;
+                for (i, (a, b)) in pairs.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{} and {}", Echo(&a.formatted), Echo(&b.formatted))?;
+                }
+                Ok(())
+            }
+            Error::ReservedName(name) => write!(
+                f,
+                "schema name {} is reserved: names starting with {} belong to Kala",
+                Quoted(name),
+                crate::RESERVED_NAME_PREFIX
+            ),
             Error::InvalidDirection(a) => {
                 write!(
                     f,
@@ -288,6 +382,21 @@ impl fmt::Display for Error {
             ),
             Error::ReadOnly => f.write_str("world is open read-only; writes are refused"),
         }
+    }
+}
+
+/// A value as `kala asof` shows it: strings quoted (escaped and cut, see
+/// [`Quoted`]), refs by ID, numbers and bools as written.
+fn write_value(f: &mut fmt::Formatter<'_>, v: &Value) -> fmt::Result {
+    match v {
+        Value::Str(s) => write!(f, "{}", Quoted(s)),
+        Value::I64(i) => write!(f, "{i}"),
+        Value::F64(x) => write!(f, "{x}"),
+        Value::Bool(b) => write!(f, "{b}"),
+        // Never in a migration error today (ref values always convert);
+        // shown without the world's type names, like a log with no DEFINE.
+        Value::Ref(e) if e.is_edge() => write!(f, "edge#{}", e.raw() & !(1 << 63)),
+        Value::Ref(e) => write!(f, "#{}#{}", e.node_type().0, e.seq()),
     }
 }
 

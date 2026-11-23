@@ -9,10 +9,13 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use kala_core::log::EntryBody;
+use kala_core::schema::SchemaEdit;
 use kala_core::{AttrId, EntityId, Op, Tick, Value, World};
 use serde::Serialize;
+use serde_json::json;
 
 use super::read::open_world;
+use super::schema;
 use crate::cli::Canon;
 use crate::error::CliError;
 use crate::escape;
@@ -50,7 +53,9 @@ struct JFact {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum JBody {
     Schema {
-        change: String,
+        change: serde_json::Value,
+        #[serde(skip)]
+        text: String,
     },
     DefineNodeType {
         id: u16,
@@ -136,7 +141,7 @@ fn precision_text(p: &str) -> String {
 
 fn body_text(b: &JBody) -> String {
     match b {
-        JBody::Schema { change } => format!("schema {}", escape::value(change)),
+        JBody::Schema { text, .. } => format!("schema {text}"),
         JBody::DefineNodeType { id, name } => {
             format!("define node type {} (id {id})", escape::value(name))
         }
@@ -248,6 +253,76 @@ fn fact(n: &World, entity: EntityId, attr: AttrId, value: &Value, tick: Tick) ->
     }
 }
 
+/// A schema entry, structured like the write report's `schema` records
+/// (`kind`, `name`, `type`, `inferred`, …; see `schema::change_json`).
+///
+/// Names: what the entry itself carries (a definition logs its full
+/// definition, name included, so a rename shows the new name and the old
+/// attribute's later entries show `age@old`). The one ID-only reference, a
+/// migration's source attribute, resolves through the world's (latest) name
+/// table like every fact's attribute in the log, and so does its type.
+fn schema_body(n: &World, edit: &SchemaEdit) -> JBody {
+    let (change, text) = match edit {
+        SchemaEdit::Attribute { id, def } => {
+            let mut change = schema::def_json(def);
+            change["kind"] = "attribute".into();
+            change["id"] = id.0.into();
+            let origin = if def.inferred { "inferred" } else { "declared" };
+            (
+                change,
+                format!("attribute {} ({origin})", schema::def_text(def)),
+            )
+        }
+        SchemaEdit::NodeType { id, name, inferred } => {
+            let origin = if *inferred { "inferred" } else { "declared" };
+            (
+                json!({"kind":"node_type","id":id.0,"name":name,"inferred":inferred}),
+                format!("node type {} ({origin})", escape::value(name)),
+            )
+        }
+        SchemaEdit::Setting { key, value } => (
+            json!({"kind":"world_setting","key":key,"value":value,"inferred":false}),
+            format!(
+                "world setting :{} :{}",
+                escape::value(key),
+                escape::value(value)
+            ),
+        ),
+        SchemaEdit::Migration {
+            source,
+            def,
+            skip_unconvertible,
+        } => {
+            let source_name = attr_name(n, *source);
+            let from = n
+                .attribute(&source_name)
+                .map(|d| schema::type_name(d.value_type));
+            let mut change = schema::def_json(def);
+            change["kind"] = "migrate".into();
+            change["source"] = source_name.clone().into();
+            change["from"] = from.into();
+            change["to"] = schema::type_name(def.value_type).into();
+            change["skip_unconvertible"] = (*skip_unconvertible).into();
+            let skip = if *skip_unconvertible {
+                ", skipping unconvertible values"
+            } else {
+                ""
+            };
+            (
+                change,
+                format!(
+                    "migrate :{} from :{}{} to {}{skip}",
+                    escape::value(&def.name),
+                    escape::value(&source_name),
+                    from.map_or(String::new(), |t| format!(" ({t})")),
+                    schema::def_text(def)
+                ),
+            )
+        }
+    };
+    JBody::Schema { change, text }
+}
+
 fn op_str(op: Op) -> &'static str {
     match op {
         Op::Assert => "assert",
@@ -257,9 +332,7 @@ fn op_str(op: Op) -> &'static str {
 
 fn body(n: &World, b: &EntryBody) -> JBody {
     match b {
-        EntryBody::Schema(edit) => JBody::Schema {
-            change: format!("{edit:?}"),
-        },
+        EntryBody::Schema(edit) => schema_body(n, edit),
         EntryBody::DefineNodeType { id, name } => JBody::DefineNodeType {
             id: id.0,
             name: name.clone(),
