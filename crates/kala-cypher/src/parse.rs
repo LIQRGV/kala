@@ -101,64 +101,102 @@ impl Parser<'_> {
             Ok(())
         }
     }
+    /// `MATCH … [MATCH …] RETURN … [ORDER BY …] [SKIP n] [LIMIT n] [;]`.
     fn query(&mut self) -> Result<Query, CypherError> {
         let mut matches = Vec::new();
         let mut canon_seen = false;
         self.need_kw("MATCH")?;
         loop {
-            let mut paths = vec![self.path()?];
-            while self.sym(",") {
-                paths.push(self.path()?);
-            }
-            // Cypher binds one relationship per variable within a clause; a later
-            // clause may reuse it to mean the same edge.
-            let mut edge_names = std::collections::BTreeSet::new();
-            for name in paths
-                .iter()
-                .flat_map(|p| &p.edges)
-                .filter_map(|e| e.name.as_ref())
-            {
-                if !edge_names.insert(name) {
-                    return Err(self.err(format!(
-                        "relationship variable `{name}` is used for more than one relationship in one MATCH"
-                    )));
-                }
-            }
-            let tick = if self.kw("AT") {
-                self.need_kw("TICK")?;
-                Some(self.integer(false)?)
-            } else {
-                None
-            };
-            let canon = if self.kw("CANON") {
-                if tick.is_none() {
-                    return Err(self.err("CANON requires AT TICK"));
-                }
-                if canon_seen {
-                    return Err(self.err("CANON may appear only once"));
-                }
-                canon_seen = true;
-                Some(self.integer(true)?)
-            } else {
-                None
-            };
-            let predicate = if self.kw("WHERE") {
-                Some(self.expression(0, 0)?)
-            } else {
-                None
-            };
-            matches.push(Match {
-                paths,
-                tick,
-                canon,
-                predicate,
-            });
+            matches.push(self.match_clause(&mut canon_seen)?);
             if !self.kw("MATCH") {
                 break;
             }
         }
         self.need_kw("RETURN")?;
         let distinct = self.kw("DISTINCT");
+        let items = self.return_items()?;
+        let order = self.order_by()?;
+        let skip = if self.kw("SKIP") {
+            Some(self.integer(true)?)
+        } else {
+            None
+        };
+        let limit = if self.kw("LIMIT") {
+            Some(self.integer(true)?)
+        } else {
+            None
+        };
+        self.sym(";");
+        if !matches!(self.token().kind, Kind::End) {
+            return Err(self.unsupported("end of query"));
+        }
+        Ok(Query {
+            matches,
+            items,
+            distinct,
+            order,
+            skip,
+            limit,
+        })
+    }
+    /// One MATCH clause after its keyword: paths, then `AT TICK`, `CANON` and
+    /// `WHERE`. `canon_seen` records that some clause already set the canon.
+    fn match_clause(&mut self, canon_seen: &mut bool) -> Result<Match, CypherError> {
+        let mut paths = vec![self.path()?];
+        while self.sym(",") {
+            paths.push(self.path()?);
+        }
+        self.unique_edge_names(&paths)?;
+        let tick = if self.kw("AT") {
+            self.need_kw("TICK")?;
+            Some(self.integer(false)?)
+        } else {
+            None
+        };
+        let canon = if self.kw("CANON") {
+            if tick.is_none() {
+                return Err(self.err("CANON requires AT TICK"));
+            }
+            if *canon_seen {
+                return Err(self.err("CANON may appear only once"));
+            }
+            *canon_seen = true;
+            Some(self.integer(true)?)
+        } else {
+            None
+        };
+        let predicate = if self.kw("WHERE") {
+            Some(self.expression(0, 0)?)
+        } else {
+            None
+        };
+        Ok(Match {
+            paths,
+            tick,
+            canon,
+            predicate,
+        })
+    }
+    /// Refuse a relationship variable that names two relationships in one clause.
+    fn unique_edge_names(&self, paths: &[Path]) -> Result<(), CypherError> {
+        // Cypher binds one relationship per variable within a clause; a later
+        // clause may reuse it to mean the same edge.
+        let mut edge_names = std::collections::BTreeSet::new();
+        for name in paths
+            .iter()
+            .flat_map(|p| &p.edges)
+            .filter_map(|e| e.name.as_ref())
+        {
+            if !edge_names.insert(name) {
+                return Err(self.err(format!(
+                    "relationship variable `{name}` is used for more than one relationship in one MATCH"
+                )));
+            }
+        }
+        Ok(())
+    }
+    /// The comma-separated RETURN items, each with a distinct column name.
+    fn return_items(&mut self) -> Result<Vec<Item>, CypherError> {
         let mut items = Vec::new();
         loop {
             self.element()?;
@@ -187,6 +225,10 @@ impl Parser<'_> {
                 break;
             }
         }
+        Ok(items)
+    }
+    /// An optional `ORDER BY` list: each key with whether it sorts descending.
+    fn order_by(&mut self) -> Result<Vec<(Expr<String>, bool)>, CypherError> {
         let mut order = Vec::new();
         if self.kw("ORDER") {
             self.need_kw("BY")?;
@@ -204,28 +246,7 @@ impl Parser<'_> {
                 }
             }
         }
-        let skip = if self.kw("SKIP") {
-            Some(self.integer(true)?)
-        } else {
-            None
-        };
-        let limit = if self.kw("LIMIT") {
-            Some(self.integer(true)?)
-        } else {
-            None
-        };
-        self.sym(";");
-        if !matches!(self.token().kind, Kind::End) {
-            return Err(self.unsupported("end of query"));
-        }
-        Ok(Query {
-            matches,
-            items,
-            distinct,
-            order,
-            skip,
-            limit,
-        })
+        Ok(order)
     }
     fn path(&mut self) -> Result<Path, CypherError> {
         let mut nodes = vec![self.node()?];
