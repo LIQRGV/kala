@@ -1183,7 +1183,8 @@ impl View<'_> {
         let canon = self.canon;
         let world = self.world;
         world
-            .entries
+            .journal
+            .entries()
             .iter()
             .take_while(move |e| e.tx <= canon)
             .filter_map(|e| {

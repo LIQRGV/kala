@@ -42,23 +42,29 @@
 //! the world's own reads are the view at its latest tx.
 //!
 //! **Layout.** This file holds the public value types, the [`World`] struct
-//! and its facade. The rest of the module is split by concern into private
-//! submodules that share its scope: `catalog` (the `Catalog` struct: schema
-//! and ID tables), `ids` (node types, entities, handles, edges), `index`
+//! and its facade. A world is composed of four components, each in a private
+//! submodule: `catalog` (the `Catalog` struct: schema and ID tables), `index`
 //! (the `Indexes` struct: the index maps and the seeks reads are built from),
-//! `open` (replaying a log), `txn` (the write path and [`Txn`]), `meter`
-//! (bounded reads), `view` ([`View`]), `schema_ops` and `migration`. The
-//! indexes themselves sit behind the `store` module's ordered-map seam.
+//! `journal` (the `Journal` struct: kept log entries, the latest tx,
+//! correction chains and the log file) and `write_gate` (the `WriteGate`
+//! struct: read-only and recovery state). The rest of the module is split by
+//! concern into submodules that share its scope: `ids` (node types, entities,
+//! handles, edges), `open` (replaying a log), `txn` (the write path and
+//! [`Txn`]), `meter` (bounded reads), `view` ([`View`]), `schema_ops` and
+//! `migration`. The indexes themselves sit behind the `store` module's
+//! ordered-map seam.
 
 mod catalog;
 mod ids;
 mod index;
+mod journal;
 mod meter;
 mod migration;
 mod open;
 mod schema_ops;
 mod txn;
 mod view;
+mod write_gate;
 
 #[cfg(feature = "test-hooks")]
 use crate::doctor::{IndexName, Tamper};
@@ -94,7 +100,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering as AtomicOrdering};
 pub use txn::{CommitResult, Txn};
 pub use view::View;
-use {catalog::*, ids::*, index::*, meter::*, open::*, txn::*};
+use {catalog::*, ids::*, index::*, journal::*, meter::*, open::*, txn::*, write_gate::*};
 
 /// A position on the author timeline: the number of the transaction that
 /// wrote a fact. Each committed transaction advances it by one.
@@ -404,28 +410,12 @@ pub struct World {
     catalog: Catalog,
     /// Every index and derived table over the stored facts (see [`Indexes`]).
     indexes: Indexes,
-    /// The last committed transaction (0 = none yet).
-    latest_tx: TxId,
-    /// The correction state of every revision chain a correction touched,
-    /// by base entry. Derived from the log; maintained on commit and replay.
-    chains: HashMap<EntryId, Chain>,
-    /// Every committed log entry, in log order: entry `i` has ID `i + 1`.
-    /// Both kinds of world keep them (milestone 0), and an in-memory world
-    /// numbers them exactly as a file-backed one, genesis included. Doctor
-    /// replays these for an in-memory world.
-    entries: Vec<EntryInfo>,
-    /// The log file, for a file-backed world; `None` in memory.
-    log: Option<LogWriter>,
-    /// What opening the log cut off (default unless [`World::open`] cut a
-    /// torn tail).
-    recovery: RecoveryReport,
-    /// Writes are refused with [`Error::RecoveryUnacknowledged`]: the open
-    /// cut a damaged tail and [`World::acknowledge_recovery`] hasn't been
-    /// called yet. Never set for a torn cut, a clean open or a new world.
-    recovery_unacknowledged: bool,
-    /// Opened by [`World::open_read_only`]: every write is refused with
-    /// [`Error::ReadOnly`]. Such a world has no `log`.
-    read_only: bool,
+    /// What was committed, in author order: the kept log entries, the
+    /// latest tx, the correction chains and the log file (see [`Journal`]).
+    journal: Journal,
+    /// Whether writes are accepted at all, and what opening the log
+    /// recovered (see [`WriteGate`]).
+    gate: WriteGate,
 }
 
 impl World {
@@ -519,13 +509,8 @@ impl World {
                 edge_by_triple: HashMap::new(),
             },
             indexes: Indexes::new(fnv1a64),
-            latest_tx: TxId(0),
-            chains: HashMap::new(),
-            entries: Vec::new(),
-            log: None,
-            recovery: RecoveryReport::default(),
-            recovery_unacknowledged: false,
-            read_only: false,
+            journal: Journal::in_memory(),
+            gate: WriteGate::open(),
         };
         let settings: Vec<_> = schema
             .settings()
@@ -566,39 +551,10 @@ impl World {
                 .chain(attrs)
                 .chain(settings.iter().map(NewEntry::Schema)),
         )?;
-        world.record(genesis.entries.iter().cloned(), TxId(0));
+        world
+            .journal
+            .record(genesis.entries.iter().cloned(), TxId(0));
         Ok((world, genesis))
-    }
-
-    /// Keeps the entries of committed transaction `tx` (in log order, right
-    /// after the ones already kept) for [`World::entry`].
-    fn record(&mut self, entries: impl IntoIterator<Item = LogEntry>, tx: TxId) {
-        for e in entries {
-            self.record_one(e, tx);
-        }
-    }
-
-    /// Keeps one entry of committed transaction `tx` (see [`World::record`]).
-    fn record_one(&mut self, e: LogEntry, tx: TxId) {
-        // `World::entry` finds an entry by position, so IDs must be
-        // consecutive from 1: the log scan and `encode_txn` from
-        // `next_entry` guarantee it.
-        debug_assert_eq!(
-            e.id,
-            self.next_entry(),
-            "invariant: entries are kept in log order without gaps"
-        );
-        self.entries.push(EntryInfo {
-            id: e.id,
-            tx,
-            body: e.body,
-        });
-    }
-
-    /// The ID the next appended entry gets.
-    fn next_entry(&self) -> EntryId {
-        // A Vec's length always fits a u64.
-        EntryId(self.entries.len() as u64 + 1)
     }
 
     /// The committed entry with ID `id`: its tx and what it says, for every
@@ -608,21 +564,7 @@ impl World {
     /// dropped or failed to commit). Not limited by canon: every committed
     /// entry is visible.
     pub fn entry(&self, id: EntryId) -> Option<EntryInfo> {
-        self.kept_entry(id).cloned()
-    }
-
-    /// The kept entry with ID `id` (see [`World::entry`]), borrowed.
-    fn kept_entry(&self, id: EntryId) -> Option<&EntryInfo> {
-        let i = usize::try_from(id.0.checked_sub(1)?).ok()?;
-        match self.entries.get(i) {
-            Some(e) if e.id == id => Some(e),
-            // Only a doctor rebuild keeps entries with ID gaps (it leaves
-            // refused entries out); they still ascend, so search by ID.
-            _ => {
-                let i = self.entries.binary_search_by_key(&id, |e| e.id).ok()?;
-                self.entries.get(i)
-            }
-        }
+        self.journal.kept_entry(id).cloned()
     }
 
     /// Entry IDs generated by migration markers, which a script dumper must
@@ -630,44 +572,32 @@ impl World {
     /// ordinary replay validator, including intra-transaction schema changes.
     pub fn migration_copy_entries(&self) -> Result<std::collections::HashSet<EntryId>, Error> {
         let mut copies = std::collections::HashSet::new();
-        if !self
-            .entries
+        let kept = self.journal.entries();
+        if !kept
             .iter()
             .any(|e| matches!(e.body, EntryBody::Schema(SchemaEdit::Migration { .. })))
         {
             return Ok(copies);
         }
-        let genesis: Vec<_> = self
-            .entries
-            .iter()
-            .take_while(|e| e.tx == TxId(0))
-            .map(|e| LogEntry {
-                id: e.id,
-                body: e.body.clone(),
-            })
-            .collect();
-        let mut rebuilt = World::from_genesis(&genesis)?;
+        // Genesis entries are the kept ones of tx#0: a prefix.
+        let genesis_len = kept.iter().take_while(|e| e.tx == TxId(0)).count();
+        let entries = self.journal.log_entries();
+        let mut rebuilt = World::from_genesis(&entries[..genesis_len])?;
         // Same value interning as this world, as the doctor rebuild does.
         rebuilt.set_rebuild_hash(self.indexes.content_hash);
         let mut txn = ReplayTxn::default();
-        for entry in self.entries.iter().filter(|e| e.tx != TxId(0)) {
+        for (info, entry) in kept.iter().zip(&entries).filter(|(e, _)| e.tx != TxId(0)) {
             if !txn.migration_expected.is_empty() {
-                copies.insert(entry.id);
+                copies.insert(info.id);
             }
-            rebuilt.replay_entry(
-                &LogEntry {
-                    id: entry.id,
-                    body: entry.body.clone(),
-                },
-                &mut txn,
-            )?;
+            rebuilt.replay_entry(entry, &mut txn)?;
         }
         Ok(copies)
     }
 
     /// The path of a file-backed world's log; `None` in memory.
     pub(crate) fn log_path(&self) -> Option<&Path> {
-        self.log.as_ref().map(LogWriter::path)
+        self.journal.log_path()
     }
 
     /// Makes the next log append fail as `fault` says, to test failure
@@ -676,9 +606,7 @@ impl World {
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub fn inject_log_fault(&mut self, fault: log::LogFault) {
-        if let Some(log) = self.log.as_mut() {
-            log.inject_fault(fault);
-        }
+        self.journal.inject_log_fault(fault);
     }
 
     /// `Err` if the world refuses writes: a read-only world or an
@@ -686,20 +614,14 @@ impl World {
     /// [`World::accepts_writes`]), or a log append that failed earlier.
     fn writable(&self) -> Result<(), Error> {
         self.accepts_writes()?;
-        self.log.as_ref().map_or(Ok(()), LogWriter::check)
+        self.journal.check_log()
     }
 
     /// `Err(ReadOnly)` for a world from [`World::open_read_only`], else
     /// `Err(RecoveryUnacknowledged)` until a damaged-tail cut is
     /// acknowledged (see [`World::acknowledge_recovery`]).
     fn accepts_writes(&self) -> Result<(), Error> {
-        if self.read_only {
-            return Err(Error::ReadOnly);
-        }
-        if self.recovery_unacknowledged {
-            return Err(Error::RecoveryUnacknowledged);
-        }
-        Ok(())
+        self.gate.accepts_writes()
     }
 
     /// Acknowledges what [`World::open`] cut off the log, allowing writes
@@ -715,18 +637,18 @@ impl World {
     /// this does nothing. On a world from [`World::open_read_only`] it does
     /// nothing either: writes stay refused with [`Error::ReadOnly`].
     pub fn acknowledge_recovery(&mut self) {
-        self.recovery_unacknowledged = false;
+        self.gate.acknowledge_recovery();
     }
 
     /// What opening the log did to recover it (see [`RecoveryReport`]).
     pub fn recovery(&self) -> &RecoveryReport {
-        &self.recovery
+        self.gate.recovery()
     }
 
     /// The last committed transaction. Every write that stores a fact
     /// advances it by one; a failed or 0-changed write leaves it unchanged.
     pub fn latest_tx(&self) -> TxId {
-        self.latest_tx
+        self.journal.latest_tx()
     }
 
     /// The world's latest tick: the highest tick of any fact (assert or
@@ -870,7 +792,7 @@ impl World {
 
     /// The transaction number the next commit gets.
     fn next_tx(&self) -> TxId {
-        TxId(self.latest_tx.0 + 1)
+        self.journal.next_tx()
     }
 
     /// Looks up a known attribute and checks the entity is defined: the
@@ -902,11 +824,11 @@ impl World {
     /// corrections there were); at an older canon it reads the main
     /// indexes, skipping entries newer than `tx`.
     pub fn at_canon(&self, tx: TxId) -> View<'_> {
-        let canon = tx.min(self.latest_tx);
+        let canon = tx.min(self.latest_tx());
         View {
             world: self,
             canon,
-            latest: canon == self.latest_tx,
+            latest: canon == self.latest_tx(),
             work: Work::NONE,
         }
     }
@@ -920,7 +842,7 @@ impl World {
     pub fn at_canon_main(&self, tx: TxId) -> View<'_> {
         View {
             world: self,
-            canon: tx.min(self.latest_tx),
+            canon: tx.min(self.latest_tx()),
             latest: false,
             work: Work::NONE,
         }
@@ -935,14 +857,14 @@ impl World {
         v: &Value,
         t: Tick,
     ) -> Result<bool, Error> {
-        self.at_canon(self.latest_tx)
+        self.at_canon(self.latest_tx())
             .as_of_value(entity, attr, v, t)
     }
 
     /// Every entity (or edge) for which `attr = v` holds at tick `t`
     /// (latest canon). Same as [`View::lookup`] on `at_canon(latest_tx())`.
     pub fn lookup(&self, attr: &str, v: &Value, t: Tick) -> Result<Vec<EntityId>, Error> {
-        self.at_canon(self.latest_tx).lookup(attr, v, t)
+        self.at_canon(self.latest_tx()).lookup(attr, v, t)
     }
 
     /// Every entity of node type `node_type` (latest canon). Same as
@@ -951,7 +873,7 @@ impl World {
         &'w self,
         node_type: &str,
     ) -> Result<impl Iterator<Item = EntityId> + use<'w>, Error> {
-        self.at_canon(self.latest_tx).entities_of_type(node_type)
+        self.at_canon(self.latest_tx()).entities_of_type(node_type)
     }
 
     /// Every entity (or edge) with a value of the string attribute `attr`
@@ -959,13 +881,13 @@ impl World {
     /// (latest canon). Same as [`View::lookup_ci`] on
     /// `at_canon(latest_tx())`.
     pub fn lookup_ci(&self, attr: &str, text: &str, t: Tick) -> Result<Vec<EntityId>, Error> {
-        self.at_canon(self.latest_tx).lookup_ci(attr, text, t)
+        self.at_canon(self.latest_tx()).lookup_ci(attr, text, t)
     }
 
     /// Every value of `entity.attr` that holds at tick `t` (latest canon).
     /// Same as [`View::as_of`] on `at_canon(latest_tx())`.
     pub fn as_of(&self, entity: EntityId, attr: &str, t: Tick) -> Result<Vec<Value>, Error> {
-        self.at_canon(self.latest_tx).as_of(entity, attr, t)
+        self.at_canon(self.latest_tx()).as_of(entity, attr, t)
     }
 
     /// Every value of `entity.attr` holding at tick `t` (latest canon) with
@@ -977,13 +899,14 @@ impl World {
         attr: &str,
         t: Tick,
     ) -> Result<Vec<Change>, Error> {
-        self.at_canon(self.latest_tx).as_of_detail(entity, attr, t)
+        self.at_canon(self.latest_tx())
+            .as_of_detail(entity, attr, t)
     }
 
     /// Every `(entity, value)` pair of `attr` holding at tick `t` (latest
     /// canon). Same as [`View::attr_scan`] on `at_canon(latest_tx())`.
     pub fn attr_scan(&self, attr: &str, t: Tick) -> Result<Vec<(EntityId, Value)>, Error> {
-        self.at_canon(self.latest_tx).attr_scan(attr, t)
+        self.at_canon(self.latest_tx()).attr_scan(attr, t)
     }
 
     /// Size estimates of attribute `attr` for a query planner, over every
@@ -1012,13 +935,13 @@ impl World {
     /// The change points of `entity.attr` (latest canon).
     /// Same as [`View::history`] on `at_canon(latest_tx())`.
     pub fn history(&self, entity: EntityId, attr: &str) -> Result<Vec<Change>, Error> {
-        self.at_canon(self.latest_tx).history(entity, attr)
+        self.at_canon(self.latest_tx()).history(entity, attr)
     }
 
     /// The change points of `attr` across every entity and edge (latest
     /// canon). Same as [`View::history_scan`] on `at_canon(latest_tx())`.
     pub fn history_scan(&self, attr: &str) -> Result<Vec<(EntityId, Change)>, Error> {
-        self.at_canon(self.latest_tx).history_scan(attr)
+        self.at_canon(self.latest_tx()).history_scan(attr)
     }
 
     /// The ticks where `entity.attr` holds `value` (latest canon).
@@ -1029,14 +952,14 @@ impl World {
         attr: &str,
         value: &Value,
     ) -> Result<IntervalSet, Error> {
-        self.at_canon(self.latest_tx)
+        self.at_canon(self.latest_tx())
             .holds_during(entity, attr, value)
     }
 
     /// Every cardinality overlap of `attr` (latest canon).
     /// Same as [`View::overlaps`] on `at_canon(latest_tx())`.
     pub fn overlaps(&self, attr: &str) -> Result<Vec<Overlap>, Error> {
-        self.at_canon(self.latest_tx).overlaps(attr)
+        self.at_canon(self.latest_tx()).overlaps(attr)
     }
 
     /// The neighbors of `entity` through `attr` at tick `t` (latest canon).
@@ -1048,7 +971,7 @@ impl World {
         dir: Direction,
         t: Tick,
     ) -> Result<Vec<(EntityId, EdgeId)>, Error> {
-        self.at_canon(self.latest_tx)
+        self.at_canon(self.latest_tx())
             .neighbors(entity, attr, dir, t)
     }
 
@@ -1100,7 +1023,7 @@ impl World {
     /// failed to commit are never listed. Not limited by canon (filter on
     /// [`EntryInfo::tx`] for that). Each item is cloned as it is yielded.
     pub fn entries(&self) -> impl Iterator<Item = EntryInfo> + '_ {
-        self.entries.iter().cloned()
+        self.journal.entries().iter().cloned()
     }
 }
 
@@ -1212,8 +1135,14 @@ mod tests {
             .assert(mara, "ally_of", Value::Ref(greg), Some(Tick(5)))
             .unwrap();
         w.correct(a.entries[0], Correction::Delete).unwrap();
-        assert_eq!(w.indexes.e_latest, rebuilt(&w.indexes.e_index, w.latest_tx));
-        assert_eq!(w.indexes.r_latest, rebuilt(&w.indexes.r_index, w.latest_tx));
+        assert_eq!(
+            w.indexes.e_latest,
+            rebuilt(&w.indexes.e_index, w.latest_tx())
+        );
+        assert_eq!(
+            w.indexes.r_latest,
+            rebuilt(&w.indexes.r_index, w.latest_tx())
+        );
         // the deleted -250 key and the deleted pair are absent, the main
         // indexes still hold their entries
         assert_eq!(w.indexes.e_latest.len(), 2);
@@ -1237,11 +1166,11 @@ mod tests {
         assert!(w.as_of(greg, "located_in", at).unwrap().is_empty());
         assert_eq!(w.history(greg, "located_in").unwrap()[0].op, Op::Retract);
         assert!(
-            !w.at_canon(w.latest_tx)
+            !w.at_canon(w.latest_tx())
                 .as_of_value(greg, "located_in", &v, at)
                 .unwrap()
         );
-        let main = w.at_canon_main(w.latest_tx);
+        let main = w.at_canon_main(w.latest_tx());
         assert!(main.as_of_value(greg, "located_in", &v, at).unwrap());
         assert_eq!(main.as_of(greg, "located_in", at).unwrap(), vec![v.clone()]);
         assert_eq!(main.history(greg, "located_in").unwrap()[0].op, Op::Assert);
@@ -1259,7 +1188,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let main = w.at_canon_main(w.latest_tx);
+        let main = w.at_canon_main(w.latest_tx());
         assert_eq!(
             main.neighbors(varrow, "located_in", Direction::In, at)
                 .unwrap()
@@ -1274,7 +1203,7 @@ mod tests {
         let v = Value::Ref(varrow);
         w.assert(greg, "located_in", v.clone(), Some(Tick(1)))
             .unwrap();
-        let first = w.latest_tx;
+        let first = w.latest_tx();
         w.assert(greg, "located_in", Value::Ref(greg), Some(Tick(2)))
             .unwrap();
         w.indexes.e_latest.clear();

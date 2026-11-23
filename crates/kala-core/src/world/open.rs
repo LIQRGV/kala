@@ -153,34 +153,6 @@ fn genesis_schema(entries: &[LogEntry]) -> Result<Schema, Error> {
     Ok(schema)
 }
 
-/// A fact as a `Fact` or `Revised` entry says it: `(entity, attr, value,
-/// tick, op, precision)`.
-type FactFields<'b> = (EntityId, AttrId, &'b Value, Tick, Op, Precision);
-
-/// The fact a `Fact` or `Revised` entry says; `None` for any other entry.
-pub(super) fn as_fact(body: &EntryBody) -> Option<FactFields<'_>> {
-    match body {
-        EntryBody::Fact {
-            entity,
-            attr,
-            value,
-            tick,
-            op,
-            precision,
-        }
-        | EntryBody::Revised {
-            entity,
-            attr,
-            value,
-            tick,
-            op,
-            precision,
-            ..
-        } => Some((*entity, *attr, value, *tick, *op, *precision)),
-        _ => None,
-    }
-}
-
 impl World {
     /// Creates a new world backed by a new log file at `path`.
     ///
@@ -205,7 +177,7 @@ impl World {
     /// so the failed commit doesn't reappear on reopen.
     pub fn create(path: &Path, schema: Schema) -> Result<World, Error> {
         let (mut world, genesis) = World::with_genesis(schema)?;
-        world.log = Some(LogWriter::create(path, &genesis)?);
+        world.journal.attach_log(LogWriter::create(path, &genesis)?);
         Ok(world)
     }
 
@@ -268,9 +240,8 @@ impl World {
 
     fn open_with(path: &Path, cut_damaged: bool) -> Result<World, Error> {
         let (mut world, writer, recovery) = LogWriter::open(path, World::replay, cut_damaged)?;
-        world.log = Some(writer);
-        world.recovery_unacknowledged = recovery.cause == Some(CutCause::Damaged);
-        world.recovery = recovery;
+        world.journal.attach_log(writer);
+        world.gate = WriteGate::after_recovery(recovery);
         Ok(world)
     }
 
@@ -301,8 +272,7 @@ impl World {
     /// [`Error::Corrupt`] for any damage other than a torn or damaged tail.
     pub fn open_read_only(path: &Path) -> Result<World, Error> {
         let (mut world, recovery) = LogWriter::read_committed(path, World::replay)?;
-        world.read_only = true;
-        world.recovery = recovery;
+        world.gate = WriteGate::read_only(recovery);
         Ok(world)
     }
 
@@ -311,15 +281,7 @@ impl World {
     /// Replays the kept entries with the same validation as opening a world;
     /// costs O(log size) memory and replay work. Recovery tails are not copied.
     pub fn preview_copy(&self) -> Result<World, Error> {
-        let entries: Vec<LogEntry> = self
-            .entries
-            .iter()
-            .map(|e| LogEntry {
-                id: e.id,
-                body: e.body.clone(),
-            })
-            .collect();
-        World::replay_with_hash(&entries, self.indexes.content_hash)
+        World::replay_with_hash(&self.journal.log_entries(), self.indexes.content_hash)
     }
 
     /// Rebuilds a world from the entries of a log's committed transactions.
@@ -355,18 +317,16 @@ impl World {
         let mut world = World::in_memory(genesis_schema(defines)?)
             .map_err(|e| Error::Corrupt(format!("genesis schema: {e}")))?;
         // Keep the genesis entries as the file has them, not as this build
-        // would re-encode them: `entry` reports what the log says. Pushed
+        // would re-encode them: `entry` reports what the log says. Kept
         // as given, not through `record_one`: `World::open`'s scan has
         // already refused entry IDs that don't start at 1, but doctor's
         // survey reports them (`EntryIdGap`) and rebuilds anyway, and a
         // rebuild copes with ascending IDs that have gaps (see
-        // `World::kept_entry`).
-        world.entries.clear();
-        world.entries.extend(genesis.iter().map(|e| EntryInfo {
-            id: e.id,
-            tx: TxId(0),
-            body: e.body.clone(),
-        }));
+        // `Journal::kept_entry`).
+        world.journal.clear_entries();
+        for e in genesis {
+            world.journal.keep(e, TxId(0));
+        }
         Ok(world)
     }
 
@@ -384,7 +344,7 @@ impl World {
         let tx = self.next_tx();
         self.apply_entry(entry, txn)
             .map_err(|fault| Error::Corrupt(format!("entry#{}: {fault}", entry.id.0)))?;
-        self.record_one(entry.clone(), tx);
+        self.journal.record_one(entry.clone(), tx);
         Ok(())
     }
 
@@ -395,7 +355,7 @@ impl World {
     /// committed at `tx` whatever happened to its entries, so the next one
     /// replays at its own tx even after a skipped transaction (a gap).
     ///
-    /// Entries kept this way may have ID gaps; [`World::kept_entry`] copes.
+    /// Entries kept this way may have ID gaps; `Journal::kept_entry` copes.
     /// Only a doctor rebuild, never a live world, takes this path.
     pub(crate) fn replay_txn_collecting(
         &mut self,
@@ -403,52 +363,34 @@ impl World {
         entries: &[LogEntry],
         mut refused: impl FnMut(EntryId, ReplayFault),
     ) {
-        if tx <= self.latest_tx {
+        if tx <= self.latest_tx() {
             // A scan only hands over ascending txs; refuse rather than rewind.
             if let Some(first) = entries.first() {
                 refused(
                     first.id,
-                    ReplayFault::Invalid(format!("{tx:?} after {:?}", self.latest_tx)),
+                    ReplayFault::Invalid(format!("{tx:?} after {:?}", self.latest_tx())),
                 );
             }
             return;
         }
         // Facts are keyed at `next_tx()`: make that `tx`.
-        self.latest_tx = TxId(tx.0 - 1);
+        self.journal.set_latest_tx(TxId(tx.0 - 1));
         let mut txn = ReplayTxn::default();
         for entry in entries {
             match self.apply_entry(entry, &mut txn) {
-                Ok(()) => self.entries.push(EntryInfo {
-                    id: entry.id,
-                    tx,
-                    body: entry.body.clone(),
-                }),
+                Ok(()) => self.journal.keep(entry, tx),
                 Err(fault) => refused(entry.id, fault),
             }
         }
         // Also when its Commit was refused: the transaction is over.
-        self.latest_tx = tx;
+        self.journal.set_latest_tx(tx);
     }
 
     /// Every kept entry grouped by transaction, in log order: what doctor
     /// replays for an in-memory world (a file-backed one is re-read from
     /// disk instead).
     pub(crate) fn kept_txns(&self) -> Vec<SurveyedTxn> {
-        let mut txns: Vec<SurveyedTxn> = Vec::new();
-        for e in &self.entries {
-            let entry = LogEntry {
-                id: e.id,
-                body: e.body.clone(),
-            };
-            match txns.last_mut() {
-                Some(t) if t.tx == e.tx => t.entries.push(entry),
-                _ => txns.push(SurveyedTxn {
-                    tx: e.tx,
-                    entries: vec![entry],
-                }),
-            }
-        }
-        txns
+        self.journal.kept_txns()
     }
 
     /// Validates and applies one replayed entry (see
@@ -682,7 +624,10 @@ impl World {
                         &"bidirectional DELETED marker with entity > value",
                     ));
                 }
-                let chain = self.replay_chain(*of).map_err(|why| bad_correction(&why))?;
+                let chain = self
+                    .journal
+                    .replay_chain(*of)
+                    .map_err(|why| bad_correction(&why))?;
                 let current = chain.current.ok_or_else(|| {
                     bad_correction(&format!("the chain of entry#{} is already deleted", of.0))
                 })?;
@@ -692,7 +637,7 @@ impl World {
                 let fact = self
                     .stored_fact_def(*entity, *attr, value, *tick, Op::Assert)
                     .map_err(ReplayFault::Refused)?;
-                if self.op_if_at_key(current, &fact).is_none() {
+                if self.journal.op_if_at_key(current, &fact).is_none() {
                     return Err(bad_correction(&format!(
                         "DELETED marker not at the current key of entry#{}",
                         of.0
@@ -700,13 +645,7 @@ impl World {
                 }
                 txn.claim_key(&fact).map_err(|why| corrupt(&why))?;
                 self.index_entry(&fact, Mark::Deleted, self.next_tx());
-                self.chains.insert(
-                    *of,
-                    Chain {
-                        rev: *rev,
-                        current: None,
-                    },
-                );
+                self.journal.set_chain(*of, *rev, None);
                 txn.prev_deleted = Some((*of, *rev));
                 Ok(())
             }
@@ -760,7 +699,10 @@ impl World {
                         &"revised ref assert with no edge defined before it",
                     ));
                 }
-                let chain = self.replay_chain(*of).map_err(|why| bad_correction(&why))?;
+                let chain = self
+                    .journal
+                    .replay_chain(*of)
+                    .map_err(|why| bad_correction(&why))?;
                 if prev_deleted == Some((*of, *rev)) {
                     // A moved key, right after the DELETED marker of the old
                     // one (which already took this rev). The same-tick rule
@@ -788,7 +730,8 @@ impl World {
                         ))
                     })?;
                     check_next_rev(chain, *of, *rev)?;
-                    let Some((c_op, c_precision)) = self.op_if_at_key(current, &fact) else {
+                    let Some((c_op, c_precision)) = self.journal.op_if_at_key(current, &fact)
+                    else {
                         return Err(bad_correction(&format!(
                             "a revision of entry#{} at another key not right after its \
                              DELETED marker",
@@ -812,13 +755,7 @@ impl World {
                         .remove(&(fact.entity, fact.attr, target));
                 }
                 self.index_entry(&fact, Mark::from(fact.op), self.next_tx());
-                self.chains.insert(
-                    *of,
-                    Chain {
-                        rev: *rev,
-                        current: Some(entry.id),
-                    },
-                );
+                self.journal.set_chain(*of, *rev, Some(entry.id));
                 Ok(())
             }
             EntryBody::Commit { tx, .. } => {
@@ -837,23 +774,9 @@ impl World {
                     )));
                 }
                 *txn = ReplayTxn::default();
-                self.latest_tx = *tx;
+                self.journal.set_latest_tx(*tx);
                 Ok(())
             }
         }
-    }
-
-    /// Replay: the state of the chain a correction names as `of`, which
-    /// must be an earlier base `Fact` entry (a live correction only names
-    /// committed entries, and resolves a chain to its base).
-    fn replay_chain(&self, of: EntryId) -> Result<Chain, String> {
-        let base = self
-            .kept_entry(of)
-            .filter(|b| b.tx <= self.latest_tx)
-            .ok_or_else(|| format!("corrects entry#{}, not an earlier entry", of.0))?;
-        if !matches!(base.body, EntryBody::Fact { .. }) {
-            return Err(format!("corrects entry#{}, not a base fact", of.0));
-        }
-        Ok(self.chain(of))
     }
 }

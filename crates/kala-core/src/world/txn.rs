@@ -35,18 +35,6 @@ impl Staged {
     }
 }
 
-/// The correction state of one revision chain (keyed by its base entry in
-/// [`World::chains`]). A chain no correction has touched has none: see
-/// [`Chain::untouched`].
-#[derive(Clone, Copy, Debug)]
-pub(super) struct Chain {
-    /// The chain's last revision (0 = only the base entry).
-    pub(super) rev: u32,
-    /// The entry holding the chain's current fact (the base or its last
-    /// `Revised`), or `None` if the last correction deleted it.
-    pub(super) current: Option<EntryId>,
-}
-
 /// What a correction acts on (from [`World::correction_target`]).
 #[derive(Debug)]
 pub(super) struct Target {
@@ -57,16 +45,6 @@ pub(super) struct Target {
     pub(super) fact: FactDef,
     /// Its value, decoded.
     pub(super) value: Value,
-}
-
-impl Chain {
-    /// The state of the chain of base entry `base` before any correction.
-    fn untouched(base: EntryId) -> Chain {
-        Chain {
-            rev: 0,
-            current: Some(base),
-        }
-    }
 }
 
 /// Outcome of judging a valid write against the stored facts.
@@ -517,7 +495,7 @@ impl Txn<'_> {
         self.world.accepts_writes()?;
         if self.order.is_empty() {
             return Ok(CommitResult {
-                tx: self.world.latest_tx,
+                tx: self.world.latest_tx(),
                 changed: 0,
                 declared: 0,
                 entries: Vec::new(),
@@ -562,9 +540,7 @@ impl Txn<'_> {
         } else {
             self.world.overlaps_of_sides(&touched)
         };
-        if let Some(log) = self.world.log.as_mut() {
-            log.append(&encoded)?;
-        }
+        self.world.journal.append(&encoded)?;
         let mut entries = Vec::new();
         let edges = self.ids.edges.iter().map(|d| d.id).collect();
         let mut migrating = false;
@@ -607,30 +583,18 @@ impl Txn<'_> {
                     match entry {
                         Staged::Fact(_) => {}
                         Staged::Deleted { of, rev, .. } => {
-                            self.world.chains.insert(
-                                *of,
-                                Chain {
-                                    rev: *rev,
-                                    current: None,
-                                },
-                            );
+                            self.world.journal.set_chain(*of, *rev, None);
                         }
                         Staged::Revised { of, rev, .. } => {
-                            self.world.chains.insert(
-                                *of,
-                                Chain {
-                                    rev: *rev,
-                                    current: Some(logged.id),
-                                },
-                            );
+                            self.world.journal.set_chain(*of, *rev, Some(logged.id));
                         }
                     }
                     entries.push(logged.id);
                 }
             }
         }
-        self.world.latest_tx = self.tx;
-        self.world.record(encoded.entries, self.tx);
+        self.world.journal.set_latest_tx(self.tx);
+        self.world.journal.record(encoded.entries, self.tx);
         let after = if !warn {
             Vec::new()
         } else if schema_changed {
@@ -804,19 +768,19 @@ impl World {
     /// `Revised` entry of its chain): the chain's base entry, its state and
     /// its current fact (as stored, encoded). Changes nothing.
     pub(super) fn correction_target(&self, entry: EntryId) -> Result<Target, Error> {
-        let info = self.kept_entry(entry).ok_or(Error::UnknownEntry(entry))?;
+        let info = self
+            .journal
+            .kept_entry(entry)
+            .ok_or(Error::UnknownEntry(entry))?;
         let base = match info.body {
             EntryBody::Fact { .. } => entry,
             // A Revised entry always names its chain's base (replay checks it).
             EntryBody::Revised { of, .. } => of,
             _ => return Err(Error::NotAFact(entry)),
         };
-        let chain = self.chain(base);
+        let chain = self.journal.chain(base);
         let current = chain.current.ok_or(Error::AlreadyDeleted(entry))?;
-        let (entity, attr, value, tick, op, precision) = self
-            .kept_entry(current)
-            .and_then(|info| as_fact(&info.body))
-            .expect("invariant: a chain's current entry is a committed Fact or Revised entry");
+        let (entity, attr, value, tick, op, precision) = self.journal.current_fact(current);
         // A committed fact's value was encoded once before; it encodes.
         let mut fact = self.stored_fact_def(entity, attr, value, tick, op)?;
         fact.precision = precision;
@@ -826,28 +790,6 @@ impl World {
             fact,
             value: value.clone(),
         })
-    }
-
-    /// The correction state of the chain of base entry `base`.
-    pub(super) fn chain(&self, base: EntryId) -> Chain {
-        self.chains
-            .get(&base)
-            .copied()
-            .unwrap_or(Chain::untouched(base))
-    }
-
-    /// Replay: the op and precision of the committed fact entry `current`
-    /// (a chain's current fact) if `fact` is at its key, else `None`.
-    /// Values compare by encoding: exact bytes.
-    pub(super) fn op_if_at_key(&self, current: EntryId, fact: &FactDef) -> Option<(Op, Precision)> {
-        let (entity, attr, value, tick, op, precision) = self
-            .kept_entry(current)
-            .and_then(|info| as_fact(&info.body))
-            .expect("invariant: a chain's current entry is a committed Fact or Revised entry");
-        // Committed values were encoded once before, so they encode.
-        let same = (entity, attr, tick) == (fact.entity, fact.attr, fact.tick)
-            && value.encode().is_ok_and(|v| v == fact.value);
-        same.then_some((op, precision))
     }
 
     /// One auto-committed write: a transaction holding just this write.
@@ -1113,7 +1055,7 @@ impl World {
     /// that involve one of its touched values, one list per entry (see
     /// [`View::overlaps_of_touching`]).
     fn overlaps_of_sides(&self, sides: &[TouchedSide]) -> Vec<Vec<Overlap>> {
-        let view = self.at_canon(self.latest_tx);
+        let view = self.at_canon(self.latest_tx());
         sides
             .iter()
             .map(|t| {

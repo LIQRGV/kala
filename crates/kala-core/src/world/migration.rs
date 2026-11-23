@@ -64,7 +64,7 @@ impl Txn<'_> {
     ) -> Vec<(EntityId, Change)> {
         let mut points = BTreeMap::new();
         let mutual = self.world.is_bidirectional(attr);
-        let view = self.world.at_canon(self.world.latest_tx);
+        let view = self.world.at_canon(self.world.latest_tx());
         let ids: Box<dyn Iterator<Item = EntityId> + '_> = match subjects {
             Some(ids) => Box::new(ids.iter().copied()),
             None => Box::new(self.world.defined_ids()),
@@ -183,10 +183,7 @@ impl Txn<'_> {
             }
             check_direction(&def)?;
             if old.kind == Kind::State && def.kind == Kind::Event {
-                let logged_retract = txn.world.entries.iter().any(|e| {
-                    as_fact(&e.body)
-                        .is_some_and(|(_, a, _, _, op, _)| a == source && op == Op::Retract)
-                });
+                let logged_retract = txn.world.journal.has_retract_of(source);
                 let staged_retract = txn.entries.iter().any(|e| {
                     let (f, m) = e.key_and_mark();
                     f.attr == source && m == Mark::Retract

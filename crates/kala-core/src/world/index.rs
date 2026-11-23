@@ -578,27 +578,18 @@ impl World {
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub fn set_content_hash(&mut self, f: fn(&[u8]) -> u64) {
-        let entries: Vec<LogEntry> = self
-            .entries
-            .iter()
-            .map(|e| LogEntry {
-                id: e.id,
-                body: e.body.clone(),
-            })
-            .collect();
-        let rebuilt = World::replay_with_hash(&entries, f)
+        let rebuilt = World::replay_with_hash(&self.journal.log_entries(), f)
             .expect("invariant: a world's kept entries replay cleanly");
         // The rebuild holds the same schema, IDs and entries; what is kept
-        // from this World is what isn't derived from the log.
-        let log = self.log.take();
-        let recovery = std::mem::take(&mut self.recovery);
-        let unacknowledged = self.recovery_unacknowledged;
-        let read_only = self.read_only;
+        // from this World is what isn't derived from the log: the log file
+        // and the write gate.
+        let log = self.journal.detach_log();
+        let gate = std::mem::take(&mut self.gate);
         *self = rebuilt;
-        self.log = log;
-        self.recovery = recovery;
-        self.recovery_unacknowledged = unacknowledged;
-        self.read_only = read_only;
+        if let Some(log) = log {
+            self.journal.attach_log(log);
+        }
+        self.gate = gate;
     }
 
     /// The stored indexes, for doctor to compare against a rebuild.

@@ -832,7 +832,7 @@ impl<'w> View<'w> {
 
 impl World {
     pub(super) fn all_overlaps(&self) -> Vec<Overlap> {
-        self.at_canon(self.latest_tx)
+        self.at_canon(self.latest_tx())
             .attributes()
             .flat_map(|def| self.overlaps(&def.name).unwrap_or_default())
             .collect()
@@ -887,7 +887,7 @@ impl Txn<'_> {
                 },
             },
         });
-        log::encode_txn(self.world.next_entry(), self.tx, items)
+        log::encode_txn(self.world.journal.next_entry(), self.tx, items)
     }
 }
 
@@ -923,7 +923,7 @@ impl World {
     pub fn tamper_schema(&mut self) {
         self.catalog
             .settings
-            .push((self.latest_tx, "schema".into(), "strict".into()));
+            .push((self.latest_tx(), "schema".into(), "strict".into()));
     }
 }
 
