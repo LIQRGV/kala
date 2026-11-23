@@ -943,7 +943,16 @@ impl<'w> Compiler<'w> {
     /// binds an op (its own type, never a value's: compared with it,
     /// `:assert` / `:retract` are op constants, not handles).
     fn history(&mut self, h: &HistoryPos, scope: &mut Scope) -> Result<Hist, DatalogError> {
-        let tick = match &h.tick {
+        Ok(Hist {
+            tick: self.history_tick(&h.tick, scope)?,
+            op: self.history_op(h.op.as_ref(), scope)?,
+            precision: self.history_precision(h.precision.as_ref(), scope)?,
+        })
+    }
+
+    /// The tick position of a history pattern.
+    fn history_tick(&mut self, tick: &Item, scope: &mut Scope) -> Result<Term, DatalogError> {
+        Ok(match tick {
             Item::Var(s) if self.is_param(scope, &s.name) => {
                 self.use_param(s, ValueType::I64, ParamKind::Tick)?;
                 Term::Param(s.name.clone())
@@ -963,8 +972,16 @@ impl<'w> Compiler<'w> {
                     "the tick position of a history pattern is a variable, an integer or `_`",
                 ));
             }
-        };
-        let op = match &h.op {
+        })
+    }
+
+    /// The op position of a history pattern (absent: any op).
+    fn history_op(
+        &mut self,
+        op: Option<&OpItem>,
+        scope: &mut Scope,
+    ) -> Result<OpTerm, DatalogError> {
+        Ok(match op {
             None | Some(OpItem::Any(_)) => OpTerm::Any,
             Some(OpItem::Assert(_)) => OpTerm::Const(kala_core::Op::Assert),
             Some(OpItem::Retract(_)) => OpTerm::Const(kala_core::Op::Retract),
@@ -983,8 +1000,16 @@ impl<'w> Compiler<'w> {
                 scope.bound.insert(s.name.clone());
                 OpTerm::Var(scope.var(&s.name))
             }
-        };
-        let precision = match &h.precision {
+        })
+    }
+
+    /// The precision position of a history pattern (absent: any precision).
+    fn history_precision(
+        &mut self,
+        precision: Option<&Item>,
+        scope: &mut Scope,
+    ) -> Result<Term, DatalogError> {
+        Ok(match precision {
             None | Some(Item::Any(_)) => Term::Any,
             Some(Item::Var(s)) if self.is_param(scope, &s.name) => {
                 return Err(param_not_a_value(s, Ty::Precision));
@@ -998,11 +1023,6 @@ impl<'w> Compiler<'w> {
                 precision_constant(i)
                     .ok_or_else(|| mismatch(i.span(), "expected a precision keyword"))?,
             ),
-        };
-        Ok(Hist {
-            tick,
-            op,
-            precision,
         })
     }
 

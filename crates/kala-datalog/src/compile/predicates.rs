@@ -38,7 +38,21 @@ impl Compiler<'_> {
             apps.push(self.func(f, scope)?);
         }
         // Operand checks that don't depend on other predicates come first.
-        for &(scope, p) in &preds {
+        self.check_operands(&preds)?;
+        let filts = self.resolve_predicates(&preds)?;
+        // Every predicate is resolved; hand them back in collection order.
+        let mut filts = filts.into_iter();
+        let mut apps = apps.into_iter();
+        Ok(bodies
+            .into_iter()
+            .map(|b| planned_body(b, &mut filts, &mut apps))
+            .collect())
+    }
+
+    /// Checks every predicate's operands: a variable must be bound in its
+    /// scope, and `_` can't be compared.
+    fn check_operands(&self, preds: &[(&Scope, &Pred)]) -> Result<(), DatalogError> {
+        for &(scope, p) in preds {
             for item in [&p.left, &p.right] {
                 match item {
                     Item::Var(s) if !self.is_param(scope, &s.name) => {
@@ -63,6 +77,13 @@ impl Compiler<'_> {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Resolves the predicates, revisiting the ones whose operands are
+    /// still untyped parameters until no more types are learned; one left
+    /// untyped is an error.
+    fn resolve_predicates(&mut self, preds: &[(&Scope, &Pred)]) -> Result<Vec<Filt>, DatalogError> {
         let mut done = vec![false; preds.len()];
         let mut out: Vec<Option<Filt>> = (0..preds.len()).map(|_| None).collect();
         loop {
@@ -95,13 +116,7 @@ impl Compiler<'_> {
                 "can't tell the type of a parameter that is only compared with another parameter",
             ));
         }
-        // Every predicate is resolved; hand them back in collection order.
-        let mut filts = out.into_iter().flatten();
-        let mut apps = apps.into_iter();
-        Ok(bodies
-            .into_iter()
-            .map(|b| planned_body(b, &mut filts, &mut apps))
-            .collect())
+        Ok(out.into_iter().flatten().collect())
     }
 
     /// One predicate, or `None` if both operands are still untyped params.
@@ -222,75 +237,10 @@ impl Compiler<'_> {
     /// argument must be bound and an interval set (`contains`'s tick an
     /// i64 variable, integer or param).
     fn func(&mut self, f: &FnClause, scope: &Scope) -> Result<App, DatalogError> {
-        let name = f.func.name();
         let mut args = Vec::with_capacity(f.args.len());
         let mut vars = Vec::new();
         for (i, a) in f.args.iter().enumerate() {
-            let tick = f.func == Func::Contains && i == 1;
-            let want = if tick {
-                Ty::Val(ValueType::I64)
-            } else {
-                Ty::Intervals
-            };
-            args.push(match a {
-                Item::Any(span) => {
-                    return Err(DatalogError::new(
-                        ErrorKind::Syntax,
-                        Some(*span),
-                        format!("`_` can't be an argument of `{name}`"),
-                    ));
-                }
-                Item::Var(s) if self.is_param(scope, &s.name) => {
-                    if !tick {
-                        return Err(param_not_a_value(s, want));
-                    }
-                    self.use_param(s, ValueType::I64, ParamKind::Tick)?;
-                    Term::Param(s.name.clone())
-                }
-                Item::Var(s) => {
-                    if !scope.bound.contains(&s.name) {
-                        return Err(unbound(
-                            s.span,
-                            format!(
-                                "?{} is not bound by any pattern, rule call or function",
-                                show(&s.name)
-                            ),
-                        ));
-                    }
-                    if let Some(&t) = scope.types.get(&s.name)
-                        && t != want
-                    {
-                        return Err(mismatch(
-                            s.span,
-                            format!(
-                                "argument {} of `{name}` needs {}, but ?{} is {}",
-                                i + 1,
-                                ty_name(want),
-                                show(&s.name),
-                                ty_name(t)
-                            ),
-                        ));
-                    }
-                    let v = scope.var(&s.name);
-                    vars.push(v.0.clone());
-                    Term::Var(v)
-                }
-                Item::Int(n, _) if tick => Term::Const(Value::I64(*n)),
-                other => {
-                    return Err(mismatch(
-                        other.span(),
-                        format!(
-                            "argument {} of `{name}` needs {}, not a constant of another type",
-                            i + 1,
-                            if tick {
-                                "an i64 tick"
-                            } else {
-                                "an interval set (a variable bound by `during` or a set function)"
-                            }
-                        ),
-                    ));
-                }
-            });
+            args.push(self.func_arg(f, i, a, scope, &mut vars)?);
         }
         Ok(App {
             func: f.func,
@@ -298,6 +248,84 @@ impl Compiler<'_> {
             out: f.out.as_ref().map(|o| scope.var(&o.name)),
             vars,
             span: f.span,
+        })
+    }
+
+    /// Argument `i` of function clause `f` as a term; a variable argument
+    /// is noted in `vars`.
+    fn func_arg(
+        &mut self,
+        f: &FnClause,
+        i: usize,
+        a: &Item,
+        scope: &Scope,
+        vars: &mut Vec<String>,
+    ) -> Result<Term, DatalogError> {
+        let name = f.func.name();
+        let tick = f.func == Func::Contains && i == 1;
+        let want = if tick {
+            Ty::Val(ValueType::I64)
+        } else {
+            Ty::Intervals
+        };
+        Ok(match a {
+            Item::Any(span) => {
+                return Err(DatalogError::new(
+                    ErrorKind::Syntax,
+                    Some(*span),
+                    format!("`_` can't be an argument of `{name}`"),
+                ));
+            }
+            Item::Var(s) if self.is_param(scope, &s.name) => {
+                if !tick {
+                    return Err(param_not_a_value(s, want));
+                }
+                self.use_param(s, ValueType::I64, ParamKind::Tick)?;
+                Term::Param(s.name.clone())
+            }
+            Item::Var(s) => {
+                if !scope.bound.contains(&s.name) {
+                    return Err(unbound(
+                        s.span,
+                        format!(
+                            "?{} is not bound by any pattern, rule call or function",
+                            show(&s.name)
+                        ),
+                    ));
+                }
+                if let Some(&t) = scope.types.get(&s.name)
+                    && t != want
+                {
+                    return Err(mismatch(
+                        s.span,
+                        format!(
+                            "argument {} of `{name}` needs {}, but ?{} is {}",
+                            i + 1,
+                            ty_name(want),
+                            show(&s.name),
+                            ty_name(t)
+                        ),
+                    ));
+                }
+                let v = scope.var(&s.name);
+                vars.push(v.0.clone());
+                Term::Var(v)
+            }
+            Item::Int(n, _) if tick => Term::Const(Value::I64(*n)),
+            other => {
+                return Err(mismatch(
+                    other.span(),
+                    format!(
+                        "argument {} of `{name}` needs {}, not a constant of another type",
+                        i + 1,
+                        if tick {
+                            "an i64 tick"
+                        } else {
+                            "an interval set (a variable bound by `during` or a set function)"
+                        }
+                    ),
+                ));
+            }
         })
     }
 }
