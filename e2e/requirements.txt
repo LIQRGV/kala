@@ -1,0 +1,2 @@
+# Latest stable 5.x verified against PyPI on 2026-11-23.
+neo4j==5.28.8

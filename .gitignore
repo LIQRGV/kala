@@ -12,3 +12,7 @@
 /docs
 
 CLAUDE.md
+
+# Optional Python driver E2E environment and bytecode
+/e2e/.venv/
+__pycache__/
