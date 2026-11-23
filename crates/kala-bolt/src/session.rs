@@ -188,13 +188,16 @@ impl Session<'_> {
                 // `kala_version`; drivers ignore unknown keys).
                 let mut hints = Map::new();
                 // Lets pooled drivers retire connections before the idle
-                // timeout closes them.
-                hints.insert(
-                    "connection.recv_timeout_seconds".into(),
-                    Value::Integer(
-                        i64::try_from(self.config.idle_timeout.as_secs()).unwrap_or(i64::MAX),
-                    ),
-                );
+                // timeout closes them. Drivers also use it as a read timeout
+                // while waiting for a response, so it is only sent for a
+                // whole number of seconds (0 means "none" to some drivers).
+                let secs = self.config.idle_timeout.as_secs();
+                if secs >= 1 {
+                    hints.insert(
+                        "connection.recv_timeout_seconds".into(),
+                        Value::Integer(i64::try_from(secs).unwrap_or(i64::MAX)),
+                    );
+                }
                 success([
                     ("server", Value::String("Neo4j/5.0.0".into())),
                     (

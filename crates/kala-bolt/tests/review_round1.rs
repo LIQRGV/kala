@@ -163,3 +163,16 @@ fn a_handle_attribute_is_not_overwritten_by_the_world_handle() {
     assert_eq!(props.get("handle"), Some(&string("greywolf")));
     let _ = metadata;
 }
+
+// Review round 2: a sub-second idle timeout sends no recv-timeout hint (0
+// means "none" to some drivers).
+#[test]
+fn sub_second_idle_timeout_sends_no_hint() {
+    let config = ServerConfig {
+        idle_timeout: std::time::Duration::from_millis(500),
+        ..ServerConfig::default()
+    };
+    let server = Running::with_config(config);
+    let meta = hello_metadata(&server);
+    assert_eq!(meta.get("hints"), Some(&map(&[])));
+}

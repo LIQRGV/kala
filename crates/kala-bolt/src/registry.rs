@@ -8,6 +8,10 @@ use std::sync::{Arc, Mutex};
 struct Database {
     path: PathBuf,
     cached: Mutex<Option<(Stamp, Arc<World>)>>,
+    /// Held while a snapshot is reloaded, so concurrent RUNs that need the
+    /// new snapshot share one replay instead of each replaying the world
+    /// (peak memory stays at about two snapshots, not one per connection).
+    loading: Mutex<()>,
 }
 
 /// What a cached snapshot was loaded from. The length alone is not enough:
@@ -19,6 +23,8 @@ struct Database {
 struct Stamp {
     len: u64,
     modified: Option<std::time::SystemTime>,
+    /// `(dev, ino)` of the file the tail was read from (Unix).
+    file: Option<(u64, u64)>,
     tail: Vec<u8>,
 }
 
@@ -31,9 +37,26 @@ fn stamp(path: &Path) -> Result<Stamp, Failure> {
     if !metadata.file_type().is_file() {
         return Err(Failure::store("world is not a regular file"));
     }
-    let len = metadata.len();
-    let mut tail = Vec::new();
     let mut file = std::fs::File::open(path).map_err(Failure::store)?;
+    // Describe the file actually opened (fstat), not the path checked
+    // before (lstat): length, mtime and tail all come from one inode, and a
+    // swap between the two calls is refused rather than half-described.
+    let opened = file.metadata().map_err(Failure::store)?;
+    if !opened.file_type().is_file() {
+        return Err(Failure::store("world is not a regular file"));
+    }
+    #[cfg(unix)]
+    let file_id = {
+        use std::os::unix::fs::MetadataExt;
+        if (metadata.dev(), metadata.ino()) != (opened.dev(), opened.ino()) {
+            return Err(Failure::store("world file changed while being checked"));
+        }
+        Some((opened.dev(), opened.ino()))
+    };
+    #[cfg(not(unix))]
+    let file_id = None;
+    let len = opened.len();
+    let mut tail = Vec::new();
     file.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))
         .map_err(Failure::store)?;
     file.take(TAIL_BYTES)
@@ -41,7 +64,8 @@ fn stamp(path: &Path) -> Result<Stamp, Failure> {
         .map_err(Failure::store)?;
     Ok(Stamp {
         len,
-        modified: metadata.modified().ok(),
+        modified: opened.modified().ok(),
+        file: file_id,
         tail,
     })
 }
@@ -63,6 +87,7 @@ impl Registry {
                     Database {
                         path: entry.path(),
                         cached: Mutex::new(None),
+                        loading: Mutex::new(()),
                     },
                 );
             } else {
@@ -104,9 +129,19 @@ impl Registry {
         {
             return Ok((name.into(), Arc::clone(world)));
         }
-        // Replay outside the lock, so queries on this database aren't stuck
-        // behind a reload; concurrent reloaders may both load, and the last
-        // one wins, which is harmless (both read committed transactions).
+        // Single-flight: one thread replays, the others wait for it and then
+        // find the fresh snapshot. Queries whose stamp matches (above) never
+        // wait behind a reload.
+        let _loading = db
+            .loading
+            .lock()
+            .map_err(|_| Failure::new(crate::error::STORE, "the world could not be read"))?;
+        let stamp = self::stamp(&db.path)?;
+        if let Some((s, world)) = lock()?.as_ref()
+            && *s == stamp
+        {
+            return Ok((name.into(), Arc::clone(world)));
+        }
         let world = Arc::new(World::open_read_only(&db.path).map_err(Failure::store)?);
         eprintln!(
             "event=bolt_database_loaded db={name} canon={}",

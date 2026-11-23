@@ -115,6 +115,8 @@ impl Server {
     pub fn run(self, shutdown: Arc<AtomicBool>) -> io::Result<()> {
         let mut clients: Vec<Client> = Vec::new();
         let mut next_id = 0u64;
+        let (mut refused, mut dropped, mut accept_failed) =
+            (LogLimit::new(), LogLimit::new(), LogLimit::new());
         let result = loop {
             let mut i = 0;
             while i < clients.len() {
@@ -132,7 +134,9 @@ impl Server {
                 Ok((stream, _)) => {
                     if clients.len() >= self.config.max_connections {
                         let _ = stream.shutdown(Shutdown::Both);
-                        eprintln!("event=bolt_connection_refused reason=connection_cap");
+                        refused.log(format_args!(
+                            "event=bolt_connection_refused reason=connection_cap"
+                        ));
                         continue;
                     }
                     // The listener is non-blocking, and on macOS/BSD and
@@ -147,7 +151,10 @@ impl Server {
                     let socket = match prepared {
                         Ok(s) => s,
                         Err(e) => {
-                            eprintln!("event=bolt_connection_dropped error={:?}", e.kind());
+                            dropped.log(format_args!(
+                                "event=bolt_connection_dropped error={:?}",
+                                e.kind()
+                            ));
                             let _ = stream.shutdown(Shutdown::Both);
                             continue;
                         }
@@ -178,7 +185,10 @@ impl Server {
                             }) {
                             Ok(t) => t,
                             Err(e) => {
-                                eprintln!("event=bolt_connection_dropped error={:?}", e.kind());
+                                dropped.log(format_args!(
+                                    "event=bolt_connection_dropped error={:?}",
+                                    e.kind()
+                                ));
                                 let _ = socket.shutdown(Shutdown::Both);
                                 continue;
                             }
@@ -194,7 +204,10 @@ impl Server {
                     // A connection aborted before accept, EMFILE/ENFILE, a
                     // network blip: drop it and keep serving (with a short
                     // pause so fd exhaustion can't spin the loop).
-                    eprintln!("event=bolt_accept_failed error={:?}", e.kind());
+                    accept_failed.log(format_args!(
+                        "event=bolt_accept_failed error={:?}",
+                        e.kind()
+                    ));
                     thread::sleep(Duration::from_millis(50));
                 }
             }
@@ -213,10 +226,63 @@ impl Server {
 /// Whether an `accept` error means the listener itself is broken (stop the
 /// server) rather than one failed connection attempt (keep serving).
 fn accept_error_is_fatal(e: &io::Error) -> bool {
-    matches!(
-        e.kind(),
-        io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported | io::ErrorKind::PermissionDenied
-    )
+    // By errno where there is one: only EBADF, ENOTSOCK and EINVAL mean the
+    // listening socket is unusable. EPERM (a firewall rule refusing a peer),
+    // EMFILE/ENFILE and the accept(2) "retry" errors are per connection.
+    #[cfg(target_os = "linux")]
+    const BROKEN: [i32; 3] = [9, 88, 22];
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    const BROKEN: [i32; 3] = [9, 38, 22];
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd"
+        ))
+    ))]
+    const BROKEN: [i32; 0] = [];
+    #[cfg(unix)]
+    if let Some(errno) = e.raw_os_error() {
+        return BROKEN.contains(&errno);
+    }
+    e.kind() == io::ErrorKind::InvalidInput
+}
+
+/// Coalesces a repeating log event: the first occurrence in each second is
+/// printed, later ones are counted and reported once with the next print,
+/// so a client looping connect/close can't flood stderr.
+struct LogLimit {
+    last: Option<std::time::Instant>,
+    suppressed: u64,
+}
+
+impl LogLimit {
+    const fn new() -> Self {
+        Self {
+            last: None,
+            suppressed: 0,
+        }
+    }
+
+    fn log(&mut self, line: std::fmt::Arguments<'_>) {
+        let now = std::time::Instant::now();
+        if self
+            .last
+            .is_some_and(|t| now.duration_since(t) < Duration::from_secs(1))
+        {
+            self.suppressed += 1;
+            return;
+        }
+        if self.suppressed > 0 {
+            eprintln!("{line} suppressed_since_last={}", self.suppressed);
+        } else {
+            eprintln!("{line}");
+        }
+        self.last = Some(now);
+        self.suppressed = 0;
+    }
 }
 
 #[cfg(test)]
@@ -234,11 +300,26 @@ mod tests {
             ErrorKind::OutOfMemory,
             ErrorKind::Other,
             ErrorKind::TimedOut,
+            // Review round 2: EPERM from accept(2) is a firewall rule
+            // refusing one peer, not a broken listener.
+            ErrorKind::PermissionDenied,
         ] {
             assert!(!accept_error_is_fatal(&Error::from(kind)), "{kind:?}");
         }
-        // EMFILE/ENFILE arrive as raw OS errors.
-        assert!(!accept_error_is_fatal(&Error::from_raw_os_error(24)));
-        assert!(accept_error_is_fatal(&Error::from(ErrorKind::InvalidInput)));
+        // EMFILE/ENFILE, EPERM, and the accept(2) "retry" errors.
+        for errno in [24, 23, 1, 13, 100, 71, 92, 112, 64, 113, 101] {
+            assert!(
+                !accept_error_is_fatal(&Error::from_raw_os_error(errno)),
+                "{errno}"
+            );
+        }
+        // A broken listener: EBADF, ENOTSOCK, EINVAL (Linux numbers).
+        #[cfg(target_os = "linux")]
+        for errno in [9, 88, 22] {
+            assert!(
+                accept_error_is_fatal(&Error::from_raw_os_error(errno)),
+                "{errno}"
+            );
+        }
     }
 }
