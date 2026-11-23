@@ -3970,6 +3970,34 @@ impl MeteredView<'_> {
         self.view.work.finish(self.view.as_of(entity, attr, t))
     }
 
+    /// Visit non-ref attribute values one at a time, without materializing the
+    /// whole property. The order is unspecified (unindexed strings use hash
+    /// order). Callback errors stop delivery; metering still bounds the scan.
+    pub fn visit_non_ref_values(
+        &self,
+        entity: EntityId,
+        attr: &str,
+        t: Tick,
+        mut visitor: impl FnMut(Value) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let (attr_id, def) = self.view.resolve(entity, attr)?;
+        if def.value_type == ValueType::Ref {
+            return Err(Error::ExpectedScalarAttribute(attr.to_string()));
+        }
+        self.view.work.finish(Ok(()))?;
+        let mut result = Ok(());
+        self.view
+            .for_each_e_value_holding(entity, attr_id, t, |encoded| {
+                if result.is_ok()
+                    && let Some(value) = self.view.world.decode_e_part(attr_id, encoded)
+                {
+                    result = visitor(value);
+                }
+            });
+        result?;
+        self.view.work.finish(Ok(()))
+    }
+
     /// Interruptible [`View::as_of_value`].
     pub fn as_of_value(
         &self,

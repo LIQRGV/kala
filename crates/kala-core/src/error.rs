@@ -49,6 +49,8 @@ pub enum Error {
     /// The attribute isn't a `ref` attribute, so it has no neighbors.
     /// Holds the attribute name as given.
     NotARef(String),
+    /// A scalar-only visitor was given a relationship attribute.
+    ExpectedScalarAttribute(String),
     /// The entity (a write's subject or a `ref` value) isn't defined in
     /// this world.
     UnknownEntity(EntityId),
@@ -170,6 +172,9 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Error::ExpectedScalarAttribute(name) => {
+                write!(f, "expected a non-ref attribute, got {}", Quoted(name))
+            }
             Error::WorkInterrupted { reason } => write!(f, "read interrupted: {reason:?}"),
             Error::UnknownNodeType(name) => write!(f, "unknown node type {}", Quoted(name)),
             Error::DuplicateHandle(h) => write!(f, "handle {} is already in use", Quoted(h)),
