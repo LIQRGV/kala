@@ -18,6 +18,7 @@ struct Operation {
     /// precision change on a held fact needs `:correct`).
     precision: Option<&'static str>,
     changed: usize,
+    declared: usize,
     entries: Vec<u64>,
     entity: Option<String>,
 }
@@ -34,6 +35,7 @@ pub struct Report {
     /// nothing was appended.
     tx: Option<u64>,
     changed: usize,
+    declared: usize,
     entries: Vec<u64>,
     edges: Vec<String>,
     ops: Vec<Operation>,
@@ -222,6 +224,7 @@ pub(super) fn execute_restore(
     let mut ops = Vec::new();
     let mut created = Vec::new();
     for (index, op) in form.ops.iter().enumerate() {
+        let schema_before = tx.schema_changes().len();
         let mut run = || -> Result<(usize, Tick, Option<Precision>, Option<EntityId>), CliError> {
             match op {
                 WriteOp::Attribute {
@@ -366,6 +369,7 @@ pub(super) fn execute_restore(
             tick: tick.0,
             precision: precision.map(out::precision_str),
             changed,
+            declared: tx.schema_changes().len() - schema_before,
             entries: Vec::new(),
             entity: None,
         });
@@ -396,6 +400,7 @@ pub(super) fn execute_restore(
             .map(super::schema::change_text)
             .collect(),
         changed: result.changed,
+        declared: result.declared,
         entries: result.entries.iter().map(|e| e.0).collect(),
         edges: result
             .edges
@@ -420,20 +425,28 @@ pub(super) fn execute_restore(
     })
 }
 
+fn counts(changed: usize, declared: usize) -> String {
+    let mut text = format!("{changed} changed");
+    if declared > 0 {
+        let _ = write!(text, ", {declared} declared");
+    }
+    text
+}
+
 pub fn render(report: &Report, json: bool) -> String {
     if json {
         return out::to_json(report);
     }
     let mut s = match report.tx {
         Some(tx) => format!(
-            "form {}: {}tx#{tx}: {} changed\n",
+            "form {}: {}tx#{tx}: {}\n",
             report.form,
             if report.dry_run {
                 "dry-run "
             } else {
                 "committed "
             },
-            report.changed
+            counts(report.changed, report.declared)
         ),
         None => format!(
             "form {}: {}: 0 changed\n",
@@ -453,7 +466,7 @@ pub fn render(report: &Report, json: bool) -> String {
         if let Some(p) = op.precision.filter(|p| *p != "exact") {
             let _ = write!(s, " ({p})");
         }
-        let _ = write!(s, ", {} changed", op.changed);
+        let _ = write!(s, ", {}", counts(op.changed, op.declared));
         if let Some(e) = &op.entity {
             let _ = write!(s, ", created {e}");
         }

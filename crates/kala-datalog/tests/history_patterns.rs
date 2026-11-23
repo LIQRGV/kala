@@ -7,7 +7,7 @@
 //!   variable (binds `Datum::Op`), `:assert`, `:retract` or `_`; any other
 //!   keyword there is `Syntax`. `e` and `v` as in 3-element patterns.
 //! - `a` is a schema attribute or an inverse name (read through `R`, like
-//!   `View::history_scan`); `:handle` is `Syntax`.
+//!   `View::history_scan`); `:kala_handle` is `Syntax`.
 //! - A history pattern inside `(at ..)` is `Syntax`; so are 7 elements.
 //! - Corrections are honoured by canon exactly as `View::history`.
 //! - A bound `?t` is an ordinary i64: usable in predicates, `(at ?t ..)`, rule
@@ -503,8 +503,8 @@ fn history_pattern_errors_are_syntax_errors() {
     let f = base();
     for (what, text) in [
         (
-            ":handle in a history pattern",
-            "[:find ?t :where [:greg :handle ?h ?t]]",
+            ":kala_handle in a history pattern",
+            "[:find ?t :where [:greg :kala_handle ?h ?t]]",
         ),
         (
             "an unknown op keyword",

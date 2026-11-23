@@ -177,7 +177,7 @@ fn handle_pattern_whose_entity_is_bound_only_by_a_later_at_pattern_works() {
     // ann seen_at 25 -> nobody likes ann; bob seen_at 5 -> ann likes bob at 5.
     let got = rows(
         w,
-        r#"[:find ?h :where [?e :handle ?h] [?x :seen_at ?t] (at ?t [?e :likes ?x])]"#,
+        r#"[:find ?h :where [?e :kala_handle ?h] [?x :seen_at ?t] (at ?t [?e :likes ?x])]"#,
     );
     assert_eq!(got, BTreeSet::from([vec![Value::Str("ann".into())]]));
 }

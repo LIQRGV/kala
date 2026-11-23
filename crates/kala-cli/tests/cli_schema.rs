@@ -303,7 +303,7 @@ fn cardinality_warnings_use_the_requested_schema_canon() {
 }
 
 #[test]
-fn deprecation_rejects_assert_retract_and_correction_but_preserves_reads() {
+fn deprecation_rejects_assert_retract_but_accepts_correction_and_preserves_old_reads() {
     let f = loaded_varrow();
     let w = World::open_read_only(&f.path).unwrap();
     let name_entry = w
@@ -320,7 +320,6 @@ fn deprecation_rejects_assert_retract_and_correction_but_preserves_reads() {
     for source in [
         "[:assert :edwin :name \"X\"]".to_owned(),
         "[:retract :edwin :name \"Edwin\" :at -250]".to_owned(),
-        format!("[:correct {name_entry} :delete]"),
     ] {
         refuses_unchanged(&f, &source, &["name", "deprecated"]);
     }
@@ -328,6 +327,14 @@ fn deprecation_rejects_assert_retract_and_correction_but_preserves_reads() {
         let query = format!("[:find ?n :at -250{canon} :where [:edwin :name ?n]]");
         assert_eq!(f.json("query", &[&query])["rows"][0][0]["value"], "Edwin");
     }
+    write(&f, &format!("[:correct {name_entry} :delete]"));
+    assert_eq!(
+        f.json(
+            "query",
+            &["[:find ?n :at -250 :canon 12 :where [:edwin :name ?n]]"]
+        )["rows"][0][0]["value"],
+        "Edwin"
+    );
     let report = write(&f, "[:deprecate :name]");
     assert!(report.contains("0 changed"), "{report}");
     no_integrity_errors(&f);
@@ -504,8 +511,8 @@ fn reserved_names_and_failed_inference_never_leave_partial_schema() {
     let f = loaded_varrow();
     for source in [
         "[:attribute :age@old :i64]",
-        "[:attribute :handle :string]",
-        "[:rename :name :handle]",
+        "[:attribute :kala_handle :string]",
+        "[:rename :name :kala_handle]",
         "[:rename :name :name@old]",
         "[:assert :edwin :oops@old 1]",
         "[[:assert :edwin :new_age 1] [:assert :greg :new_age \"old\"]]",

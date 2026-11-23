@@ -146,7 +146,11 @@ Follow the [story-author guide](GUIDE.md) to write scenes, ask questions and
 correct earlier canon. Open `kala repl w.kala --write` for interactive writes,
 or run `kala transact w.kala scene.edn` for scripts. New attributes and node types
 are inferred on write by default. Declare, rename, deprecate or migrate them with
-Datalog schema forms; inspect definitions with `kala schema w.kala`. YAML fixtures
+Datalog schema forms; inspect definitions with `kala schema w.kala`. Write reports
+count facts as `changed` and schema actions as `declared`. Deprecated attributes
+allow corrections while refusing new assertions and retractions. Query permanent
+handles with `:kala_handle` (the Bolt Node property is also `kala_handle`); a user
+attribute named `handle` is ordinary data. YAML fixtures
 loaded with `kala load` provide the initial schema:
 
 ```yaml

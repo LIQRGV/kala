@@ -671,11 +671,6 @@ impl World {
                         &"bidirectional DELETED marker with entity > value",
                     ));
                 }
-                if def.deprecated {
-                    return Err(ReplayFault::Refused(Error::DeprecatedAttribute(
-                        def.name.clone(),
-                    )));
-                }
                 let chain = self.replay_chain(*of).map_err(|why| bad_correction(&why))?;
                 let current = chain.current.ok_or_else(|| {
                     bad_correction(&format!("the chain of entry#{} is already deleted", of.0))
@@ -730,7 +725,15 @@ impl World {
                 // length, RetractEvent); not judged by the hold-based no-op
                 // rules, which don't apply to corrections.
                 let mut fact = self
-                    .prepare_fact(&StagedIds::default(), *entity, &def.name, value, *tick, *op)
+                    .prepare_fact_as(
+                        &StagedIds::default(),
+                        *entity,
+                        &def.name,
+                        value,
+                        *tick,
+                        *op,
+                        DeprecatedWrites::Correction,
+                    )
                     .map_err(ReplayFault::from_write)?;
                 fact.precision = *precision;
                 // A live correction interns the edge of a revised assert's
@@ -744,11 +747,6 @@ impl World {
                     return Err(corrupt(
                         &"revised ref assert with no edge defined before it",
                     ));
-                }
-                if def.deprecated {
-                    return Err(ReplayFault::Refused(Error::DeprecatedAttribute(
-                        def.name.clone(),
-                    )));
                 }
                 let chain = self.replay_chain(*of).map_err(|why| bad_correction(&why))?;
                 if prev_deleted == Some((*of, *rev)) {

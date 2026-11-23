@@ -77,6 +77,38 @@ fn queries_see_commits_without_reload() {
 }
 
 #[test]
+fn repl_counts_inferred_and_explicit_schema_separately() {
+    for json in [false, true] {
+        let f = build(EMPTY);
+        let source = format!(
+            "{}[:assert :greg :height 180 :at -1]\n[:attribute :title :string]\n[:assert :greg :title \"Sir\" :at 0]\n.quit\n",
+            if json { ".json on\n" } else { "" }
+        );
+        let output = repl(&f, &source, &["--write"]);
+        assert_eq!(code(&output), 0, "{}", stderr(&output));
+        if json {
+            let docs = documents(&output);
+            for (report, (changed, declared)) in docs.iter().zip([(1, 1), (0, 1), (1, 0)]) {
+                assert_eq!(report["changed"], changed, "{report}");
+                assert_eq!(report["declared"], declared, "{report}");
+                assert_eq!(report["ops"][0]["changed"], changed, "{report}");
+                assert_eq!(report["ops"][0]["declared"], declared, "{report}");
+            }
+            assert_eq!(docs.len(), 3);
+        } else {
+            let text = stdout(&output);
+            assert!(text.contains("1 changed, 1 declared"), "{text}");
+            assert!(text.contains("0 changed, 1 declared"), "{text}");
+            let fact_report = text
+                .lines()
+                .rfind(|line| line.contains("committed tx#"))
+                .unwrap();
+            assert!(fact_report.ends_with("1 changed"), "{text}");
+        }
+    }
+}
+
+#[test]
 fn at_defaults_follow_op_then_transaction_then_session_then_world() {
     let f = build(EMPTY);
     let o = repl(

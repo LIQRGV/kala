@@ -98,6 +98,9 @@
 //! A structural redefinition is refused after any fact entry for that ID. New
 //! inferred definitions require infer mode and the exact inference defaults.
 //! New names containing `@` are refused except the migration-generated suffix.
+//! `kala_` schema names are always reserved; `_KALA_` names may originate only
+//! at genesis. These rules cover node types, attributes and inverse names.
+//! `edge` is reserved only for node types (the `edge#N` ID syntax).
 //!
 //! **Migration.** Edit 3 announces a copy-forward operation. Replay regenerates
 //! the exact marker and following edit-0 definitions, edge definitions and Fact
@@ -106,8 +109,9 @@
 //! in order, before Commit. Only these verified copies may contain a Fact that
 //! normal write judgement would call a no-op, or an edge with only retracts.
 //! This preserves original change points after corrections, without permitting
-//! arbitrary copies or schema sequences. Deprecated attributes refuse facts and
-//! corrections, including properties copied by a migration.
+//! arbitrary copies or schema sequences. Deprecated attributes allow corrections
+//! but refuse new asserts and retracts. Only verified migration copies may append
+//! plain facts for deprecated edge properties. Live validation and replay agree.
 //!
 //! **Versions.** Versions 1 through 4 are [`Error::UnsupportedVersion`]; worlds
 //! written by older Kala builds must be recreated (no migration before 1.0).

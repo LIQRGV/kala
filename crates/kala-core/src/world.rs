@@ -540,7 +540,7 @@ impl World {
             if i > usize::from(MAX_NODE_TYPE) {
                 return Err(IdError::NodeTypeOutOfRange(MAX_NODE_TYPE + 1).into());
             }
-            schema_ops::check_name(name)?;
+            schema_ops::check_node_type_name(name)?;
             let id = NodeTypeId(i as u16); // i <= MAX_NODE_TYPE, checked above
             if node_type_by_name.insert(name.clone(), id).is_some() {
                 return Err(Error::DuplicateName(name.clone()));
@@ -1186,14 +1186,15 @@ impl World {
     }
 }
 
-/// Whether a prepared fact may target a deprecated attribute. Every user
-/// write refuses; only the internal copy of a migration (live, and replay of
-/// the exact copy sequence regenerated from the migration marker) may write
-/// the history of a deprecated edge property onto the new edges. Private to
-/// the world module, so no public API or flag can select it.
+/// Whether a prepared fact may target a deprecated attribute. New asserts
+/// and retracts refuse; corrections may revise existing history. Only the
+/// internal, verified copy of a migration may append plain facts for a
+/// deprecated edge property onto new edges. Private to the world module,
+/// so no public write flag can bypass deprecation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeprecatedWrites {
     Refuse,
+    Correction,
     MigrationCopy,
 }
 

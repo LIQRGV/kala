@@ -198,3 +198,12 @@ assert_eq!(world.format_id(greg), "CHARACTER#3");
 - `load_fixture`, `load_fixture_to`: build a world from YAML.
 - `doctor`, `doctor_log`: the read-only integrity checker (`Report`,
   `Finding`, `Severity`).
+
+Transaction commit results count fact and correction entries in `changed` and
+reported schema actions in `declared` (no-ops count zero). Deprecated attributes
+still accept corrections; new assertions and retractions are refused.
+
+Schema names beginning with `kala_` are reserved, including at genesis. `_KALA_`
+names can only originate at genesis (for the system schema). Both prefixes are
+case-sensitive. `edge` is reserved only for node types; attributes and inverse
+names may use `handle` and `edge`. Datalog reads world handles with `:kala_handle`.

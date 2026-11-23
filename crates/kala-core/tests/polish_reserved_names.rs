@@ -1,5 +1,5 @@
-//! Names starting with `_KALA_` are reserved for node types and attributes in
-//! every schema edit after genesis. The system world's genesis may use them.
+//! `kala_` is reserved everywhere. `_KALA_` is reserved after genesis;
+//! the system world's genesis may use that prefix.
 
 mod common;
 
@@ -178,4 +178,251 @@ fn crafted_schema_edit_introducing_a_reserved_name_is_corrupt_with_controls() {
             "{what}: a live write could not have produced this: {opened:?}"
         );
     }
+}
+
+fn assert_kala_reserved<T: std::fmt::Debug>(result: Result<T, Error>) {
+    assert!(
+        matches!(&result, Err(Error::ReservedName(_))),
+        "expected ReservedName, got {result:?}"
+    );
+    let message = result.unwrap_err().to_string();
+    assert!(
+        message.contains("kala_") && message.contains("_KALA_"),
+        "{message}"
+    );
+}
+
+#[test]
+fn kala_prefix_is_refused_by_every_live_name_introduction() {
+    let mut world = World::in_memory(schema()).unwrap();
+    assert_kala_reserved(world.begin().declare_node_type("kala_T"));
+    assert_kala_reserved(world.begin().infer_node_type("kala_T"));
+    assert_kala_reserved(world.begin().declare_attribute(AttrDef::new(
+        "kala_x",
+        ValueType::Str,
+        Kind::State,
+        Cardinality::One,
+    )));
+    assert_kala_reserved(world.begin().infer_attribute("kala_x", &Value::I64(1)));
+    assert_kala_reserved(world.begin().rename_attribute("title", "kala_name"));
+    assert_kala_reserved(world.begin().declare_attribute(
+        AttrDef::new("relation", ValueType::Ref, Kind::State, Cardinality::Many).inverse("kala_y"),
+    ));
+    let mut tx = world.begin();
+    tx.declare_attribute(AttrDef::new(
+        "relation",
+        ValueType::Ref,
+        Kind::State,
+        Cardinality::Many,
+    ))
+    .unwrap();
+    tx.commit().unwrap();
+    assert_kala_reserved(world.begin().migrate_attribute(
+        "relation",
+        MigrationOptions {
+            inverse: Some("kala_inverse".into()),
+            ..MigrationOptions::default()
+        },
+    ));
+    let mut tx = world.begin();
+    for name in ["kala", "Kala_T", "KALA_T", "handle"] {
+        tx.declare_node_type(name).unwrap();
+        tx.declare_attribute(AttrDef::new(
+            name,
+            ValueType::I64,
+            Kind::State,
+            Cardinality::One,
+        ))
+        .unwrap();
+    }
+    tx.commit().unwrap();
+}
+
+#[test]
+fn kala_prefix_is_refused_at_genesis_for_types_attributes_and_inverses() {
+    for schema in [
+        Schema::new().node_type("kala_T"),
+        schema().attribute(AttrDef::new(
+            "kala_x",
+            ValueType::Str,
+            Kind::State,
+            Cardinality::One,
+        )),
+        schema().attribute(
+            AttrDef::new("relation", ValueType::Ref, Kind::State, Cardinality::Many)
+                .inverse("kala_y"),
+        ),
+    ] {
+        assert_kala_reserved(World::in_memory(schema));
+    }
+}
+
+fn relation(id: u32, name: &str, inverse: &str) -> Vec<u8> {
+    let mut out = vec![0];
+    out.extend_from_slice(&id.to_le_bytes());
+    string(&mut out, name);
+    out.extend_from_slice(&[5, 0, 1, 1, 0, 1, 1]);
+    string(&mut out, inverse);
+    out.extend_from_slice(&[0, 0]);
+    out
+}
+
+#[test]
+fn crafted_kala_prefix_schema_edits_are_corrupt_with_positive_controls() {
+    assert!(open_appended(node_type(1, "Kala_T")).is_ok());
+    assert!(open_appended(attribute(1, "Kala_x", 4)).is_ok());
+    assert!(open_appended(relation(1, "relation", "Kala_y")).is_ok());
+    for entry in [
+        node_type(1, "kala_T"),
+        attribute(1, "kala_x", 4),
+        attribute(0, "kala_title", 4),
+        relation(1, "relation", "kala_y"),
+    ] {
+        let opened = open_appended(entry);
+        assert!(matches!(&opened, Err(Error::Corrupt(_))), "{opened:?}");
+        assert!(opened.unwrap_err().to_string().contains("kala_"));
+    }
+}
+
+fn open_genesis(entries: Vec<(u8, Vec<u8>)>) -> Result<World, Error> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("world.kala");
+    let mut bytes = common::header(kala_core::log::LOG_FORMAT_VERSION);
+    let mut body = Vec::new();
+    for (i, (kind, payload)) in entries.iter().enumerate() {
+        body.extend_from_slice(&frame(*kind, i as u64 + 1, payload));
+    }
+    body.extend_from_slice(&commit_frame(&body, entries.len() as u64 + 1, 0));
+    bytes.extend_from_slice(&txn(0, &body));
+    std::fs::write(&path, bytes).unwrap();
+    World::open_read_only(&path)
+}
+
+#[test]
+fn crafted_kala_prefix_genesis_is_corrupt_with_positive_controls() {
+    for (name, reserved) in [("kala_T", true), ("Kala_T", false)] {
+        let nt = node_type(0, name);
+        let opened = open_genesis(vec![(1, nt[1..nt.len() - 1].to_vec())]);
+        if reserved {
+            assert!(matches!(opened, Err(Error::Corrupt(_))), "{opened:?}");
+        } else {
+            assert!(opened.is_ok(), "{opened:?}");
+        }
+    }
+    for (name, inverse, reserved) in [
+        ("kala_x", "ordinary", true),
+        ("ordinary", "kala_y", true),
+        ("ordinary", "Kala_y", false),
+    ] {
+        let payload = relation(0, name, inverse);
+        let opened = open_genesis(vec![(2, payload[1..].to_vec())]);
+        if reserved {
+            assert!(matches!(opened, Err(Error::Corrupt(_))), "{opened:?}");
+        } else {
+            assert!(opened.is_ok(), "{opened:?}");
+        }
+    }
+}
+
+#[test]
+fn handle_and_edge_are_ordinary_attribute_and_inverse_names() {
+    for name in ["handle", "edge"] {
+        let mut world = World::in_memory(schema().attribute(AttrDef::new(
+            name,
+            ValueType::Ref,
+            Kind::State,
+            Cardinality::Many,
+        )))
+        .unwrap_or_else(|error| panic!("{name} must be accepted at genesis: {error}"));
+        let a = world.create_entity("CHARACTER", Some("a")).unwrap();
+        let b = world.create_entity("CHARACTER", Some("b")).unwrap();
+        world
+            .assert(a, name, Value::Ref(b), Some(Tick(-10)))
+            .unwrap();
+        let edge = world.edge_id(a, name, b).unwrap();
+        world
+            .assert(
+                edge.into(),
+                "title",
+                Value::Str("edge property".into()),
+                Some(Tick(0)),
+            )
+            .unwrap();
+        assert_eq!(
+            world.parse_id(&world.format_id(edge.into())).unwrap(),
+            EntityId::from(edge)
+        );
+        assert_eq!(world.as_of(a, name, Tick(0)).unwrap(), [Value::Ref(b)]);
+        world
+            .assert(edge.into(), name, Value::Ref(a), Some(Tick(0)))
+            .unwrap();
+        assert_eq!(
+            world.as_of(edge.into(), name, Tick(0)).unwrap(),
+            [Value::Ref(a)]
+        );
+        let mut inverse_world = World::in_memory(schema().attribute(
+            AttrDef::new("relation", ValueType::Ref, Kind::State, Cardinality::Many).inverse(name),
+        ))
+        .unwrap();
+        let a = inverse_world.create_entity("CHARACTER", None).unwrap();
+        let b = inverse_world.create_entity("CHARACTER", None).unwrap();
+        inverse_world
+            .assert(a, "relation", Value::Ref(b), Some(Tick(0)))
+            .unwrap();
+        let neighbors = inverse_world
+            .neighbors(b, name, Direction::Out, Tick(0))
+            .unwrap();
+        assert_eq!(
+            neighbors
+                .iter()
+                .map(|(entity, _)| *entity)
+                .collect::<Vec<_>>(),
+            [a]
+        );
+        let mut world = World::in_memory(schema()).unwrap();
+        let a = world.create_entity("CHARACTER", None).unwrap();
+        let b = world.create_entity("CHARACTER", None).unwrap();
+        let mut tx = world.begin();
+        tx.infer_attribute(name, &Value::Ref(b)).unwrap();
+        tx.assert(a, name, Value::Ref(b), Some(Tick(0))).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(world.as_of(a, name, Tick(0)).unwrap(), [Value::Ref(b)]);
+        let mut tx = world.begin();
+        tx.declare_attribute(AttrDef::new(
+            name,
+            ValueType::Ref,
+            Kind::State,
+            Cardinality::Many,
+        ))
+        .unwrap();
+        tx.commit().unwrap();
+        let mut renamed = World::in_memory(schema()).unwrap();
+        let mut tx = renamed.begin();
+        tx.rename_attribute("title", name).unwrap();
+        tx.commit().unwrap();
+        assert!(renamed.attribute(name).is_some());
+        assert!(open_appended(attribute(1, name, 4)).is_ok());
+        assert!(open_appended(relation(1, "relation", name)).is_ok());
+    }
+}
+
+#[test]
+fn edge_node_type_is_refused_live_and_on_replay() {
+    let mut world = World::in_memory(schema()).unwrap();
+    assert!(matches!(
+        world.begin().declare_node_type("edge"),
+        Err(Error::InvalidName(_))
+    ));
+    assert!(matches!(
+        world.begin().infer_node_type("edge"),
+        Err(Error::InvalidName(_))
+    ));
+    assert!(matches!(
+        World::in_memory(Schema::new().node_type("edge")),
+        Err(Error::InvalidName(_))
+    ));
+    assert!(matches!(
+        open_appended(node_type(1, "edge")),
+        Err(Error::Corrupt(_))
+    ));
 }

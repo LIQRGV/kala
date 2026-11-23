@@ -146,7 +146,9 @@ bookmark required.
 
 Nodes and relationships are enriched at the result's default tick and canon.
 Node labels include its immutable type and active string `label` values.
-Properties include every active non-ref attribute and the handle (if present) under `handle`, unless the schema has its own `handle` attribute, whose value then wins.
+Properties include every active non-ref attribute and the world handle (if present)
+under `kala_handle`. A user attribute named `handle` is an ordinary property and
+can coexist with `kala_handle`. The `kala_` schema-name prefix is reserved.
 Cardinality-many attributes are sorted lists. A cardinality-one overlap is also
 returned as a list so neither asserted value is lost. Reference attributes are
 relationships, not properties. Graph data is returned verbatim; diagnostics are

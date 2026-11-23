@@ -95,9 +95,12 @@ pub struct CommitResult {
     /// no-op and no entity was created), nothing is appended and this is
     /// the unchanged latest tx.
     pub tx: TxId,
-    /// Fact/correction entries plus reported schema actions (no-ops excluded).
-    /// A migration reports its rename, deprecation, declaration and copy action.
+    /// Fact, `DELETED` and revised entries, including migration copies.
+    /// Entity creation, edge interning and schema actions do not count.
     pub changed: usize,
+    /// Reported schema actions, excluding no-ops. A migration reports its
+    /// rename, deprecation, declaration and copy action.
+    pub declared: usize,
     /// IDs of the fact, `DELETED` and `Revised` entries the transaction appended, in
     /// log order (`DEFINE`s and the `Commit` are not listed): one per stored
     /// entry. Empty if nothing was appended.
@@ -329,9 +332,6 @@ impl Txn<'_> {
                 value: current_value,
             } = txn.world.correction_target(entry)?;
             let attr = txn.world.attributes[current.attr.0 as usize].name.clone();
-            if txn.world.attributes[current.attr.0 as usize].deprecated {
-                return Err(Error::DeprecatedAttribute(attr));
-            }
             // Judged against the committed chain: if this transaction already
             // corrected it, that state is stale, so refuse before anything
             // else (a "no-op" against stale state could be a real change).
@@ -370,13 +370,14 @@ impl Txn<'_> {
             // replaced, validated like a write. The subject is the current
             // fact's (stored) entity; a bidirectional pair is renormalised,
             // which may swap it with the value.
-            let mut new = txn.world.prepare_fact(
+            let mut new = txn.world.prepare_fact_as(
                 &txn.ids,
                 current.entity,
                 &attr,
                 value.as_ref().unwrap_or(&current_value),
                 tick.unwrap_or(current.tick),
                 op.unwrap_or(current.op),
+                DeprecatedWrites::Correction,
             )?;
             // Kept unless given, also when the key moves.
             new.precision = precision.unwrap_or(current.precision);
@@ -515,6 +516,7 @@ impl Txn<'_> {
             return Ok(CommitResult {
                 tx: self.world.latest_tx,
                 changed: 0,
+                declared: 0,
                 entries: Vec::new(),
                 edges: Vec::new(),
                 warnings: Warnings::default(),
@@ -651,7 +653,8 @@ impl Txn<'_> {
         };
         Ok(CommitResult {
             tx: self.tx,
-            changed: self.entries.len() + self.schema_changes.len(),
+            changed: self.entries.len(),
+            declared: self.schema_changes.len(),
             entries,
             edges,
             warnings,
@@ -884,9 +887,9 @@ impl World {
         self.prepare_fact_as(staged, entity, attr, v, tick, op, DeprecatedWrites::Refuse)
     }
 
-    /// [`World::prepare_fact`] with an explicit deprecation rule. Only a
-    /// migration's own copy (and replay of exactly the copy sequence it
-    /// regenerates) passes [`DeprecatedWrites::MigrationCopy`].
+    /// [`World::prepare_fact`] with an explicit deprecation rule. Corrections
+    /// may revise deprecated history; only a migration's own verified copy
+    /// may append plain facts to deprecated attributes.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare_fact_as(
         &self,

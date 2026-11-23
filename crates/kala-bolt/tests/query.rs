@@ -32,13 +32,14 @@ fn datalog_nodes_have_types_handles_sorted_properties_and_temporal_labels() {
         let (labels, props, element_id) = node(&row[0]);
         assert!(labels.contains(&string("CHARACTER")));
         assert!(element_id.starts_with("CHARACTER#"));
-        assert!(props.contains_key("handle"));
+        assert!(props.contains_key("kala_handle"));
+        assert!(!props.contains_key("handle"));
         assert!(!props.contains_key("located_in"));
         names.push(props["name"].clone());
     }
     assert_eq!(names, [string("Greg"), string("Tomas")]);
     let rows =
-        client.query("// kala:datalog   \n[:find ?e :at -210 :where [?e :handle \"edwin\"]]");
+        client.query("// kala:datalog   \n[:find ?e :at -210 :where [?e :kala_handle \"edwin\"]]");
     let (labels, props, _) = node(&rows[0][0]);
     assert!(labels.contains(&string("Knight")));
     assert!(!labels.contains(&string("King")));
@@ -51,7 +52,8 @@ fn datalog_nodes_have_types_handles_sorted_properties_and_temporal_labels() {
             string("the Lost Knight")
         ])
     );
-    let rows = client.query("// kala:datalog\n[:find ?e :at -180 :where [?e :handle \"edwin\"]]");
+    let rows =
+        client.query("// kala:datalog\n[:find ?e :at -180 :where [?e :kala_handle \"edwin\"]]");
     let (labels, props, _) = node(&rows[0][0]);
     assert!(labels.contains(&string("King")));
     assert_eq!(props["name"], string("the Grey King"));
@@ -59,8 +61,8 @@ fn datalog_nodes_have_types_handles_sorted_properties_and_temporal_labels() {
         props["alias"],
         Value::List(vec![string("Ed"), string("Eddie")])
     );
-    let rows =
-        client.query("// kala:datalog\n[:find ?e :at -210 :canon 5 :where [?e :handle \"edwin\"]]");
+    let rows = client
+        .query("// kala:datalog\n[:find ?e :at -210 :canon 5 :where [?e :kala_handle \"edwin\"]]");
     let (_, props, _) = node(&rows[0][0]);
     assert_eq!(
         props["alias"],
@@ -70,6 +72,39 @@ fn datalog_nodes_have_types_handles_sorted_properties_and_temporal_labels() {
             string("the Lost Knight")
         ])
     );
+}
+
+#[test]
+fn node_keeps_world_handle_separate_from_user_handle_property() {
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = r#"
+schema:
+  node_types: [CHARACTER]
+  attributes:
+    - { name: handle, type: string }
+entities:
+  CHARACTER: [alice]
+transactions:
+  - tick: 0
+    ops:
+      - assert: [alice, handle, user-alias]
+"#;
+    drop(kala_core::load_fixture_to(yaml, &dir.path().join("typed.kala")).unwrap());
+    let server = Running::in_dir(
+        dir,
+        ServerConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            ..ServerConfig::default()
+        },
+    );
+    let mut client = Client::ready(&server);
+    let rows = client.query("// kala:datalog\n[:find ?e :where [?e :handle \"user-alias\"]]");
+    assert_eq!(rows.len(), 1);
+    let (_, props, _) = node(&rows[0][0]);
+    assert_eq!(props["kala_handle"], string("alice"));
+    assert_eq!(props["handle"], string("user-alias"));
+    let builtin = client.query("// kala:datalog\n[:find ?e :where [?e :kala_handle \"alice\"]]");
+    assert_eq!(rows, builtin);
 }
 
 #[test]
@@ -96,7 +131,7 @@ fn relationships_have_bolt5_layout_and_properties_at_result_tick() {
 fn parameters_types_missing_extra_entity_and_canon() {
     let server = Running::start();
     let mut client = Client::ready(&server);
-    let query = "// kala:datalog\n[:find ?a :in $ ?who ?t :at ?t :where [?e :handle ?who] [?e :ally_of ?a]]";
+    let query = "// kala:datalog\n[:find ?a :in $ ?who ?t :at ?t :where [?e :kala_handle ?who] [?e :ally_of ?a]]";
     client.run(
         query,
         map(&[

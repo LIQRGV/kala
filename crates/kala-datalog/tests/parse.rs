@@ -42,7 +42,7 @@ const HEADLINE: &str = r#"[:find ?name
  :at -210                         ; query default tick (optional; else latest tick)
  :canon 41                        ; read canon tx <= 41 (optional; else latest)
  :where
- [?e :handle ?who]
+ [?e :kala_handle ?who]
  [?e :ally_of ?a]                 ; read at the query default tick
  (at -200 [?a :located_in ?p])    ; this pattern reads at its own tick
  [?a :name ?name]
@@ -54,7 +54,7 @@ fn headline_query_structure() {
     let q = ok(HEADLINE);
     assert_eq!(
         shape(&q),
-        "find(?name) in($ ?who) at(-210) canon(41) where{ [?e :handle ?who] [?e :ally_of ?a] \
+        "find(?name) in($ ?who) at(-210) canon(41) where{ [?e :kala_handle ?who] [?e :ally_of ?a] \
          (at -200 [?a :located_in ?p]) [?a :name ?name] [(!= ?a ?e)] }"
     );
 }
@@ -555,12 +555,12 @@ fn clause_must_be_vector_or_list() {
 
 #[test]
 fn handle_pseudo_attribute_is_just_an_attr_name() {
-    let t = q("[?e :handle :edwin]");
+    let t = q("[?e :kala_handle :edwin]");
     let qq = ok(&t);
     let Clause::Pattern(p) = &qq.clauses[0] else {
         panic!()
     };
-    assert_eq!(p.a.name, "handle");
+    assert_eq!(p.a.name, "kala_handle");
     assert!(matches!(&p.v, Item::Keyword(k, _) if k == "edwin"));
 }
 

@@ -186,7 +186,7 @@ pub enum Clause {
 /// holds, over every tick at the query's canon.
 #[derive(Clone, Debug, PartialEq)]
 pub struct During {
-    /// The 3-element pattern (never a history pattern, never `:handle`).
+    /// The 3-element pattern (never a history pattern, never `:kala_handle`).
     pub pattern: Pattern,
     /// The variable bound to the set.
     pub out: Sym,

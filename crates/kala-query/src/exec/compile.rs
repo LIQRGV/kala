@@ -565,7 +565,7 @@ impl Compiler<'_> {
         Ok((step, bound))
     }
 
-    /// Compiles an `Expand` (a `:handle` read included).
+    /// Compiles an `Expand` (a `:kala_handle` read included).
     fn op_expand(
         &mut self,
         entity: &Term,
@@ -583,7 +583,7 @@ impl Compiler<'_> {
             AttrRef::Handle => {
                 if *access != Access::Handle {
                     return Err(QueryError::Plan(format!(
-                        ":handle can only be read via handle, not {access:?}"
+                        ":kala_handle can only be read via handle, not {access:?}"
                     )));
                 }
                 (None, ValueType::Str)
@@ -591,7 +591,7 @@ impl Compiler<'_> {
             AttrRef::Named(name) => {
                 if *access == Access::Handle {
                     return Err(QueryError::Plan(format!(
-                        "handle access is only for :handle, not :{name}"
+                        "handle access is only for :kala_handle, not :{name}"
                     )));
                 }
                 let a = resolve_attr(world, self.canon, name)?;
@@ -1026,7 +1026,7 @@ fn check_access(access: Access, attr: &Attr, e: &Pos, v: &Pos) -> Result<(), Que
             format!("V access needs an indexed attribute; :{name} is unindexed"),
         )),
         Access::Handle => Err(QueryError::Plan(format!(
-            "handle access is only for :handle, not :{name}"
+            "handle access is only for :kala_handle, not :{name}"
         ))),
         _ => Ok(()),
     }

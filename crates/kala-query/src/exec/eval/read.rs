@@ -175,7 +175,9 @@ impl Exec<'_, '_> {
                     .cloned()
                     .collect()
             }
-            Access::Handle => unreachable!("invariant: compile routes :handle to Step::Handle"),
+            Access::Handle => {
+                unreachable!("invariant: compile routes :kala_handle to Step::Handle")
+            }
         };
         self.budget.step(pairs.len() as u64)?;
         Ok(pairs)

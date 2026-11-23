@@ -155,7 +155,7 @@ fn impossible_schema_redefinitions_are_corrupt_with_positive_controls() {
         attribute(2, "height", 3, 0, 0, 0),  // nonconsecutive new ID
         attribute(1, "age", 2, 0, 0, 0),     // duplicate latest name
         attribute(0, "age@old", 2, 0, 0, 0), // reserved migration rename
-        attribute(1, "handle", 2, 0, 0, 0),  // pseudo-attribute
+        attribute(1, "kala_handle", 2, 0, 0, 0), // reserved built-in namespace
         node_type(2, "FACTION", 0),          // unknown node-type ID gap
         node_type(1, "CHARACTER", 0),        // duplicate node type
     ] {

@@ -45,7 +45,7 @@ fn renamed_properties_and_relationships_use_new_names_at_old_canon() {
     let mut client = Client::ready(&server);
     for canon in ["", " :canon 12"] {
         let rows = client.query(&format!(
-            "// kala:datalog\n[:find ?e :at -230{canon} :where [?e :handle \"edwin\"]]"
+            "// kala:datalog\n[:find ?e :at -230{canon} :where [?e :kala_handle \"edwin\"]]"
         ));
         assert_eq!(rows.len(), 1);
         let fields = structure(rows[0][0].clone(), 0x4e);

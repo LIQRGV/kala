@@ -105,7 +105,7 @@ fn session_defaults_fall_back_clear_and_report_actual_canon_and_tick() {
 #[test]
 fn session_parameters_are_typed_unused_ignored_and_missing_rejected() {
     let fx = varrow();
-    let query = "[:find ?a :in $ ?who :at -210 :where [?e :handle ?who] [?e :ally_of ?a]]";
+    let query = "[:find ?a :in $ ?who :at -210 :where [?e :kala_handle ?who] [?e :ally_of ?a]]";
     let input = format!(
         ".param ?who edwin\n.param unused ignored\n{query}\n.params\n.unparam who\n{query}\n{ALLIES}\n"
     );

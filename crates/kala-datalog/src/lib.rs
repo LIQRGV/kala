@@ -79,7 +79,7 @@ pub fn parse(text: &str) -> Result<ast::Query, DatalogError> {
 
 /// Compile a parsed query against `world` and plan it.
 ///
-/// Resolves attribute names (inverse names allowed; `:handle` is the
+/// Resolves attribute names (inverse names allowed; `:kala_handle` is the
 /// built-in entity <-> handle pseudo-attribute), handle and ID constants,
 /// and types every variable and `:in` parameter from its uses. Then a
 /// greedy, deterministic planner orders the patterns and picks each one's

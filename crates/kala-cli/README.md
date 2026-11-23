@@ -136,8 +136,8 @@ with `[:correct N :delete]` or `[:correct N :replace :at 830]`. Replacement also
 accepts `:value`, `:op` and `:precision`. A no-op prints 0 changed.
 
 `--json` prints one document per successful form, with fields `form`, `dry_run`,
-`tx`, `changed`, `entries`, `edges`, `ops`, `schema` and `warnings`. Each op has `position`,
-`kind`, `tick`, `precision`, `changed`, `entries` and `entity` (null unless created).
+`tx`, `changed`, `declared`, `entries`, `edges`, `ops`, `schema` and `warnings`. Each op has `position`,
+`kind`, `tick`, `precision`, `changed`, `declared`, `entries` and `entity` (null unless created).
 Entry IDs are integers; new edges are `edge#N` strings. Warnings have `introduced`
 and `resolved` arrays of the same messages as `kala load`. Errors stay on stderr.
 
@@ -278,12 +278,21 @@ explicit definition or deprecation is a no-op. Cardinality labels can change
 with overlap warnings; doctor uses the label at its requested canon. Structural
 changes (type, kind, direction, indexing) in place require no fact entry ever
 having been logged for that attribute; otherwise use migration. Deprecated
-attributes reject assertions, retractions and corrections but remain readable.
+attributes reject new assertions and retractions, but accept corrections and remain
+readable. Corrections can delete an entry or replace its value, tick, op or precision,
+including entries on a migration's `x@old` attribute.
 
 Renaming keeps the attribute ID: only the new name works at every canon, and the
 old name is immediately free. Names containing `@` are reserved for migration;
-`handle` (query pseudo-attribute) and `edge` (ID prefix) are reserved. Attribute
-and inverse names share a namespace. Node type renaming and inverse renaming
+`kala_` is reserved for Kala at genesis and in later schema edits, and `_KALA_`
+is reserved for names introduced after genesis. Both prefixes are case-sensitive.
+`edge` (ID prefix) is reserved only for node types. Attributes and inverse names
+may use `handle` or `edge`; the built-in query pseudo-attribute is `:kala_handle`.
+Upgrading queries: the built-in used to be `:handle`. In a world without a
+`handle` attribute an old `[?e :handle …]` query fails with a hint; in a world
+that declares its own `handle` attribute it reads that attribute's values
+instead, so rewrite old queries to `:kala_handle`.
+Attribute and inverse names share a namespace. Node type renaming and inverse renaming
 are not supported.
 
 A migration accepts an optional type and the same options; omitted fields retain
@@ -315,7 +324,8 @@ Directed → bidirectional refuses pairs with histories in both directions.
 Bidirectional → directed copies both orientations (self-pairs once). Ref copies
 create new edge IDs and copy edge-property histories to the corresponding edges,
 including the histories of deprecated edge-property attributes (such as
-`disguised@old` from an earlier migration); users still cannot write to those.
+`disguised@old` from an earlier migration); new assertions and retractions on
+those attributes stay refused, while corrections are accepted.
 Directed → bidirectional drops the source's inverse name (freeing it) and its
 reverse cardinality, since a bidirectional attribute has neither; the report
 line ends with e.g. `; dropped inverse :child_of and reverse cardinality one`.
@@ -327,8 +337,14 @@ JSON `schema` array is ordered, with `kind` equal to `attribute`, `node_type`,
 `rename`, `deprecate`, `cardinality`, `world_setting` or `migrate`. Records include
 names/types and `inferred`; migration records add `from`, `to`, `change_points`,
 `edges`, `edge_properties`, `skipped`, `dropped_inverse` (the inverse name or
-`null`) and `dropped_reverse_cardinality` (`"one"`, `"many"` or `null`). `changed` counts fact/correction entries and
-reported schema actions; per-op `changed` still counts fact entries.
+`null`) and `dropped_reverse_cardinality` (`"one"`, `"many"` or `null`). `changed` counts only fact/correction entries, including migration copies.
+`declared` counts reported schema actions: declarations (inferred or explicit),
+renames, deprecations, cardinality changes, world settings and the migration action.
+Both fields are always present at the report and per-op levels. Schema no-ops
+count zero; entity creation and edge interning count in neither. Text adds
+`, M declared` only when M is nonzero: an inferred assertion prints
+`1 changed, 1 declared`, a pure declaration `0 changed, 1 declared`, and a
+fact-only write still prints `1 changed`. The write REPL uses the same reports.
 
 This release writes **log format 5**. Format-4 and older worlds are refused with
 an older-Kala message and must be recreated from their source fixtures/scripts.

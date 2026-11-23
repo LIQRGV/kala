@@ -586,7 +586,7 @@ impl Exec<'_, '_> {
         Ok(out)
     }
 
-    /// Runs a `:handle` read on its input's rows.
+    /// Runs a `:kala_handle` read on its input's rows.
     fn eval_handle(
         &mut self,
         entity: &Pos,

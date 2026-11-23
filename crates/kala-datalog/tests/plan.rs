@@ -2,7 +2,7 @@
 //!
 //! Binding rule (contract "Item 5: planner"): greedy and deterministic. Next pattern = best
 //! given the vars bound so far: bound entity -> E; else bound ref value -> R; else bound value
-//! of an indexed attribute -> V; `:handle` with a side bound -> Handle; else Scan of the attr
+//! of an indexed attribute -> V; `:kala_handle` with a side bound -> Handle; else Scan of the attr
 //! with the smallest `World::attr_stats(attr).pairs` (ties: query order). `(at ?t ..)` is
 //! eligible only once ?t is bound. Left-deep nested Expands over Unit. A Filter sits right after
 //! the step binding its last var. Project of the find vars on top. Constants and `:in` params
@@ -85,7 +85,7 @@ fn explain(w: &World, text: &str) -> String {
 }
 
 /// The plan's steps in execution order (bottom first): `attr:Access` for an Expand
-/// (`handle:Handle` for the pseudo-attribute), `filter` for a Filter. Fails on anything that
+/// (`kala_handle:Handle` for the pseudo-attribute), `filter` for a Filter. Fails on anything that
 /// is not a left-deep chain `Project(Filter|Expand ... Unit)`.
 fn steps(p: &Plan, shown: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -107,7 +107,7 @@ fn steps(p: &Plan, shown: &str) -> Vec<String> {
             } => {
                 let name = match attr {
                     AttrRef::Named(n) => n.clone(),
-                    AttrRef::Handle => "handle".to_string(),
+                    AttrRef::Handle => "kala_handle".to_string(),
                 };
                 out.push(format!("{name}:{access:?}"));
                 op = input;
@@ -158,16 +158,20 @@ fn rows(w: &World, text: &str, params: &[(&str, Value)]) -> BTreeSet<Vec<Value>>
 #[test]
 fn handle_then_e_and_no_scan_anywhere() {
     let w = varrow();
-    let text = r#"[:find ?a :where [?e :handle "edwin"] [?e :ally_of ?a]]"#;
+    let text = r#"[:find ?a :where [?e :kala_handle "edwin"] [?e :ally_of ?a]]"#;
     let shown = explain(w, text);
-    assert_eq!(sig(w, text), ["handle:Handle", "ally_of:E"], "\n{shown}");
+    assert_eq!(
+        sig(w, text),
+        ["kala_handle:Handle", "ally_of:E"],
+        "\n{shown}"
+    );
     assert!(!shown.contains("via scan"), "\n{shown}");
     assert_eq!(
         shown,
         "Find ?a  at latest  canon latest\n\
          \x20 Project ?a\n\
          \x20   Expand [?e :ally_of ?a] @latest via E\n\
-         \x20     Expand [?e :handle \"edwin\"] via handle\n\
+         \x20     Expand [?e :kala_handle \"edwin\"] via handle\n\
          \x20       Unit\n"
     );
 }
@@ -242,19 +246,27 @@ fn bound_value_variable_of_indexed_attr_uses_v() {
 #[test]
 fn handle_with_bound_entity_uses_handle() {
     let w = varrow();
-    let text = "[:find ?h :where [:edwin :ally_of ?a] [?a :handle ?h]]";
+    let text = "[:find ?h :where [:edwin :ally_of ?a] [?a :kala_handle ?h]]";
     let shown = explain(w, text);
-    assert_eq!(sig(w, text), ["ally_of:E", "handle:Handle"], "\n{shown}");
+    assert_eq!(
+        sig(w, text),
+        ["ally_of:E", "kala_handle:Handle"],
+        "\n{shown}"
+    );
 }
 
 #[test]
 fn param_counts_as_bound() {
     let w = varrow();
-    let text = "[:find ?a :in $ ?who :where [?e :ally_of ?a] [?e :handle ?who]]";
+    let text = "[:find ?a :in $ ?who :where [?e :ally_of ?a] [?e :kala_handle ?who]]";
     let shown = explain(w, text);
-    assert_eq!(sig(w, text), ["handle:Handle", "ally_of:E"], "\n{shown}");
+    assert_eq!(
+        sig(w, text),
+        ["kala_handle:Handle", "ally_of:E"],
+        "\n{shown}"
+    );
     assert!(
-        shown.contains("Expand [?e :handle $who] via handle"),
+        shown.contains("Expand [?e :kala_handle $who] via handle"),
         "\n{shown}"
     );
 }
@@ -266,8 +278,8 @@ fn reversed_text_order_gives_the_same_plan_for_selective_queries() {
     let w = varrow();
     let pairs = [
         (
-            r#"[:find ?a :where [?e :handle "edwin"] [?e :ally_of ?a]]"#,
-            r#"[:find ?a :where [?e :ally_of ?a] [?e :handle "edwin"]]"#,
+            r#"[:find ?a :where [?e :kala_handle "edwin"] [?e :ally_of ?a]]"#,
+            r#"[:find ?a :where [?e :ally_of ?a] [?e :kala_handle "edwin"]]"#,
         ),
         (
             "[:find ?n :where [?p :located_in :varrow] [?p :name ?n]]",
@@ -295,11 +307,11 @@ fn reversed_text_order_gives_the_same_plan_for_selective_queries() {
 fn selective_queries_never_scan() {
     let w = varrow();
     for text in [
-        r#"[:find ?a :where [?e :handle "edwin"] [?e :ally_of ?a] [?a :name ?n]]"#,
+        r#"[:find ?a :where [?e :kala_handle "edwin"] [?e :ally_of ?a] [?a :name ?n]]"#,
         "[:find ?a :where [:edwin :ally_of ?a] [?a :located_in ?p] [?p :name ?n]]",
         "[:find ?e :where [?e :located_in :varrow] [?e :name ?n]]",
         r#"[:find ?e ?p :where [?e :name "Edwin"] [?e :located_in ?p] [?p :name ?pn]]"#,
-        r#"[:find ?a :in $ ?who :where [?a :name ?n] [?e :ally_of ?a] [?e :handle ?who]]"#,
+        r#"[:find ?a :in $ ?who :where [?a :name ?n] [?e :ally_of ?a] [?e :kala_handle ?who]]"#,
     ] {
         let shown = explain(w, text);
         assert!(!shown.contains("via scan"), "{text}\n{shown}");
@@ -387,12 +399,11 @@ fn planning_is_deterministic() {
 #[test]
 fn filter_sits_right_after_the_step_binding_its_last_var() {
     let w = varrow();
-    let text =
-        r#"[:find ?n :where [?e :handle "edwin"] [?e :ally_of ?a] [?a :name ?n] [(!= ?a ?e)]]"#;
+    let text = r#"[:find ?n :where [?e :kala_handle "edwin"] [?e :ally_of ?a] [?a :name ?n] [(!= ?a ?e)]]"#;
     let shown = explain(w, text);
     assert_eq!(
         sig(w, text),
-        ["handle:Handle", "ally_of:E", "filter", "name:E"],
+        ["kala_handle:Handle", "ally_of:E", "filter", "name:E"],
         "\n{shown}"
     );
 }
@@ -400,12 +411,11 @@ fn filter_sits_right_after_the_step_binding_its_last_var() {
 #[test]
 fn filter_written_first_still_waits_for_its_vars() {
     let w = varrow();
-    let text =
-        r#"[:find ?n :where [(!= ?a ?e)] [?e :handle "edwin"] [?e :ally_of ?a] [?a :name ?n]]"#;
+    let text = r#"[:find ?n :where [(!= ?a ?e)] [?e :kala_handle "edwin"] [?e :ally_of ?a] [?a :name ?n]]"#;
     let shown = explain(w, text);
     assert_eq!(
         sig(w, text),
-        ["handle:Handle", "ally_of:E", "filter", "name:E"],
+        ["kala_handle:Handle", "ally_of:E", "filter", "name:E"],
         "\n{shown}"
     );
 }
@@ -413,12 +423,11 @@ fn filter_written_first_still_waits_for_its_vars() {
 #[test]
 fn filter_on_param_and_var_goes_right_after_the_var_is_bound() {
     let w = varrow();
-    let text =
-        "[:find ?a :in $ ?who ?other :where [?e :handle ?who] [(!= ?e ?other)] [?e :ally_of ?a]]";
+    let text = "[:find ?a :in $ ?who ?other :where [?e :kala_handle ?who] [(!= ?e ?other)] [?e :ally_of ?a]]";
     let shown = explain(w, text);
     assert_eq!(
         sig(w, text),
-        ["handle:Handle", "filter", "ally_of:E"],
+        ["kala_handle:Handle", "filter", "ally_of:E"],
         "\n{shown}"
     );
 }
@@ -489,7 +498,7 @@ const HEADLINE: &str = r#"[:find ?name
  :at -210
  :canon 41
  :where
- [?e :handle ?who]
+ [?e :kala_handle ?who]
  [?e :ally_of ?a]
  (at -200 [?a :located_in ?p])
  [?a :name ?name]
@@ -507,7 +516,7 @@ fn headline_query_explain_is_pinned() {
          \x20     Expand [?a :located_in ?p] @-200 via E\n\
          \x20       Filter ?a != ?e\n\
          \x20         Expand [?e :ally_of ?a] @latest via E\n\
-         \x20           Expand [?e :handle $who] via handle\n\
+         \x20           Expand [?e :kala_handle $who] via handle\n\
          \x20             Unit\n"
     );
 }
@@ -525,7 +534,7 @@ fn headline_query_never_scans_and_matches_a_hand_reordered_equivalent() {
  [?a :name ?name]
  (at -200 [?a :located_in ?p])
  [?e :ally_of ?a]
- [?e :handle ?who]]"#;
+ [?e :kala_handle ?who]]"#;
     let params = [("who", Value::Str("edwin".into()))];
     let a = rows(w, HEADLINE, &params);
     let b = rows(w, reordered, &params);
@@ -538,12 +547,12 @@ fn results_are_unchanged_by_pattern_order() {
     let w = varrow();
     let a = rows(
         w,
-        r#"[:find ?a ?n :at -210 :where [?e :handle "edwin"] [?e :ally_of ?a] [?a :name ?n]]"#,
+        r#"[:find ?a ?n :at -210 :where [?e :kala_handle "edwin"] [?e :ally_of ?a] [?a :name ?n]]"#,
         &[],
     );
     let b = rows(
         w,
-        r#"[:find ?a ?n :at -210 :where [?a :name ?n] [?e :ally_of ?a] [?e :handle "edwin"]]"#,
+        r#"[:find ?a ?n :at -210 :where [?a :name ?n] [?e :ally_of ?a] [?e :kala_handle "edwin"]]"#,
         &[],
     );
     assert_eq!(a, b);

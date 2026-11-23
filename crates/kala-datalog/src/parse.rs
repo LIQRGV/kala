@@ -804,7 +804,7 @@ fn not(items: Vec<Form>, span: Span, counts: &mut Counts) -> Result<Not, Datalog
     })
 }
 
-/// `(during [e a v] ?s)`, exactly: a 3-element pattern (not `:handle`) and
+/// `(during [e a v] ?s)`, exactly: a 3-element pattern (not `:kala_handle`) and
 /// a variable.
 fn during(items: Vec<Form>, span: Span, counts: &mut Counts) -> Result<During, DatalogError> {
     const SHAPE: &str = "`during` is written `(during [e a v] ?s)`: a 3-element pattern and a \
@@ -833,10 +833,10 @@ fn during(items: Vec<Form>, span: Span, counts: &mut Counts) -> Result<During, D
         }
         other => return Err(DatalogError::syntax(other.span(), SHAPE)),
     };
-    if pattern.a.name == "handle" {
+    if pattern.a.name == "kala_handle" {
         return Err(DatalogError::syntax(
             pattern.a.span,
-            "`:handle` has no history; `during` needs a schema attribute",
+            "`:kala_handle` has no history; `during` needs a schema attribute",
         ));
     }
     let out = match out {
@@ -1020,10 +1020,10 @@ fn pattern(items: Vec<Form>, span: Span, history_ok: bool) -> Result<Pattern, Da
     let history = match it.next() {
         None => None,
         Some(t) => {
-            if a.name == "handle" {
+            if a.name == "kala_handle" {
                 return Err(DatalogError::syntax(
                     a.span,
-                    "`:handle` has no history; a history pattern needs a schema attribute",
+                    "`:kala_handle` has no history; a history pattern needs a schema attribute",
                 ));
             }
             let tick = match item(t)? {

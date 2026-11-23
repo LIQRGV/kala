@@ -8,9 +8,9 @@ use serde_json::Value as Json;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-const ALLIES: &str = "[:find ?a :in $ ?who :where [?e :handle ?who] [?e :ally_of ?a]]";
+const ALLIES: &str = "[:find ?a :in $ ?who :where [?e :kala_handle ?who] [?e :ally_of ?a]]";
 const ALLIES_AT: &str =
-    "[:find ?a :in $ ?who ?t ?c :at ?t :canon ?c :where [?e :handle ?who] [?e :ally_of ?a]]";
+    "[:find ?a :in $ ?who ?t ?c :at ?t :canon ?c :where [?e :kala_handle ?who] [?e :ally_of ?a]]";
 
 struct W {
     _dir: tempfile::TempDir,

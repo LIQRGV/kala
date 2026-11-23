@@ -366,7 +366,7 @@ Find ?a  in $who  at 5  canon latest
         Unit
       Expand [_ :ally_of ?a] @latest via scan
         Unit
-      Expand [?e :handle \"edwin\"] via handle
+      Expand [?e :kala_handle \"edwin\"] via handle
         Unit
       Filter ?x >= $y
         Filter ?x > $y
