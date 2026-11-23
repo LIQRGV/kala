@@ -12,6 +12,8 @@ use crate::escape;
 
 /// Where entity IDs and labels come from.
 pub trait Names {
+    /// Whether this is the reserved account store.
+    fn is_system(&self) -> bool;
     /// The entity's handle, if it has one.
     fn handle(&self, id: EntityId) -> Option<&str>;
     /// `CHARACTER#1`, `edge#9`, as [`World::format_id`] formats it.
@@ -24,6 +26,9 @@ pub trait Names {
 }
 
 impl Names for World {
+    fn is_system(&self) -> bool {
+        kala_bolt::system::is_system(self)
+    }
     fn handle(&self, id: EntityId) -> Option<&str> {
         self.handle_of(id)
     }
@@ -63,6 +68,11 @@ impl LogNames {
 }
 
 impl Names for LogNames {
+    fn is_system(&self) -> bool {
+        self.node_types
+            .values()
+            .any(|name| name == kala_bolt::system::SYSTEM_MARKER)
+    }
     fn handle(&self, id: EntityId) -> Option<&str> {
         self.handles.get(&id).map(String::as_str)
     }
@@ -92,6 +102,7 @@ pub fn entity(n: &dyn Names, id: EntityId) -> String {
 pub fn value(n: &dyn Names, v: &Value) -> String {
     match v {
         Value::Ref(id) => entity(n, *id),
+        Value::Str(s) if n.is_system() && s.starts_with("$argon2") => "\"<redacted>\"".into(),
         Value::Str(s) => format!("\"{}\"", escape::value(s)),
         Value::Bool(b) => b.to_string(),
         Value::I64(i) => i.to_string(),
@@ -111,7 +122,11 @@ fn interval(i: &Interval) -> String {
 pub fn overlap_line(n: &dyn Names, o: &Overlap) -> String {
     let who = entity(n, o.entity);
     let attr = escape::value(&o.attr);
-    let (a, b) = (value(n, &o.a), value(n, &o.b));
+    let (a, b) = if n.is_system() && o.attr == "password_hash" {
+        ("<redacted>".into(), "<redacted>".into())
+    } else {
+        (value(n, &o.a), value(n, &o.b))
+    };
     let during = interval(&o.during);
     match o.side {
         Side::Forward => format!("{who} {attr}: {a} and {b} both hold {during}"),

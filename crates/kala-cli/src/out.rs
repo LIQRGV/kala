@@ -70,6 +70,14 @@ impl JValue {
         JValue { ty, value }
     }
 
+    /// Secret placeholders retain the string shape without exposing a hash.
+    pub fn redacted() -> JValue {
+        JValue {
+            ty: "string",
+            value: JInner::Str("<redacted>".into()),
+        }
+    }
+
     /// A query answer's cell: a value as [`JValue::new`] shows it, an op as
     /// `{"type": "op", "value": "assert"}`, an interval set as
     /// `{"type": "intervals", "value": [[from, until or null], ...]}`.
@@ -194,12 +202,29 @@ impl<'w> Labeler<'w> {
     }
 
     pub fn value(&self, v: &Value) -> JValue {
+        if kala_bolt::system::is_system(self.world)
+            && matches!(v, Value::Str(s) if s.starts_with("$argon2"))
+        {
+            return JValue::redacted();
+        }
         JValue::new(v, |e| self.entity(e))
+    }
+
+    /// Attribute-aware redaction also covers damaged hash values.
+    pub fn attribute_value(&self, attr: &str, value: &Value) -> JValue {
+        if attr == "password_hash" && kala_bolt::system::is_system(self.world) {
+            JValue::redacted()
+        } else {
+            self.value(value)
+        }
     }
 
     /// A query answer's cell ([`JValue::datum`]).
     pub fn datum(&self, d: &Datum) -> JValue {
-        JValue::datum(d, |e| self.entity(e))
+        match d {
+            Datum::Value(value) => self.value(value),
+            _ => JValue::datum(d, |e| self.entity(e)),
+        }
     }
 
     /// The values of `entity.attr` holding at the tick.
@@ -209,7 +234,7 @@ impl<'w> Labeler<'w> {
             .as_of_detail(entity, attr, self.tick)?
             .iter()
             .map(|c| JHeld {
-                value: self.value(&c.value),
+                value: self.attribute_value(attr, &c.value),
                 since: JTick::new(c.tick, c.precision),
             })
             .collect();

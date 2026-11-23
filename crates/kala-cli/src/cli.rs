@@ -67,16 +67,19 @@ fn parse_param(s: &str) -> Result<(String, String), String> {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Serve read-only Datalog queries over Bolt 5 on loopback.
+    /// Serve read-only Datalog queries over Bolt 5 with account authentication.
     Serve {
         /// Directory containing <database>.kala world files.
         dir: PathBuf,
-        /// Loopback IP:port, [::1]:port, or localhost:port.
+        /// IP:port, [IPv6]:port, or localhost:port.
         #[arg(long, default_value = "127.0.0.1:7687")]
         listen: String,
-        /// Authentication policy (only none is available yet).
-        #[arg(long, default_value = "none", value_parser = ["none"])]
+        /// Authentication policy (accounts by default; none is loopback-only).
+        #[arg(long, default_value = "accounts", value_parser = ["accounts", "none"])]
         auth: String,
+        /// Allow passwords over plaintext on a non-loopback listener.
+        #[arg(long)]
+        insecure_allow_plaintext: bool,
         #[arg(long)]
         default_db: Option<String>,
         /// Maximum simultaneous client connections.
@@ -85,6 +88,11 @@ pub enum Command {
         /// Seconds allowed to receive a complete message.
         #[arg(long, default_value_t = 600)]
         idle_timeout: u64,
+    },
+    /// Manage the server directory's accounts and database privileges.
+    User {
+        #[command(subcommand)]
+        command: UserCommand,
     },
     /// Build a world file from a YAML fixture.
     Load {
@@ -281,4 +289,52 @@ pub enum Command {
         #[command(flatten)]
         query: QueryArgs,
     },
+}
+
+/// Authentication input is never taken from argv.
+#[derive(Debug, Args)]
+pub struct UserCredentials {
+    /// Read exactly one password line from stdin.
+    #[arg(long, conflicts_with = "trust")]
+    pub password_stdin: bool,
+    /// Trust a loopback-only account without a password.
+    #[arg(long)]
+    pub trust: bool,
+}
+
+/// Local administrative operations, serialized by the system world's writer lock.
+#[derive(Debug, Subcommand)]
+pub enum UserCommand {
+    /// Create an account (a TTY prompts without echo if no plugin flag is given).
+    Add {
+        dir: PathBuf,
+        account: String,
+        #[command(flatten)]
+        credentials: UserCredentials,
+    },
+    /// Change an account's authentication plugin or password.
+    Set {
+        dir: PathBuf,
+        account: String,
+        #[command(flatten)]
+        credentials: UserCredentials,
+    },
+    /// Grant read, write or admin on a database (or *).
+    Grant {
+        dir: PathBuf,
+        account: String,
+        privilege: String,
+        database: String,
+    },
+    /// Revoke a grant; the last admin:* account is protected.
+    Revoke {
+        dir: PathBuf,
+        account: String,
+        privilege: String,
+        database: String,
+    },
+    /// Drop an account while preserving its audit history.
+    Drop { dir: PathBuf, account: String },
+    /// List accounts, plugins and grants (never password hashes).
+    List { dir: PathBuf },
 }

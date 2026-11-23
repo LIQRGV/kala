@@ -24,6 +24,8 @@ serde_json = "1.0.154"
 # approved for the read-only REPL. Persistence uses our bounded history wrapper.
 rustyline = { version = "=19.0.0", default-features = false }
 ctrlc = { version = "=3.5.3", default-features = false }
+# Security-consultant approved: hidden terminal password input, no optional features.
+rpassword = { version = "=7.4.0", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 # Security-consultant approved: platform constants only, for safe nonblocking,

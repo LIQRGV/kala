@@ -25,6 +25,12 @@ use crate::names;
 /// Runs `kala load` and returns the text to print on stdout.
 pub fn run(fixture: &Path, world: &Path, force: bool) -> Result<String, CliError> {
     let file_name = world_file_name(world)?;
+    if file_name == "system.kala" {
+        return Err(CliError::User("system is reserved; use `kala user`".into()));
+    }
+    if force && exists(world) {
+        refuse_system_file(world)?;
+    }
     if is_dir(world) {
         return Err(refuse_dir(world));
     }
@@ -38,6 +44,11 @@ pub fn run(fixture: &Path, world: &Path, force: bool) -> Result<String, CliError
     };
 
     let (tmp, loaded) = load_to_temp(&yaml, fixture, world, &dir, file_name)?;
+    if let Err(error) = super::transact::refuse_system(&loaded) {
+        drop(loaded);
+        remove_quietly(&tmp);
+        return Err(error);
+    }
     // Summarise before dropping the world: dropping releases its file lock,
     // which must happen before the file is moved into place.
     let summary = summary(&loaded, fixture, world);
@@ -107,14 +118,26 @@ fn lock_old(world: &Path) -> Result<Option<World>, CliError> {
     if is_dir(world) {
         return Err(refuse_dir(world));
     }
+    refuse_system_file(world)?;
     match World::open(world) {
-        Ok(w) => Ok(Some(w)),
+        Ok(w) => {
+            super::transact::refuse_system(&w)?;
+            Ok(Some(w))
+        }
         Err(kala_core::Error::WorldLocked) => Err(CliError::User(format!(
             "{} is open in another process (its lock is held); close it before replacing it with --force",
             escape::path(world)
         ))),
         Err(_) => Ok(None),
     }
+}
+
+/// Check content before opening a writer, which could otherwise recover the log.
+fn refuse_system_file(path: &Path) -> Result<(), CliError> {
+    if let Ok(world) = World::open_read_only(path) {
+        super::transact::refuse_system(&world)?;
+    }
+    Ok(())
 }
 
 /// Whether anything (a file, a directory, a dangling symlink) is at `p`.

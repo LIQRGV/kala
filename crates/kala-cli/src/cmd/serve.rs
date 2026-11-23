@@ -13,6 +13,8 @@ use std::time::Duration;
 pub fn run(
     dir: &Path,
     listen: &str,
+    auth: &str,
+    insecure_allow_plaintext: bool,
     default_db: Option<String>,
     max_connections: usize,
     idle_timeout: u64,
@@ -31,11 +33,34 @@ pub fn run(
     let config = ServerConfig {
         listen: addr,
         default_db,
+        insecure_allow_plaintext,
         max_connections,
         idle_timeout: Duration::from_secs(idle_timeout),
         ..ServerConfig::default()
     };
-    let server = Server::bind(dir, config).map_err(server_error)?;
+    let server = if auth == "accounts" {
+        Server::bind_accounts(dir, config)
+    } else {
+        // Validate loopback before creating any persistent state.
+        if !addr.ip().is_loopback() {
+            return Err(CliError::Usage(
+                "no-auth server requires a loopback listen address".into(),
+            ));
+        }
+        if kala_bolt::system::ensure(dir).map_err(|e| CliError::User(e.to_string()))? {
+            eprintln!("kala serve: created system.kala with root@localhost");
+        }
+        for account in kala_bolt::system::list(dir).map_err(|e| CliError::User(e.to_string()))? {
+            if account.plugin == kala_bolt::auth::Plugin::Trust {
+                eprintln!(
+                    "kala serve: account {}@{} uses trust (no password)",
+                    account.user, account.host
+                );
+            }
+        }
+        Server::bind(dir, config)
+    }
+    .map_err(server_error)?;
     let stop = Arc::new(AtomicBool::new(false));
     let signal_stop = Arc::clone(&stop);
     ctrlc::set_handler(move || signal_stop.store(true, Ordering::Relaxed))

@@ -173,3 +173,44 @@ returns a set union. `or-join` and `not-join` remain unsupported. A sixth histor
 position, `[?e :attribute ?v ?tick ?op ?precision]`, binds precision keywords such
 as `:year` and `:exact` (JSON cells have type `precision`). Precision annotates the
 stored tick; it does not turn it into a range.
+
+
+## Accounts (`kala user`)
+
+Every account command takes the server directory, bootstrapping `system.kala`
+with `root@localhost` (`trust`, `admin:*`) when absent. `kala serve DIR` defaults
+to `--auth accounts`; local `auth=None` uses that root account. Startup announces
+creation on stderr and warns for every trust account.
+
+```sh
+kala user add worlds alice@127.0.0.1 --password-stdin < private-password-file
+kala user grant worlds alice@127.0.0.1 read varrow
+kala user list worlds
+kala user set worlds root@localhost --password-stdin < private-root-password-file
+kala user revoke worlds alice@127.0.0.1 read varrow
+kala user drop worlds alice@127.0.0.1
+kala user add worlds local_tool@localhost --trust
+```
+
+`add` and `set` read one line with `--password-stdin` (LF or CRLF removed), or
+prompt without echo if stdin is a TTY and neither authentication flag is given.
+Empty passwords and passwords longer than 4096 bytes are refused. There is no
+password-on-argv option. `--trust` is restricted to `localhost`, `127.0.0.1` and
+`::1`. Do not use local trust behind a proxy that makes remote clients appear
+local. Lists show accounts, plugins and grants, never hashes.
+
+Grant/revoke syntax is `kala user grant|revoke DIR USER@HOST PRIV DB`, where
+PRIV is `read`, `write` or `admin`, and DB is a database name or `*` (quote it in
+a shell). The final `admin:*` account is protected against removal/demotion.
+Changes take effect at the next Bolt login without restarting the server;
+existing sessions keep their granted identity until LOGOFF or disconnect.
+
+`system` is reserved; ordinary `load`, `transact` and `repl --write` cannot
+create or overwrite its content, including renamed system files. Read commands
+remain available, with password hashes redacted in text and JSON audit history.
+Account operations append native transactions; protect `system.kala` and its
+backups because they retain old password hashes too.
+
+See [Bolt accounts and listen rules](../kala-bolt/README.md) for host precedence,
+database authorization and the explicit plaintext opt-in needed for a
+non-loopback listener. `--auth none` remains loopback-only.

@@ -52,7 +52,13 @@ fn usage(e: clap::Error, args: &[OsString]) -> ExitCode {
             ExitCode::SUCCESS,
         );
     }
-    let rendered = echo_safe_render(e, args);
+    // A mistaken --password=... or extra positional secret must not be echoed
+    // by clap while explaining that passwords never belong on argv.
+    let rendered = if args.get(1).is_some_and(|arg| arg == "user") {
+        "error: invalid kala user arguments; use `kala user --help` (passwords require --password-stdin or a hidden prompt)\n".into()
+    } else {
+        echo_safe_render(e, args)
+    };
     emit(Stream::Stderr, &escape::text(&rendered), ExitCode::from(2))
 }
 

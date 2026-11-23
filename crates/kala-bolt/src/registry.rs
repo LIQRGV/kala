@@ -100,17 +100,19 @@ impl Registry {
                 "default database is not a registered world",
             ));
         }
-        let default = default.or_else(|| {
-            (databases.len() == 1)
-                .then(|| databases.keys().next().cloned())
-                .flatten()
-        });
+        // The reserved system world is never an implicit user database.
+        let user_names: Vec<_> = databases.keys().filter(|name| *name != "system").collect();
+        let default = default.or_else(|| (user_names.len() == 1).then(|| user_names[0].clone()));
         Ok(Self { databases, default })
     }
+    /// Resolve the name before loading a world, so authorization precedes I/O.
+    pub fn name<'a>(&'a self, requested: Option<&'a str>) -> Result<&'a str, Failure> {
+        requested
+            .or(self.default.as_deref())
+            .ok_or_else(|| Failure::new(DATABASE, "no default database; specify a database name"))
+    }
     pub fn get(&self, requested: Option<&str>) -> Result<(String, Arc<World>), Failure> {
-        let name = requested.or(self.default.as_deref()).ok_or_else(|| {
-            Failure::new(DATABASE, "no default database; specify a database name")
-        })?;
+        let name = self.name(requested)?;
         let db = self
             .databases
             .get(name)
@@ -143,6 +145,11 @@ impl Registry {
             return Ok((name.into(), Arc::clone(world)));
         }
         let world = Arc::new(World::open_read_only(&db.path).map_err(Failure::store)?);
+        // Content, not a filename, identifies privileged worlds. A renamed
+        // system file must never become readable using an ordinary read grant.
+        if crate::system::is_system(&world) != (name == "system") {
+            return Err(Failure::store("reserved system database marker mismatch"));
+        }
         eprintln!(
             "event=bolt_database_loaded db={name} canon={}",
             world.latest_tx().0

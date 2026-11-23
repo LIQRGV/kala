@@ -41,6 +41,7 @@ pub(crate) fn run(
         bytes: 0,
         steps: 0,
         limits,
+        system: crate::system::is_system(world),
     };
     let mut rows = VecDeque::new();
     for row in result.rows {
@@ -137,6 +138,7 @@ struct Budget {
     bytes: usize,
     steps: u64,
     limits: Limits,
+    system: bool,
 }
 impl Budget {
     fn charge(&mut self, n: usize) -> Result<(), Failure> {
@@ -209,7 +211,13 @@ fn scalar(value: CoreValue, budget: &mut Budget) -> Result<Value, Failure> {
         CoreValue::Bool(v) => Value::Bool(v),
         CoreValue::I64(v) => Value::Integer(v),
         CoreValue::F64(v) => Value::Float(v),
-        CoreValue::Str(s) => return budget.string(s),
+        CoreValue::Str(s) => {
+            return budget.string(if budget.system && s.starts_with("$argon2") {
+                "<redacted>".into()
+            } else {
+                s
+            });
+        }
         CoreValue::Ref(_) => return Err(Failure::new(EXECUTION, "unexpected reference property")),
     })
 }
@@ -240,7 +248,11 @@ fn properties(
                     reason: kala_core::WorkInterruptReason::Limit,
                 });
             }
-            values.push(value);
+            values.push(if budget.system && attr.name == "password_hash" {
+                CoreValue::Str("<redacted>".into())
+            } else {
+                value
+            });
             Ok(())
         })
         .map_err(|e| failure.unwrap_or_else(|| core_error(e)))?;

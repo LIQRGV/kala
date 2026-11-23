@@ -90,7 +90,13 @@ with GraphDatabase.driver(uri, auth=None) as driver:
 # CHARACTER#… frozenset({'CHARACTER', ...}) Greg / Tomas
 ```
 
-The server is read-only and accepts no-auth connections only on loopback.
+The server defaults to account authentication. First startup creates
+`worlds/system.kala` with `root@localhost`, a loopback-only `trust` account,
+so the example's `auth=None` works locally. Use `kala user set worlds
+root@localhost --password-stdin` to switch root to a password, and `kala user`
+to manage per-database grants. Password accounts use Argon2id; non-loopback
+listeners require `--insecure-allow-plaintext` until TLS is available.
+`--auth none` remains a loopback-only development option. The server is read-only.
 Changes committed by `kala transact` become visible on the next query.
 Ctrl-C stops the server. Cypher comes next; explicit transactions, routing,
 Neo4j Browser and writes over Bolt are not supported yet. See the
@@ -186,4 +192,6 @@ The native Rust API (`kala-core`) can also write directly. See
 - [x] `kala serve`: read-only Bolt 5 Datalog queries through Neo4j drivers
 - [ ] Neo4j Browser compatibility and routing/procedure stubs
 - [ ] Cypher (a subset first), then Gremlin
-- [ ] On-disk indexes with checkpoints, authentication
+- [x] Accounts, host matching, Argon2id passwords and database privileges
+- [ ] TLS for encrypted Bolt connections
+- [ ] On-disk indexes with checkpoints

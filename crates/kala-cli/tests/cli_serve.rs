@@ -16,6 +16,9 @@ struct Process {
 }
 impl Process {
     fn start(listen: &str) -> Self {
+        Self::with_options(listen, &[], true)
+    }
+    fn with_options(listen: &str, options: &[&str], test_user: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         drop(
             kala_core::load_fixture_to(
@@ -24,11 +27,15 @@ impl Process {
             )
             .unwrap(),
         );
+        if test_user {
+            kala_bolt::system::add(dir.path(), "test-user@localhost", None).unwrap();
+        }
         let stderr = std::fs::File::create(dir.path().join("stderr.txt")).unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_kala"))
             .arg("serve")
             .arg(dir.path())
             .args(["--listen", listen])
+            .args(options)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(stderr)
@@ -196,4 +203,44 @@ fn localhost_maps_to_ipv4_and_basic_credentials_never_reach_output() {
     let (stdout, stderr) = server.stop();
     assert!(!stdout.contains(password));
     assert!(!stderr.contains(password));
+}
+
+#[test]
+#[cfg(unix)]
+fn default_accounts_bootstraps_system_and_warns_for_root_trust() {
+    let server = Process::with_options("127.0.0.1:0", &[], false);
+    assert!(server.dir.path().join("system.kala").is_file());
+    let (_, stderr) = server.stop();
+    assert!(stderr.contains("root@localhost uses trust (no password)"));
+}
+
+#[test]
+#[cfg(unix)]
+fn non_loopback_accounts_require_plaintext_opt_in_and_warn() {
+    let server = Process::with_options(
+        "0.0.0.0:0",
+        &["--auth", "accounts", "--insecure-allow-plaintext"],
+        false,
+    );
+    let (_, stderr) = server.stop();
+    assert!(stderr.contains("unencrypted"), "{stderr}");
+}
+
+#[test]
+fn no_auth_rejects_non_loopback_even_with_plaintext_opt_in() {
+    let dir = tempfile::tempdir().unwrap();
+    for options in [
+        vec!["--auth", "none"],
+        vec!["--auth", "none", "--insecure-allow-plaintext"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_kala"))
+            .arg("serve")
+            .arg(dir.path())
+            .args(["--listen", "0.0.0.0:0"])
+            .args(options)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("loopback"));
+    }
 }
