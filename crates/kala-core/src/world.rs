@@ -52,7 +52,8 @@
 //! handles, edges), `open` (replaying a log), `txn` (the write path and
 //! [`Txn`]), `meter` (bounded reads), `view` ([`View`]), `schema_ops` and
 //! `migration`. The indexes themselves sit behind the `store` module's
-//! ordered-map seam.
+//! ordered-map seam. Every hook of the `test-hooks` feature is in the
+//! `test_hooks` submodule.
 
 mod catalog;
 mod ids;
@@ -62,12 +63,12 @@ mod meter;
 mod migration;
 mod open;
 mod schema_ops;
+#[cfg(feature = "test-hooks")]
+mod test_hooks;
 mod txn;
 mod view;
 mod write_gate;
 
-#[cfg(feature = "test-hooks")]
-use crate::doctor::{IndexName, Tamper};
 use crate::error::{Error, WorkInterruptReason};
 use crate::id::{AttrId, EdgeId, EntityId, IdError, MAX_NODE_TYPE, NodeTypeId};
 use crate::interval::IntervalSet;
@@ -545,15 +546,6 @@ impl World {
         self.journal.log_path()
     }
 
-    /// Makes the next log append fail as `fault` says, to test failure
-    /// handling. An in-memory world has no log and ignores it. Not part of
-    /// the supported API.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn inject_log_fault(&mut self, fault: log::LogFault) {
-        self.journal.inject_log_fault(fault);
-    }
-
     /// `Err` if the world refuses writes: a read-only world or an
     /// unacknowledged damaged-tail recovery (checked first, see
     /// [`World::accepts_writes`]), or a log append that failed earlier.
@@ -752,21 +744,6 @@ impl World {
             world: self,
             canon,
             latest: canon == self.latest_tx(),
-            work: Work::NONE,
-        }
-    }
-
-    /// Like [`World::at_canon`], but always reading the main indexes with
-    /// the canon skip, even at the latest canon: the reference path the
-    /// latest-revision indexes must agree with. Not part of the supported
-    /// API.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn at_canon_main(&self, tx: TxId) -> View<'_> {
-        View {
-            world: self,
-            canon: tx.min(self.latest_tx()),
-            latest: false,
             work: Work::NONE,
         }
     }

@@ -42,8 +42,9 @@ pub(super) struct Journal {
     /// numbers them exactly as a file-backed one, genesis included. Doctor
     /// replays these for an in-memory world.
     entries: Vec<EntryInfo>,
-    /// The log file, for a file-backed world; `None` in memory.
-    log: Option<LogWriter>,
+    /// The log file, for a file-backed world; `None` in memory. Visible to
+    /// the module for the `test_hooks` (fault injection, rebuilds).
+    pub(super) log: Option<LogWriter>,
 }
 
 impl Journal {
@@ -223,12 +224,6 @@ impl Journal {
         self.log = Some(writer);
     }
 
-    /// Takes the log file out, leaving an in-memory journal.
-    #[cfg(feature = "test-hooks")]
-    pub(super) fn detach_log(&mut self) -> Option<LogWriter> {
-        self.log.take()
-    }
-
     /// The path of a file-backed world's log; `None` in memory.
     pub(super) fn log_path(&self) -> Option<&Path> {
         self.log.as_ref().map(LogWriter::path)
@@ -245,14 +240,6 @@ impl Journal {
         match self.log.as_mut() {
             Some(log) => log.append(txn),
             None => Ok(()),
-        }
-    }
-
-    /// Arms a fault for the next log append; ignored in memory.
-    #[cfg(feature = "test-hooks")]
-    pub(super) fn inject_log_fault(&mut self, fault: log::LogFault) {
-        if let Some(log) = self.log.as_mut() {
-            log.inject_fault(fault);
         }
     }
 }

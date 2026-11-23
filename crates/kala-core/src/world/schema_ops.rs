@@ -1054,14 +1054,6 @@ impl World {
     pub(crate) fn schema_matches(&self, other: &Self) -> bool {
         self.catalog.schema_matches(&other.catalog)
     }
-    /// Test hook: alter derived metadata without writing the source log.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn tamper_schema(&mut self) {
-        self.catalog
-            .settings
-            .push((self.latest_tx(), "schema".into(), "strict".into()));
-    }
 }
 
 pub(super) fn schema_warnings(before: Vec<Vec<Overlap>>, after: Vec<Vec<Overlap>>) -> Warnings {
