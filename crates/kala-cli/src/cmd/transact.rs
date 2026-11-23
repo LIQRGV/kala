@@ -1,7 +1,7 @@
 //! Terminal writes are adapters over the native transaction API.
 use super::{Done, query::read_text_file, read::core_err as read_core_err};
 use crate::{cli::TransactArgs, error::CliError, escape, names, out};
-use kala_core::{Correction, EntityId, Op, Precision, Tick, Txn, Value, World};
+use kala_core::{CommitResult, Correction, EntityId, Op, Precision, Tick, Txn, Value, World};
 use kala_datalog::ast::{Item, WriteOp, WriteTxn, WriteValue};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -188,7 +188,76 @@ pub(super) fn execute_restore(
         return Err(user(":genesis must be first; use kala transact --create"));
     }
     let default = form.at.or(default);
-    let fallback = default.unwrap_or_else(|| w.latest_tick());
+    let mut state = FormState {
+        fallback: default.unwrap_or_else(|| w.latest_tick()),
+        refs: known_refs(w, form),
+        precisions: stored_precisions(w, form),
+    };
+    let mut tx = w.begin();
+    if let Some(t) = default {
+        tx.set_default_tick(t);
+    }
+    let mut ops = Vec::new();
+    let mut created = Vec::new();
+    for (index, op) in form.ops.iter().enumerate() {
+        let schema_before = tx.schema_changes().len();
+        let staged = stage(&mut tx, op, index, &mut state).map_err(|e| {
+            let msg = format!("op {} (:{}): {}", index + 1, kind(op), e.message());
+            match e {
+                CliError::Store(_) => CliError::Store(msg),
+                _ => user(msg),
+            }
+        })?;
+        created.push(staged.entity);
+        ops.push(Operation {
+            position: index + 1,
+            kind: kind(op),
+            tick: staged.tick.0,
+            precision: staged.precision.map(out::precision_str),
+            changed: staged.changed,
+            declared: tx.schema_changes().len() - schema_before,
+            entries: Vec::new(),
+            entity: None,
+        });
+    }
+    let result = tx.commit().map_err(core_err)?;
+    Ok(committed_report(w, &result, ops, created))
+}
+
+/// What the ops of one form share while they are staged.
+struct FormState {
+    /// The tick reported by an op that names none.
+    fallback: Tick,
+    /// Entities the form can refer to: those it names that already exist,
+    /// plus the ones its own `:create` ops have staged so far.
+    refs: HashMap<String, EntityId>,
+    /// Per op: the precision stored for the entry a `:correct` points at.
+    precisions: Vec<Option<Precision>>,
+}
+
+/// What staging one op did.
+struct Staged {
+    changed: usize,
+    tick: Tick,
+    precision: Option<Precision>,
+    /// The entity a `:create` staged.
+    entity: Option<EntityId>,
+}
+
+impl Staged {
+    /// A schema op: no facts, reported at the form's fallback tick.
+    fn schema(fallback: Tick) -> Staged {
+        Staged {
+            changed: 0,
+            tick: fallback,
+            precision: None,
+            entity: None,
+        }
+    }
+}
+
+/// Every existing entity the form's facts and replacements name.
+fn known_refs(w: &World, form: &WriteTxn) -> HashMap<String, EntityId> {
     let mut refs = HashMap::new();
     for op in &form.ops {
         match op {
@@ -207,181 +276,210 @@ pub(super) fn execute_restore(
             _ => {}
         }
     }
-    // Corrections retain omitted precision, including deletions and no-ops.
-    // Use the core's chain resolver; a bad target is still reported by its op.
-    let precisions: Vec<_> = form
-        .ops
+    refs
+}
+
+/// Corrections retain omitted precision, including deletions and no-ops.
+/// Use the core's chain resolver; a bad target is still reported by its op.
+fn stored_precisions(w: &World, form: &WriteTxn) -> Vec<Option<Precision>> {
+    form.ops
         .iter()
         .map(|op| match op {
             WriteOp::Correct { entry, .. } => w.current_change(*entry).ok().map(|c| c.precision),
             _ => None,
         })
-        .collect();
-    let mut tx = w.begin();
-    if let Some(t) = default {
-        tx.set_default_tick(t);
-    }
-    let mut ops = Vec::new();
-    let mut created = Vec::new();
-    for (index, op) in form.ops.iter().enumerate() {
-        let schema_before = tx.schema_changes().len();
-        let mut run = || -> Result<(usize, Tick, Option<Precision>, Option<EntityId>), CliError> {
-            match op {
-                WriteOp::Attribute {
-                    name,
-                    value_type,
-                    options,
-                    inferred,
-                    ..
-                } => {
-                    if *inferred {
-                        tx.infer_attribute_with(name, *value_type, options)
-                            .map_err(core_err)?;
-                    } else {
-                        tx.declare_attribute_with(name, *value_type, options)
-                            .map_err(core_err)?;
-                    }
-                    Ok((0, fallback, None, None))
-                }
-                WriteOp::NodeType { name, inferred, .. } => {
-                    if *inferred {
-                        tx.infer_node_type(name).map_err(core_err)?;
-                    } else {
-                        tx.declare_node_type(name).map_err(core_err)?;
-                    }
-                    Ok((0, fallback, None, None))
-                }
-                WriteOp::Rename { old, new, .. } => {
-                    tx.rename_attribute(old, new).map_err(core_err)?;
-                    Ok((0, fallback, None, None))
-                }
-                WriteOp::Deprecate { name, .. } => {
-                    tx.deprecate_attribute(name).map_err(core_err)?;
-                    Ok((0, fallback, None, None))
-                }
-                WriteOp::Cardinality {
-                    name, cardinality, ..
-                } => {
-                    tx.set_cardinality(name, *cardinality).map_err(core_err)?;
-                    Ok((0, fallback, None, None))
-                }
-                WriteOp::WorldSetting { key, value, .. } => {
-                    tx.world_setting(key, value).map_err(core_err)?;
-                    Ok((0, fallback, None, None))
-                }
-                WriteOp::Migrate { name, options, .. } => {
-                    let report = tx
-                        .migrate_attribute(name, options.clone())
-                        .map_err(|e| migrate_err(&tx, e))?;
-                    Ok((
-                        report.change_points + report.edge_properties,
-                        fallback,
-                        None,
-                        None,
-                    ))
-                }
-                WriteOp::Create {
-                    node_type, handle, ..
-                } => {
-                    tx.infer_node_type(node_type).map_err(core_err)?;
-                    let id = tx
-                        .create_entity(node_type, handle.as_deref())
-                        .map_err(core_err)?;
-                    if let Some(handle) = handle {
-                        refs.insert(format!(":{handle}"), id);
-                    }
-                    // Numeric IDs may also refer to entities created earlier in this transaction.
-                    refs.insert(format!("{node_type}#{}", id.seq()), id);
-                    Ok((0, fallback, None, Some(id)))
-                }
-                WriteOp::Fact {
-                    op,
-                    subject: s,
-                    attr,
-                    value: v,
-                    at,
-                    precision,
-                    ..
-                } => {
-                    let e = subject(&tx, s, &refs)?;
-                    let v = value(&tx, v, &refs)?;
-                    if !tx
-                        .infer_write_attribute(&attr.name, &v, *op)
-                        .map_err(core_err)?
-                    {
-                        return Ok((0, at.unwrap_or(fallback), None, None));
-                    }
-                    let r = match op {
-                        Op::Assert => tx.assert_with_precision(e, &attr.name, v, *at, *precision),
-                        Op::Retract => tx.retract_with_precision(e, &attr.name, v, *at, *precision),
-                    }
+        .collect()
+}
+
+/// Stages one op in the native transaction.
+fn stage(
+    tx: &mut Txn<'_>,
+    op: &WriteOp,
+    index: usize,
+    state: &mut FormState,
+) -> Result<Staged, CliError> {
+    let fallback = state.fallback;
+    match op {
+        WriteOp::Attribute {
+            name,
+            value_type,
+            options,
+            inferred,
+            ..
+        } => {
+            if *inferred {
+                tx.infer_attribute_with(name, *value_type, options)
                     .map_err(core_err)?;
-                    // A no-op stores nothing, so it reports no precision (changing a
-                    // held fact's precision needs `:correct`).
-                    Ok((
-                        r.changed,
-                        r.tick,
-                        (r.changed > 0).then_some(*precision),
-                        None,
-                    ))
-                }
-                WriteOp::Correct {
-                    entry, replacement, ..
-                } => {
-                    let c = match replacement {
-                        None => Correction::Delete,
-                        Some(r) => Correction::Replace {
-                            value: r.value.as_ref().map(|v| value(&tx, v, &refs)).transpose()?,
-                            tick: r.at,
-                            op: r.op,
-                            precision: r.precision,
-                        },
-                    };
-                    let r = tx.correct(*entry, c).map_err(core_err)?;
-                    // The chain's stored precision, so a no-op or delete
-                    // still reports the truth.
-                    Ok((
-                        r.changed,
-                        r.tick,
-                        Some(
-                            replacement
-                                .as_ref()
-                                .and_then(|r| r.precision)
-                                .or(precisions[index])
-                                .unwrap_or(Precision::Exact),
-                        ),
-                        None,
-                    ))
-                }
+            } else {
+                tx.declare_attribute_with(name, *value_type, options)
+                    .map_err(core_err)?;
             }
-        };
-        let (changed, tick, precision, entity) = run().map_err(|e| {
-            let msg = format!("op {} (:{}): {}", index + 1, kind(op), e.message());
-            match e {
-                CliError::Store(_) => CliError::Store(msg),
-                _ => user(msg),
+            Ok(Staged::schema(fallback))
+        }
+        WriteOp::NodeType { name, inferred, .. } => {
+            if *inferred {
+                tx.infer_node_type(name).map_err(core_err)?;
+            } else {
+                tx.declare_node_type(name).map_err(core_err)?;
             }
-        })?;
-        created.push(entity);
-        ops.push(Operation {
-            position: index + 1,
-            kind: kind(op),
-            tick: tick.0,
-            precision: precision.map(out::precision_str),
-            changed,
-            declared: tx.schema_changes().len() - schema_before,
-            entries: Vec::new(),
-            entity: None,
+            Ok(Staged::schema(fallback))
+        }
+        WriteOp::Rename { old, new, .. } => {
+            tx.rename_attribute(old, new).map_err(core_err)?;
+            Ok(Staged::schema(fallback))
+        }
+        WriteOp::Deprecate { name, .. } => {
+            tx.deprecate_attribute(name).map_err(core_err)?;
+            Ok(Staged::schema(fallback))
+        }
+        WriteOp::Cardinality {
+            name, cardinality, ..
+        } => {
+            tx.set_cardinality(name, *cardinality).map_err(core_err)?;
+            Ok(Staged::schema(fallback))
+        }
+        WriteOp::WorldSetting { key, value, .. } => {
+            tx.world_setting(key, value).map_err(core_err)?;
+            Ok(Staged::schema(fallback))
+        }
+        WriteOp::Migrate { name, options, .. } => {
+            let report = tx
+                .migrate_attribute(name, options.clone())
+                .map_err(|e| migrate_err(tx, e))?;
+            Ok(Staged {
+                changed: report.change_points + report.edge_properties,
+                ..Staged::schema(fallback)
+            })
+        }
+        WriteOp::Create {
+            node_type, handle, ..
+        } => stage_create(tx, node_type, handle.as_deref(), state),
+        WriteOp::Fact { .. } => stage_fact(tx, op, state),
+        WriteOp::Correct { .. } => stage_correct(tx, op, index, state),
+    }
+}
+
+/// `[:create TYPE handle]`: later ops of the form may refer to the entity.
+fn stage_create(
+    tx: &mut Txn<'_>,
+    node_type: &str,
+    handle: Option<&str>,
+    state: &mut FormState,
+) -> Result<Staged, CliError> {
+    tx.infer_node_type(node_type).map_err(core_err)?;
+    let id = tx.create_entity(node_type, handle).map_err(core_err)?;
+    if let Some(handle) = handle {
+        state.refs.insert(format!(":{handle}"), id);
+    }
+    // Numeric IDs may also refer to entities created earlier in this transaction.
+    state.refs.insert(format!("{node_type}#{}", id.seq()), id);
+    Ok(Staged {
+        entity: Some(id),
+        ..Staged::schema(state.fallback)
+    })
+}
+
+/// `[:assert ...]` / `[:retract ...]`.
+fn stage_fact(tx: &mut Txn<'_>, op: &WriteOp, state: &FormState) -> Result<Staged, CliError> {
+    let WriteOp::Fact {
+        op,
+        subject: s,
+        attr,
+        value: v,
+        at,
+        precision,
+        ..
+    } = op
+    else {
+        return Err(user("expected a fact"));
+    };
+    let e = subject(tx, s, &state.refs)?;
+    let v = value(tx, v, &state.refs)?;
+    if !tx
+        .infer_write_attribute(&attr.name, &v, *op)
+        .map_err(core_err)?
+    {
+        return Ok(Staged {
+            tick: at.unwrap_or(state.fallback),
+            ..Staged::schema(state.fallback)
         });
     }
+    let r = match op {
+        Op::Assert => tx.assert_with_precision(e, &attr.name, v, *at, *precision),
+        Op::Retract => tx.retract_with_precision(e, &attr.name, v, *at, *precision),
+    }
+    .map_err(core_err)?;
+    // A no-op stores nothing, so it reports no precision (changing a
+    // held fact's precision needs `:correct`).
+    Ok(Staged {
+        changed: r.changed,
+        tick: r.tick,
+        precision: (r.changed > 0).then_some(*precision),
+        entity: None,
+    })
+}
+
+/// `[:correct ENTRY ...]`.
+fn stage_correct(
+    tx: &mut Txn<'_>,
+    op: &WriteOp,
+    index: usize,
+    state: &FormState,
+) -> Result<Staged, CliError> {
+    let WriteOp::Correct {
+        entry, replacement, ..
+    } = op
+    else {
+        return Err(user("expected a correction"));
+    };
+    let c = match replacement {
+        None => Correction::Delete,
+        Some(r) => Correction::Replace {
+            value: r
+                .value
+                .as_ref()
+                .map(|v| value(tx, v, &state.refs))
+                .transpose()?,
+            tick: r.at,
+            op: r.op,
+            precision: r.precision,
+        },
+    };
+    let r = tx.correct(*entry, c).map_err(core_err)?;
+    // The chain's stored precision, so a no-op or delete
+    // still reports the truth.
+    Ok(Staged {
+        changed: r.changed,
+        tick: r.tick,
+        precision: Some(
+            replacement
+                .as_ref()
+                .and_then(|r| r.precision)
+                .or(state.precisions[index])
+                .unwrap_or(Precision::Exact),
+        ),
+        entity: None,
+    })
+}
+
+/// The report of a committed form: each op gets the entries it stored and
+/// the entity it created.
+fn committed_report(
+    w: &World,
+    result: &CommitResult,
+    mut ops: Vec<Operation>,
+    created: Vec<Option<EntityId>>,
+) -> Report {
     let created_any = created.iter().any(Option::is_some);
-    let result = tx.commit().map_err(core_err)?;
     let mut ids = result.entries.iter();
     for (op, entity) in ops.iter_mut().zip(created) {
         op.entity = entity.map(|e| w.format_id(e));
         op.entries = ids.by_ref().take(op.changed).map(|id| id.0).collect();
     }
-    Ok(Report {
+    let overlap_lines = |overlaps: &[_]| -> Vec<String> {
+        overlaps.iter().map(|o| names::overlap_line(w, o)).collect()
+    };
+    Report {
         form: 1,
         dry_run: false,
         tx: (!result.entries.is_empty()
@@ -409,20 +507,10 @@ pub(super) fn execute_restore(
             .collect(),
         ops,
         warnings: Warnings {
-            introduced: result
-                .warnings
-                .introduced
-                .iter()
-                .map(|o| names::overlap_line(w, o))
-                .collect(),
-            resolved: result
-                .warnings
-                .resolved
-                .iter()
-                .map(|o| names::overlap_line(w, o))
-                .collect(),
+            introduced: overlap_lines(&result.warnings.introduced),
+            resolved: overlap_lines(&result.warnings.resolved),
         },
-    })
+    }
 }
 
 fn counts(changed: usize, declared: usize) -> String {
@@ -488,33 +576,9 @@ pub fn render(report: &Report, json: bool) -> String {
 }
 
 pub fn run(args: &TransactArgs) -> Result<Done, CliError> {
-    let (path, input) = (args.world.as_path(), args.input.as_path());
-    let (dry_run, json, acknowledge_recovery) =
-        (args.dry_run, args.json, args.acknowledge_recovery);
-    let text = if input == Path::new("-") {
-        let mut bytes = Vec::new();
-        io::stdin()
-            .take(kala_datalog::MAX_QUERY_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| user(format!("reading stdin: {e}")))?;
-        if bytes.len() > kala_datalog::MAX_QUERY_BYTES {
-            return Err(user("input exceeds the 65536-byte limit"));
-        }
-        String::from_utf8(bytes).map_err(|_| user("input is not UTF-8"))?
-    } else {
-        read_text_file(input, kala_datalog::MAX_QUERY_BYTES, "the transactions")?
-    };
-    let mut w = if dry_run {
-        World::open_read_only(path).map_err(|e| CliError::at_path(path, &e))?
-    } else {
-        open_write(path, acknowledge_recovery)?
-    };
-    refuse_system(&w)?;
-    if dry_run && w.recovery().cause == Some(kala_core::CutCause::Damaged) {
-        return Err(user(
-            "dry-run refused: damaged log needs recovery acknowledgement before writes",
-        ));
-    }
+    let (dry_run, json) = (args.dry_run, args.json);
+    let text = read_input(&args.input)?;
+    let mut w = open_target(args)?;
     let forms = kala_datalog::write_forms(&text).map_err(|e| user(e.to_string()))?;
     // A dry run previews every form on one discarded copy, so later forms
     // see earlier ones exactly as a real run would.
@@ -532,27 +596,7 @@ pub fn run(args: &TransactArgs) -> Result<Done, CliError> {
                 None => execute(&mut w, &form, None),
             }
         };
-        let mut report = action().map_err(|e| match e {
-            CliError::Store(s) => CliError::Store(format!(
-                "form {} failed; {count} prior forms {}: {s}",
-                i + 1,
-                if dry_run {
-                    "previewed (nothing committed)"
-                } else {
-                    "committed"
-                }
-            )),
-            e => user(format!(
-                "form {} failed; {count} prior forms {}: {}",
-                i + 1,
-                if dry_run {
-                    "previewed (nothing committed)"
-                } else {
-                    "committed"
-                },
-                e.message()
-            )),
-        })?;
+        let mut report = action().map_err(|e| form_failed(i + 1, count, dry_run, e))?;
         report.form = i + 1;
         report.dry_run = dry_run;
         let text = escape::text(&render(&report, json));
@@ -566,6 +610,58 @@ pub fn run(args: &TransactArgs) -> Result<Done, CliError> {
         return Err(user("expected at least one write transaction"));
     }
     Ok(String::new().into())
+}
+
+/// The write forms' text, from a file or from stdin (`-`).
+fn read_input(input: &Path) -> Result<String, CliError> {
+    if input != Path::new("-") {
+        return read_text_file(input, kala_datalog::MAX_QUERY_BYTES, "the transactions");
+    }
+    let mut bytes = Vec::new();
+    io::stdin()
+        .take(kala_datalog::MAX_QUERY_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| user(format!("reading stdin: {e}")))?;
+    if bytes.len() > kala_datalog::MAX_QUERY_BYTES {
+        return Err(user("input exceeds the 65536-byte limit"));
+    }
+    String::from_utf8(bytes).map_err(|_| user("input is not UTF-8"))
+}
+
+/// Opens the world: for writing, or read-only for a dry run (which never
+/// cuts a damaged tail and so refuses one).
+fn open_target(args: &TransactArgs) -> Result<World, CliError> {
+    let path = args.world.as_path();
+    let w = if args.dry_run {
+        World::open_read_only(path).map_err(|e| CliError::at_path(path, &e))?
+    } else {
+        open_write(path, args.acknowledge_recovery)?
+    };
+    refuse_system(&w)?;
+    if args.dry_run && w.recovery().cause == Some(kala_core::CutCause::Damaged) {
+        return Err(user(
+            "dry-run refused: damaged log needs recovery acknowledgement before writes",
+        ));
+    }
+    Ok(w)
+}
+
+/// A form's error, saying which form failed and what happened to the
+/// `count` forms before it. A store error stays a store error.
+fn form_failed(form: usize, count: usize, dry_run: bool, e: CliError) -> CliError {
+    let msg = format!(
+        "form {form} failed; {count} prior forms {}: {}",
+        if dry_run {
+            "previewed (nothing committed)"
+        } else {
+            "committed"
+        },
+        e.message()
+    );
+    match e {
+        CliError::Store(_) => CliError::Store(msg),
+        _ => user(msg),
+    }
 }
 
 /// [`core_err`], with a migration refusal's entities shown by handle (else
