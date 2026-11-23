@@ -11,8 +11,6 @@ pub enum Expr<V = Var, C = Value> {
     Value(C),
     /// A missing value.
     Null,
-    /// A list expression (including supplied list parameters).
-    List(Vec<Self>),
     /// A scalar query parameter.
     Param(String),
     /// An optional property read at the variable's binding tick.
@@ -46,7 +44,6 @@ impl<V, C> Expr<V, C> {
                     todo.push(b);
                 }
                 Self::Not(e) | Self::IsNull(e) => todo.push(e),
-                Self::List(values) => todo.extend(values),
                 Self::Var(_) | Self::Value(_) | Self::Null | Self::Param(_) => {}
             }
         }

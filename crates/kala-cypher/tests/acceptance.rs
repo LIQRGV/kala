@@ -393,12 +393,16 @@ fn embedded_nullable_and_list_parameters_keep_cypher_semantics() {
     params.insert("aliases".into(), aliases.clone());
     params.insert("value".into(), Datum::Null);
     assert_eq!(
-        run(&w, &p.plan, &params, &Limits::default()).unwrap().rows,
+        kala_query::run_with_values(&w, &p.plan, &params, &Limits::default())
+            .unwrap()
+            .rows,
         vec![vec![Datum::Null]]
     );
     params.insert("value".into(), aliases.clone());
     assert_eq!(
-        run(&w, &p.plan, &params, &Limits::default()).unwrap().rows,
+        kala_query::run_with_values(&w, &p.plan, &params, &Limits::default())
+            .unwrap()
+            .rows,
         vec![vec![aliases]]
     );
     params.insert(
@@ -411,7 +415,7 @@ fn embedded_nullable_and_list_parameters_keep_cypher_semantics() {
         ),
     );
     assert!(
-        run(&w, &p.plan, &params, &Limits::default())
+        kala_query::run_with_values(&w, &p.plan, &params, &Limits::default())
             .unwrap()
             .rows
             .is_empty()
@@ -472,7 +476,8 @@ fn parameter_list_equality_propagates_null_until_inequality_is_known() {
                 &format!("MATCH (e {{kala_handle: 'edwin'}}) WHERE {expression} RETURN e"),
             )
             .unwrap();
-            let result = run(&w, &p.plan, &params, &Limits::default()).unwrap();
+            let result =
+                kala_query::run_with_values(&w, &p.plan, &params, &Limits::default()).unwrap();
             assert_eq!(
                 result.rows.len(),
                 usize::from(want),

@@ -138,7 +138,7 @@ pub struct ResultSet {
 pub fn run_with_cancel(
     world: &World,
     plan: &Plan,
-    params: &dyn ParameterInput,
+    params: &Params,
     limits: &Limits,
     cancel: &AtomicBool,
 ) -> Result<ResultSet, QueryError> {
@@ -160,7 +160,7 @@ pub struct Usage {
 pub fn run_with_usage(
     world: &World,
     plan: &Plan,
-    params: &dyn ParameterInput,
+    params: &Params,
     limits: &Limits,
 ) -> Result<(ResultSet, Usage), QueryError> {
     run_tracked(world, plan, params, limits, &AtomicBool::new(false))
@@ -171,7 +171,7 @@ pub fn run_with_usage(
 pub fn run(
     world: &World,
     plan: &Plan,
-    params: &dyn ParameterInput,
+    params: &Params,
     limits: &Limits,
 ) -> Result<ResultSet, QueryError> {
     run_with_cancel(world, plan, params, limits, &AtomicBool::new(false))
@@ -215,7 +215,7 @@ fn run_tracked(
 pub fn execute(
     view: &View,
     plan: &Plan,
-    params: &dyn ParameterInput,
+    params: &Params,
     limits: &Limits,
 ) -> Result<ResultSet, QueryError> {
     execute_on(
@@ -493,6 +493,8 @@ fn output_rows(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut seen = HashSet::new();
+    let key_bytes = val::index_entry_bytes(find.len());
+    let mut seen_bytes = 0usize;
     let mut out = Vec::new();
     let mut orders = Vec::new();
     for row in rows {
@@ -502,9 +504,14 @@ fn output_rows(
             .iter()
             .map(|&s| row[s].clone().expect("checked find binding"))
             .collect();
-        if spec.distinct && !seen.insert(value.clone()) {
-            budget.release_bytes(tuple_bytes(find.len()));
-            continue;
+        if spec.distinct {
+            // The hash key and projected output retain separate tuples.
+            budget.charge_bytes(key_bytes)?;
+            if !seen.insert(value.clone()) {
+                budget.release_bytes(key_bytes.saturating_add(tuple_bytes(find.len())));
+                continue;
+            }
+            seen_bytes = seen_bytes.saturating_add(key_bytes);
         }
         budget.charge_bytes(result_row_bytes(&value).saturating_add(tuple_bytes(keys.len())))?;
         orders.push(
@@ -518,6 +525,8 @@ fn output_rows(
         );
         out.push(value);
     }
+    drop(seen);
+    budget.release_bytes(seen_bytes);
     let order = sort_by(out.len(), budget, |a, b, budget| {
         for (k, (_, desc)) in keys.iter().enumerate() {
             // Charge list traversal as well as string comparison prefixes.
@@ -586,4 +595,24 @@ fn sort_by(
     }
     budget.release_bytes(n.saturating_mul(std::mem::size_of::<usize>()));
     Ok(a)
+}
+
+/// Run with nullable/list parameters, leaving the original scalar API unchanged.
+pub fn run_with_values(
+    world: &World,
+    plan: &Plan,
+    params: &crate::QueryParams,
+    limits: &Limits,
+) -> Result<ResultSet, QueryError> {
+    run_with_values_and_cancel(world, plan, params, limits, &AtomicBool::new(false))
+}
+/// Run nullable/list parameters with caller-owned cancellation.
+pub fn run_with_values_and_cancel(
+    world: &World,
+    plan: &Plan,
+    params: &crate::QueryParams,
+    limits: &Limits,
+    cancel: &AtomicBool,
+) -> Result<ResultSet, QueryError> {
+    run_tracked(world, plan, params, limits, cancel).map(|(rows, _)| rows)
 }

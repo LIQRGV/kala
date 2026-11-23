@@ -89,8 +89,9 @@ pub(crate) fn run(
     );
     let params = parameters(world, &prepared.params, given, !datalog)?;
     let limits = Limits::default();
-    let result = kala_query::run_with_cancel(world, &prepared.plan, &params, &limits, stop)
-        .map_err(query_error)?;
+    let result =
+        kala_query::run_with_values_and_cancel(world, &prepared.plan, &params, &limits, stop)
+            .map_err(query_error)?;
     let meter = WorkMeter::bounded(limits.max_steps, Some(stop));
     let view = world.at_canon(result.canon).metered(&meter);
     let mut budget = Budget {

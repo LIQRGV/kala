@@ -125,12 +125,6 @@ impl Compiler<'_> {
             ),
             Expr::Value(v) => Expr::Value(v.clone()),
             Expr::Null => Expr::Null,
-            Expr::List(values) => Expr::List(
-                values
-                    .iter()
-                    .map(|e| self.expr(e))
-                    .collect::<Result<_, _>>()?,
-            ),
             Expr::Param(p) => {
                 self.param(p, ParamKind::Scalar)?;
                 Expr::Param(p.clone())

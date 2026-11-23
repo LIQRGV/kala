@@ -105,7 +105,7 @@ fn large_reused_parameters_are_budgeted_even_when_match_is_empty() {
                 .collect(),
         ),
     );
-    let result = run(
+    let result = kala_query::run_with_values(
         &world,
         &p.plan,
         &params,

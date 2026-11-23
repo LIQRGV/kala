@@ -422,7 +422,6 @@ impl Parser<'_> {
             }
             match e {
                 Expr::Not(e) | Expr::IsNull(e) => stack.push((e, d + 1)),
-                Expr::List(values) => stack.extend(values.iter().map(|e| (e, d + 1))),
                 Expr::Compare(_, a, b) | Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
                     stack.push((a, d + 1));
                     stack.push((b, d + 1));

@@ -216,12 +216,29 @@ impl Exec<'_, '_> {
                 return Ok(false);
             }
             let value = self.property(id, "label", t)?;
+            // A many-valued label must pay for every comparison, even when
+            // its property value came from the memo.
+            self.budget.step(label.len() as u64 / 64)?;
+            let wanted = self.intern_str(label)?;
             let matches = match value {
-                Val::Str(_, s) => s.as_ref() == label,
-                Val::List(_, xs) => xs
-                    .iter()
-                    .any(|v| matches!(v,Val::Str(_,s) if s.as_ref() == label)),
-                _ => false,
+                Val::List(_, xs) => {
+                    let mut found = false;
+                    for value in xs.iter() {
+                        self.budget.step(1)?;
+                        let same = cmp_real(value, &wanted, &mut self.budget.cmp).is_eq();
+                        self.budget.charge_cmp()?;
+                        if same {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
+                }
+                value => {
+                    let same = cmp_real(&value, &wanted, &mut self.budget.cmp).is_eq();
+                    self.budget.charge_cmp()?;
+                    same
+                }
             };
             if !matches {
                 return Ok(false);
@@ -326,20 +343,6 @@ impl Exec<'_, '_> {
                 .ok_or_else(|| QueryError::Plan("unbound expression".into()))?,
             Expr::Value(v) => v.clone(),
             Expr::Null => Val::Null,
-            Expr::List(values) => {
-                self.budget
-                    .charge_bytes(64 + values.len().saturating_mul(std::mem::size_of::<Val>()))?;
-                let values = values
-                    .iter()
-                    .map(|e| self.expression(e, row))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let bytes = 64 + values.len().saturating_mul(std::mem::size_of::<Val>());
-                let (v, new) = self.interner.list(values)?;
-                if !new {
-                    self.budget.release_bytes(bytes);
-                }
-                v
-            }
             Expr::Param(_) => unreachable!("parameters resolved by compile"),
             Expr::Property {
                 entity,

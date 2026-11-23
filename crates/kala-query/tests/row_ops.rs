@@ -250,3 +250,29 @@ fn nullable_expression_attributes_are_visible_before_evaluation() {
     assert!(names.contains(&"password_hash"));
     assert!(names.contains(&"secret_in_false_branch"));
 }
+
+#[test]
+fn distinct_output_accounts_for_hash_keys_while_projected_rows_are_live() {
+    let w = world();
+    let values: Vec<_> = (0..512).map(|n| Some(Value::I64(n))).collect();
+    let bag = plan(&values, false, vec![], None, None);
+    let distinct = plan(&values, true, vec![], None, None);
+    let (bag_rows, bag_usage) =
+        run_with_usage(&w, &bag, &Params::new(), &Limits::default()).unwrap();
+    let (distinct_rows, distinct_usage) =
+        run_with_usage(&w, &distinct, &Params::new(), &Limits::default()).unwrap();
+    assert_eq!(distinct_rows.rows, bag_rows.rows);
+    assert!(
+        distinct_usage.peak_bytes > bag_usage.peak_bytes,
+        "DISTINCT keeps independent hash keys alongside output tuples: distinct {distinct_usage:?}, bag {bag_usage:?}"
+    );
+    let limited = Limits {
+        max_bytes: bag_usage.peak_bytes,
+        ..Limits::default()
+    };
+    assert!(run(&w, &bag, &Params::new(), &limited).is_ok());
+    assert!(matches!(
+        run(&w, &distinct, &Params::new(), &limited),
+        Err(QueryError::MemoryBudget { .. })
+    ));
+}

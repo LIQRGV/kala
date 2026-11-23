@@ -99,12 +99,6 @@ impl Compiler<'_, '_> {
                 };
                 Expr::Value(value)
             }
-            Expr::List(values) => Expr::List(
-                values
-                    .iter()
-                    .map(|e| self.row_expr(e, bound, depth + 1))
-                    .collect::<Result<_, _>>()?,
-            ),
             Expr::Property { entity, key, tick } => Expr::Property {
                 entity: input_slot(self.slots, bound, entity, "property")?,
                 key: key.clone(),
