@@ -9,6 +9,9 @@ pub enum Value {
     Integer(i64),
     Float(f64),
     String(String),
+    /// A byte array (markers `0xCC`-`0xCE`). Kala never sends one; a client
+    /// may, and a query parameter of this type is a type error.
+    Bytes(Vec<u8>),
     List(Vec<Value>),
     Map(BTreeMap<String, Value>),
     Structure(u8, Vec<Value>),
@@ -88,9 +91,9 @@ impl<'a> Decoder<'a> {
     fn len(&mut self, marker: u8) -> Result<usize, Error> {
         match marker {
             0x80..=0xbf => Ok(usize::from(marker & 15)),
-            0xd0 | 0xd4 | 0xd8 => Ok(usize::from(self.byte()?)),
-            0xd1 | 0xd5 | 0xd9 => Ok(usize::from(u16::from_be_bytes(self.number()?))),
-            0xd2 | 0xd6 | 0xda => usize::try_from(u32::from_be_bytes(self.number()?))
+            0xcc | 0xd0 | 0xd4 | 0xd8 => Ok(usize::from(self.byte()?)),
+            0xcd | 0xd1 | 0xd5 | 0xd9 => Ok(usize::from(u16::from_be_bytes(self.number()?))),
+            0xce | 0xd2 | 0xd6 | 0xda => usize::try_from(u32::from_be_bytes(self.number()?))
                 .map_err(|_| Error("length overflow")),
             _ => Err(Error("invalid length marker")),
         }
@@ -117,6 +120,12 @@ impl<'a> Decoder<'a> {
                         .map_err(|_| Error("invalid UTF-8"))?
                         .to_owned(),
                 )
+            }
+            0xcc..=0xce => {
+                // `take` checks `n` against the bytes actually remaining
+                // before anything is copied.
+                let n = self.len(marker)?;
+                Value::Bytes(self.take(n)?.to_vec())
             }
             0x90..=0x9f | 0xd4..=0xd6 => {
                 let n = self.len(marker)?;
@@ -215,6 +224,19 @@ impl Encoder {
             Value::String(v) => {
                 self.len(v.len(), 0x80, 0xd0)?;
                 self.put(v.as_bytes())
+            }
+            Value::Bytes(v) => {
+                if v.len() < 256 {
+                    self.put(&[0xcc, v.len() as u8])?;
+                } else if let Ok(n) = u16::try_from(v.len()) {
+                    self.put(&[0xcd])?;
+                    self.put(&n.to_be_bytes())?;
+                } else {
+                    let n = u32::try_from(v.len()).map_err(|_| Error("bytes too long"))?;
+                    self.put(&[0xce])?;
+                    self.put(&n.to_be_bytes())?;
+                }
+                self.put(v)
             }
             Value::List(v) => {
                 self.len(v.len(), 0x90, 0xd4)?;

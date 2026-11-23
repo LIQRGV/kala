@@ -13,7 +13,14 @@ fn handwritten_hello_and_run_then_pull_have_spec_metadata() {
     let hello = client.success();
     assert!(matches!(hello.get("server"), Some(Value::String(_))));
     assert!(matches!(hello.get("connection_id"), Some(Value::String(_))));
-    assert_eq!(hello.get("hints"), Some(&map(&[])));
+    // Review round 1: hints announce the idle timeout (default 600 s).
+    assert_eq!(
+        hello.get("hints"),
+        Some(&map(&[(
+            "connection.recv_timeout_seconds",
+            Value::Integer(600)
+        )]))
+    );
     client.send(0x6a, vec![map(&[("scheme", string("none"))])]);
     client.success();
     let mut run = vec![0xb3, 0x10, 0xd0, ALLIES.len() as u8];

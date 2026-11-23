@@ -182,13 +182,27 @@ impl Session<'_> {
                 } else {
                     self.state = State::Authentication;
                 }
+                // Drivers require an agent starting with `Neo4j/` and may
+                // read its version for feature checks, so it names the Bolt-5
+                // compatibility level, not Kala's own version (which is
+                // `kala_version`; drivers ignore unknown keys).
+                let mut hints = Map::new();
+                // Lets pooled drivers retire connections before the idle
+                // timeout closes them.
+                hints.insert(
+                    "connection.recv_timeout_seconds".into(),
+                    Value::Integer(
+                        i64::try_from(self.config.idle_timeout.as_secs()).unwrap_or(i64::MAX),
+                    ),
+                );
                 success([
+                    ("server", Value::String("Neo4j/5.0.0".into())),
                     (
-                        "server",
-                        Value::String(format!("Neo4j/{}", env!("CARGO_PKG_VERSION"))),
+                        "kala_version",
+                        Value::String(env!("CARGO_PKG_VERSION").into()),
                     ),
                     ("connection_id", Value::String(format!("kala-{}", self.id))),
-                    ("hints", Value::Map(Map::new())),
+                    ("hints", Value::Map(hints)),
                 ])
             }
             Message::Logon(extra) if self.minor >= 1 && self.state == State::Authentication => {

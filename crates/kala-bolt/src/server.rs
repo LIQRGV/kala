@@ -135,12 +135,22 @@ impl Server {
                         eprintln!("event=bolt_connection_refused reason=connection_cap");
                         continue;
                     }
-                    if let Err(e) = stream.set_nodelay(true) {
-                        break Err(e);
-                    }
-                    let socket = match stream.try_clone() {
+                    // The listener is non-blocking, and on macOS/BSD and
+                    // Windows an accepted socket inherits that; sessions use
+                    // blocking reads with timeouts. A failure on one socket
+                    // (reset by the peer, fd pressure) drops that client
+                    // only, never the server.
+                    let prepared = stream
+                        .set_nonblocking(false)
+                        .and_then(|()| stream.set_nodelay(true))
+                        .and_then(|()| stream.try_clone());
+                    let socket = match prepared {
                         Ok(s) => s,
-                        Err(e) => break Err(e),
+                        Err(e) => {
+                            eprintln!("event=bolt_connection_dropped error={:?}", e.kind());
+                            let _ = stream.shutdown(Shutdown::Both);
+                            continue;
+                        }
                     };
                     let registry = Arc::clone(&self.registry);
                     let auth = Arc::clone(&self.auth);
@@ -167,7 +177,11 @@ impl Server {
                                 );
                             }) {
                             Ok(t) => t,
-                            Err(e) => break Err(e),
+                            Err(e) => {
+                                eprintln!("event=bolt_connection_dropped error={:?}", e.kind());
+                                let _ = socket.shutdown(Shutdown::Both);
+                                continue;
+                            }
                         };
                     clients.push(Client { socket, thread });
                 }
@@ -175,7 +189,14 @@ impl Server {
                     thread::sleep(Duration::from_millis(5))
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
-                Err(e) => break Err(e),
+                Err(e) if accept_error_is_fatal(&e) => break Err(e),
+                Err(e) => {
+                    // A connection aborted before accept, EMFILE/ENFILE, a
+                    // network blip: drop it and keep serving (with a short
+                    // pause so fd exhaustion can't spin the loop).
+                    eprintln!("event=bolt_accept_failed error={:?}", e.kind());
+                    thread::sleep(Duration::from_millis(50));
+                }
             }
         };
         shutdown.store(true, Ordering::Relaxed);
@@ -186,5 +207,38 @@ impl Server {
             let _ = client.thread.join();
         }
         result
+    }
+}
+
+/// Whether an `accept` error means the listener itself is broken (stop the
+/// server) rather than one failed connection attempt (keep serving).
+fn accept_error_is_fatal(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported | io::ErrorKind::PermissionDenied
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::accept_error_is_fatal;
+    use std::io::{Error, ErrorKind};
+
+    // PR #4 review round 1: per-connection accept failures never stop the
+    // server; only a broken listener does.
+    #[test]
+    fn only_listener_errors_stop_the_accept_loop() {
+        for kind in [
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionReset,
+            ErrorKind::OutOfMemory,
+            ErrorKind::Other,
+            ErrorKind::TimedOut,
+        ] {
+            assert!(!accept_error_is_fatal(&Error::from(kind)), "{kind:?}");
+        }
+        // EMFILE/ENFILE arrive as raw OS errors.
+        assert!(!accept_error_is_fatal(&Error::from_raw_os_error(24)));
+        assert!(accept_error_is_fatal(&Error::from(ErrorKind::InvalidInput)));
     }
 }

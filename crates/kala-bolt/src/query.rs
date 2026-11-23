@@ -22,12 +22,15 @@ pub(crate) fn run(
     max_message: usize,
     max_depth: usize,
 ) -> Result<Output, Failure> {
-    let (prefix, text) = text.split_once('\n').unwrap_or((text, ""));
-    if prefix.trim_end_matches(' ') != "// kala:datalog" {
+    let (prefix, rest) = text.split_once('\n').unwrap_or((text, ""));
+    if prefix.trim_end_matches([' ', '\r']) != "// kala:datalog" {
         return Err(Failure::new(SYNTAX, "query language is not supported yet"));
     }
+    // Keep the prefix's line as an empty line, so error positions count the
+    // lines of the text the client sent.
+    let text = format!("\n{rest}");
     let prepared =
-        kala_datalog::prepare(world, text).map_err(|e| Failure::new(SYNTAX, e.to_string()))?;
+        kala_datalog::prepare(world, &text).map_err(|e| Failure::new(SYNTAX, e.to_string()))?;
     let params = parameters(world, &prepared.params, given)?;
     let limits = Limits::default();
     let result = kala_query::run_with_cancel(world, &prepared.plan, &params, &limits, stop)
@@ -270,7 +273,11 @@ fn properties(
         };
         props.insert(attr.name.clone(), value);
     }
-    if let Some(handle) = view.world().handle_of(id) {
+    // A user attribute named `handle` wins; the world handle stays in the
+    // node's `element_id`/labels identity and Datalog's `:handle`.
+    if let Some(handle) = view.world().handle_of(id)
+        && !props.contains_key("handle")
+    {
         props.insert("handle".into(), budget.string(handle.into())?);
     }
     Ok(props)

@@ -7,7 +7,43 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 struct Database {
     path: PathBuf,
-    cached: Mutex<Option<(u64, Arc<World>)>>,
+    cached: Mutex<Option<(Stamp, Arc<World>)>>,
+}
+
+/// What a cached snapshot was loaded from. The length alone is not enough:
+/// recovery can cut a log and a later commit can grow it back to the same
+/// length with different content. The last bytes of the file hold the last
+/// transaction's commit checksum, so they change with any different last
+/// transaction; the modification time covers the rest.
+#[derive(Clone, PartialEq, Eq)]
+struct Stamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    tail: Vec<u8>,
+}
+
+/// Bytes read from the end of the file for [`Stamp::tail`].
+const TAIL_BYTES: u64 = 64;
+
+fn stamp(path: &Path) -> Result<Stamp, Failure> {
+    use std::io::{Read, Seek, SeekFrom};
+    let metadata = std::fs::symlink_metadata(path).map_err(Failure::store)?;
+    if !metadata.file_type().is_file() {
+        return Err(Failure::store("world is not a regular file"));
+    }
+    let len = metadata.len();
+    let mut tail = Vec::new();
+    let mut file = std::fs::File::open(path).map_err(Failure::store)?;
+    file.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))
+        .map_err(Failure::store)?;
+    file.take(TAIL_BYTES)
+        .read_to_end(&mut tail)
+        .map_err(Failure::store)?;
+    Ok(Stamp {
+        len,
+        modified: metadata.modified().ok(),
+        tail,
+    })
 }
 pub(crate) struct Registry {
     databases: BTreeMap<String, Database>,
@@ -54,32 +90,30 @@ impl Registry {
             .databases
             .get(name)
             .ok_or_else(|| Failure::new(DATABASE, format!("database {name:?} was not found")))?;
-        let mut cached = db
-            .cached
-            .lock()
-            .map_err(|_| Failure::new(crate::error::STORE, "the world could not be read"))?;
-        // Save the BEFORE length: a concurrent commit after this observation
-        // forces another refresh. Never stamp a stale snapshot with a newer length.
-        let metadata = std::fs::symlink_metadata(&db.path).map_err(Failure::store)?;
-        if !metadata.file_type().is_file() {
-            return Err(Failure::store("world is not a regular file"));
+        let lock = || {
+            db.cached
+                .lock()
+                .map_err(|_| Failure::new(crate::error::STORE, "the world could not be read"))
+        };
+        // Take the stamp BEFORE loading: a commit after this observation
+        // changes the stamp again and forces another refresh, so a snapshot
+        // is never labelled with a newer stamp than its own.
+        let stamp = stamp(&db.path)?;
+        if let Some((s, world)) = lock()?.as_ref()
+            && *s == stamp
+        {
+            return Ok((name.into(), Arc::clone(world)));
         }
-        let length = metadata.len();
-        if cached.as_ref().is_none_or(|(len, _)| *len != length) {
-            let world = Arc::new(World::open_read_only(&db.path).map_err(Failure::store)?);
-            eprintln!(
-                "event=bolt_database_loaded db={name} canon={}",
-                world.latest_tx().0
-            );
-            *cached = Some((length, world));
-        }
-        match cached.as_ref() {
-            Some((_, world)) => Ok((name.into(), Arc::clone(world))),
-            None => Err(Failure::new(
-                crate::error::STORE,
-                "the world could not be read",
-            )),
-        }
+        // Replay outside the lock, so queries on this database aren't stuck
+        // behind a reload; concurrent reloaders may both load, and the last
+        // one wins, which is harmless (both read committed transactions).
+        let world = Arc::new(World::open_read_only(&db.path).map_err(Failure::store)?);
+        eprintln!(
+            "event=bolt_database_loaded db={name} canon={}",
+            world.latest_tx().0
+        );
+        *lock()? = Some((stamp, Arc::clone(&world)));
+        Ok((name.into(), world))
     }
 }
 fn valid_name(name: &str) -> bool {

@@ -62,8 +62,14 @@ The pinned official Python driver `neo4j==5.28.8` proposed
 4.4–4.2 and 3.0. Kala selects the plain 5.4 proposal (`00000405`);
 manifest support is unnecessary for this driver. The driver rejected the initial
 `Kala/0.1.0` agent with `UnsupportedServerProduct`. HELLO therefore advertises
-`Neo4j/0.1.0`, the smallest compatible prefix plus this crate's version. This is
-a compatibility identifier, not a claim to implement Neo4j's Cypher or features.
+`server: "Neo4j/5.0.0"`: the prefix drivers require, with the Bolt-5
+compatibility level as its version (tools read that number for feature checks,
+and a `0.x` would look like an ancient server). Kala's own version is in
+`kala_version`, which drivers ignore. This is a compatibility identifier, like a
+browser's `Mozilla/5.0`, not a claim to be Neo4j or to implement its features.
+
+HELLO `hints` carry `connection.recv_timeout_seconds` (the server's idle
+timeout), so pooled drivers retire connections before the server closes them.
 The real-driver tests accepted the metadata and graph layouts above, with no
 bookmark required.
 
@@ -80,7 +86,7 @@ bookmark required.
 
 Nodes and relationships are enriched at the result's default tick and canon.
 Node labels include its immutable type and active string `label` values.
-Properties include every active non-ref attribute and the handle (if present).
+Properties include every active non-ref attribute and the handle (if present) under `handle`, unless the schema has its own `handle` attribute, whose value then wins.
 Cardinality-many attributes are sorted lists. A cardinality-one overlap is also
 returned as a list so neither asserted value is lost. Reference attributes are
 relationships, not properties. Graph data is returned verbatim; diagnostics are
@@ -89,7 +95,7 @@ escaped with `kala_core::must_escape` rules.
 RUN parameters use their declared Datalog kinds: integers for ticks/i64,
 floats for f64, booleans, strings for strings, handles or readable IDs for
 entities, and a nonnegative integer or `tx#N`/`N` string for canon. No numeric
-coercion; null, NaN and mismatched types are TypeError. Undeclared params are
+coercion; null, NaN, byte arrays and other mismatched types are TypeError. Undeclared params are
 ignored. Fields omit the variable's `?`; aggregate names retain their text.
 
 ## Errors and limits
