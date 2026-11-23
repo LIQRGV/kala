@@ -20,18 +20,52 @@ use kala_query::{CanonSource, Limits, Params, QueryError, Usage};
 use serde::Serialize;
 
 use super::Done;
-use super::query::{query_err, read_text_file, row_text, table};
+use super::query::{query_err, read_text_file, row_text};
 use super::read::open_world;
 use crate::cli::Canon;
 use crate::error::CliError;
 use crate::escape;
 use crate::names::{self, LogNames, Names};
-use crate::out::{JValue, Text, render};
+use crate::out::{JInner, JValue, Labeler, Text, json_size_within, render, value_text};
 
 /// Rows of one hint shown in the text output.
 const TEXT_ROWS: usize = 5;
 /// Rows of one hint carried in the JSON output (`rows_total` is exact).
 const JSON_ROWS: usize = 100;
+const TOTAL_ROWS: usize = 10_000;
+const TOTAL_BYTES: usize = 16 * 1024 * 1024;
+
+/// Size the row before rendering. String escaping and interval output can
+/// expand substantially; neither needs a temporary rendered allocation.
+fn text_row_size(row: &[JValue], limit: usize) -> Option<usize> {
+    let mut bytes = 5usize; // indentation and newline
+    for (i, cell) in row.iter().enumerate() {
+        bytes = bytes.checked_add(if i == 0 { 0 } else { 2 })?;
+        let remaining = limit.checked_sub(bytes)?;
+        let n = match &cell.value {
+            JInner::Str(s) => escape::quoted_len_within(s, remaining)?,
+            JInner::Intervals(intervals) => {
+                let mut n = 2usize; // braces
+                for (i, (from, until)) in intervals.iter().enumerate() {
+                    let end = until.map_or_else(|| "∞".to_owned(), |u| u.to_string());
+                    n = n.checked_add(
+                        from.to_string().len() + end.len() + 4 + usize::from(i > 0) * 2,
+                    )?;
+                    if n > remaining {
+                        return None;
+                    }
+                }
+                n
+            }
+            _ => value_text(cell).len(), // bounded scalars / truncated labels
+        };
+        bytes = bytes.checked_add(n)?;
+        if bytes > limit {
+            return None;
+        }
+    }
+    (bytes <= limit).then_some(bytes)
+}
 
 /// `kala doctor`'s options.
 pub struct Options<'a> {
@@ -64,6 +98,10 @@ struct JHint {
     columns: Vec<String>,
     /// The first [`JSON_ROWS`] rows, as `kala query --json` prints them.
     rows: Vec<Vec<JValue>>,
+    /// Text output retains only what it displays, never hidden reference
+    /// names or other full JSON metadata behind a shortened label.
+    #[serde(skip)]
+    text_rows: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -111,11 +149,11 @@ impl Text for Doctor {
                     escape::value(&h.check),
                     if k == 1 { "row" } else { "rows" }
                 );
-                for r in h.rows.iter().take(TEXT_ROWS) {
-                    let _ = writeln!(s, "    {}", row_text(r));
+                for row in &h.text_rows {
+                    let _ = writeln!(s, "    {row}");
                 }
-                if k > TEXT_ROWS {
-                    let _ = writeln!(s, "    ... ({} more)", k - TEXT_ROWS);
+                if k > h.text_rows.len() {
+                    let _ = writeln!(s, "    ... ({} more)", k - h.text_rows.len());
                 }
             }
         }
@@ -220,13 +258,15 @@ fn run_checks(
     }
     let mut hints = Vec::new();
     let mut remaining = Limits::default();
+    let (mut rendered_rows, mut rendered_bytes) = (0usize, 0usize);
+    let mut truncated = false;
     for (c, p) in checks.iter().zip(&prepared) {
         let result = if remaining.max_steps == 0 {
             Err(QueryError::StepBudget { limit: 0 })
         } else {
             kala_query::run_with_usage(&world, &p.plan, &Params::new(), &remaining)
         };
-        let (mut rs, usage) = match result {
+        let (rs, usage) = match result {
             Ok(result) => result,
             Err(e @ (QueryError::StepBudget { .. } | QueryError::MemoryBudget { .. }))
                 if !stops_later_checks(&e) =>
@@ -241,6 +281,7 @@ fn run_checks(
                     rows_total: 0,
                     columns: Vec::new(),
                     rows: Vec::new(),
+                    text_rows: Vec::new(),
                 });
                 continue;
             }
@@ -255,6 +296,7 @@ fn run_checks(
                     rows_total: 0,
                     columns: Vec::new(),
                     rows: Vec::new(),
+                    text_rows: Vec::new(),
                 });
                 break;
             }
@@ -265,9 +307,59 @@ fn run_checks(
             continue;
         }
         let rows_total = rs.rows.len();
-        // Cut before label resolution/rendering, including in text mode.
-        rs.rows.truncate(if json { JSON_ROWS } else { TEXT_ROWS });
-        let (columns, rows) = table(&world, &rs);
+        let columns = rs
+            .columns
+            .iter()
+            .map(|v| super::query::column_name(&v.0))
+            .collect();
+        let mut rows = Vec::new();
+        let mut text_rows = Vec::new();
+        if !truncated {
+            let labeler = Labeler::new(&world, rs.canon, rs.tick);
+            for row in rs
+                .rows
+                .iter()
+                .take(if json { JSON_ROWS } else { TEXT_ROWS })
+            {
+                let candidate = if rendered_rows == TOTAL_ROWS {
+                    None
+                } else {
+                    let row: Vec<JValue> = row.iter().map(|d| labeler.datum(d)).collect();
+                    let allowance = TOTAL_BYTES - rendered_bytes;
+                    let bytes = if json {
+                        // Include a separator per row, conservatively even
+                        // for the first row of a hint's array.
+                        allowance
+                            .checked_sub(1)
+                            .and_then(|n| json_size_within(&row, n))
+                            .map(|n| n + 1)
+                    } else {
+                        text_row_size(&row, allowance)
+                    };
+                    bytes.map(|n| (row, n))
+                };
+                let Some((row, bytes)) = candidate else {
+                    truncated = true;
+                    hints.push(JHint {
+                        kind: "output_truncated",
+                        message: Some(format!("output_truncated: story-check rows omitted from :{} onward (output cap)", escape::value(&c.name))),
+                        check: c.name.clone(),
+                        rows_total: 0,
+                        columns: Vec::new(),
+                        rows: Vec::new(),
+                    text_rows: Vec::new(),
+                    });
+                    break;
+                };
+                rendered_rows += 1;
+                rendered_bytes += bytes;
+                if json {
+                    rows.push(row);
+                } else {
+                    text_rows.push(row_text(&row));
+                }
+            }
+        }
         hints.push(JHint {
             kind: "story_check",
             message: None,
@@ -275,6 +367,7 @@ fn run_checks(
             rows_total,
             columns,
             rows,
+            text_rows,
         });
     }
     Ok(hints)
@@ -465,5 +558,86 @@ mod budget_flow_tests {
     fn only_the_shared_step_budget_stops_later_checks() {
         assert!(stops_later_checks(&QueryError::StepBudget { limit: 1 }));
         assert!(!stops_later_checks(&QueryError::MemoryBudget { limit: 1 }));
+    }
+}
+
+#[cfg(test)]
+mod retained_text_tests {
+    use super::{Doctor, TOTAL_BYTES, run_checks};
+    use crate::out::Text;
+    use kala_core::{AttrDef, Cardinality, Kind, Schema, Tick, Value, ValueType, World};
+
+    #[test]
+    fn text_hints_retain_only_rendered_labels_not_full_reference_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("names.kala");
+        let mut name = AttrDef::new("name", ValueType::Str, Kind::State, Cardinality::One);
+        name.indexed = false;
+        let schema = Schema::new()
+            .node_type("N")
+            .attribute(name)
+            .attribute(AttrDef::new(
+                "flag",
+                ValueType::Bool,
+                Kind::State,
+                Cardinality::One,
+            ));
+        let mut world = World::create(&path, schema).unwrap();
+        let entity = world.create_entity("N", None).unwrap();
+        world
+            .assert(
+                entity,
+                "name",
+                Value::Str("n".repeat(1024 * 1024)),
+                Some(Tick(0)),
+            )
+            .unwrap();
+        world
+            .assert(entity, "flag", Value::Bool(true), Some(Tick(0)))
+            .unwrap();
+        drop(world);
+        let source = format!(
+            "[{}]",
+            (0..16)
+                .map(|i| format!("[:c{i} [:find ?e :where [?e :flag true]]]"))
+                .collect::<String>()
+        );
+        let checks = kala_datalog::parse_checks(&source).unwrap();
+        let hints = run_checks(&path, &(source, checks), None, false).unwrap();
+        assert_eq!(hints.len(), 16);
+        assert!(
+            hints
+                .iter()
+                .all(|hint| hint.kind == "story_check" && hint.rows_total == 1)
+        );
+        // Text renders short labels. Retaining each full name and its
+        // duplicated label in JValue would silently accumulate >32 MiB.
+        let retained_json = serde_json::to_vec(&hints).unwrap();
+        assert!(
+            retained_json.len() < TOTAL_BYTES,
+            "text hints retained {} bytes of hidden JSON payload",
+            retained_json.len()
+        );
+        let report = Doctor {
+            command: "doctor",
+            canon: None,
+            since: None,
+            clean: false,
+            errors: Vec::new(),
+            warnings: Vec::new(),
+            hints,
+            checks_skipped: false,
+        };
+        let text = report.text();
+        assert!(text.len() < TOTAL_BYTES);
+        let rows: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("    "))
+            .collect();
+        assert_eq!(rows.len(), 16);
+        assert!(
+            rows.iter()
+                .all(|line| line.len() <= crate::escape::MAX_VALUE_CHARS + 7)
+        );
     }
 }

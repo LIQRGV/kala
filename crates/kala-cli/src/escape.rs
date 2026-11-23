@@ -127,6 +127,28 @@ pub fn quoted(s: &str) -> String {
     out
 }
 
+/// The size of [`quoted`] without allocating the escaped string. Stop at
+/// `limit`, so an oversized value is never rendered just to discard it.
+pub fn quoted_len_within(s: &str, limit: usize) -> Option<usize> {
+    let mut bytes = 2usize;
+    if bytes > limit {
+        return None;
+    }
+    for c in s.chars() {
+        let n = match c {
+            '"' | '\\' => 2,
+            c if c.is_control() => c.escape_debug().count(),
+            c if needs_escape(c, false) => 4 + (u32::from(c).ilog(16) as usize + 1),
+            c => c.len_utf8(),
+        };
+        bytes = bytes.checked_add(n)?;
+        if bytes > limit {
+            return None;
+        }
+    }
+    Some(bytes)
+}
+
 /// Whether a JSON writer must emit `c` as a `\u` escape: every
 /// [`kala_core::must_escape`] char. (JSON itself only requires it below
 /// U+0020; the rest are escaped too so `--json` is terminal-safe.)

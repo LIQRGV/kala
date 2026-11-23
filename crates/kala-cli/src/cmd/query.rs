@@ -98,7 +98,7 @@ pub(crate) fn render_result(world: &World, rs: &ResultSet, json: bool) -> String
 /// A result column's printed name: `?a` for a variable; an aggregate
 /// column is already named by its text (`(count ?c)`), and variable names
 /// never start with `(`.
-fn column_name(name: &str) -> String {
+pub(crate) fn column_name(name: &str) -> String {
     if name.starts_with('(') {
         name.to_string()
     } else {
