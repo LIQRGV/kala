@@ -1,6 +1,6 @@
 //! Performance guards for the fixture loader (security review H1, H2).
 //!
-//! Release only: `cargo test --release -p kala-core --test fixture_loader_perf
+//! Release only: `cargo test --release -p kala-fixture --test fixture_loader_perf
 //! -- --include-ignored`. Each case also pins the stored data: the loaded log
 //! is byte-identical to the same writes through the native API, so a speed-up
 //! cannot change what is stored.
