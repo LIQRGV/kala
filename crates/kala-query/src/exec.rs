@@ -83,8 +83,8 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use kala_core::{
-    Direction, EdgeId, EntityId, Error as CoreError, Interval, IntervalSet, Op as FactOp, Tick,
-    TxId, Value, ValueType, View, WorkMeter, World,
+    Direction, EdgeId, EntityId, Error as CoreError, Interval, IntervalSet, MeteredView,
+    Op as FactOp, Tick, TxId, Value, ValueType, View, WorkMeter, World,
 };
 
 use crate::datum::{Datum, op_rank};
@@ -342,6 +342,27 @@ fn execute_on(
     limits: &Limits,
     cancel: &AtomicBool,
 ) -> Result<(ResultSet, Usage), QueryError> {
+    let meter = WorkMeter::bounded(limits.max_steps, Some(cancel));
+    execute_inner(world, view, plan, params, limits, cancel, &meter).map_err(|error| match error {
+        QueryError::Core(CoreError::WorkInterrupted { reason }) => match reason {
+            kala_core::WorkInterruptReason::Limit => QueryError::StepBudget {
+                limit: limits.max_steps,
+            },
+            kala_core::WorkInterruptReason::Stopped => QueryError::Cancelled,
+        },
+        other => other,
+    })
+}
+
+fn execute_inner(
+    world: &World,
+    view: &View,
+    plan: &Plan,
+    params: &Params,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    meter: &WorkMeter,
+) -> Result<(ResultSet, Usage), QueryError> {
     check_cancel(cancel)?;
     let depth = plan_depth(&plan.root);
     if depth > MAX_PLAN_DEPTH {
@@ -356,10 +377,9 @@ fn execute_on(
     }
     // Every read below goes through the metered view, so its index work is
     // charged to the step budget (after each kala-core call).
-    let meter = WorkMeter::new();
-    let view = &view.metered(&meter);
+    let view = &view.metered(meter);
     let default_tick = match &plan.default_tick {
-        TickSource::Default => view.latest_tick(),
+        TickSource::Default => view.latest_tick()?,
         TickSource::Const(t) => *t,
         TickSource::Param(name) => tick_param(params, name)?,
         TickSource::Var(v) => {
@@ -398,7 +418,7 @@ fn execute_on(
     let mut ex = Exec {
         world,
         view,
-        meter: &meter,
+        meter,
         width,
         budget: Budget {
             cancel,
@@ -414,7 +434,7 @@ fn execute_on(
         scans: HashMap::new(),
         history_scans: HashMap::new(),
         during_scans: HashMap::new(),
-        type_counts: HashMap::new(),
+        checked_types: HashSet::new(),
         rels: prog
             .rels
             .iter()
@@ -871,8 +891,13 @@ const STRING_OVERHEAD_BYTES: usize = 32;
 /// Charged per `(entity, value)` pair of a held scan.
 const PAIR_BYTES: usize = size_of::<(EntityId, Val)>();
 
-/// Charged per tuple of a `Rel`'s hash index while it is held.
-const INDEX_ENTRY_BYTES: usize = 2 * size_of::<usize>() + ROW_OVERHEAD_BYTES;
+/// Conservative hash entry charge: key slots use the same fixed cost as
+/// row sets, plus a row-reference slot and the bucket's vector/header.
+fn index_entry_bytes(keys: usize) -> usize {
+    row_bytes(keys)
+        .saturating_add(size_of::<Vec<&Row>>())
+        .saturating_add(size_of::<&Row>())
+}
 
 /// What one tuple of an `arity`-column relation costs while it is held.
 fn tuple_bytes(arity: usize) -> usize {
@@ -2555,9 +2580,9 @@ const MEMO_ENTRY_BYTES: usize = 64;
 struct Exec<'a, 'w> {
     world: &'a World,
     /// The query's view, metered by `meter`.
-    view: &'a View<'w>,
+    view: &'a MeteredView<'w>,
     /// Index keys examined by `view`'s reads not yet charged as steps.
-    meter: &'a WorkMeter,
+    meter: &'a WorkMeter<'a>,
     width: usize,
     budget: Budget<'a>,
     /// Every string and interval set the query holds, each once with its
@@ -2575,9 +2600,9 @@ struct Exec<'a, 'w> {
     /// value)`, by attribute name, built once per query and charged while
     /// held (until the query ends).
     during_scans: HashMap<String, Rc<Sets>>,
-    /// Entities of each node type defined at the canon (a prefix of the
-    /// type's sequence numbers, so a count is enough).
-    type_counts: HashMap<u16, u64>,
+    /// Types whose visibility lookup has paid its historical one-step
+    /// charge. Individual IDs can be checked in constant time.
+    checked_types: HashSet<u16>,
     /// Every relation of the plan, by id (empty outside its `Fixpoint`).
     rels: Vec<Relation>,
 }
@@ -2616,10 +2641,23 @@ struct Relation {
 }
 
 impl Exec<'_, '_> {
+    /// Bound this read by the steps still available. Updating the allowance
+    /// does not change successful reads' historical key/step accounting.
+    fn read_view(&self) -> MeteredView<'_> {
+        self.meter.set_max_keys(
+            self.budget
+                .limits
+                .max_steps
+                .saturating_sub(self.budget.steps),
+        );
+        *self.view
+    }
+
     /// Charges the index keys the view's reads examined since the last
     /// charge as steps (one per key). Called after every kala-core read.
     fn charge_index_work(&mut self) -> Result<(), QueryError> {
-        self.budget.step(self.meter.take())
+        self.meter.check()?;
+        self.budget.step(self.meter.take_keys())
     }
 
     /// Charges the up-front part of a memo-missing kala-core read that takes
@@ -2641,7 +2679,8 @@ impl Exec<'_, '_> {
     /// key it examined carries (and compares) the whole value, so each costs
     /// one step plus `per_key`.
     fn charge_bound_read(&mut self, per_key: u64) -> Result<(), QueryError> {
-        let keys = self.meter.take();
+        self.meter.check()?;
+        let keys = self.meter.take_keys();
         self.budget
             .step(keys.saturating_add(keys.saturating_mul(per_key)))
     }
@@ -2937,7 +2976,19 @@ impl Exec<'_, '_> {
         shared: &[usize],
         keep_matched: bool,
     ) -> Result<BTreeSet<Row>, QueryError> {
-        let keys: HashSet<Vec<&Val>> = r.iter().map(|row| key_of(row, shared)).collect();
+        let mut keys = HashSet::new();
+        let entry_bytes = index_entry_bytes(shared.len());
+        let mut held = 0usize;
+        for row in r {
+            // Charge before allocating even the temporary key. Duplicate
+            // keys release their temporary charge immediately.
+            self.budget.charge_bytes(entry_bytes)?;
+            if keys.insert(key_of(row, shared)) {
+                held = held.saturating_add(entry_bytes);
+            } else {
+                self.budget.release_bytes(entry_bytes);
+            }
+        }
         let mut out = BTreeSet::new();
         for row in l {
             self.budget.step(1)?;
@@ -2945,6 +2996,8 @@ impl Exec<'_, '_> {
                 self.budget.emit(&mut out, row.clone())?;
             }
         }
+        drop(keys);
+        self.budget.release_bytes(held);
         Ok(out)
     }
 
@@ -3048,21 +3101,23 @@ impl Exec<'_, '_> {
         // Reading the relation (or indexing it) examines every tuple once.
         self.budget.step(tuples.len() as u64)?;
         let mut index: HashMap<Vec<&Val>, Vec<&Vec<Val>>> = HashMap::new();
-        let index_bytes = if keyed.is_empty() {
-            0
+        let entry_bytes = if keyed.is_empty() {
+            size_of::<&Vec<Val>>()
         } else {
-            for t in tuples {
+            index_entry_bytes(keyed.len())
+        };
+        let mut index_bytes = 0usize;
+        let mut all = Vec::new();
+        for t in tuples {
+            self.budget.charge_bytes(entry_bytes)?;
+            index_bytes = index_bytes.saturating_add(entry_bytes);
+            if keyed.is_empty() {
+                all.push(t);
+            } else {
                 let k: Vec<&Val> = keyed.iter().map(|&i| &t[i]).collect();
                 index.entry(k).or_default().push(t);
             }
-            tuples.len().saturating_mul(INDEX_ENTRY_BYTES)
-        };
-        self.budget.charge_bytes(index_bytes)?;
-        let all: Vec<&Vec<Val>> = if keyed.is_empty() {
-            tuples.iter().collect()
-        } else {
-            Vec::new()
-        };
+        }
         for row in rows {
             self.budget.step(1)?;
             let found: &[&Vec<Val>] = if keyed.is_empty() {
@@ -3092,6 +3147,8 @@ impl Exec<'_, '_> {
                 self.budget.emit(out, r)?;
             }
         }
+        drop(index);
+        drop(all);
         self.budget.release_bytes(index_bytes);
         Ok(())
     }
@@ -3106,7 +3163,11 @@ impl Exec<'_, '_> {
     ) -> Result<BTreeSet<Row>, QueryError> {
         let mut out = BTreeSet::new();
         let mut by_key: HashMap<Vec<&Val>, Vec<&Row>> = HashMap::new();
+        let entry_bytes = index_entry_bytes(shared.len());
+        let mut held = 0usize;
         for row in r {
+            self.budget.charge_bytes(entry_bytes)?;
+            held = held.saturating_add(entry_bytes);
             by_key.entry(key_of(row, shared)).or_default().push(row);
         }
         for lrow in l {
@@ -3122,6 +3183,8 @@ impl Exec<'_, '_> {
                 self.budget.emit(&mut out, merged)?;
             }
         }
+        drop(by_key);
+        self.budget.release_bytes(held);
         Ok(out)
     }
 
@@ -3139,7 +3202,10 @@ impl Exec<'_, '_> {
                 node_type,
             } => {
                 self.budget.step(1)?;
-                let all: Vec<EntityId> = self.view.entities_of_type(node_type)?.collect();
+                let all: Vec<EntityId> = self
+                    .read_view()
+                    .entities_of_type(node_type)?
+                    .collect::<Result<_, _>>()?;
                 self.charge_index_work()?;
                 for row in rows {
                     if *bound {
@@ -3389,7 +3455,7 @@ impl Exec<'_, '_> {
                             // copied here, once per memo key, and charged by
                             // its length (a per-row tick misses every time).
                             let per_key = self.charge_bound_value(v)?;
-                            let r = self.view.as_of_value(e, name, &value_of(v), t);
+                            let r = self.read_view().as_of_value(e, name, &value_of(v), t);
                             self.charge_bound_read(per_key)?;
                             let h = absent_as_empty(r)? == Some(true);
                             let n = MEMO_ENTRY_BYTES + size_of_val(&key);
@@ -3405,7 +3471,7 @@ impl Exec<'_, '_> {
                         Vec::new()
                     }
                 } else if attr.inverse {
-                    let ns = self.view.neighbors(e, name, Direction::Out, t);
+                    let ns = self.read_view().neighbors(e, name, Direction::Out, t);
                     self.charge_index_work()?;
                     absent_as_empty(ns)?
                         .unwrap_or_default()
@@ -3417,7 +3483,7 @@ impl Exec<'_, '_> {
                     let vals = match memo.and_then(|m| m.as_of.get(&(e, t))) {
                         Some(vals) => Rc::clone(vals),
                         None => {
-                            let vs = self.view.as_of(e, name, t);
+                            let vs = self.read_view().as_of(e, name, t);
                             self.charge_index_work()?;
                             let mut vals = Vec::new();
                             for x in absent_as_empty(vs)?.unwrap_or_default() {
@@ -3439,7 +3505,7 @@ impl Exec<'_, '_> {
                 self.budget.step(1)?;
                 match v {
                     Val::Ref(y) => {
-                        let ns = self.view.neighbors(*y, name, Direction::In, t);
+                        let ns = self.read_view().neighbors(*y, name, Direction::In, t);
                         self.charge_index_work()?;
                         absent_as_empty(ns)?
                             .unwrap_or_default()
@@ -3456,7 +3522,7 @@ impl Exec<'_, '_> {
                                 // Copies a string value, once per memo key,
                                 // charged by its length.
                                 let per_key = self.charge_bound_value(v)?;
-                                let found = self.view.lookup(name, &value_of(v), t);
+                                let found = self.read_view().lookup(name, &value_of(v), t);
                                 self.charge_bound_read(per_key)?;
                                 let found: Rc<[EntityId]> = found?.into();
                                 let n = MEMO_ENTRY_BYTES
@@ -3634,12 +3700,13 @@ impl Exec<'_, '_> {
                         let read = match (attr.inverse, v) {
                             // `[e child_of v]` is `[v parent_of e]`.
                             (true, Val::Ref(source)) => {
-                                self.view.holds_during(*source, &attr.base, &Value::Ref(e))
+                                self.read_view()
+                                    .holds_during(*source, &attr.base, &Value::Ref(e))
                             }
                             (true, _) => {
                                 unreachable!("invariant: an inverse name's values are refs")
                             }
-                            (false, v) => self.view.holds_during(e, name, &value_of(v)),
+                            (false, v) => self.read_view().holds_during(e, name, &value_of(v)),
                         };
                         self.charge_bound_read(per_key)?;
                         let found = absent_as_empty(read)?.unwrap_or_default();
@@ -3781,7 +3848,7 @@ impl Exec<'_, '_> {
         if let Some(points) = self.budget.memo(attr).and_then(|m| m.history.get(&e)) {
             return Ok(Rc::clone(points));
         }
-        let read = self.view.history(e, attr);
+        let read = self.read_view().history(e, attr);
         self.charge_index_work()?;
         let mut points = Vec::new();
         for c in absent_as_empty(read)?.unwrap_or_default() {
@@ -3848,7 +3915,7 @@ impl Exec<'_, '_> {
             return Ok(Rc::clone(p));
         }
         self.budget.step(1)?;
-        let read = self.view.history_scan(attr);
+        let read = self.read_view().history_scan(attr);
         self.charge_index_work()?;
         let read = read?;
         self.budget.step(read.len() as u64)?;
@@ -3895,7 +3962,7 @@ impl Exec<'_, '_> {
     /// pair plus the index work, and the pairs' bytes (strings interned).
     fn read_scan(&mut self, attr: &str, t: Tick) -> Result<Rc<Pairs>, QueryError> {
         self.budget.step(1)?;
-        let read = self.view.attr_scan(attr, t);
+        let read = self.read_view().attr_scan(attr, t);
         self.charge_index_work()?;
         let read = read?;
         self.budget.step(read.len() as u64)?;
@@ -3913,23 +3980,17 @@ impl Exec<'_, '_> {
         if id.is_edge() {
             return Ok(id
                 .as_edge()
-                .is_some_and(|edge: EdgeId| self.view.edge(edge).is_some()));
+                .is_some_and(|edge: EdgeId| self.read_view().edge(edge).is_some()));
         }
         let ty = id.node_type();
-        let count = match self.type_counts.get(&ty.0) {
-            Some(&n) => n,
-            None => {
-                let Some(name) = self.world.node_types().nth(usize::from(ty.0)) else {
-                    return Ok(false);
-                };
-                self.budget.step(1)?;
-                let n = self.view.entities_of_type(name)?.count() as u64;
-                self.type_counts.insert(ty.0, n);
-                n
+        if !self.checked_types.contains(&ty.0) {
+            if self.world.node_types().nth(usize::from(ty.0)).is_none() {
+                return Ok(false);
             }
-        };
-        // A canon's entities of a type are a prefix of its sequences.
-        Ok(id.seq() >= 1 && id.seq() <= count)
+            self.budget.step(1)?;
+            self.checked_types.insert(ty.0);
+        }
+        Ok(self.read_view().is_defined(id))
     }
 }
 
@@ -4033,5 +4094,225 @@ fn absent_as_empty<T>(r: Result<T, CoreError>) -> Result<Option<T>, QueryError> 
         Ok(x) => Ok(Some(x)),
         Err(CoreError::UnknownEntity(_)) => Ok(None),
         Err(e) => Err(QueryError::Core(e)),
+    }
+}
+
+#[cfg(test)]
+mod scan_meter_tests {
+    use super::*;
+    use kala_core::{AttrDef, Cardinality, Kind, Schema, WorkInterruptReason};
+    use proptest::prelude::*;
+
+    fn world(values: &[i64]) -> World {
+        let mut world = World::in_memory(Schema::new().node_type("N").attribute(AttrDef::new(
+            "score",
+            ValueType::I64,
+            Kind::State,
+            Cardinality::Many,
+        )))
+        .unwrap();
+        let mut tx = world.begin();
+        for &value in values {
+            let entity = tx.create_entity("N", None).unwrap();
+            tx.assert(entity, "score", Value::I64(value), Some(Tick(-1)))
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        world
+    }
+
+    fn scan_plan() -> Plan {
+        Plan {
+            find: vec![Var("e".into()), Var("v".into())],
+            params: Vec::new(),
+            default_tick: TickSource::Const(Tick(0)),
+            canon: CanonSource::Latest,
+            root: Op::Expand {
+                input: Box::new(Op::Unit),
+                entity: Term::Var(Var("e".into())),
+                attr: AttrRef::Named("score".into()),
+                value: Term::Var(Var("v".into())),
+                tick: TickSource::Default,
+                access: Access::Scan,
+            },
+        }
+    }
+
+    #[test]
+    fn one_scan_is_interrupted_before_finishing_its_key_walk() {
+        let world = world(&(0..10_000).collect::<Vec<_>>());
+        let limits = Limits {
+            max_steps: 100,
+            ..Limits::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let meter = WorkMeter::bounded(limits.max_steps, Some(&cancel));
+        let result = execute_inner(
+            &world,
+            &world.at_canon(world.latest_tx()),
+            &scan_plan(),
+            &Params::new(),
+            &limits,
+            &cancel,
+            &meter,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(QueryError::Core(CoreError::WorkInterrupted {
+                    reason: WorkInterruptReason::Limit
+                }))
+            ),
+            "scan must stop inside kala-core; got {result:?}"
+        );
+        assert!(
+            (1..=101).contains(&meter.keys()),
+            "scan examined {} keys",
+            meter.keys()
+        );
+    }
+
+    #[test]
+    fn cancellation_interrupts_one_scan_before_all_keys_are_read() {
+        let world = world(&(0..100_000).collect::<Vec<_>>());
+        let cancel = AtomicBool::new(false);
+        let meter = WorkMeter::bounded(u64::MAX, Some(&cancel));
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                execute_inner(
+                    &world,
+                    &world.at_canon(world.latest_tx()),
+                    &scan_plan(),
+                    &Params::new(),
+                    &Limits::default(),
+                    &cancel,
+                    &meter,
+                )
+            });
+            while meter.keys() < 100 && !reader.is_finished() {
+                std::thread::yield_now();
+            }
+            cancel.store(true, AtomicOrdering::Relaxed);
+            let result = reader.join().unwrap();
+            assert!(
+                matches!(
+                    result,
+                    Err(QueryError::Core(CoreError::WorkInterrupted {
+                        reason: WorkInterruptReason::Stopped
+                    }))
+                ),
+                "cancellation must land in the core scan, got {result:?}"
+            );
+            assert!(
+                (100..100_000).contains(&meter.keys()),
+                "scan completed {} keys",
+                meter.keys()
+            );
+        });
+    }
+
+    #[test]
+    fn repeated_empty_scans_share_the_query_id_budget() {
+        // Every scan crosses 5,001 IDs, but nearly all prefix seeks miss:
+        // only the first ID has facts, under a different attribute. Ten
+        // per-row ticks must not each receive a fresh 10,000-ID allowance.
+        let schema = Schema::new()
+            .node_type("N")
+            .attribute(AttrDef::new(
+                "score",
+                ValueType::I64,
+                Kind::State,
+                Cardinality::Many,
+            ))
+            .attribute(AttrDef::new(
+                "tick",
+                ValueType::I64,
+                Kind::State,
+                Cardinality::Many,
+            ));
+        let mut world = World::in_memory(schema).unwrap();
+        let mut tx = world.begin();
+        let seed = tx.create_entity("N", None).unwrap();
+        for tick in 0..10 {
+            tx.assert(seed, "tick", Value::I64(tick), Some(Tick(0)))
+                .unwrap();
+        }
+        for _ in 0..5_000 {
+            tx.create_entity("N", None).unwrap();
+        }
+        tx.commit().unwrap();
+        let tick_var = Var("t".into());
+        let mut plan = scan_plan();
+        if let Op::Expand { input, tick, .. } = &mut plan.root {
+            **input = Op::Expand {
+                input: Box::new(Op::Unit),
+                entity: Term::Const(Value::Ref(seed)),
+                attr: AttrRef::Named("tick".into()),
+                value: Term::Var(tick_var.clone()),
+                tick: TickSource::Const(Tick(0)),
+                access: Access::E,
+            };
+            *tick = TickSource::Var(tick_var);
+        }
+        let limits = Limits {
+            max_steps: 10_000,
+            ..Limits::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let meter = WorkMeter::bounded(limits.max_steps, Some(&cancel));
+        let result = execute_inner(
+            &world,
+            &world.at_canon(world.latest_tx()),
+            &plan,
+            &Params::new(),
+            &limits,
+            &cancel,
+            &meter,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(QueryError::Core(CoreError::WorkInterrupted {
+                    reason: WorkInterruptReason::Limit
+                })) | Err(QueryError::StepBudget { .. })
+            ),
+            "repeated empty scans escaped the query ID budget: {result:?}"
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn bounded_and_unbounded_execution_have_identical_rows_and_steps(
+            values in prop::collection::vec(-10i64..11, 0..40),
+            ticks in prop::sample::select(vec![i64::MIN, -2, -1, 0, i64::MAX]),
+            main_index in any::<bool>(),
+            default_tick in any::<bool>(),
+        ) {
+            let mut world = world(&values);
+            let ids: Vec<_> = world.entities_of_type("N").unwrap().collect();
+            let mut tx = world.begin();
+            for (&id, &value) in ids.iter().zip(&values) {
+                if value % 2 == 0 {
+                    tx.retract(id, "score", Value::I64(value), Some(Tick(1))).unwrap();
+                }
+                if value < 0 {
+                    tx.assert(id, "score", Value::I64(value), Some(Tick(i64::MAX))).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+            let canon = world.latest_tx();
+            if main_index { world.create_entity("N", None).unwrap(); }
+            let view = world.at_canon(canon);
+            let mut plan = scan_plan();
+            plan.default_tick = if default_tick { TickSource::Default } else { TickSource::Const(Tick(ticks)) };
+            let cancel = AtomicBool::new(false);
+            let limits = Limits::default();
+            let unbounded = WorkMeter::new();
+            let bounded = WorkMeter::bounded(limits.max_steps, Some(&cancel));
+            let (want, want_usage) = execute_inner(&world, &view, &plan, &Params::new(), &limits, &cancel, &unbounded).unwrap();
+            let (got, got_usage) = execute_inner(&world, &view, &plan, &Params::new(), &limits, &cancel, &bounded).unwrap();
+            prop_assert_eq!(got, want);
+            prop_assert_eq!(got_usage.steps, want_usage.steps);
+        }
     }
 }

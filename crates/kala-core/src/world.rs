@@ -44,11 +44,11 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering as AtomicOrdering};
 
 #[cfg(feature = "test-hooks")]
 use crate::doctor::{IndexName, Tamper};
-use crate::error::Error;
+use crate::error::{Error, WorkInterruptReason};
 use crate::id::{AttrId, EdgeId, EntityId, IdError, MAX_NODE_TYPE, NodeTypeId};
 use crate::interval::IntervalSet;
 use crate::key::{self, ValueRef};
@@ -3723,14 +3723,42 @@ pub struct View<'w> {
 /// reads, never on timing. Shared by reference, so a `View` stays `Copy`;
 /// atomic, so a metered view stays `Send` and `Sync`.
 #[derive(Debug, Default)]
-pub struct WorkMeter {
+pub struct WorkMeter<'a> {
     keys: AtomicU64,
+    limit: Option<AtomicU64>,
+    stop: Option<&'a AtomicBool>,
+    interrupted: AtomicU8,
+    // ID walks also need a bound when their prefix seeks find no keys.
+    // Kept separate to preserve historical index-key accounting.
+    ids: AtomicU64,
+    id_limit: Option<u64>,
 }
 
-impl WorkMeter {
-    /// A meter at zero.
-    pub fn new() -> WorkMeter {
-        WorkMeter::default()
+impl<'a> WorkMeter<'a> {
+    /// An unbounded meter at zero.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stop a read after `max_keys` keys, or when `stop` is set.
+    /// A limit-crossing key is counted but not processed. Interruption is
+    /// sticky: reuse an interrupted meter only after [`Self::take`].
+    pub fn bounded(max_keys: u64, stop: Option<&'a AtomicBool>) -> Self {
+        Self {
+            limit: Some(AtomicU64::new(max_keys)),
+            id_limit: Some(max_keys),
+            stop,
+            ..Self::default()
+        }
+    }
+
+    /// Update a bounded meter's key allowance before the next read. Does
+    /// not reset counted work, clear an interruption or change the initial
+    /// ID-walk allowance. Unbounded meters stay unbounded.
+    pub fn set_max_keys(&self, max_keys: u64) {
+        if let Some(limit) = &self.limit {
+            limit.store(max_keys, AtomicOrdering::Relaxed);
+        }
     }
 
     /// The index keys examined since the meter was made or last taken.
@@ -3738,28 +3766,242 @@ impl WorkMeter {
         self.keys.load(AtomicOrdering::Relaxed)
     }
 
-    /// The index keys examined since the meter was made or last taken, and
-    /// resets it to zero.
+    /// Return counted keys and reset this meter for the next read.
     pub fn take(&self) -> u64 {
+        self.ids.store(0, AtomicOrdering::Relaxed);
+        self.interrupted.store(0, AtomicOrdering::Relaxed);
+        self.take_keys()
+    }
+
+    /// Take the index-key count while retaining cumulative ID-walk work
+    /// and any interruption. Query callers use this between reads, so
+    /// repeated empty-prefix scans cannot each spend a fresh ID allowance.
+    pub fn take_keys(&self) -> u64 {
         self.keys.swap(0, AtomicOrdering::Relaxed)
+    }
+
+    /// Report a latched interruption or a currently set stop flag.
+    pub fn check(&self) -> Result<(), Error> {
+        let reason = self.interrupted.load(AtomicOrdering::Relaxed);
+        let reason = if reason != 0 {
+            reason
+        } else if self
+            .stop
+            .is_some_and(|flag| flag.load(AtomicOrdering::Relaxed))
+        {
+            self.interrupted.store(2, AtomicOrdering::Relaxed);
+            2
+        } else {
+            return Ok(());
+        };
+        Err(Error::WorkInterrupted {
+            reason: if reason == 1 {
+                WorkInterruptReason::Limit
+            } else {
+                WorkInterruptReason::Stopped
+            },
+        })
+    }
+
+    fn count(&self, count: &AtomicU64, n: u64, limit: Option<u64>) -> bool {
+        if self.limit.is_none() && self.stop.is_none() {
+            count.fetch_add(n, AtomicOrdering::Relaxed);
+            return true;
+        }
+        if self.check().is_err() {
+            return false;
+        }
+        let before = count.fetch_add(n, AtomicOrdering::Relaxed);
+        if limit.is_some_and(|limit| before.saturating_add(n) > limit) {
+            self.interrupted.store(1, AtomicOrdering::Relaxed);
+            return false;
+        }
+        true
     }
 }
 
-/// The meter a read charges, if any (unmetered views and the write path
-/// charge nothing).
+/// The meter a read charges, if any. Writes always use `NONE`.
 #[derive(Clone, Copy, Debug, Default)]
-struct Work<'a>(Option<&'a WorkMeter>);
+struct Work<'a>(Option<&'a WorkMeter<'a>>);
 
 impl Work<'_> {
-    /// Not metered.
     const NONE: Work<'static> = Work(None);
 
-    /// Charges `keys` examined index keys.
     #[inline]
-    fn add(self, keys: u64) {
+    fn add(self, keys: u64) -> bool {
+        self.0.is_none_or(|m| {
+            m.count(
+                &m.keys,
+                keys,
+                m.limit
+                    .as_ref()
+                    .map(|limit| limit.load(AtomicOrdering::Relaxed)),
+            )
+        })
+    }
+
+    #[inline]
+    fn id(self) -> bool {
+        self.0
+            .is_none_or(|m| m.limit.is_none() && m.stop.is_none() || m.count(&m.ids, 1, m.id_limit))
+    }
+
+    fn finish<T>(self, answer: Result<T, Error>) -> Result<T, Error> {
         if let Some(m) = self.0 {
-            m.keys.fetch_add(keys, AtomicOrdering::Relaxed);
+            m.check()?;
         }
+        answer
+    }
+}
+
+/// A read-only, interruptible view. Every potentially scanning operation
+/// returns an error on interruption, including [`Self::latest_tick`] and
+/// the items of [`Self::entities_of_type`]. Unmetered [`View`] APIs retain
+/// their infallible signatures. No write operation uses this wrapper.
+#[derive(Clone, Copy, Debug)]
+pub struct MeteredView<'a> {
+    view: View<'a>,
+}
+
+impl MeteredView<'_> {
+    /// The world this view reads.
+    pub fn world(&self) -> &World {
+        self.view.world()
+    }
+
+    /// Replace the meter, preserving the world and pinned canon.
+    pub fn metered<'m>(&self, meter: &'m WorkMeter<'m>) -> MeteredView<'m>
+    where
+        Self: 'm,
+    {
+        self.view.metered(meter)
+    }
+
+    /// Resolve a stored edge triple at the pinned canon (constant time).
+    pub fn edge_id(&self, source: EntityId, attr: &str, target: EntityId) -> Option<EdgeId> {
+        self.view.edge_id(source, attr, target)
+    }
+
+    /// The pinned canon.
+    pub fn canon(&self) -> TxId {
+        self.view.canon()
+    }
+
+    /// Whether an ID is defined at the pinned canon (constant time).
+    pub fn is_defined(&self, id: EntityId) -> bool {
+        self.view.is_defined(id)
+    }
+
+    /// Resolve an edge at the pinned canon (constant time).
+    pub fn edge(&self, id: EdgeId) -> Option<(EntityId, String, EntityId)> {
+        self.view.edge(id)
+    }
+
+    /// The latest tick, interruptible even at an older canon.
+    pub fn latest_tick(&self) -> Result<Tick, Error> {
+        self.view.work.finish(Ok(self.view.latest_tick()))
+    }
+
+    /// The entities of a type. Each lazy ID read can fail; no partial
+    /// answer should be used if any item reports an interruption.
+    pub fn entities_of_type(
+        &self,
+        node_type: &str,
+    ) -> Result<impl Iterator<Item = Result<EntityId, Error>> + '_, Error> {
+        let ids = self.view.entities_of_type(node_type)?;
+        self.view.work.finish(Ok(()))?;
+        let mut done = false;
+        Ok(ids.scan((), move |_, id| {
+            if done {
+                return None;
+            }
+            done = !self.view.work.id();
+            Some(self.view.work.finish(Ok(id)))
+        }))
+    }
+    /// Interruptible [`View::as_of`].
+    pub fn as_of(&self, entity: EntityId, attr: &str, t: Tick) -> Result<Vec<Value>, Error> {
+        self.view.work.finish(self.view.as_of(entity, attr, t))
+    }
+
+    /// Interruptible [`View::as_of_value`].
+    pub fn as_of_value(
+        &self,
+        entity: EntityId,
+        attr: &str,
+        value: &Value,
+        t: Tick,
+    ) -> Result<bool, Error> {
+        self.view
+            .work
+            .finish(self.view.as_of_value(entity, attr, value, t))
+    }
+
+    /// Interruptible [`View::as_of_detail`].
+    pub fn as_of_detail(
+        &self,
+        entity: EntityId,
+        attr: &str,
+        t: Tick,
+    ) -> Result<Vec<Change>, Error> {
+        self.view
+            .work
+            .finish(self.view.as_of_detail(entity, attr, t))
+    }
+
+    /// Interruptible [`View::attr_scan`].
+    pub fn attr_scan(&self, attr: &str, t: Tick) -> Result<Vec<(EntityId, Value)>, Error> {
+        self.view.work.finish(self.view.attr_scan(attr, t))
+    }
+
+    /// Interruptible [`View::lookup`].
+    pub fn lookup(&self, attr: &str, value: &Value, t: Tick) -> Result<Vec<EntityId>, Error> {
+        self.view.work.finish(self.view.lookup(attr, value, t))
+    }
+
+    /// Interruptible [`View::lookup_ci`].
+    pub fn lookup_ci(&self, attr: &str, text: &str, t: Tick) -> Result<Vec<EntityId>, Error> {
+        self.view.work.finish(self.view.lookup_ci(attr, text, t))
+    }
+
+    /// Interruptible [`View::neighbors`].
+    pub fn neighbors(
+        &self,
+        entity: EntityId,
+        attr: &str,
+        dir: Direction,
+        t: Tick,
+    ) -> Result<Vec<(EntityId, EdgeId)>, Error> {
+        self.view
+            .work
+            .finish(self.view.neighbors(entity, attr, dir, t))
+    }
+
+    /// Interruptible [`View::history`].
+    pub fn history(&self, entity: EntityId, attr: &str) -> Result<Vec<Change>, Error> {
+        self.view.work.finish(self.view.history(entity, attr))
+    }
+
+    /// Interruptible [`View::history_scan`].
+    pub fn history_scan(&self, attr: &str) -> Result<Vec<(EntityId, Change)>, Error> {
+        self.view.work.finish(self.view.history_scan(attr))
+    }
+
+    /// Interruptible [`View::holds_during`].
+    pub fn holds_during(
+        &self,
+        entity: EntityId,
+        attr: &str,
+        value: &Value,
+    ) -> Result<IntervalSet, Error> {
+        self.view
+            .work
+            .finish(self.view.holds_during(entity, attr, value))
+    }
+
+    /// Interruptible [`View::overlaps`].
+    pub fn overlaps(&self, attr: &str) -> Result<Vec<Overlap>, Error> {
+        self.view.work.finish(self.view.overlaps(attr))
     }
 }
 
@@ -3770,17 +4012,20 @@ impl<'w> View<'w> {
     }
 
     /// This view (same world, canon and indexes), with every read adding
-    /// the index keys it examines to `meter` (see [`WorkMeter`]). Answers
-    /// are unchanged. Metering an already metered view replaces its meter.
-    pub fn metered<'m>(&self, meter: &'m WorkMeter) -> View<'m>
+    /// the index keys it examines to `meter` (see [`WorkMeter`]). Successful
+    /// answers and key counts are unchanged. The returned [`MeteredView`]
+    /// also makes latest-tick and lazy entity reads fallible.
+    pub fn metered<'m>(&self, meter: &'m WorkMeter<'m>) -> MeteredView<'m>
     where
         'w: 'm,
     {
-        View {
-            world: self.world,
-            canon: self.canon,
-            latest: self.latest,
-            work: Work(Some(meter)),
+        MeteredView {
+            view: View {
+                world: self.world,
+                canon: self.canon,
+                latest: self.latest,
+                work: Work(Some(meter)),
+            },
         }
     }
 
@@ -3903,9 +4148,17 @@ impl View<'_> {
         // The key (history and tick) whose current entry at the canon was
         // already found: its older entries are skipped.
         let mut done: Option<&[u8]> = None;
-        // Every stored entry is examined.
-        self.work.add(self.world.e_index.len() as u64);
+        // Unbounded meters retain the old bulk-count fast path.
+        let work = if self.work.0.is_some_and(|m| m.limit.is_none()) {
+            self.work.add(self.world.e_index.len() as u64);
+            Work::NONE
+        } else {
+            self.work
+        };
         for (k, mark) in &self.world.e_index {
+            if !work.add(1) {
+                break;
+            }
             let at_key = key::without_tx(k);
             if done == Some(at_key) {
                 continue;
@@ -4020,6 +4273,9 @@ impl View<'_> {
                 out.push(v);
             }
         });
+        if self.work.finish(Ok(())).is_err() {
+            return Vec::new();
+        }
         if world.keys_by_ref(attr_id) {
             // Value references sort by hash, not by value: restore the
             // value-encoding order every other attribute has by key order
@@ -4057,6 +4313,9 @@ impl View<'_> {
             // IDs ascend and each entity's values come sorted, so `out` is
             // sorted and duplicate-free as built.
             for id in world.defined_ids() {
+                if !self.work.id() {
+                    break;
+                }
                 for v in self.values_holding(id, attr_id, t) {
                     out.push((id, v));
                 }
@@ -4070,6 +4329,9 @@ impl View<'_> {
         // Inverse names belong to directed attributes only, so each stored
         // pair `source -> id` is read once, from `R|id|attr|`.
         for id in world.defined_ids() {
+            if !self.work.id() {
+                break;
+            }
             let start = out.len();
             self.for_each_partner_holding(id, attr_id, false, true, t, |source| {
                 out.push((id, Value::Ref(source)));
@@ -4650,7 +4912,13 @@ impl View<'_> {
             ),
         };
         let mut out = Vec::new();
-        for id in world.defined_ids().filter(|&id| self.id_visible(id)) {
+        for id in world.defined_ids() {
+            if !self.work.id() {
+                break;
+            }
+            if !self.id_visible(id) {
+                continue;
+            }
             let changes = if inverse {
                 self.reverse_changes(id, attr_id)
             } else {
@@ -4730,6 +4998,9 @@ impl View<'_> {
                 }
             }
         }
+        if self.work.finish(Ok(())).is_err() {
+            return Vec::new();
+        }
         // (tick, value) is unique among the points: only each key's
         // current entry is listed, and a bidirectional pair is stored under
         // one side only (the self pair's R side is skipped).
@@ -4782,6 +5053,9 @@ impl View<'_> {
             return Ok(out);
         }
         for entity in world.defined_ids() {
+            if !self.work.id() {
+                break;
+            }
             for side in [Side::Forward, Side::Reverse] {
                 out.extend(self.overlaps_of(entity, attr_id, side));
             }
@@ -5007,7 +5281,9 @@ fn for_each_history<V>(
         .range::<[u8], _>((as_slice(&from), Bound::Unbounded))
         .next()
     {
-        work.add(1);
+        if !work.add(1) {
+            break;
+        }
         if !k.starts_with(attr_prefix) {
             break;
         }
@@ -5037,7 +5313,7 @@ fn under<'i>(
 ) -> impl Iterator<Item = (&'i [u8], &'i Op)> + 'i {
     index
         .range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded))
-        .inspect(move |_| work.add(1))
+        .take_while(move |_| work.add(1))
         .take_while(move |(k, _)| k.starts_with(prefix))
         .map(|(k, op)| (&k[..], op))
 }
@@ -5077,9 +5353,11 @@ fn latest_seek<'i>(
     t: Tick,
     work: Work<'_>,
 ) -> Option<(&'i [u8], Op)> {
+    if !work.add(1) {
+        return None;
+    }
     let len = value_prefix.len();
     key::push_seek_tick(value_prefix, t);
-    work.add(1);
     let found = index
         .range::<[u8], _>((Bound::Included(&value_prefix[..]), Bound::Unbounded))
         .next()
@@ -5114,7 +5392,7 @@ fn current_entries_metered<'i>(
     let mut last_key: Option<&'i [u8]> = None;
     index
         .range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded))
-        .inspect(move |_| work.add(1))
+        .take_while(move |_| work.add(1))
         .take_while(move |(k, _)| k.starts_with(prefix))
         .filter(move |(k, _)| key::e_key_tx(k).is_some_and(|tx| tx <= canon))
         .filter(move |(k, _)| {
@@ -5380,18 +5658,16 @@ fn seek_entry<'i>(
             None => Bound::Included(from),
             Some(p) => Bound::Excluded(&p[..]),
         };
-        let mut examined = 0u64;
         let found = layers
             .iter()
             .filter_map(|index| {
                 index
                     .range::<[u8], _>((lower, Bound::Unbounded))
-                    .inspect(|_| examined += 1)
+                    .take_while(|_| work.add(1))
                     .take_while(|(k, _)| k.starts_with(prefix))
                     .find(|(k, _)| key::e_key_tx(k).is_some_and(|tx| tx <= canon))
             })
             .min_by(|(a, _), (b, _)| a.cmp(b));
-        work.add(examined);
         let (k, mark) = found?;
         match mark.op() {
             Some(op) => return Some((&k[..], op)),
