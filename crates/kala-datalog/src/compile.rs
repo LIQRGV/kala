@@ -13,8 +13,8 @@ use kala_query::{
 };
 
 use crate::ast::{
-    Call, CanonExpr, Clause, During, FnClause, HistoryPos, Input, Item, Not, OpItem, Pattern, Pred,
-    Query, Sym, TickExpr,
+    Call, CanonExpr, Clause, During, FnClause, HistoryPos, Input, Item, Not, OpItem, Or, Pattern,
+    Pred, Query, Sym, TickExpr,
 };
 use crate::error::{DatalogError, ErrorKind, Span, show};
 use crate::plan::{self, Hist, Pat, PatAttr};
@@ -25,8 +25,8 @@ mod rules;
 
 use clauses::{Clauses, body_vars, check_or_cost};
 use rules::{
-    RuleInfo, all_calls, components, group_rules, propagate_head_types, reachable, renames,
-    resolve_call, stratify,
+    Component, RuleInfo, components, group_rules, link_calls, propagate_head_types, reachable,
+    renames, stratify,
 };
 
 pub use kala_query::{ParamKind, Prepared};
@@ -173,6 +173,26 @@ struct NotC<'q> {
     uses: Vec<String>,
 }
 
+/// Every rule definition resolved, before `:where` is.
+struct Resolved<'q> {
+    /// One scope per definition, in resolution order.
+    scopes: Vec<Scope>,
+    /// Each scope's body.
+    bodies: Vec<BodyC<'q>>,
+    /// Per rule: (the plan's head vars, scope index of each definition).
+    heads: Vec<(Vec<Var>, Vec<usize>)>,
+}
+
+/// The `:find` columns of a query.
+struct Columns {
+    /// Every column, in order.
+    find: Vec<Var>,
+    /// The plain variables: an aggregate query's groups.
+    group: Vec<Var>,
+    /// The aggregates, each distinct one once.
+    aggs: Vec<Agg>,
+}
+
 struct Compiler<'w> {
     world: &'w World,
     schema_canon: kala_core::TxId,
@@ -207,174 +227,30 @@ impl<'w> Compiler<'w> {
         if let Some(CanonExpr::Int(canon, _)) = q.canon {
             self.schema_canon = kala_core::TxId(canon);
         }
-        for input in &q.inputs {
-            if let Input::Var(s) = input {
-                if self.params.contains_key(&s.name) {
-                    return Err(DatalogError::new(
-                        ErrorKind::Syntax,
-                        Some(s.span),
-                        format!("parameter ?{} is declared twice", show(&s.name)),
-                    ));
-                }
-                self.params.insert(
-                    s.name.clone(),
-                    Param {
-                        span: s.span,
-                        kind: None,
-                        used: false,
-                    },
-                );
-                self.param_order.push(s.name.clone());
-            }
-        }
+        self.declare_params(&q.inputs)?;
 
         let (mut rules, by_name) = group_rules(&q.rules)?;
-        // A call inside a `not` is a dependency like any other: the rule
-        // needs the callee's relation complete before it can negate it.
-        for r in &q.rules {
-            let caller = by_name[r.name.as_str()];
-            for c in all_calls(&r.calls, &r.nots, &r.ors) {
-                let callee = resolve_call(c, &rules, &by_name)?;
-                rules[caller].callees.insert(callee);
-            }
-        }
-        let mut where_callees = BTreeSet::new();
-        for c in all_calls(&q.calls, &q.nots, &q.ors) {
-            where_callees.insert(resolve_call(c, &rules, &by_name)?);
-        }
+        let where_callees = link_calls(q, &mut rules, &by_name)?;
         let comps = components(&rules);
         stratify(&q.rules, &by_name, &comps)?;
 
-        let default_tick = match &q.at {
-            None => TickSource::Default,
-            Some(TickExpr::Int(n, _)) => TickSource::Const(Tick(*n)),
-            Some(TickExpr::Var(s)) => {
-                self.section_param(s, "`:at`", ParamKind::Tick)?;
-                TickSource::Param(s.name.clone())
-            }
-        };
-        let canon = match &q.canon {
-            None => CanonSource::Latest,
-            Some(CanonExpr::Int(n, _)) => CanonSource::Const(*n),
-            Some(CanonExpr::Var(s)) => {
-                self.section_param(s, "`:canon`", ParamKind::Canon)?;
-                CanonSource::Param(s.name.clone())
-            }
-        };
+        let default_tick = self.default_tick(q)?;
+        let canon = self.canon(q)?;
 
         // Every scope (rule definitions, then `:where` last) and its body.
-        let mut scopes: Vec<Scope> = Vec::new();
-        let mut bodies: Vec<BodyC<'_>> = Vec::new();
-        // Per rule: (the plan's head vars, scope index of each definition).
-        let mut compiled: Vec<(Vec<Var>, Vec<usize>)> = vec![(Vec::new(), Vec::new()); rules.len()];
-        for comp in &comps {
-            // Resolve once for the initial type seeds, propagate only newly
-            // known head positions, then resolve once more for the original
-            // validations and final IR. Rotating a large recursive head must
-            // not recompile its whole body once per position.
-            let mut out = Vec::new();
-            for &ri in &comp.rules {
-                self.rule_defs(ri, &mut rules, &by_name, &mut out)?;
-            }
-            if comp.recursive {
-                propagate_head_types(comp, &mut rules, &by_name);
-                out.clear();
-                for &ri in &comp.rules {
-                    self.rule_defs(ri, &mut rules, &by_name, &mut out)?;
-                }
-            }
-            for (ri, scope, body) in out {
-                compiled[ri].1.push(scopes.len());
-                scopes.push(scope);
-                bodies.push(body);
-            }
-            for &ri in &comp.rules {
-                compiled[ri].0 = rules[ri].defs[0]
-                    .head
-                    .iter()
-                    .map(|h| Var(h.name.clone()))
-                    .collect();
-            }
-        }
-
-        let where_scope = scopes.len();
-        scopes.push(Scope::default());
-        let body = self.body(
-            Clauses::of_query(q),
-            &mut scopes[where_scope],
-            &rules,
-            &by_name,
-        )?;
-        bodies.push(body);
-
+        let Resolved {
+            mut scopes,
+            mut bodies,
+            heads,
+        } = self.rule_bodies(&comps, &mut rules, &by_name)?;
+        let mut where_scope = Scope::default();
+        bodies.push(self.body(Clauses::of_query(q), &mut where_scope, &rules, &by_name)?);
+        scopes.push(where_scope);
         let mut planned = self.predicates(&scopes, bodies)?;
+        let Columns { find, group, aggs } = self.columns(q, &scopes[scopes.len() - 1])?;
+        let params = self.used_params()?;
 
-        // The columns, and for an aggregate query its groups (the plain
-        // variables) and aggregates (each distinct one once).
-        let mut find = Vec::with_capacity(q.find.len());
-        let mut group: Vec<Var> = Vec::new();
-        let mut aggs: Vec<Agg> = Vec::new();
-        for f in &q.find {
-            let col = Var(f.name.clone());
-            match &f.agg {
-                None => {
-                    self.find_var(&scopes[where_scope], &f.name, f.span)?;
-                    if !group.contains(&col) {
-                        group.push(col.clone());
-                    }
-                }
-                Some(a) => {
-                    let ty = self.find_var(&scopes[where_scope], &a.var.name, a.var.span)?;
-                    check_agg_type(a.func, &a.var, ty, f.span)?;
-                    if !aggs.iter().any(|g| g.out == col) {
-                        aggs.push(Agg {
-                            func: a.func,
-                            var: Var(a.var.name.clone()),
-                            out: col.clone(),
-                        });
-                    }
-                }
-            }
-            find.push(col);
-        }
-
-        let mut params = Vec::with_capacity(self.param_order.len());
-        for name in &self.param_order {
-            let p = &self.params[name];
-            match (&p.kind, p.used) {
-                (Some(kind), true) => params.push((name.clone(), kind.clone())),
-                _ => {
-                    return Err(unbound(
-                        p.span,
-                        format!("parameter ?{} is not used by the query", show(name)),
-                    ));
-                }
-            }
-        }
-
-        // Plan the rules `:where` reaches, each body as a conjunctive
-        // query projected onto the head: one `Fixpoint` per component of
-        // the call graph (all of a component's relations, so mutually
-        // recursive rules are evaluated together), in dependency order.
-        let reach = reachable(&rules, &where_callees);
-        let mut fixes: Vec<Vec<RelDef>> = Vec::new();
-        for comp in comps.iter().filter(|c| reach.contains(&c.rules[0])) {
-            let mut rels = Vec::with_capacity(comp.rules.len());
-            for &ri in &comp.rules {
-                let (head, defs) = &compiled[ri];
-                let mut bodies = Vec::with_capacity(defs.len());
-                for &si in defs {
-                    let b = std::mem::take(&mut planned[si]);
-                    bodies.push(plan::plan(self.world, b, BTreeSet::new(), Some(head))?);
-                }
-                rels.push(RelDef {
-                    name: rules[ri].defs[0].name.clone(),
-                    vars: head.clone(),
-                    rules: bodies,
-                });
-            }
-            fixes.push(rels);
-        }
+        let fixes = self.plan_rules(&rules, &comps, &where_callees, &heads, &mut planned)?;
         let b = planned
             .pop()
             .expect("invariant: the :where body is the last one planned");
@@ -411,6 +287,188 @@ impl<'w> Compiler<'w> {
             },
             params,
         })
+    }
+
+    /// Declares the `:in` parameters, in order; each name once.
+    fn declare_params(&mut self, inputs: &[Input]) -> Result<(), DatalogError> {
+        for input in inputs {
+            if let Input::Var(s) = input {
+                if self.params.contains_key(&s.name) {
+                    return Err(DatalogError::new(
+                        ErrorKind::Syntax,
+                        Some(s.span),
+                        format!("parameter ?{} is declared twice", show(&s.name)),
+                    ));
+                }
+                self.params.insert(
+                    s.name.clone(),
+                    Param {
+                        span: s.span,
+                        kind: None,
+                        used: false,
+                    },
+                );
+                self.param_order.push(s.name.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// The query's default tick, from `:at`.
+    fn default_tick(&mut self, q: &Query) -> Result<TickSource, DatalogError> {
+        Ok(match &q.at {
+            None => TickSource::Default,
+            Some(TickExpr::Int(n, _)) => TickSource::Const(Tick(*n)),
+            Some(TickExpr::Var(s)) => {
+                self.section_param(s, "`:at`", ParamKind::Tick)?;
+                TickSource::Param(s.name.clone())
+            }
+        })
+    }
+
+    /// The canon the query reads, from `:canon`.
+    fn canon(&mut self, q: &Query) -> Result<CanonSource, DatalogError> {
+        Ok(match &q.canon {
+            None => CanonSource::Latest,
+            Some(CanonExpr::Int(n, _)) => CanonSource::Const(*n),
+            Some(CanonExpr::Var(s)) => {
+                self.section_param(s, "`:canon`", ParamKind::Canon)?;
+                CanonSource::Param(s.name.clone())
+            }
+        })
+    }
+
+    /// Resolves every rule definition's body, component by component in
+    /// dependency order, so a call's head positions are typed before its
+    /// callers are resolved.
+    fn rule_bodies<'q>(
+        &mut self,
+        comps: &[Component],
+        rules: &mut [RuleInfo<'q>],
+        by_name: &HashMap<&str, usize>,
+    ) -> Result<Resolved<'q>, DatalogError> {
+        let mut scopes: Vec<Scope> = Vec::new();
+        let mut bodies: Vec<BodyC<'_>> = Vec::new();
+        let mut heads: Vec<(Vec<Var>, Vec<usize>)> = vec![(Vec::new(), Vec::new()); rules.len()];
+        for comp in comps {
+            // Resolve once for the initial type seeds, propagate only newly
+            // known head positions, then resolve once more for the original
+            // validations and final IR. Rotating a large recursive head must
+            // not recompile its whole body once per position.
+            let mut out = Vec::new();
+            for &ri in &comp.rules {
+                self.rule_defs(ri, rules, by_name, &mut out)?;
+            }
+            if comp.recursive {
+                propagate_head_types(comp, rules, by_name);
+                out.clear();
+                for &ri in &comp.rules {
+                    self.rule_defs(ri, rules, by_name, &mut out)?;
+                }
+            }
+            for (ri, scope, body) in out {
+                heads[ri].1.push(scopes.len());
+                scopes.push(scope);
+                bodies.push(body);
+            }
+            for &ri in &comp.rules {
+                heads[ri].0 = rules[ri].defs[0]
+                    .head
+                    .iter()
+                    .map(|h| Var(h.name.clone()))
+                    .collect();
+            }
+        }
+        Ok(Resolved {
+            scopes,
+            bodies,
+            heads,
+        })
+    }
+
+    /// The `:find` columns, and for an aggregate query its groups (the plain
+    /// variables) and aggregates (each distinct one once).
+    fn columns(&self, q: &Query, where_scope: &Scope) -> Result<Columns, DatalogError> {
+        let mut find = Vec::with_capacity(q.find.len());
+        let mut group: Vec<Var> = Vec::new();
+        let mut aggs: Vec<Agg> = Vec::new();
+        for f in &q.find {
+            let col = Var(f.name.clone());
+            match &f.agg {
+                None => {
+                    self.find_var(where_scope, &f.name, f.span)?;
+                    if !group.contains(&col) {
+                        group.push(col.clone());
+                    }
+                }
+                Some(a) => {
+                    let ty = self.find_var(where_scope, &a.var.name, a.var.span)?;
+                    check_agg_type(a.func, &a.var, ty, f.span)?;
+                    if !aggs.iter().any(|g| g.out == col) {
+                        aggs.push(Agg {
+                            func: a.func,
+                            var: Var(a.var.name.clone()),
+                            out: col.clone(),
+                        });
+                    }
+                }
+            }
+            find.push(col);
+        }
+        Ok(Columns { find, group, aggs })
+    }
+
+    /// The declared parameters with their kinds, in `:in` order; one the
+    /// query never uses is an error.
+    fn used_params(&self) -> Result<Vec<(String, ParamKind)>, DatalogError> {
+        let mut params = Vec::with_capacity(self.param_order.len());
+        for name in &self.param_order {
+            let p = &self.params[name];
+            match (&p.kind, p.used) {
+                (Some(kind), true) => params.push((name.clone(), kind.clone())),
+                _ => {
+                    return Err(unbound(
+                        p.span,
+                        format!("parameter ?{} is not used by the query", show(name)),
+                    ));
+                }
+            }
+        }
+        Ok(params)
+    }
+
+    /// Plans the rules `:where` reaches, each body as a conjunctive query
+    /// projected onto the head: one `Fixpoint`'s relations per component of
+    /// the call graph (all of a component's relations, so mutually
+    /// recursive rules are evaluated together), in dependency order.
+    fn plan_rules(
+        &self,
+        rules: &[RuleInfo<'_>],
+        comps: &[Component],
+        where_callees: &BTreeSet<usize>,
+        heads: &[(Vec<Var>, Vec<usize>)],
+        planned: &mut [plan::Body],
+    ) -> Result<Vec<Vec<RelDef>>, DatalogError> {
+        let reach = reachable(rules, where_callees);
+        let mut fixes: Vec<Vec<RelDef>> = Vec::new();
+        for comp in comps.iter().filter(|c| reach.contains(&c.rules[0])) {
+            let mut rels = Vec::with_capacity(comp.rules.len());
+            for &ri in &comp.rules {
+                let (head, defs) = &heads[ri];
+                let mut bodies = Vec::with_capacity(defs.len());
+                for &si in defs {
+                    let b = std::mem::take(&mut planned[si]);
+                    bodies.push(plan::plan(self.world, b, BTreeSet::new(), Some(head))?);
+                }
+                rels.push(RelDef {
+                    name: rules[ri].defs[0].name.clone(),
+                    vars: head.clone(),
+                    rules: bodies,
+                });
+            }
+            fixes.push(rels);
+        }
+        Ok(fixes)
     }
 
     /// Checks that `:find` may use the `:where` variable `name` (a positive
@@ -506,19 +564,7 @@ impl<'w> Compiler<'w> {
                     pats.push(self.pattern(p, TickSource::Default, None, scope)?)
                 }
                 Clause::At { tick, patterns, .. } => {
-                    let (source, tick_var) = match tick {
-                        TickExpr::Int(n, _) => (TickSource::Const(Tick(*n)), None),
-                        TickExpr::Var(s) if self.is_param(scope, &s.name) => {
-                            self.use_param(s, ValueType::I64, ParamKind::Tick)?;
-                            (TickSource::Param(s.name.clone()), None)
-                        }
-                        TickExpr::Var(s) => {
-                            unify_var(scope, &s.name, Ty::Val(ValueType::I64), s.span)?;
-                            tick_vars.push(s);
-                            let v = scope.var(&s.name);
-                            (TickSource::Var(v.clone()), Some((v.0, s.span)))
-                        }
-                    };
+                    let (source, tick_var) = self.at_tick(tick, scope, &mut tick_vars)?;
                     for p in patterns {
                         pats.push(self.pattern(p, source.clone(), tick_var.clone(), scope)?);
                     }
@@ -544,76 +590,9 @@ impl<'w> Compiler<'w> {
         }
         let mut ors = Vec::new();
         for o in c.ors {
-            let mut vars = Vec::new();
-            let mut branches = Vec::new();
-            let inherited = scope.bound.clone();
-            for b in &o.branches {
-                let mut mentioned = Vec::new();
-                body_vars(Clauses::of_not(b), &mut mentioned);
-                let names: BTreeSet<String> = mentioned
-                    .into_iter()
-                    .filter(|v| !self.is_param(scope, v))
-                    .map(str::to_owned)
-                    .collect();
-                if let Some(first) = vars.first()
-                    && first != &names
-                {
-                    return Err(DatalogError::new(
-                        ErrorKind::UnboundVariable,
-                        Some(o.span),
-                        "every or branch must bind the same set of variables",
-                    ));
-                }
-                vars.push(names);
-                let mut sub = scope.clone();
-                let body = self.body(Clauses::of_not(b), &mut sub, rules, by_name)?;
-                branches.push((sub, body));
-            }
-            let names = vars.into_iter().next().unwrap_or_default();
-            let mut binds = BTreeSet::new();
-            for (sub, _) in &branches {
-                for name in &names {
-                    if let Some(&ty) = sub.types.get(name) {
-                        unify_var(scope, name, ty, o.span)?;
-                    }
-                    if sub.bound.contains(name) {
-                        binds.insert(name.clone());
-                    }
-                }
-            }
-            // Mentioning a variable inside `not` does not bind it outside.
-            // Reject unequal output schemas here, before emitting a Union.
-            if let Some((first, _)) = branches.first()
-                && branches.iter().any(|(s, _)| s.bound != first.bound)
-            {
-                return Err(unbound(
-                    o.span,
-                    "every or branch must bind the same set of variables",
-                ));
-            }
-            let uses = names
-                .intersection(&inherited)
-                .map(|n| scope.var(n).0)
-                .collect();
-            scope.bound.extend(binds.iter().cloned());
-            ors.push(OrC {
-                branches,
-                binds: binds.iter().map(|n| scope.var(n).0).collect(),
-                uses,
-                span: o.span,
-            });
+            ors.push(self.or(o, scope, rules, by_name)?);
         }
-        for s in tick_vars {
-            if !scope.bound.contains(&s.name) {
-                return Err(unbound(
-                    s.span,
-                    format!(
-                        "tick variable ?{} is not bound by any pattern, rule call or `:in` parameter",
-                        show(&s.name)
-                    ),
-                ));
-            }
-        }
+        check_tick_vars_bound(&tick_vars, scope)?;
         let mut out_nots = Vec::with_capacity(c.nots.len());
         for n in c.nots {
             out_nots.push(self.not(n, scope, rules, by_name)?);
@@ -626,6 +605,106 @@ impl<'w> Compiler<'w> {
             nots: out_nots,
             ors,
         })
+    }
+
+    /// The tick of an `(at tick ..)` clause as its patterns read it: a
+    /// constant, a parameter, or a variable some other clause must bind
+    /// (noted in `tick_vars`, and handed to the patterns as their tick
+    /// variable).
+    fn at_tick<'q>(
+        &mut self,
+        tick: &'q TickExpr,
+        scope: &mut Scope,
+        tick_vars: &mut Vec<&'q Sym>,
+    ) -> Result<(TickSource, Option<(String, Span)>), DatalogError> {
+        Ok(match tick {
+            TickExpr::Int(n, _) => (TickSource::Const(Tick(*n)), None),
+            TickExpr::Var(s) if self.is_param(scope, &s.name) => {
+                self.use_param(s, ValueType::I64, ParamKind::Tick)?;
+                (TickSource::Param(s.name.clone()), None)
+            }
+            TickExpr::Var(s) => {
+                unify_var(scope, &s.name, Ty::Val(ValueType::I64), s.span)?;
+                tick_vars.push(s);
+                let v = scope.var(&s.name);
+                (TickSource::Var(v.clone()), Some((v.0, s.span)))
+            }
+        })
+    }
+
+    /// One `(or ..)` of a body: each branch is resolved in a copy of
+    /// `scope`; every branch must mention and bind the same variables, which
+    /// the `or` then binds (and types) in `scope`.
+    fn or<'q>(
+        &mut self,
+        o: &'q Or,
+        scope: &mut Scope,
+        rules: &[RuleInfo<'_>],
+        by_name: &HashMap<&str, usize>,
+    ) -> Result<OrC<'q>, DatalogError> {
+        let mut vars = Vec::new();
+        let mut branches = Vec::new();
+        let inherited = scope.bound.clone();
+        for b in &o.branches {
+            let names = self.branch_vars(b, scope);
+            if let Some(first) = vars.first()
+                && first != &names
+            {
+                return Err(DatalogError::new(
+                    ErrorKind::UnboundVariable,
+                    Some(o.span),
+                    "every or branch must bind the same set of variables",
+                ));
+            }
+            vars.push(names);
+            let mut sub = scope.clone();
+            let body = self.body(Clauses::of_not(b), &mut sub, rules, by_name)?;
+            branches.push((sub, body));
+        }
+        let names = vars.into_iter().next().unwrap_or_default();
+        let mut binds = BTreeSet::new();
+        for (sub, _) in &branches {
+            for name in &names {
+                if let Some(&ty) = sub.types.get(name) {
+                    unify_var(scope, name, ty, o.span)?;
+                }
+                if sub.bound.contains(name) {
+                    binds.insert(name.clone());
+                }
+            }
+        }
+        // Mentioning a variable inside `not` does not bind it outside.
+        // Reject unequal output schemas here, before emitting a Union.
+        if let Some((first, _)) = branches.first()
+            && branches.iter().any(|(s, _)| s.bound != first.bound)
+        {
+            return Err(unbound(
+                o.span,
+                "every or branch must bind the same set of variables",
+            ));
+        }
+        let uses = names
+            .intersection(&inherited)
+            .map(|n| scope.var(n).0)
+            .collect();
+        scope.bound.extend(binds.iter().cloned());
+        Ok(OrC {
+            branches,
+            binds: binds.iter().map(|n| scope.var(n).0).collect(),
+            uses,
+            span: o.span,
+        })
+    }
+
+    /// The variables (parameters left out) one `or` branch mentions.
+    fn branch_vars(&self, branch: &Not, scope: &Scope) -> BTreeSet<String> {
+        let mut mentioned = Vec::new();
+        body_vars(Clauses::of_not(branch), &mut mentioned);
+        mentioned
+            .into_iter()
+            .filter(|v| !self.is_param(scope, v))
+            .map(str::to_owned)
+            .collect()
     }
 
     /// One `(not ..)` of a body whose positive clauses are resolved into
@@ -1048,6 +1127,23 @@ impl<'w> Compiler<'w> {
         scope.bound.insert(out.name.clone());
         Ok(scope.var(&out.name))
     }
+}
+
+/// Checks that every tick variable of a body's `(at ?t ..)` clauses is bound
+/// by one of the body's clauses.
+fn check_tick_vars_bound(tick_vars: &[&Sym], scope: &Scope) -> Result<(), DatalogError> {
+    for s in tick_vars {
+        if !scope.bound.contains(&s.name) {
+            return Err(unbound(
+                s.span,
+                format!(
+                    "tick variable ?{} is not bound by any pattern, rule call or `:in` parameter",
+                    show(&s.name)
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `[?p :kala_handle :varrow]`: a handle keyword where `:kala_handle` needs the

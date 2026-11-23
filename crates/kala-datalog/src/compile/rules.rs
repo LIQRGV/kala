@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
-use crate::ast::{Call, Item, Not, Or, Rule};
+use crate::ast::{Call, Item, Not, Or, Query, Rule};
 use crate::error::{DatalogError, ErrorKind, show};
 
 use super::Ty;
@@ -62,7 +62,7 @@ pub(super) fn group_rules(
 }
 
 /// The rule `c` calls, checking it exists and takes that many arguments.
-pub(super) fn resolve_call(
+fn resolve_call(
     c: &Call,
     rules: &[RuleInfo<'_>],
     by_name: &HashMap<&str, usize>,
@@ -88,6 +88,29 @@ pub(super) fn resolve_call(
         ));
     }
     Ok(i)
+}
+
+/// Resolves every rule call, recording each rule's callees, and returns the
+/// rules `:where` calls.
+pub(super) fn link_calls(
+    q: &Query,
+    rules: &mut [RuleInfo<'_>],
+    by_name: &HashMap<&str, usize>,
+) -> Result<BTreeSet<usize>, DatalogError> {
+    // A call inside a `not` is a dependency like any other: the rule
+    // needs the callee's relation complete before it can negate it.
+    for r in &q.rules {
+        let caller = by_name[r.name.as_str()];
+        for c in all_calls(&r.calls, &r.nots, &r.ors) {
+            let callee = resolve_call(c, rules, by_name)?;
+            rules[caller].callees.insert(callee);
+        }
+    }
+    let mut where_callees = BTreeSet::new();
+    for c in all_calls(&q.calls, &q.nots, &q.ors) {
+        where_callees.insert(resolve_call(c, rules, by_name)?);
+    }
+    Ok(where_callees)
 }
 
 /// A strongly connected component of the rule call graph: rules that call
@@ -172,7 +195,7 @@ pub(super) fn reachable(rules: &[RuleInfo<'_>], roots: &BTreeSet<usize>) -> BTre
 
 /// Every rule call of a body, those inside its negations (at any depth)
 /// included.
-pub(super) fn all_calls<'q>(calls: &'q [Call], nots: &'q [Not], ors: &'q [Or]) -> Vec<&'q Call> {
+fn all_calls<'q>(calls: &'q [Call], nots: &'q [Not], ors: &'q [Or]) -> Vec<&'q Call> {
     let mut out: Vec<&Call> = calls.iter().collect();
     for n in nots {
         out.extend(all_calls(&n.calls, &n.nots, &n.ors));
