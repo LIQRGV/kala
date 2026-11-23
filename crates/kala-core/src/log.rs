@@ -353,7 +353,7 @@ pub struct LogEntry {
 ///
 /// Only a regular file (or a symlink to one) is read: a directory, FIFO,
 /// device or socket is refused with [`Error::Io`] of kind `InvalidInput`
-/// before anything is read (see [`read_log_file`]).
+/// before anything is read (see `read_log_file`).
 pub fn read_log(path: &Path) -> Result<Vec<LogEntry>, Error> {
     let bytes = read_log_file(path)?;
     Ok(scan(&bytes)?.entries)

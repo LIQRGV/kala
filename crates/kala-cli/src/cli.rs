@@ -5,6 +5,10 @@
 //! no `allow_hyphen_values` / `trailing_var_arg`; negative ticks go through
 //! `--at` with `allow_negative_numbers`.
 
+// The doc comments on the items below are the `--help` text clap prints, not
+// rustdoc: `<database>` and `[IPv6]` are meant literally.
+#![allow(rustdoc::broken_intra_doc_links, rustdoc::invalid_html_tags)]
+
 use std::path::PathBuf;
 
 use clap::{ArgGroup, Args, Parser, Subcommand};

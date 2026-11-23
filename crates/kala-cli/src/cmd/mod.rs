@@ -1,5 +1,5 @@
 //! One module per subcommand. Each returns the text for stdout, or a
-//! [`CliError`](crate::error::CliError); `main` prints and picks the exit code.
+//! [`CliError`]; `main` prints and picks the exit code.
 
 pub mod asof;
 pub mod create;

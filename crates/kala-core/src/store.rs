@@ -103,7 +103,8 @@ impl<V> OrderedMap<V> {
         self.0.iter().map(|(k, v)| (k.as_slice(), v))
     }
 
-    /// Every key, in order.
+    /// Every key, in order: for the index tamper hooks and tests.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn keys(&self) -> impl Iterator<Item = &[u8]> {
         self.0.keys().map(Vec::as_slice)
     }

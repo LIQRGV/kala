@@ -6,6 +6,9 @@ edition.workspace = true
 [lib]
 name = "kala_datalog"
 
+[lints]
+workspace = true
+
 [dependencies]
 kala-core = { path = "../kala-core" }
 kala-query = { path = "../kala-query" }
