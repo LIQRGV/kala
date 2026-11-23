@@ -294,14 +294,12 @@ fn schema_body(n: &World, edit: &SchemaEdit) -> JBody {
             skip_unconvertible,
         } => {
             let source_name = attr_name(n, *source);
-            let from = n
-                .attribute(&source_name)
-                .map(|d| schema::type_name(d.value_type));
+            let from = n.attribute(&source_name).map(|d| d.value_type.name());
             let mut change = schema::def_json(def);
             change["kind"] = "migrate".into();
             change["source"] = source_name.clone().into();
             change["from"] = from.into();
-            change["to"] = schema::type_name(def.value_type).into();
+            change["to"] = def.value_type.name().into();
             change["skip_unconvertible"] = (*skip_unconvertible).into();
             let skip = if *skip_unconvertible {
                 ", skipping unconvertible values"

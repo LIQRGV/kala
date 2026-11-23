@@ -14,7 +14,7 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use kala_core::{DoctorOptions, Finding, IndexName, Severity, TxId, ValueType, doctor_log};
+use kala_core::{DoctorOptions, Finding, IndexName, Severity, TxId, doctor_log};
 use kala_datalog::{MAX_CHECKS_BYTES, Prepared};
 use kala_query::{CanonSource, Limits, Params, QueryError, Usage};
 use serde::Serialize;
@@ -510,8 +510,8 @@ fn message(n: &dyn Names, f: &Finding) -> String {
             "entry#{}: attribute {} holds {} values, got a {} value; the entry is skipped",
             entry.0,
             escape::value(attr),
-            type_name(*expected),
-            type_name(*got)
+            expected.name(),
+            got.name()
         ),
         Finding::RetractedEvent { entry, attr } => format!(
             "entry#{}: retracts event attribute {}; the entry is skipped",
@@ -531,17 +531,6 @@ fn index_name(i: IndexName) -> &'static str {
         IndexName::VLatest => "V_latest",
         IndexName::VFold => "V_fold",
         IndexName::VFoldLatest => "V_fold_latest",
-    }
-}
-
-/// The value type as the CLI's JSON values name it.
-fn type_name(t: ValueType) -> &'static str {
-    match t {
-        ValueType::Bool => "bool",
-        ValueType::I64 => "i64",
-        ValueType::F64 => "f64",
-        ValueType::Str => "string",
-        ValueType::Ref => "ref",
     }
 }
 

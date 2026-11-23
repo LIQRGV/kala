@@ -27,16 +27,6 @@ pub(crate) fn compile(world: &World, q: &Query) -> Result<Prepared, DatalogError
     Compiler::new(world).run(q)
 }
 
-fn type_name(t: ValueType) -> &'static str {
-    match t {
-        ValueType::Bool => "bool",
-        ValueType::I64 => "i64",
-        ValueType::F64 => "f64",
-        ValueType::Str => "string",
-        ValueType::Ref => "ref",
-    }
-}
-
 /// The type of a variable: a stored value's type, a change point's op (a
 /// history pattern's op position) or an interval set (`during` and the set
 /// functions). Parameters are always values.
@@ -50,7 +40,7 @@ enum Ty {
 
 fn ty_name(t: Ty) -> &'static str {
     match t {
-        Ty::Val(v) => type_name(v),
+        Ty::Val(v) => v.name(),
         Ty::Op => "an op",
         Ty::Precision => "a precision",
         Ty::Intervals => "an interval set",
@@ -731,7 +721,7 @@ impl<'w> Compiler<'w> {
                             let want = if ty == ValueType::Ref {
                                 "an entity (`:edwin`, `TYPE#n` or `edge#n`)".to_string()
                             } else {
-                                format!("a {}", type_name(ty))
+                                format!("a {}", ty.name())
                             };
                             return Err(mismatch(
                                 other.span(),
@@ -972,7 +962,7 @@ impl<'w> Compiler<'w> {
                         } else if ty == ValueType::Ref {
                             "a ref (`:edwin`, `TYPE#n` or `edge#n`)".to_string()
                         } else {
-                            format!("a {}", type_name(ty))
+                            format!("a {}", ty.name())
                         };
                         let pos = if entity_pos { "entity" } else { "value" };
                         return Err(mismatch(
@@ -1389,8 +1379,8 @@ fn unify_in(
             format!(
                 "?{} is used as {} here but as {} elsewhere",
                 show(name),
-                type_name(ty),
-                type_name(t)
+                ty.name(),
+                t.name()
             ),
         )),
         Some(_) => Ok(()),
