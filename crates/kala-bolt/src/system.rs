@@ -38,6 +38,14 @@ pub enum SystemError {
     Store,
     /// Password hashing or OS randomness failed.
     Password,
+    /// The server directory does not exist (it is never created).
+    NoSuchDirectory,
+    /// The system world's last transaction is damaged; writing would cut it
+    /// to a quarantine file, which needs the caller's acknowledgement.
+    RecoveryRequired {
+        /// The size of the damaged tail.
+        bytes: u64,
+    },
 }
 impl fmt::Display for SystemError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -61,6 +69,11 @@ impl fmt::Display for SystemError {
             Self::Busy => "system world is open in another writer; retry the command",
             Self::Store => "system world could not be read or written",
             Self::Password => "password hashing failed",
+            Self::NoSuchDirectory => "no such directory",
+            Self::RecoveryRequired { .. } => {
+                "the last transaction of the system world is damaged; writing would cut it \
+                 to a quarantine file, so the recovery must be acknowledged"
+            }
         })
     }
 }
@@ -68,6 +81,7 @@ impl std::error::Error for SystemError {}
 fn store(error: kala_core::Error) -> SystemError {
     match error {
         kala_core::Error::WorldLocked => SystemError::Busy,
+        kala_core::Error::RecoveryRequired { bytes } => SystemError::RecoveryRequired { bytes },
         _ => SystemError::Store,
     }
 }
@@ -132,6 +146,17 @@ fn schema() -> Schema {
 pub fn is_system(world: &World) -> bool {
     world.node_types().any(|name| name == SYSTEM_MARKER)
 }
+/// The system attribute no query may read: comparisons, aggregates and
+/// negations over it would reveal hashes even with output redacted.
+const SECRET_ATTR: &str = "password_hash";
+/// Whether a query on the system world may not name `attr`: the secret
+/// attribute itself, or any name that resolves to it (an inverse name).
+pub(crate) fn is_secret_attribute(world: &World, attr: &str) -> bool {
+    attr == SECRET_ATTR
+        || world
+            .attributes()
+            .any(|def| def.name == SECRET_ATTR && def.inverse.as_deref() == Some(attr))
+}
 fn validate(world: &World) -> Result<(), SystemError> {
     if !is_system(world) {
         return Err(SystemError::ReservedSystem);
@@ -169,11 +194,22 @@ fn existing(directory: &Path) -> Result<(), SystemError> {
     read_accounts(&world)?;
     Ok(())
 }
+/// The server directory must already exist: account commands and the
+/// server never create it (only `system.kala` inside it).
+fn require_directory(directory: &Path) -> Result<(), SystemError> {
+    match fs::metadata(directory) {
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(SystemError::NoSuchDirectory),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(SystemError::NoSuchDirectory),
+        Err(_) => Err(SystemError::Store),
+    }
+}
 /// Create the system world once, atomically publishing a complete root bootstrap.
-/// Returns true only for the process that created it.
+/// Returns true only for the process that created it. The directory itself
+/// must exist ([`SystemError::NoSuchDirectory`] otherwise).
 pub fn ensure(directory: impl AsRef<Path>) -> Result<bool, SystemError> {
     let directory = directory.as_ref();
-    fs::create_dir_all(directory).map_err(|_| SystemError::Store)?;
+    require_directory(directory)?;
     let path = directory.join("system.kala");
     match fs::symlink_metadata(&path) {
         Ok(meta) => {
@@ -337,10 +373,185 @@ pub fn list(directory: impl AsRef<Path>) -> Result<Vec<AccountSummary>, SystemEr
         .map(|a| a.summary)
         .collect())
 }
-fn writer(directory: &Path) -> Result<World, SystemError> {
+/// What a damaged last transaction of `system.kala` may do to a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Recovery {
+    /// Refuse the write under the writer lock, before anything is cut
+    /// ([`SystemError::RecoveryRequired`]).
+    #[default]
+    Refuse,
+    /// Cut the damaged tail to the quarantine file, acknowledge the
+    /// recovery and apply the write, as `kala transact --acknowledge-recovery`.
+    Acknowledge,
+}
+/// The native result of one account change: how many entries it stored and
+/// the tick it used (for "0 changed", the tick it was judged at).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteReport {
+    /// Entries stored (0 for a no-op, which appends nothing).
+    pub changed: usize,
+    /// The tick the change was judged and written at.
+    pub tick: Tick,
+}
+impl fmt::Display for WriteReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} changed, written at tick {}",
+            self.changed, self.tick.0
+        )
+    }
+}
+/// One account-management change, applied by [`apply`].
+#[derive(Clone, Copy)]
+pub enum Change<'a> {
+    /// Add an account; `None` selects trust (explicit loopback only).
+    Add {
+        /// `user@host`.
+        account: &'a str,
+        /// The new password, or `None` for trust.
+        password: Option<&'a str>,
+    },
+    /// Change an account's authentication, keeping its grants.
+    Set {
+        /// `user@host`.
+        account: &'a str,
+        /// The new password, or `None` for trust.
+        password: Option<&'a str>,
+    },
+    /// Grant `privilege:db`; an existing grant is "0 changed".
+    Grant {
+        /// `user@host`.
+        account: &'a str,
+        /// `read`, `write` or `admin`.
+        privilege: &'a str,
+        /// A database name or `*`.
+        db: &'a str,
+    },
+    /// Revoke `privilege:db`; an absent grant is "0 changed". The last
+    /// `admin:*` grant cannot be revoked.
+    Revoke {
+        /// `user@host`.
+        account: &'a str,
+        /// `read`, `write` or `admin`.
+        privilege: &'a str,
+        /// A database name or `*`.
+        db: &'a str,
+    },
+    /// Drop an account by retracting its active fields (history is kept).
+    Drop {
+        /// `user@host`.
+        account: &'a str,
+    },
+}
+/// Never prints the password.
+impl fmt::Debug for Change<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Add { account, password } | Self::Set { account, password } => f
+                .debug_struct(if matches!(self, Self::Add { .. }) {
+                    "Add"
+                } else {
+                    "Set"
+                })
+                .field("account", account)
+                .field("password", &password.map(|_| "<redacted>"))
+                .finish(),
+            Self::Grant {
+                account,
+                privilege,
+                db,
+            }
+            | Self::Revoke {
+                account,
+                privilege,
+                db,
+            } => f
+                .debug_struct(if matches!(self, Self::Grant { .. }) {
+                    "Grant"
+                } else {
+                    "Revoke"
+                })
+                .field("account", account)
+                .field("privilege", privilege)
+                .field("db", db)
+                .finish(),
+            Self::Drop { account } => f.debug_struct("Drop").field("account", account).finish(),
+        }
+    }
+}
+/// The outcome of [`apply`]: the change's result, and the damaged tail an
+/// acknowledged recovery cut before the change was judged.
+#[derive(Debug)]
+pub struct Applied {
+    /// Set only when [`Recovery::Acknowledge`] cut a damaged last
+    /// transaction (fully present, checksum failed) to its quarantine file.
+    /// Any account change in it (a password rotation, a revoke, a drop) is
+    /// gone from the world, so the caller must tell the operator. Kept even
+    /// when `result` is an error: the cut has already happened.
+    pub recovered: Option<kala_core::RecoveryReport>,
+    /// The change's own result.
+    pub result: Result<WriteReport, SystemError>,
+}
+/// Apply one account change to `directory/system.kala` under its writer
+/// lock, creating the system world (never the directory) if it is absent.
+pub fn apply(directory: impl AsRef<Path>, change: Change<'_>, recovery: Recovery) -> Applied {
+    let directory = directory.as_ref();
+    let mut open = Open {
+        recovery,
+        recovered: None,
+    };
+    let result = match change {
+        Change::Add { account, password } => add_inner(directory, account, password, &mut open),
+        Change::Set { account, password } => set_inner(directory, account, password, &mut open),
+        Change::Grant {
+            account,
+            privilege,
+            db,
+        } => change_grant(directory, account, privilege, db, true, &mut open),
+        Change::Revoke {
+            account,
+            privilege,
+            db,
+        } => change_grant(directory, account, privilege, db, false, &mut open),
+        Change::Drop { account } => drop_inner(directory, account, &mut open),
+    };
+    Applied {
+        recovered: open.recovered,
+        result,
+    }
+}
+/// How [`writer`] may recover the log, and what it cut.
+struct Open {
+    recovery: Recovery,
+    recovered: Option<kala_core::RecoveryReport>,
+}
+fn writer(directory: &Path, open: &mut Open) -> Result<World, SystemError> {
+    // `ensure` validates the committed prefix read-only, so a world that is
+    // not a system world is refused before any recovery can cut its tail.
     ensure(directory)?;
-    let world = World::open_refusing_damaged(&directory.join("system.kala")).map_err(store)?;
+    let path = directory.join("system.kala");
+    let mut world = match open.recovery {
+        Recovery::Refuse => World::open_refusing_damaged(&path),
+        Recovery::Acknowledge => World::open(&path),
+    }
+    .map_err(store)?;
+    let damaged = world.recovery().cause == Some(kala_core::CutCause::Damaged);
+    if damaged {
+        // Reachable only with `Recovery::Acknowledge`: the refusing open
+        // never cuts a damaged tail. Recorded before anything else can
+        // fail, because the tail is already gone from the log.
+        let report = world.recovery();
+        eprintln!(
+            "event=system_recovery_acknowledged bytes_cut={}",
+            report.bytes_cut
+        );
+        open.recovered = Some(report.clone());
+    }
     validate(&world)?;
+    if damaged {
+        world.acknowledge_recovery();
+    }
     Ok(world)
 }
 fn next_tick(world: &World) -> Result<Tick, SystemError> {
@@ -367,14 +578,28 @@ fn find<'a>(accounts: &'a [Account], name: &AccountName) -> Option<&'a Account> 
         .find(|a| a.summary.user == name.user && a.summary.host == name.host)
 }
 /// Add an account. `None` selects trust and is accepted only for explicit loopback.
+/// A damaged last transaction is refused (see [`apply`] and [`Recovery`]).
 pub fn add(
     directory: impl AsRef<Path>,
     account: &str,
     password: Option<&str>,
-) -> Result<(), SystemError> {
+) -> Result<WriteReport, SystemError> {
+    apply(
+        directory,
+        Change::Add { account, password },
+        Recovery::Refuse,
+    )
+    .result
+}
+fn add_inner(
+    directory: &Path,
+    account: &str,
+    password: Option<&str>,
+    open: &mut Open,
+) -> Result<WriteReport, SystemError> {
     let name = AccountName::parse(account)?;
     let (plugin, password) = authentication(&name, password)?;
-    let mut world = writer(directory.as_ref())?;
+    let mut world = writer(directory, open)?;
     if find(&read_accounts(&world)?, &name).is_some() {
         return Err(SystemError::AccountExists);
     }
@@ -400,12 +625,15 @@ pub fn add(
         txn.assert(id, "password_hash", Value::Str(hash.expose().into()), None)
             .map_err(store)?;
     }
-    txn.commit().map_err(store)?;
+    let committed = txn.commit().map_err(store)?;
     eprintln!(
         "event=account_added user={} host={} plugin={plugin}",
         name.user, name.host
     );
-    Ok(())
+    Ok(WriteReport {
+        changed: committed.changed,
+        tick,
+    })
 }
 fn replace(
     txn: &mut Txn<'_>,
@@ -428,14 +656,28 @@ fn replace(
     Ok(())
 }
 /// Change authentication while preserving grants and previous password history.
+/// A damaged last transaction is refused (see [`apply`] and [`Recovery`]).
 pub fn set(
     directory: impl AsRef<Path>,
     account: &str,
     password: Option<&str>,
-) -> Result<(), SystemError> {
+) -> Result<WriteReport, SystemError> {
+    apply(
+        directory,
+        Change::Set { account, password },
+        Recovery::Refuse,
+    )
+    .result
+}
+fn set_inner(
+    directory: &Path,
+    account: &str,
+    password: Option<&str>,
+    open: &mut Open,
+) -> Result<WriteReport, SystemError> {
     let name = AccountName::parse(account)?;
     let (plugin, password) = authentication(&name, password)?;
-    let mut world = writer(directory.as_ref())?;
+    let mut world = writer(directory, open)?;
     let accounts = read_accounts(&world)?;
     let old = find(&accounts, &name).ok_or(SystemError::AccountNotFound)?;
     let tick = next_tick(&world)?;
@@ -455,12 +697,15 @@ pub fn set(
         old.password.as_ref().map(Credentials::expose),
         password.as_ref().map(Credentials::expose),
     )?;
-    txn.commit().map_err(store)?;
+    let committed = txn.commit().map_err(store)?;
     eprintln!(
-        "event=account_auth_changed user={} host={} plugin={plugin}",
-        name.user, name.host
+        "event=account_auth_changed user={} host={} plugin={plugin} changed={}",
+        name.user, name.host, committed.changed
     );
-    Ok(())
+    Ok(WriteReport {
+        changed: committed.changed,
+        tick,
+    })
 }
 fn validate_grant(privilege: &str, db: &str) -> Result<(), SystemError> {
     if !matches!(privilege, "read" | "write" | "admin")
@@ -488,22 +733,42 @@ fn guard_last_admin(accounts: &[Account], target: &Account) -> Result<(), System
     Ok(())
 }
 /// Grant a privilege; granting an existing privilege writes nothing.
+/// A damaged last transaction is refused (see [`apply`] and [`Recovery`]).
 pub fn grant(
     directory: impl AsRef<Path>,
     account: &str,
     privilege: &str,
     db: &str,
-) -> Result<(), SystemError> {
-    change_grant(directory.as_ref(), account, privilege, db, true)
+) -> Result<WriteReport, SystemError> {
+    apply(
+        directory,
+        Change::Grant {
+            account,
+            privilege,
+            db,
+        },
+        Recovery::Refuse,
+    )
+    .result
 }
 /// Revoke a privilege; the last `admin:*` grant cannot be revoked.
+/// A damaged last transaction is refused (see [`apply`] and [`Recovery`]).
 pub fn revoke(
     directory: impl AsRef<Path>,
     account: &str,
     privilege: &str,
     db: &str,
-) -> Result<(), SystemError> {
-    change_grant(directory.as_ref(), account, privilege, db, false)
+) -> Result<WriteReport, SystemError> {
+    apply(
+        directory,
+        Change::Revoke {
+            account,
+            privilege,
+            db,
+        },
+        Recovery::Refuse,
+    )
+    .result
 }
 fn change_grant(
     directory: &Path,
@@ -511,21 +776,23 @@ fn change_grant(
     privilege: &str,
     db: &str,
     add: bool,
-) -> Result<(), SystemError> {
+    open: &mut Open,
+) -> Result<WriteReport, SystemError> {
     let name = AccountName::parse(account)?;
     validate_grant(privilege, db)?;
-    let mut world = writer(directory)?;
+    let mut world = writer(directory, open)?;
     let accounts = read_accounts(&world)?;
     let target = find(&accounts, &name).ok_or(SystemError::AccountNotFound)?;
     let grant = format!("{privilege}:{db}");
-    let present = target.summary.grants.contains(&grant);
-    if add == present {
-        return Ok(());
+    let tick = next_tick(&world)?;
+    if add == target.summary.grants.contains(&grant) {
+        // Asserting a held grant or retracting an absent one: "0 changed",
+        // judged at the tick the write would have used. Nothing is appended.
+        return Ok(WriteReport { changed: 0, tick });
     }
     if !add && grant == "admin:*" {
         guard_last_admin(&accounts, target)?;
     }
-    let tick = next_tick(&world)?;
     let mut txn = world.begin();
     txn.set_default_tick(tick);
     if add {
@@ -535,17 +802,31 @@ fn change_grant(
         txn.retract(target.id, "grant", Value::Str(grant), None)
             .map_err(store)?;
     }
-    txn.commit().map_err(store)?;
+    let committed = txn.commit().map_err(store)?;
     eprintln!(
         "event=account_grant_changed user={} host={} privilege={privilege} db={db} granted={add}",
         name.user, name.host
     );
-    Ok(())
+    Ok(WriteReport {
+        changed: committed.changed,
+        tick,
+    })
 }
 /// Drop an account by retracting its active fields, preserving audit history.
-pub fn drop_account(directory: impl AsRef<Path>, account: &str) -> Result<(), SystemError> {
+/// A damaged last transaction is refused (see [`apply`] and [`Recovery`]).
+pub fn drop_account(
+    directory: impl AsRef<Path>,
+    account: &str,
+) -> Result<WriteReport, SystemError> {
+    apply(directory, Change::Drop { account }, Recovery::Refuse).result
+}
+fn drop_inner(
+    directory: &Path,
+    account: &str,
+    open: &mut Open,
+) -> Result<WriteReport, SystemError> {
     let name = AccountName::parse(account)?;
-    let mut world = writer(directory.as_ref())?;
+    let mut world = writer(directory, open)?;
     let accounts = read_accounts(&world)?;
     let target = find(&accounts, &name).ok_or(SystemError::AccountNotFound)?;
     guard_last_admin(&accounts, target)?;
@@ -562,10 +843,13 @@ pub fn drop_account(directory: impl AsRef<Path>, account: &str) -> Result<(), Sy
                 .map_err(store)?;
         }
     }
-    txn.commit().map_err(store)?;
+    let committed = txn.commit().map_err(store)?;
     eprintln!(
         "event=account_dropped user={} host={}",
         name.user, name.host
     );
-    Ok(())
+    Ok(WriteReport {
+        changed: committed.changed,
+        tick,
+    })
 }

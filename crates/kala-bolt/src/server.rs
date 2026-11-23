@@ -1,7 +1,7 @@
 //! Loopback listener, bounded connection threads and cooperative shutdown.
 use crate::{
     auth::{Accounts, Authenticator, NoAuth, Plugin},
-    registry::Registry,
+    registry::{Registry, SystemDb},
     session,
 };
 use std::io;
@@ -64,8 +64,11 @@ struct Client {
 }
 impl Server {
     /// Bind a loopback-only, no-auth server and discover its databases.
+    /// Never creates, opens or reads `system.kala`, and never serves the
+    /// `system` database; writes nothing to `directory`.
     pub fn bind(directory: impl AsRef<Path>, config: ServerConfig) -> io::Result<Self> {
-        Self::bind_with_auth(directory, config, Arc::new(NoAuth))
+        Self::require_loopback(&config)?;
+        Self::bind_inner(directory.as_ref(), config, Arc::new(NoAuth), SystemDb::Skip)
     }
     /// Bind with persisted accounts, bootstrapping root@localhost when needed.
     pub fn bind_accounts(directory: impl AsRef<Path>, config: ServerConfig) -> io::Result<Self> {
@@ -93,7 +96,7 @@ impl Server {
             }
         }
         let auth = Accounts::open(directory).map_err(io::Error::other)?;
-        Self::bind_inner(directory, config, Arc::new(auth))
+        Self::bind_inner(directory, config, Arc::new(auth), SystemDb::Serve)
     }
     /// Supply an authenticator on a loopback-only listener.
     pub fn bind_with_auth(
@@ -101,18 +104,23 @@ impl Server {
         config: ServerConfig,
         auth: Arc<dyn Authenticator>,
     ) -> io::Result<Self> {
+        Self::require_loopback(&config)?;
+        Self::bind_inner(directory.as_ref(), config, auth, SystemDb::Serve)
+    }
+    fn require_loopback(config: &ServerConfig) -> io::Result<()> {
         if !config.listen.ip().is_loopback() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "no-auth server requires a loopback listen address",
             ));
         }
-        Self::bind_inner(directory.as_ref(), config, auth)
+        Ok(())
     }
     fn bind_inner(
         directory: &Path,
         config: ServerConfig,
         auth: Arc<dyn Authenticator>,
+        system: SystemDb,
     ) -> io::Result<Self> {
         if config.max_connections == 0
             || config.max_message_bytes == 0
@@ -131,7 +139,15 @@ impl Server {
                 "invalid Bolt resource limits",
             ));
         }
-        let registry = Arc::new(Registry::open(directory, config.default_db.clone())?);
+        // The server directory is never created, in any auth mode.
+        if !directory.is_dir() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "no such directory"));
+        }
+        let registry = Arc::new(Registry::open(
+            directory,
+            config.default_db.clone(),
+            system,
+        )?);
         let listener = TcpListener::bind(config.listen)?;
         listener.set_nonblocking(true)?;
         Ok(Self {

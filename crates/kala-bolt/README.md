@@ -29,10 +29,13 @@ A single discovered user database is the implicit default (`system` is excluded)
 set `--default-db` or supply the driver's session database. The library exports
 `Server`, `ServerConfig`, PackStream values/codecs and `auth::Authenticator`.
 `Server::bind_accounts` implements the default CLI policy.
-`Server::bind` retains its loopback-only `NoAuth` library behavior;
+`Server::bind` retains its loopback-only `NoAuth` library behavior; it never
+creates, opens or reads `system.kala` (skipping it with one stderr line) and never
+serves the `system` database;
 `Server::bind_with_auth` accepts a custom authenticator but still restricts
 binding to loopback. Authenticators receive the peer IP and return an identity
-with a matched host and grants. `NoAuth` accepts all well-formed tokens. Credentials format as
+with a matched host and grants. `NoAuth` accepts all well-formed tokens with a `read:*` identity (a
+development mode, not an administrator). Credentials format as
 `<redacted>` and are dropped after the authentication callback.
 
 Query text must start with exactly `// kala:datalog` followed by a newline;

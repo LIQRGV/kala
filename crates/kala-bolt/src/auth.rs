@@ -1,6 +1,6 @@
 //! Account selection by user and peer IP, followed by bounded password verification.
 use crate::{
-    registry::Registry,
+    registry::{Registry, SystemDb},
     system::{self, SystemError},
 };
 use argon2::{
@@ -87,6 +87,8 @@ pub trait Authenticator: Send + Sync {
     fn authenticate(&self, token: &AuthToken, peer: IpAddr) -> Result<Identity, AuthFailure>;
 }
 /// Accept every well-formed token. Server listeners are restricted to loopback.
+/// A development mode, not an administrator: the identity may read every
+/// user database (`read:*`) but never the `system` database.
 #[derive(Debug, Default)]
 pub struct NoAuth;
 impl Authenticator for NoAuth {
@@ -94,7 +96,7 @@ impl Authenticator for NoAuth {
         Ok(Identity {
             principal: String::new(),
             host: String::new(),
-            grants: vec!["admin:*".into()],
+            grants: vec!["read:*".into()],
         })
     }
 }
@@ -338,7 +340,8 @@ impl Accounts {
     /// Initialize the system world and prepare one dummy hash for unknown users.
     pub fn open(directory: impl AsRef<Path>) -> Result<Self, SystemError> {
         system::ensure(directory.as_ref())?;
-        let registry = Registry::open(directory.as_ref(), None).map_err(|_| SystemError::Store)?;
+        let registry = Registry::open(directory.as_ref(), None, SystemDb::Serve)
+            .map_err(|_| SystemError::Store)?;
         let mut random = [0u8; 32];
         OsRng
             .try_fill_bytes(&mut random)

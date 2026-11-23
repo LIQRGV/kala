@@ -269,7 +269,7 @@ impl Session<'_> {
                     .is_some_and(|identity| identity.permits_read(name))
                 {
                     return Err(Failure::new(
-                        "Neo.ClientError.Security.Forbidden",
+                        crate::error::FORBIDDEN,
                         format!("access to database {name:?} is forbidden"),
                     )
                     .into());

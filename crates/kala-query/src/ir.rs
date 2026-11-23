@@ -803,6 +803,47 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// The name of every schema attribute the plan reads (`Expand`,
+    /// `History`, `During`, in every subplan and every `Fixpoint` rule),
+    /// possibly repeated. The `:handle` pseudo-attribute is not a schema
+    /// attribute and is left out.
+    ///
+    /// For callers that refuse plans by attribute. Every attribute
+    /// reference is a constant name today; a non-constant one added to
+    /// [`AttrRef`] must be surfaced here (the match below is exhaustive for
+    /// that reason) so such callers can fail closed.
+    pub fn attribute_names(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut stack = vec![&self.root];
+        while let Some(op) = stack.pop() {
+            match op {
+                Op::Expand { attr, .. } => match attr {
+                    AttrRef::Named(name) => out.push(name.as_str()),
+                    AttrRef::Handle => {}
+                },
+                Op::History { attr, .. } | Op::During { attr, .. } => out.push(attr.as_str()),
+                // Listed, not `_`: a new operator that names an attribute
+                // must be added above, or the compiler asks for a decision.
+                Op::Unit
+                | Op::NodeScan { .. }
+                | Op::NodeSeek { .. }
+                | Op::Filter { .. }
+                | Op::Join { .. }
+                | Op::Project { .. }
+                | Op::Union { .. }
+                | Op::Apply { .. }
+                | Op::Not { .. }
+                | Op::Difference { .. }
+                | Op::Intersect { .. }
+                | Op::Aggregate { .. }
+                | Op::Fixpoint { .. }
+                | Op::Rel { .. } => {}
+            }
+            op.children(&mut stack);
+        }
+        out
+    }
+
     /// Renders the plan as stable text: a header line
     /// (`Find ?a  in $who  at -210  canon 41`), then one line per operator,
     /// each child indented two spaces more than its parent. Every line ends

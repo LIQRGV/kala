@@ -69,19 +69,33 @@ fn stamp(path: &Path) -> Result<Stamp, Failure> {
         tail,
     })
 }
+/// Whether a registry serves the reserved `system` database.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SystemDb {
+    /// Register `system.kala` (account authentication reads it; admins query it).
+    Serve,
+    /// Never register, open or read `system.kala` (`--auth none`): the file is
+    /// skipped by name, whatever it contains or whoever may read it.
+    Skip,
+}
 pub(crate) struct Registry {
     databases: BTreeMap<String, Database>,
     default: Option<String>,
 }
 impl Registry {
-    pub fn open(directory: &Path, default: Option<String>) -> io::Result<Self> {
+    pub fn open(directory: &Path, default: Option<String>, system: SystemDb) -> io::Result<Self> {
         let mut databases = BTreeMap::new();
         for entry in std::fs::read_dir(directory)? {
             let entry = entry?;
             let name = entry.file_name();
             let text = name.to_string_lossy();
             let db = text.strip_suffix(".kala");
-            if entry.file_type()?.is_file() && db.is_some_and(valid_name) {
+            if system == SystemDb::Skip && db == Some("system") {
+                // Decided by name only, before any metadata or content is read.
+                eprintln!(
+                    "kala serve: skipping system.kala: the system database is never served without account authentication"
+                );
+            } else if entry.file_type()?.is_file() && db.is_some_and(valid_name) {
                 databases.insert(
                     db.unwrap_or_default().to_string(),
                     Database {

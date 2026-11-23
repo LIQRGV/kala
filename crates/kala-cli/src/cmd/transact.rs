@@ -44,8 +44,9 @@ pub struct Report {
 /// checksum fails) may have been acknowledged to a writer, so it is never
 /// cut without `acknowledge`: kala-core refuses it under the writer lock,
 /// before anything is cut or quarantined, so retrying can't get past it.
+/// System worlds are refused once the writer has opened (so a system world
+/// with an acknowledged damaged tail is recovered before it is refused).
 pub fn open_write(path: &Path, acknowledge: bool) -> Result<World, CliError> {
-    refuse_system(&World::open_read_only(path).map_err(|e| CliError::at_path(path, &e))?)?;
     let opened = if acknowledge {
         World::open(path)
     } else {

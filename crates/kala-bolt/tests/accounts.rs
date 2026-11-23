@@ -187,24 +187,31 @@ fn most_specific_account_is_selected_before_password_verification() {
 fn system_queries_redact_hash_scalars_and_account_node_properties() {
     let server = account_server();
     let mut root = Client::ready(&server);
-    for query in [
-        "[:find ?p :where [?e :password_hash ?p]]",
-        "[:find ?e :where [?e :user \"alice\"]]",
-    ] {
-        root.run(
-            &format!("// kala:datalog\n{query}"),
+    // Reading the hash attribute is refused outright.
+    root.send(
+        0x10,
+        vec![
+            string("// kala:datalog\n[:find ?p :where [?e :password_hash ?p]]"),
             map(&[]),
             map(&[("db", string("system"))]),
-        );
-        let rows = root.pull(-1).0;
-        assert!(!rows.is_empty());
-        let rendered = format!("{rows:?}");
-        assert!(!rendered.contains("$argon2"), "hash exposed in Bolt result");
-        assert!(
-            !rendered.contains(PASSWORD),
-            "password exposed in Bolt result"
-        );
-    }
+        ],
+    );
+    root.failure("Neo.ClientError.Security.Forbidden");
+    root.reset();
+    let query = "[:find ?e :where [?e :user \"alice\"]]";
+    root.run(
+        &format!("// kala:datalog\n{query}"),
+        map(&[]),
+        map(&[("db", string("system"))]),
+    );
+    let rows = root.pull(-1).0;
+    assert!(!rows.is_empty());
+    let rendered = format!("{rows:?}");
+    assert!(!rendered.contains("$argon2"), "hash exposed in Bolt result");
+    assert!(
+        !rendered.contains(PASSWORD),
+        "password exposed in Bolt result"
+    );
 }
 
 #[test]

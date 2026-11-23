@@ -131,8 +131,15 @@ pub fn compile(world: &World, q: &ast::Query) -> Result<Plan, DatalogError> {
 /// value each `:in` parameter takes. Errors are located in `text`, so
 /// their `Display` is `line L, column C: message`. Never panics.
 pub fn prepare(world: &World, text: &str) -> Result<Prepared, DatalogError> {
-    let q = parse(text)?;
-    compile::compile(world, &q).map_err(|e| e.locate(text))
+    prepare_parsed(world, text, &parse(text)?)
+}
+
+/// [`prepare`] for a query already parsed from `text` (so a caller can
+/// inspect the [`ast::Query`], e.g. [`ast::Query::attributes`], before
+/// compiling it). `q` must be `parse(text)`'s result: errors are located in
+/// `text`. Never panics.
+pub fn prepare_parsed(world: &World, text: &str, q: &ast::Query) -> Result<Prepared, DatalogError> {
+    compile::compile(world, q).map_err(|e| e.locate(text))
 }
 
 /// Parse a story-check file (`kala doctor --checks FILE`): exactly one

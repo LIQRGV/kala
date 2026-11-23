@@ -178,9 +178,13 @@ stored tick; it does not turn it into a range.
 ## Accounts (`kala user`)
 
 Every account command takes the server directory, bootstrapping `system.kala`
-with `root@localhost` (`trust`, `admin:*`) when absent. `kala serve DIR` defaults
-to `--auth accounts`; local `auth=None` uses that root account. Startup announces
-creation on stderr and warns for every trust account.
+with `root@localhost` (`trust`, `admin:*`) when absent. The directory itself must
+exist: neither `kala user` nor `kala serve` creates it ("no such directory").
+`kala serve DIR` defaults to `--auth accounts`; local `auth=None` uses that root
+account. Startup announces creation on stderr and warns for every trust account.
+`--auth none` never creates, opens or reads `system.kala` (a file of that name is
+skipped with one stderr line), writes nothing to the directory, and serves every
+other database read-only; the `system` database is never served without accounts.
 
 ```sh
 kala user add worlds alice@127.0.0.1 --password-stdin < private-password-file
@@ -204,6 +208,14 @@ PRIV is `read`, `write` or `admin`, and DB is a database name or `*` (quote it i
 a shell). The final `admin:*` account is protected against removal/demotion.
 Changes take effect at the next Bolt login without restarting the server;
 existing sessions keep their granted identity until LOGOFF or disconnect.
+
+Write commands print the native write result, e.g. `1 changed, written at tick 7`;
+granting a held privilege or revoking an absent one prints `0 changed, …`. If the
+last transaction of `system.kala` is damaged, writes are refused until rerun with
+`--acknowledge-recovery`, which cuts the damaged tail to a private quarantine file
+(`system.kala.torn-<offset>`) exactly as `kala transact --acknowledge-recovery`.
+Usage errors keep clap's diagnosis but never echo argument values, so a mistyped
+`--password=…` is not printed back.
 
 `system` is reserved; ordinary `load`, `transact` and `repl --write` cannot
 create or overwrite its content, including renamed system files. Read commands

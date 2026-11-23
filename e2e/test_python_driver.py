@@ -83,10 +83,16 @@ class AccountsTests(unittest.TestCase):
                 with driver.session(database="system") as session:
                     names = [row[0] for row in session.run(PREFIX + "[:find ?u :where [?e :user ?u]]")]
                     self.assertIn("root", names)
-                    for query in ["[:find ?p :where [?e :password_hash ?p]]", '[:find ?e :where [?e :user "alice"]]']:
-                        rows = list(session.run(PREFIX + query))
-                        self.assertTrue(bool(rows))
-                        self.assertTrue("$argon2" not in repr(rows), "hash leaked in query result")
+                    for query in [
+                        "[:find ?p :where [?e :password_hash ?p]]",
+                        '[:find ?u :where [?e :user ?u] [?e :password_hash ?p] [(< ?p "$argon2z")]]',
+                    ]:
+                        with self.assertRaises(ClientError) as error:
+                            list(session.run(PREFIX + query))
+                        self.assertEqual(error.exception.code, "Neo.ClientError.Security.Forbidden")
+                    rows = list(session.run(PREFIX + '[:find ?e :where [?e :user "alice"]]'))
+                    self.assertTrue(bool(rows))
+                    self.assertTrue("$argon2" not in repr(rows), "hash leaked in query result")
         finally:
             account_command("set", "root@localhost", "--trust")
         with GraphDatabase.driver(URI, auth=None, connection_timeout=5) as driver:

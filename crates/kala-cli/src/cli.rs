@@ -302,6 +302,15 @@ pub struct UserCredentials {
     pub trust: bool,
 }
 
+/// Recovery handling for the `kala user` write subcommands.
+#[derive(Debug, Args)]
+pub struct UserWrite {
+    /// Accept cutting a damaged last transaction of system.kala (see
+    /// `kala info`) to a quarantine file, then apply the change.
+    #[arg(long)]
+    pub acknowledge_recovery: bool,
+}
+
 /// Local administrative operations, serialized by the system world's writer lock.
 #[derive(Debug, Subcommand)]
 pub enum UserCommand {
@@ -311,6 +320,8 @@ pub enum UserCommand {
         account: String,
         #[command(flatten)]
         credentials: UserCredentials,
+        #[command(flatten)]
+        write: UserWrite,
     },
     /// Change an account's authentication plugin or password.
     Set {
@@ -318,6 +329,8 @@ pub enum UserCommand {
         account: String,
         #[command(flatten)]
         credentials: UserCredentials,
+        #[command(flatten)]
+        write: UserWrite,
     },
     /// Grant read, write or admin on a database (or *).
     Grant {
@@ -325,6 +338,8 @@ pub enum UserCommand {
         account: String,
         privilege: String,
         database: String,
+        #[command(flatten)]
+        write: UserWrite,
     },
     /// Revoke a grant; the last admin:* account is protected.
     Revoke {
@@ -332,9 +347,16 @@ pub enum UserCommand {
         account: String,
         privilege: String,
         database: String,
+        #[command(flatten)]
+        write: UserWrite,
     },
     /// Drop an account while preserving its audit history.
-    Drop { dir: PathBuf, account: String },
+    Drop {
+        dir: PathBuf,
+        account: String,
+        #[command(flatten)]
+        write: UserWrite,
+    },
     /// List accounts, plugins and grants (never password hashes).
     List { dir: PathBuf },
 }

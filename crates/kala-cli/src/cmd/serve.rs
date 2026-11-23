@@ -38,25 +38,17 @@ pub fn run(
         idle_timeout: Duration::from_secs(idle_timeout),
         ..ServerConfig::default()
     };
+    // Never create the directory, in either auth mode.
+    super::user::require_directory(dir)?;
     let server = if auth == "accounts" {
         Server::bind_accounts(dir, config)
     } else {
-        // Validate loopback before creating any persistent state.
+        // `--auth none` never touches accounts: no system.kala is created,
+        // opened or read, and nothing is written to the directory.
         if !addr.ip().is_loopback() {
             return Err(CliError::Usage(
                 "no-auth server requires a loopback listen address".into(),
             ));
-        }
-        if kala_bolt::system::ensure(dir).map_err(|e| CliError::User(e.to_string()))? {
-            eprintln!("kala serve: created system.kala with root@localhost");
-        }
-        for account in kala_bolt::system::list(dir).map_err(|e| CliError::User(e.to_string()))? {
-            if account.plugin == kala_bolt::auth::Plugin::Trust {
-                eprintln!(
-                    "kala serve: account {}@{} uses trust (no password)",
-                    account.user, account.host
-                );
-            }
         }
         Server::bind(dir, config)
     }
