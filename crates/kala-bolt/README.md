@@ -7,7 +7,9 @@ invalid names are skipped with a startup diagnostic. Files are discovered at
 startup and opened read-only on first RUN. Length changes trigger a reload of
 committed transactions; each result pins one snapshot. A torn tail is never
 served or repaired by this server. Replacing a file without changing its length
-is outside this append-only reload contract.
+is outside this append-only reload contract. The served directory and its files
+are trusted local input: concurrent replacement of directory entries is outside
+the network security boundary.
 
 ## Using it
 
