@@ -363,11 +363,11 @@ fn negation_through_a_nested_not_is_still_a_stratification_error() {
 }
 
 #[test]
-fn not_join_and_or_stay_unsupported() {
+fn not_join_and_or_join_stay_unsupported() {
     let f = world();
     for text in [
         "[:find ?c :where [?c :kind \"character\"] (not-join [?c] [?c :located_in _])]",
-        "[:find ?c :where (or [?c :name \"Edwin\"] [?c :name \"Mara\"])]",
+        "[:find ?c :where (or-join [?c] [?c :name \"Edwin\"] [?c :name \"Mara\"])]",
     ] {
         let e = err_kind(&f.w, text);
         assert_eq!(e.kind, ErrorKind::Unsupported, "{text}: {e}");

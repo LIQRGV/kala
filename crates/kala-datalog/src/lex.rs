@@ -76,6 +76,7 @@ fn is_name_char(c: char) -> bool {
         )
 }
 
+#[derive(Clone)]
 pub(crate) struct Lexer<'a> {
     text: &'a str,
     pos: usize,

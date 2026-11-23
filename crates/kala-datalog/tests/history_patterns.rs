@@ -8,7 +8,7 @@
 //!   keyword there is `Syntax`. `e` and `v` as in 3-element patterns.
 //! - `a` is a schema attribute or an inverse name (read through `R`, like
 //!   `View::history_scan`); `:handle` is `Syntax`.
-//! - A history pattern inside `(at ..)` is `Syntax`; so are 6 elements.
+//! - A history pattern inside `(at ..)` is `Syntax`; so are 7 elements.
 //! - Corrections are honoured by canon exactly as `View::history`.
 //! - A bound `?t` is an ordinary i64: usable in predicates, `(at ?t ..)`, rule
 //!   heads and `not`.
@@ -519,8 +519,8 @@ fn history_pattern_errors_are_syntax_errors() {
             "[:find ?t :where (at -250 [:greg :located_in ?p ?t ?op])]",
         ),
         (
-            "six elements",
-            "[:find ?t :where [?g :located_in ?p ?t ?op ?x]]",
+            "seven elements",
+            "[:find ?t :where [?g :located_in ?p ?t ?op ?x ?extra]]",
         ),
     ] {
         assert_eq!(kind(&f.w, text), ErrorKind::Syntax, "{what}");

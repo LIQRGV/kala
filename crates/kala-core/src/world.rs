@@ -966,6 +966,22 @@ impl World {
         Ok(world)
     }
 
+    /// A detached, writable in-memory copy of the committed state, for previews.
+    /// Writes to this copy cannot touch this world's log or acquire its lock.
+    /// Replays the kept entries with the same validation as opening a world;
+    /// costs O(log size) memory and replay work. Recovery tails are not copied.
+    pub fn preview_copy(&self) -> Result<World, Error> {
+        let entries: Vec<LogEntry> = self
+            .entries
+            .iter()
+            .map(|e| LogEntry {
+                id: e.id,
+                body: e.body.clone(),
+            })
+            .collect();
+        World::replay_with_hash(&entries, self.content_hash)
+    }
+
     /// Rebuilds a world from the entries of a log's committed transactions.
     fn replay(entries: &[LogEntry]) -> Result<World, Error> {
         World::replay_with_hash(entries, fnv1a64)

@@ -76,6 +76,10 @@ impl JValue {
     pub fn datum(d: &Datum, entity: impl Fn(EntityId) -> JEntity) -> JValue {
         match d {
             Datum::Value(v) => JValue::new(v, entity),
+            Datum::Precision(p) => JValue {
+                ty: "precision",
+                value: JInner::Op(precision_str(*p)),
+            },
             Datum::Op(op) => JValue {
                 ty: "op",
                 value: JInner::Op(match op {
@@ -294,7 +298,7 @@ pub(crate) fn json_size_within<T: Serialize>(value: &T, limit: usize) -> Option<
 }
 
 /// One JSON document and one newline.
-fn to_json<T: Serialize>(v: &T) -> String {
+pub(crate) fn to_json<T: Serialize>(v: &T) -> String {
     let mut buf = Vec::new();
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, SafeFormatter);
     // Invariant: these structs have string keys and no fallible Serialize

@@ -14,8 +14,8 @@ use kala_query::{
 };
 
 use crate::ast::{
-    Call, CanonExpr, Clause, During, FnClause, HistoryPos, Input, Item, Not, OpItem, Pattern, Pred,
-    Query, Rule, Sym, TickExpr,
+    Call, CanonExpr, Clause, During, FnClause, HistoryPos, Input, Item, Not, OpItem, Or, Pattern,
+    Pred, Query, Rule, Sym, TickExpr,
 };
 use crate::error::{DatalogError, ErrorKind, Span, show};
 use crate::plan::{self, App, Filt, Hist, Pat, PatAttr};
@@ -67,6 +67,7 @@ fn type_name(t: ValueType) -> &'static str {
 enum Ty {
     Val(ValueType),
     Op,
+    Precision,
     Intervals,
 }
 
@@ -74,6 +75,7 @@ fn ty_name(t: Ty) -> &'static str {
     match t {
         Ty::Val(v) => type_name(v),
         Ty::Op => "an op",
+        Ty::Precision => "a precision",
         Ty::Intervals => "an interval set",
     }
 }
@@ -177,9 +179,17 @@ struct BodyC<'q> {
     fns: Vec<&'q FnClause>,
     /// The body's negations, each with its own scope.
     nots: Vec<NotC<'q>>,
+    ors: Vec<OrC<'q>>,
 }
 
 /// A `(not ..)` resolved for the planner.
+struct OrC<'q> {
+    branches: Vec<(Scope, BodyC<'q>)>,
+    binds: Vec<String>,
+    uses: Vec<String>,
+    span: Span,
+}
+
 struct NotC<'q> {
     /// Its scope (its predicates are typed and checked in it).
     scope: Scope,
@@ -217,6 +227,7 @@ impl<'w> Compiler<'w> {
     /// recursive component, after enough passes). Every definition is
     /// checked; only rules reachable from `:where` are planned.
     fn run(mut self, q: &Query) -> Result<Prepared, DatalogError> {
+        check_or_cost(q)?;
         for input in &q.inputs {
             if let Input::Var(s) = input {
                 if self.params.contains_key(&s.name) {
@@ -243,13 +254,13 @@ impl<'w> Compiler<'w> {
         // needs the callee's relation complete before it can negate it.
         for r in &q.rules {
             let caller = by_name[r.name.as_str()];
-            for c in all_calls(&r.calls, &r.nots) {
+            for c in all_calls(&r.calls, &r.nots, &r.ors) {
                 let callee = resolve_call(c, &rules, &by_name)?;
                 rules[caller].callees.insert(callee);
             }
         }
         let mut where_callees = BTreeSet::new();
-        for c in all_calls(&q.calls, &q.nots) {
+        for c in all_calls(&q.calls, &q.nots, &q.ors) {
             where_callees.insert(resolve_call(c, &rules, &by_name)?);
         }
         let comps = components(&rules);
@@ -552,6 +563,59 @@ impl<'w> Compiler<'w> {
             let ri = by_name[call.name.as_str()];
             out_calls.push(self.call(call, &rules[ri], scope)?);
         }
+        let mut ors = Vec::new();
+        for o in c.ors {
+            let mut vars = Vec::new();
+            let mut branches = Vec::new();
+            let inherited = scope.bound.clone();
+            for b in &o.branches {
+                let mut mentioned = Vec::new();
+                body_vars(Clauses::of_not(b), &mut mentioned);
+                let names: BTreeSet<String> = mentioned
+                    .into_iter()
+                    .filter(|v| !self.is_param(scope, v))
+                    .map(str::to_owned)
+                    .collect();
+                if let Some(first) = vars.first() {
+                    if first != &names {
+                        return Err(DatalogError::new(
+                            ErrorKind::UnboundVariable,
+                            Some(o.span),
+                            "every or branch must bind the same set of variables",
+                        ));
+                    }
+                }
+                vars.push(names);
+                let mut sub = scope.clone();
+                let body = self.body(Clauses::of_not(b), &mut sub, rules, by_name)?;
+                branches.push((sub, body));
+            }
+            let names = vars.into_iter().next().unwrap_or_default();
+            let mut binds = BTreeSet::new();
+            for (sub, _) in &branches {
+                for name in &names {
+                    if let Some(&ty) = sub.types.get(name) {
+                        unify_var(scope, name, ty, o.span)?;
+                    }
+                    if sub.bound.contains(name) {
+                        binds.insert(name.clone());
+                    }
+                }
+            }
+            // Only variables bound in every branch may escape the union.
+            binds.retain(|name| branches.iter().all(|(s, _)| s.bound.contains(name)));
+            let uses = names
+                .intersection(&inherited)
+                .map(|n| scope.var(n).0)
+                .collect();
+            scope.bound.extend(binds.iter().cloned());
+            ors.push(OrC {
+                branches,
+                binds: binds.iter().map(|n| scope.var(n).0).collect(),
+                uses,
+                span: o.span,
+            });
+        }
         for s in tick_vars {
             if !scope.bound.contains(&s.name) {
                 return Err(unbound(
@@ -573,6 +637,7 @@ impl<'w> Compiler<'w> {
             preds,
             fns,
             nots: out_nots,
+            ors,
         })
     }
 
@@ -638,6 +703,10 @@ impl<'w> Compiler<'w> {
                 }
                 (Item::Any(_), _) => Term::Any,
                 (other, None) => Term::Const(self.constant(other)?.0),
+                (other, Some(Ty::Precision)) => Term::Precision(
+                    precision_constant(other)
+                        .ok_or_else(|| mismatch(other.span(), "expected a precision keyword"))?,
+                ),
                 (other, Some(Ty::Op)) => match op_constant(other) {
                     Some(o) => Term::Op(o),
                     None => {
@@ -841,7 +910,26 @@ impl<'w> Compiler<'w> {
                 OpTerm::Var(scope.var(&s.name))
             }
         };
-        Ok(Hist { tick, op })
+        let precision = match &h.precision {
+            None | Some(Item::Any(_)) => Term::Any,
+            Some(Item::Var(s)) if self.is_param(scope, &s.name) => {
+                return Err(param_not_a_value(s, Ty::Precision));
+            }
+            Some(Item::Var(s)) => {
+                unify_var(scope, &s.name, Ty::Precision, s.span)?;
+                scope.bound.insert(s.name.clone());
+                Term::Var(scope.var(&s.name))
+            }
+            Some(i) => Term::Precision(
+                precision_constant(i)
+                    .ok_or_else(|| mismatch(i.span(), "expected a precision keyword"))?,
+            ),
+        };
+        Ok(Hist {
+            tick,
+            op,
+            precision,
+        })
     }
 
     /// An attribute's value type and `indexed` flag; an inverse name reads
@@ -1105,6 +1193,9 @@ impl<'w> Compiler<'w> {
     fn const_type(&self, item: &Item, other: Option<Ty>) -> Result<Option<Ty>, DatalogError> {
         Ok(match item {
             Item::Var(_) | Item::Any(_) => None,
+            _ if other == Some(Ty::Precision) && precision_constant(item).is_some() => {
+                Some(Ty::Precision)
+            }
             _ if other == Some(Ty::Op) && op_constant(item).is_some() => Some(Ty::Op),
             other => Some(Ty::Val(self.constant(other)?.0.value_type())),
         })
@@ -1124,6 +1215,10 @@ impl<'w> Compiler<'w> {
             Item::Any(span) => {
                 unreachable!("invariant: `_` operands were rejected before typing ({span:?})")
             }
+            other if ty == Ty::Precision => Term::Precision(
+                precision_constant(other)
+                    .ok_or_else(|| mismatch(other.span(), "expected a precision keyword"))?,
+            ),
             other if ty == Ty::Op => match op_constant(other) {
                 Some(o) => Term::Op(o),
                 None => unreachable!("invariant: an op-typed constant is :assert or :retract"),
@@ -1510,6 +1605,11 @@ fn collect_preds<'a, 'q>(
 ) {
     out.extend(b.preds.iter().map(|p| (scope, *p)));
     fns.extend(b.fns.iter().map(|f| (scope, *f)));
+    for o in &b.ors {
+        for (s, b) in &o.branches {
+            collect_preds(s, b, out, fns);
+        }
+    }
     for n in &b.nots {
         collect_preds(&n.scope, &n.body, out, fns);
     }
@@ -1524,6 +1624,20 @@ fn planned_body(
 ) -> plan::Body {
     let own = filts.by_ref().take(b.preds.len()).collect();
     let own_apps = apps.by_ref().take(b.fns.len()).collect();
+    let ors = b
+        .ors
+        .into_iter()
+        .map(|o| plan::Disjunction {
+            branches: o
+                .branches
+                .into_iter()
+                .map(|(_, b)| planned_body(b, filts, apps))
+                .collect(),
+            binds: o.binds,
+            uses: o.uses,
+            span: o.span,
+        })
+        .collect();
     let nots = b
         .nots
         .into_iter()
@@ -1538,17 +1652,30 @@ fn planned_body(
         filts: own,
         apps: own_apps,
         nots,
+        ors,
     }
 }
 
 /// Every rule call of a body, those inside its negations (at any depth)
 /// included.
-fn all_calls<'q>(calls: &'q [Call], nots: &'q [Not]) -> Vec<&'q Call> {
+fn all_calls<'q>(calls: &'q [Call], nots: &'q [Not], ors: &'q [Or]) -> Vec<&'q Call> {
     let mut out: Vec<&Call> = calls.iter().collect();
-    let mut todo: Vec<&Not> = nots.iter().collect();
-    while let Some(n) = todo.pop() {
-        out.extend(&n.calls);
-        todo.extend(&n.nots);
+    for n in nots {
+        out.extend(all_calls(&n.calls, &n.nots, &n.ors));
+    }
+    for o in ors {
+        for b in &o.branches {
+            out.extend(all_calls(&b.calls, &b.nots, &b.ors));
+        }
+    }
+    out
+}
+fn negated_calls(c: Clauses<'_>) -> Vec<&Call> {
+    let mut out = all_calls(&[], c.nots, &[]);
+    for o in c.ors {
+        for b in &o.branches {
+            out.extend(negated_calls(Clauses::of_not(b)));
+        }
     }
     out
 }
@@ -1570,7 +1697,7 @@ fn stratify(
     }
     for d in defs {
         let me = comp_of[&by_name[d.name.as_str()]];
-        let negated = all_calls(&[], &d.nots);
+        let negated = negated_calls(Clauses::of_rule(d));
         if let Some(c) = negated
             .into_iter()
             .find(|c| comp_of[&by_name[c.name.as_str()]] == me)
@@ -1619,7 +1746,7 @@ fn propagate_head_types(
                 .collect();
             // Every head is bound positively (checked by rule_defs), so a
             // same-named use inside a negation is shared with the outer body.
-            for call in all_calls(&def.calls, &def.nots) {
+            for call in all_calls(&def.calls, &def.nots, &def.ors) {
                 let callee = by_name[call.name.as_str()];
                 let Some(source) = offsets[callee] else {
                     continue;
@@ -1686,6 +1813,7 @@ struct Clauses<'q> {
     clauses: &'q [Clause],
     calls: &'q [Call],
     nots: &'q [Not],
+    ors: &'q [Or],
     durings: &'q [During],
     fns: &'q [FnClause],
 }
@@ -1696,6 +1824,7 @@ impl<'q> Clauses<'q> {
             clauses: &q.clauses,
             calls: &q.calls,
             nots: &q.nots,
+            ors: &q.ors,
             durings: &q.durings,
             fns: &q.fns,
         }
@@ -1706,6 +1835,7 @@ impl<'q> Clauses<'q> {
             clauses: &r.clauses,
             calls: &r.calls,
             nots: &r.nots,
+            ors: &r.ors,
             durings: &r.durings,
             fns: &r.fns,
         }
@@ -1716,6 +1846,7 @@ impl<'q> Clauses<'q> {
             clauses: &n.clauses,
             calls: &n.calls,
             nots: &n.nots,
+            ors: &n.ors,
             durings: &n.durings,
             fns: &n.fns,
         }
@@ -1769,6 +1900,11 @@ fn body_vars<'q>(c: Clauses<'q>, out: &mut Vec<&'q str>) {
                 }
             }
         }
+        for o in c.ors {
+            for b in &o.branches {
+                todo.push(Clauses::of_not(b));
+            }
+        }
         for n in c.nots {
             todo.push(Clauses::of_not(n));
         }
@@ -1776,6 +1912,13 @@ fn body_vars<'q>(c: Clauses<'q>, out: &mut Vec<&'q str>) {
 }
 
 fn pattern_vars<'p>(p: &'p Pattern, out: &mut Vec<&'p str>) {
+    if let Some(HistoryPos {
+        precision: Some(Item::Var(s)),
+        ..
+    }) = &p.history
+    {
+        out.push(&s.name);
+    }
     let tick = p.history.as_ref().map(|h| &h.tick);
     for it in [Some(&p.e), Some(&p.v), tick].into_iter().flatten() {
         if let Item::Var(s) = it {
@@ -1789,4 +1932,54 @@ fn pattern_vars<'p>(p: &'p Pattern, out: &mut Vec<&'p str>) {
     {
         out.push(&s.name);
     }
+}
+
+fn precision_constant(item: &Item) -> Option<kala_core::Precision> {
+    match item {
+        Item::Keyword(k, _) => crate::write::precision_name(k),
+        _ => None,
+    }
+}
+
+// Bound the expanded prefix copies BEFORE planning/cloning. Each union branch
+// carries its input bindings; successive disjunctions can multiply plan size.
+fn check_or_cost(q: &Query) -> Result<(), DatalogError> {
+    fn cost(c: Clauses<'_>, span: Span) -> Result<usize, DatalogError> {
+        let mut n = 1 + c.clauses.len() * 2 + c.calls.len() + c.durings.len() + c.fns.len();
+        for o in c.ors {
+            let mut sum = 0usize;
+            for b in &o.branches {
+                sum = sum.saturating_add(n.saturating_mul(cost(Clauses::of_not(b), b.span)?));
+            }
+            n = sum.saturating_add(1);
+            if n > 4096 {
+                return Err(DatalogError::limit(
+                    Some(o.span),
+                    "or expansion exceeds the 4096-node planning budget",
+                ));
+            }
+        }
+        for b in c.nots {
+            n = n.saturating_add(cost(Clauses::of_not(b), b.span)?);
+        }
+        if n > 4096 {
+            Err(DatalogError::limit(
+                Some(span),
+                "or expansion exceeds the 4096-node planning budget",
+            ))
+        } else {
+            Ok(n)
+        }
+    }
+    let mut n = cost(Clauses::of_query(q), q.span)?;
+    for r in &q.rules {
+        n = n.saturating_add(cost(Clauses::of_rule(r), r.span)?);
+    }
+    if n > 4096 {
+        return Err(DatalogError::limit(
+            Some(q.span),
+            "query exceeds the 4096-node planning budget",
+        ));
+    }
+    Ok(())
 }

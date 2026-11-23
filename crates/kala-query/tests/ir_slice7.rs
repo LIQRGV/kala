@@ -112,6 +112,7 @@ fn history_op() -> Op {
         value: tv("p"),
         tick: tv("t"),
         op: OpTerm::Var(v("op")),
+        precision: kala_query::Term::Any,
     }
 }
 
@@ -311,6 +312,7 @@ fn explain_history_lines() {
         value,
         tick,
         op,
+        precision: kala_query::Term::Any,
     };
     assert_eq!(
         body_of(&w, &one(h(tv("g"), tv("p"), tv("t"), OpTerm::Var(v("op"))))),
@@ -327,6 +329,7 @@ fn explain_history_lines() {
         value: Term::Const(Value::Bool(true)),
         tick: tv("t"),
         op: OpTerm::Const(kala_core::Op::Assert),
+        precision: kala_query::Term::Any,
     });
     assert_eq!(
         body_of(&w, &p),

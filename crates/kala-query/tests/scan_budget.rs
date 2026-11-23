@@ -34,6 +34,7 @@ fn whole_attribute_and_history_scans_report_step_budget() {
             value: tv("s"),
             tick: tv("t"),
             op: OpTerm::Any,
+            precision: kala_query::Term::Any,
         },
     ] {
         let p = plan(&["e", "s"], root);

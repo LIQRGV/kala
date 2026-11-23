@@ -219,8 +219,21 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Ask Datalog questions in a read-only snapshot session.
+    /// Commit Datalog write transactions from a file or stdin (-).
+    Transact {
+        world: PathBuf,
+        input: PathBuf,
+        /// Preview each form independently without changing the log.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask Datalog questions, optionally holding the world open for writing.
     Repl {
+        /// Enable writes and hold the world's exclusive writer lock.
+        #[arg(long, conflicts_with = "canon")]
+        write: bool,
         /// The world file.
         world: PathBuf,
         /// Initial default story tick.
