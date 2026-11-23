@@ -218,7 +218,7 @@ impl<'a> Lexer<'a> {
                             return Err(DatalogError::syntax(
                                 Span::new(i, after),
                                 format!(
-                                    "unknown escape `\\{}` (use \\\" \\\\ \\n \\t \\r or \\uXXXX)",
+                                    "unknown escape `\\{}` (use \\\" \\\\ \\n \\t \\r or \\uXXXX or \\UXXXXXXXX)",
                                     show(other.encode_utf8(&mut [0; 4]))
                                 ),
                             ));

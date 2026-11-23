@@ -136,9 +136,9 @@ fn subject(
     refs: &HashMap<String, EntityId>,
 ) -> Result<EntityId, CliError> {
     match v {
-        WriteValue::Scalar(Item::Id(s, _)) => {
-            tx.parse_id(s).ok_or_else(|| user("invalid entity ID"))
-        }
+        WriteValue::Scalar(Item::Id(s, _)) => tx
+            .parse_id(s)
+            .ok_or_else(|| user(format!("unknown entity `{}`", escape::value(s)))),
         WriteValue::Scalar(i) => reference(i, refs),
         WriteValue::Edge {
             source,

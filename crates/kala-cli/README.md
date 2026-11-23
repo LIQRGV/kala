@@ -395,6 +395,7 @@ one object with `command`, `create`, `transactions`, `entries`, and `world`.
 A failed restore of an ordinary world names the failing transaction form and its
 reason. An accounts database dump (and any input that fails before its genesis is
 known) gets diagnostics without content, because it may contain account hashes.
+A restore refuses `_KALA_` names unless the dump is Kala's accounts database.
 Restored worlds get the default file mode, like `kala load`; a restored accounts
 database is always private (0600).
 `--create` conflicts with `--dry-run` and `--acknowledge-recovery`.
@@ -455,7 +456,9 @@ accounts before publication. Normal `transact`, `repl --write` and `load --force
 continue to refuse the system world.
 
 `kala user grant DIR USER@HOST backup DB` (or `'*'`) stores a backup grant, and
-`kala user list` shows it. `admin` implies backup. Backup alone grants no Bolt
+`kala user list` shows it. `admin` implies backup. Like `read`, `backup` never
+covers the accounts database (`system`): neither `backup:*` nor `backup:system`
+reaches its password hashes; only `admin` does. Backup alone grants no Bolt
 read access. There is no server-side dump yet: local backups are authorized by
 filesystem access; the privilege is stored for the future server operation.
 

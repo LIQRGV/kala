@@ -59,6 +59,22 @@ fn schema(ops: impl IntoIterator<Item = WriteOp>) -> Result<Schema, CliError> {
     }
     Ok(schema)
 }
+fn reserved(ops: &[WriteOp]) -> bool {
+    let reserved = |name: &str| name.starts_with(kala_core::RESERVED_NAME_PREFIX);
+    ops.iter().any(|op| match op {
+        WriteOp::NodeType { name, .. } => reserved(name),
+        WriteOp::Attribute { name, options, .. } => {
+            reserved(name) || options.inverse.as_deref().is_some_and(reserved)
+        }
+        _ => false,
+    })
+}
+fn reserved_error() -> CliError {
+    user(&format!(
+        "names starting with {} are reserved for Kala",
+        kala_core::RESERVED_NAME_PREFIX
+    ))
+}
 pub fn run(path: &Path, source: Option<&Path>) -> Result<String, CliError> {
     transfer::absent(path)?;
     let mut ops = Vec::new();
@@ -77,20 +93,10 @@ pub fn run(path: &Path, source: Option<&Path>) -> Result<String, CliError> {
             ops.extend(form.ops);
         }
     }
-    // Genesis may hold reserved names only when restoring a dump of a world
-    // Kala created (the accounts database); a user schema never may.
-    let reserved = |name: &str| name.starts_with(kala_core::RESERVED_NAME_PREFIX);
-    if ops.iter().any(|op| match op {
-        WriteOp::NodeType { name, .. } => reserved(name),
-        WriteOp::Attribute { name, options, .. } => {
-            reserved(name) || options.inverse.as_deref().is_some_and(reserved)
-        }
-        _ => false,
-    }) {
-        return Err(user(&format!(
-            "names starting with {} are reserved for Kala",
-            kala_core::RESERVED_NAME_PREFIX
-        )));
+    // Genesis may hold reserved names only when restoring a dump of Kala's
+    // own accounts database; a user schema never may.
+    if reserved(&ops) {
+        return Err(reserved_error());
     }
     let stage = transfer::Staging::new(path)?;
     let world =
@@ -126,11 +132,16 @@ pub fn replay(path: &Path, source: &Path, as_json: bool) -> Result<String, CliEr
     if !first.genesis {
         return Err(user("dump must start with [:genesis ...]"));
     }
+    let reserved_names = reserved(&first.ops);
     let stage = transfer::Staging::new(path)?;
     let genesis =
         schema(first.ops).map_err(|_| user("invalid genesis schema (content withheld)"))?;
     let mut world = World::create(&stage.path, genesis).map_err(|_| user("cannot create restore world: invalid genesis or unavailable storage (content withheld)"))?;
     let system = kala_bolt::system::is_system(&world);
+    // Only Kala's own accounts database may carry reserved names.
+    if reserved_names && !system {
+        return Err(reserved_error());
+    }
     // An ordinary world's dump holds no secrets: name the failing form and
     // the reason, so an author can fix an edited dump.
     let failed = |i: usize, e: &str| {

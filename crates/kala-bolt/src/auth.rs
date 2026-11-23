@@ -63,10 +63,13 @@ pub struct Identity {
 impl Identity {
     /// Whether this identity has the stored backup privilege. Local file
     /// backups use filesystem permissions; a future server dump will call this.
+    /// Like reads, the accounts database (password hashes) is covered only by
+    /// `admin`: neither `backup:*` nor `backup:system` reaches it.
     pub fn permits_backup(&self, db: &str) -> bool {
         self.grants.iter().any(|grant| {
             grant.split_once(':').is_some_and(|(privilege, target)| {
-                (target == "*" || target == db) && matches!(privilege, "admin" | "backup")
+                (target == "*" || target == db)
+                    && (privilege == "admin" || (db != "system" && privilege == "backup"))
             })
         })
     }

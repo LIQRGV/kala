@@ -76,7 +76,11 @@ impl Staging {
             fs::rename(&self.path, target).map_err(io)?;
         } else {
             match fs::hard_link(&self.path, target) {
-                Ok(()) => fs::remove_file(&self.path).map_err(io)?,
+                // Published: the staged name is cleaned up best-effort (Drop
+                // removes the staging directory anyway).
+                Ok(()) => {
+                    let _ = fs::remove_file(&self.path);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     return Err(CliError::Usage("destination already exists".into()));
                 }
@@ -91,7 +95,16 @@ impl Staging {
                 Err(_) => copy_new(&self.path, target)?,
             }
         }
-        sync_parent(target)
+        // The file is in place; a failed directory sync must not report the
+        // publication as failed (a retry would then refuse "already exists").
+        if let Err(e) = sync_parent(target) {
+            eprintln!(
+                "warning: published {} but could not sync its directory: {}",
+                escape::path(target),
+                e.message()
+            );
+        }
+        Ok(())
     }
 }
 fn copy_new(from: &Path, target: &Path) -> Result<(), CliError> {

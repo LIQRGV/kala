@@ -1158,6 +1158,8 @@ impl World {
             })
             .collect();
         let mut rebuilt = World::from_genesis(&genesis)?;
+        // Same value interning as this world, as the doctor rebuild does.
+        rebuilt.set_rebuild_hash(self.content_hash);
         let mut txn = ReplayTxn::default();
         for entry in self.entries.iter().filter(|e| e.tx != TxId(0)) {
             if !txn.migration_expected.is_empty() {

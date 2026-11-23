@@ -492,3 +492,22 @@ fn backup_only_grant_never_authorizes_bolt_read() {
     );
     alice.failure(FORBIDDEN);
 }
+
+#[test]
+fn backup_grants_never_cover_the_accounts_database() {
+    let id = |grants: &[&str]| kala_bolt::auth::Identity {
+        principal: "bob".into(),
+        host: "%".into(),
+        grants: grants.iter().map(|g| (*g).to_owned()).collect(),
+    };
+    let wildcard = id(&["backup:*"]);
+    assert!(wildcard.permits_backup("varrow"));
+    assert!(
+        !wildcard.permits_backup("system"),
+        "backup:* must not copy hashes"
+    );
+    assert!(!id(&["backup:system"]).permits_backup("system"));
+    assert!(id(&["admin:*"]).permits_backup("system"));
+    assert!(id(&["backup:varrow"]).permits_backup("varrow"));
+    assert!(!id(&["backup:varrow"]).permits_backup("other"));
+}

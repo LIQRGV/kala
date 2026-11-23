@@ -333,6 +333,9 @@ pub fn run(path: &Path, output: Option<&Path>, all: bool, force: bool) -> Result
         }
         return dump_all(path, output);
     }
+    if force && output.is_none() {
+        return Err(CliError::Usage("--force needs -o FILE".into()));
+    }
     if let Some(output) = output {
         let source_meta = fs::metadata(path).map_err(transfer::io)?;
         if let Ok(target_meta) = fs::metadata(output) {

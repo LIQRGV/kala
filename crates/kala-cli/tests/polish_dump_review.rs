@@ -191,3 +191,56 @@ fn handles_that_look_like_syntax_roundtrip_by_handle() {
     ok(&kala(["transact", "--create", s(&replay), s(&dump)]));
     assert!(fs::read(&world).unwrap() == fs::read(&replay).unwrap());
 }
+
+// Review round 2.
+
+#[test]
+fn restore_refuses_reserved_names_outside_an_accounts_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let dump = dir.path().join("d.edn");
+    fs::write(&dump, "[:genesis [:attribute :_KALA_secret :string]]\n").unwrap();
+    let target = dir.path().join("w.kala");
+    let o = kala(["transact", "--create", s(&target), s(&dump)]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(!target.exists());
+}
+
+#[test]
+fn an_unknown_typed_id_names_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let world = dir.path().join("w.kala");
+    ok(&kala(["create", s(&world)]));
+    let forms = dir.path().join("f.edn");
+    fs::write(&forms, "[:assert GHOST#1 :name \"x\" :at 0]\n").unwrap();
+    let o = kala(["transact", s(&world), s(&forms)]);
+    assert_ne!(code(&o), 0);
+    assert!(
+        stderr(&o).contains("unknown entity `GHOST#1`"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+#[test]
+fn dump_force_without_output_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let world = dir.path().join("w.kala");
+    ok(&kala(["create", s(&world)]));
+    let o = kala(["dump", s(&world), "--force"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+}
+
+#[test]
+fn the_unknown_escape_hint_lists_eight_digit_escapes() {
+    let dir = tempfile::tempdir().unwrap();
+    let world = dir.path().join("w.kala");
+    ok(&kala(["create", s(&world)]));
+    let forms = dir.path().join("f.edn");
+    fs::write(
+        &forms,
+        "[[:create :T :a] [:assert :a :bio \"\\x\" :at 0]]\n",
+    )
+    .unwrap();
+    let o = kala(["transact", s(&world), s(&forms)]);
+    assert!(stderr(&o).contains("\\UXXXXXXXX"), "{}", stderr(&o));
+}
