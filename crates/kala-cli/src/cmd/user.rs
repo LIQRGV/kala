@@ -4,7 +4,7 @@ use crate::{
     error::CliError,
     escape,
 };
-use kala_bolt::{
+use kala_system::{
     auth::Credentials,
     system::{self, Applied, Change, Recovery, SystemError},
 };

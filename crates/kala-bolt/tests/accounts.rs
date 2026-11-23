@@ -5,7 +5,8 @@ mod common;
 use client::{ALLIES, Client, map, string};
 use common::{Running, VARROW, assert_closed};
 use kala_bolt::auth::{Accounts, AuthToken, Authenticator, Credentials};
-use kala_bolt::{Server, ServerConfig, system};
+use kala_bolt::{Server, ServerConfig};
+use kala_system::system;
 use std::sync::Arc;
 
 const PASSWORD: &str = "test-only-account-password";

@@ -177,7 +177,7 @@ fn script(world: &World) -> Result<String, CliError> {
         .map_err(|_| CliError::Store("cannot reconstruct migration operations".into()))?;
     let entries: Vec<_> = world.entries().collect();
     let mut s = String::new();
-    if kala_bolt::system::is_system(world) {
+    if kala_system::is_system(world) {
         s.push_str(";; WARNING: CONTAINS ACCOUNT PASSWORD HASHES. Protect this dump like the server directory.\n");
     }
     let _ = writeln!(
@@ -357,7 +357,7 @@ pub fn run(path: &Path, output: Option<&Path>, all: bool, force: bool) -> Result
         }
     }
     let world = open(path)?;
-    if kala_bolt::system::is_system(&world) {
+    if kala_system::is_system(&world) {
         return Err(CliError::User(
             "single-world dump refuses system accounts; use kala dump --all DIR -o OUTDIR".into(),
         ));
@@ -387,7 +387,8 @@ fn dump_all(directory: &Path, output: &Path) -> Result<String, CliError> {
         let Some(db) = file_name.strip_suffix(".kala") else {
             continue;
         };
-        if kala_bolt::valid_database_name(db) && entry.file_type().map_err(transfer::io)?.is_file()
+        if kala_system::valid_database_name(db)
+            && entry.file_type().map_err(transfer::io)?.is_file()
         {
             worlds.insert(db.to_owned(), entry.path());
         }
@@ -457,7 +458,7 @@ fn dump_all(directory: &Path, output: &Path) -> Result<String, CliError> {
             "event=world_dumped canon={} entries={} system={}",
             world.latest_tx().0,
             world.entries().count(),
-            kala_bolt::system::is_system(&world)
+            kala_system::is_system(&world)
         );
         let _ = writeln!(
             summary,

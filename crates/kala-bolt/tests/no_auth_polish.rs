@@ -6,9 +6,10 @@ mod common;
 
 use client::{ALLIES, Client, map, string};
 use common::{Running, VARROW};
+use kala_bolt::ServerConfig;
 use kala_bolt::auth::{AuthToken, Authenticator, Credentials, NoAuth};
 use kala_bolt::packstream::Value;
-use kala_bolt::{ServerConfig, system};
+use kala_system::system;
 
 #[test]
 fn no_auth_identity_holds_read_star_and_not_admin() {

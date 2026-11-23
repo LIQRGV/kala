@@ -137,7 +137,7 @@ pub fn replay(path: &Path, source: &Path, as_json: bool) -> Result<String, CliEr
     let genesis =
         schema(first.ops).map_err(|_| user("invalid genesis schema (content withheld)"))?;
     let mut world = World::create(&stage.path, genesis).map_err(|_| user("cannot create restore world: invalid genesis or unavailable storage (content withheld)"))?;
-    let system = kala_bolt::system::is_system(&world);
+    let system = kala_system::is_system(&world);
     // Only Kala's own accounts database may carry reserved names.
     if reserved_names && !system {
         return Err(reserved_error());
@@ -167,7 +167,7 @@ pub fn replay(path: &Path, source: &Path, as_json: bool) -> Result<String, CliEr
         return Err(user("system.kala requires an accounts database dump"));
     }
     if system {
-        kala_bolt::system::validate_restore(&world)
+        kala_system::validate_restore(&world)
             .map_err(|_| user("invalid accounts database restore"))?;
     }
     drop(world);

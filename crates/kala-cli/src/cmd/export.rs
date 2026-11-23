@@ -33,7 +33,7 @@ pub fn run(
     output: Option<&Path>,
 ) -> Result<String, CliError> {
     let world = dump::open(path)?;
-    if kala_bolt::system::is_system(&world) {
+    if kala_system::is_system(&world) {
         return Err(CliError::User(
             "export refuses the system accounts database".into(),
         ));

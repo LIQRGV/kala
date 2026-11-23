@@ -78,7 +78,7 @@ pub fn open_write(path: &Path, acknowledge: bool) -> Result<World, CliError> {
 }
 /// System worlds can be changed only through account management.
 pub(crate) fn refuse_system(world: &World) -> Result<(), CliError> {
-    if kala_bolt::system::is_system(world) {
+    if kala_system::is_system(world) {
         return Err(user("system world is managed only by `kala user`"));
     }
     Ok(())

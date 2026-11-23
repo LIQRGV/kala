@@ -244,7 +244,7 @@ fn fact(n: &World, entity: EntityId, attr: AttrId, value: &Value, tick: Tick) ->
     JFact {
         entity: ent(n, entity),
         attr: attr_name(n, attr),
-        value: if kala_bolt::system::is_system(n) && n.attr_name(attr) == Some("password_hash") {
+        value: if kala_system::is_system(n) && n.attr_name(attr) == Some("password_hash") {
             JValue::redacted()
         } else {
             JValue::new(value, |e| ent(n, e))

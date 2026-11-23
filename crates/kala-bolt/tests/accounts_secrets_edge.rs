@@ -7,7 +7,8 @@ mod common;
 use client::{Client, map, string};
 use common::Running;
 use kala_bolt::packstream::Value;
-use kala_bolt::{Server, ServerConfig, auth::Accounts, system};
+use kala_bolt::{Server, ServerConfig, auth::Accounts};
+use kala_system::system;
 use std::sync::Arc;
 
 const FORBIDDEN: &str = "Neo.ClientError.Security.Forbidden";
