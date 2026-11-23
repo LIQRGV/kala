@@ -843,3 +843,87 @@ fn query_history_pattern_prints_ops_in_the_op_column() {
     got.sort();
     assert_eq!(got, want);
 }
+
+#[test]
+fn cypher_language_dispatch_json_shape_and_datalog_default() {
+    let f = varrow();
+    let datalog =
+        f.json(&["[:find ?a :at -210 :where [?e :kala_handle \"edwin\"] [?e :ally_of ?a]]"]);
+    let cypher = f.json(&[
+        "--lang",
+        "cypher",
+        "MATCH (e {kala_handle: 'edwin'})-[:ally_of]->(a) AT TICK -210 RETURN DISTINCT a",
+    ]);
+    assert_eq!(cypher, datalog);
+    let explicit = f.json(&[
+        "--lang",
+        "datalog",
+        "[:find ?a :at -210 :where [?e :kala_handle \"edwin\"] [?e :ally_of ?a]]",
+    ]);
+    assert_eq!(explicit, datalog);
+    let expected = f.run(
+        "explain",
+        &["[:find ?a :at -210 :where [?e :kala_handle \"edwin\"] [?e :ally_of ?a]]"],
+    );
+    let actual = f.run(
+        "explain",
+        &[
+            "--lang",
+            "cypher",
+            "MATCH (e {kala_handle: 'edwin'})-[:ally_of]->(a) AT TICK -210 RETURN DISTINCT a",
+        ],
+    );
+    assert_eq!(code(&actual), 0, "{}", stderr(&actual));
+    assert_eq!(stdout(&actual), stdout(&expected));
+}
+
+#[test]
+fn cypher_cli_parameters_order_null_list_and_positioned_errors() {
+    let f = varrow();
+    let names = f.json(&[
+        "--lang",
+        "cypher",
+        "MATCH (c:CHARACTER) RETURN c.name ORDER BY c.name SKIP $s LIMIT $n",
+        "--param",
+        "s=2",
+        "--param",
+        "n=2",
+    ]);
+    let text = names.to_string();
+    assert!(text.contains("Hild") && text.contains("Lisa"), "{text}");
+    let result = f.q(&[
+        "--lang",
+        "cypher",
+        "MATCH (c:CHARACTER) RETURN c.name ORDER BY c.name DESC LIMIT 3",
+    ]);
+    assert_eq!(code(&result), 0, "{}", stderr(&result));
+    let text = stdout(&result);
+    assert!(text.find("the Grey King").unwrap() < text.find("Wren Åberg").unwrap());
+    assert!(text.find("Wren Åberg").unwrap() < text.find("Villager 24").unwrap());
+    let nulls = f.json(&[
+        "--lang",
+        "cypher",
+        "MATCH (c {kala_handle: 'kael'}) RETURN c.biography",
+    ]);
+    assert!(nulls.to_string().contains("null"));
+    let aliases = f.json(&[
+        "--lang",
+        "cypher",
+        "MATCH (e {kala_handle: 'edwin'}) AT TICK -210 RETURN e.alias",
+    ]);
+    assert!(aliases.to_string().contains("the Lost Knight"));
+    let syntax = f.q(&["--lang", "cypher", "OPTIONAL MATCH (c) RETURN c"]);
+    assert_ne!(code(&syntax), 0);
+    assert!(stderr(&syntax).contains("OPTIONAL"));
+    assert!(stderr(&syntax).contains("line") && stderr(&syntax).contains("column"));
+    let missing = f.q(&["--lang", "cypher", "MATCH (c) AT TICK $t RETURN c"]);
+    assert_ne!(code(&missing), 0);
+    let bad = f.q(&[
+        "--lang",
+        "cypher",
+        "MATCH (c) AT TICK $t RETURN c",
+        "--param",
+        "t=wrong",
+    ]);
+    assert_ne!(code(&bad), 0);
+}

@@ -315,3 +315,34 @@ fn guide_backing_up_and_moving_a_world_replays_identical_bytes() {
     let j: Json = serde_json::from_slice(&fs::read(snapshot).unwrap()).unwrap();
     assert_eq!(j["tick"], -208);
 }
+
+#[test]
+fn guide_cypher_examples_match_the_fixture() {
+    let text = normalized(&guide());
+    let f = fixture_through_cli();
+    for (query, expected) in [
+        (
+            "MATCH (e {kala_handle: 'edwin'})-[:ally_of]->(a) AT TICK -210 RETURN DISTINCT a",
+            vec!["greg", "tomas"],
+        ),
+        (
+            "MATCH (c:CHARACTER) RETURN c.name ORDER BY c.name LIMIT 3",
+            vec!["Edwin", "Greg", "Hild"],
+        ),
+    ] {
+        assert!(
+            text.contains(&normalized(query)),
+            "missing checked Cypher example: {query}"
+        );
+        let o = f.run("query", &["--lang", "cypher", query]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        let output = stdout(&o);
+        let mut last = 0;
+        for name in expected {
+            let at = output[last..]
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} absent: {output}"));
+            last += at + name.len();
+        }
+    }
+}

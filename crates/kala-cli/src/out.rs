@@ -82,7 +82,18 @@ impl JValue {
     /// `{"type": "op", "value": "assert"}`, an interval set as
     /// `{"type": "intervals", "value": [[from, until or null], ...]}`.
     pub fn datum(d: &Datum, entity: impl Fn(EntityId) -> JEntity) -> JValue {
+        Self::datum_with(d, &entity)
+    }
+    fn datum_with(d: &Datum, entity: &dyn Fn(EntityId) -> JEntity) -> JValue {
         match d {
+            Datum::Null => JValue {
+                ty: "null",
+                value: JInner::Null,
+            },
+            Datum::List(values) => JValue {
+                ty: "list",
+                value: JInner::List(values.iter().map(|v| Self::datum_with(v, entity)).collect()),
+            },
             Datum::Value(v) => JValue::new(v, entity),
             Datum::Precision(p) => JValue {
                 ty: "precision",
@@ -112,6 +123,8 @@ impl JValue {
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub enum JInner {
+    Null,
+    List(Vec<JValue>),
     Bool(bool),
     I64(i64),
     F64(f64),
@@ -358,6 +371,11 @@ pub fn entity_text(e: &JEntity) -> String {
 /// A value for text: strings quoted, refs by label.
 pub fn value_text(v: &JValue) -> String {
     match &v.value {
+        JInner::Null => "NULL".into(),
+        JInner::List(values) => format!(
+            "[{}]",
+            values.iter().map(value_text).collect::<Vec<_>>().join(", ")
+        ),
         JInner::Bool(b) => b.to_string(),
         JInner::I64(i) => i.to_string(),
         JInner::F64(f) => f.to_string(),

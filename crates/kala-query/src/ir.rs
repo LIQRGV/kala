@@ -234,6 +234,16 @@ pub struct RelDef {
 /// recurses).
 #[derive(Debug)]
 pub enum Op {
+    /// Nullable, row-preserving read or expression.
+    Row {
+        input: Box<Op>,
+        action: crate::RowAction,
+    },
+    /// Final bag/set projection, ordering and slicing.
+    Output {
+        input: Box<Op>,
+        spec: crate::OutputSpec,
+    },
     /// Exactly one empty row.
     Unit,
     /// For each input row, bind `var` to every entity of `node_type` defined
@@ -410,6 +420,8 @@ impl Op {
     /// by [`Plan::explain`] and named in errors.
     pub fn name(&self) -> &'static str {
         match self {
+            Op::Row { .. } => "Row",
+            Op::Output { .. } => "Output",
             Op::Unit => "Unit",
             Op::NodeScan { .. } => "NodeScan",
             Op::NodeSeek { .. } => "NodeSeek",
@@ -437,7 +449,9 @@ impl Op {
     pub(crate) fn children<'p>(&'p self, out: &mut Vec<&'p Op>) {
         match self {
             Op::Unit => {}
-            Op::NodeScan { input, .. }
+            Op::Row { input, .. }
+            | Op::Output { input, .. }
+            | Op::NodeScan { input, .. }
             | Op::NodeSeek { input, .. }
             | Op::Expand { input, .. }
             | Op::Filter { input, .. }
@@ -476,6 +490,14 @@ impl Op {
         };
         let mut input = || Box::new(next());
         match self {
+            Op::Row { action, .. } => Op::Row {
+                input: input(),
+                action: action.clone(),
+            },
+            Op::Output { spec, .. } => Op::Output {
+                input: input(),
+                spec: spec.clone(),
+            },
             Op::Unit => Op::Unit,
             Op::NodeScan { var, node_type, .. } => Op::NodeScan {
                 input: input(),
@@ -597,6 +619,8 @@ impl Op {
     /// count, each `Fixpoint` relation's rule count).
     fn shallow_eq(&self, other: &Op) -> bool {
         match (self, other) {
+            (Op::Row { action: a, .. }, Op::Row { action: b, .. }) => a == b,
+            (Op::Output { spec: a, .. }, Op::Output { spec: b, .. }) => a == b,
             (Op::Unit, Op::Unit)
             | (Op::Join { .. }, Op::Join { .. })
             | (Op::Not { .. }, Op::Not { .. })
@@ -817,6 +841,8 @@ impl Plan {
         let mut stack = vec![&self.root];
         while let Some(op) = stack.pop() {
             match op {
+                Op::Row { action, .. } => action.attributes(&mut out),
+                Op::Output { .. } => {}
                 Op::Expand { attr, .. } => match attr {
                     AttrRef::Named(name) => out.push(name.as_str()),
                     AttrRef::Handle => {}
@@ -984,6 +1010,14 @@ fn explain_op(root: &Op, world: &World, indent: usize, out: &mut String) {
             }
         };
         match op {
+            Op::Row { input, action } => {
+                let _ = writeln!(out, "Row {action:?}");
+                todo.push((Item::Op(input), child));
+            }
+            Op::Output { input, spec } => {
+                let _ = writeln!(out, "Output {spec:?}");
+                todo.push((Item::Op(input), child));
+            }
             Op::Unit => out.push_str("Unit\n"),
             Op::NodeScan {
                 input,
@@ -1210,7 +1244,9 @@ fn detach_children(op: &mut Op, todo: &mut Vec<Op>) {
     };
     match op {
         Op::Unit => {}
-        Op::NodeScan { input, .. }
+        Op::Row { input, .. }
+        | Op::Output { input, .. }
+        | Op::NodeScan { input, .. }
         | Op::NodeSeek { input, .. }
         | Op::Expand { input, .. }
         | Op::Filter { input, .. }

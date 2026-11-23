@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 import neo4j
 from neo4j import GraphDatabase
-from neo4j.exceptions import AuthError, ClientError
+from neo4j.exceptions import AuthError, ClientError, CypherSyntaxError
 from neo4j.graph import Node, Relationship
 
 URI = os.environ["KALA_BOLT_URI"]
@@ -108,6 +108,57 @@ class DriverTests(unittest.TestCase):
     def setUp(self):
         self.driver = GraphDatabase.driver(URI, auth=None, connection_timeout=5)
         self.addCleanup(self.driver.close)
+
+    def test_plain_cypher_nodes_parameters_and_datalog_prefix(self):
+        with self.driver.session(database="varrow") as session:
+            query = "MATCH (p {kala_handle: 'varrow'}) AT TICK $tick CANON $canon RETURN p"
+            node = session.run(query, tick=-210, canon=10).single()[0]
+            self.assertIsInstance(node, Node)
+            self.assertEqual(node.labels, frozenset(["PLACE", "City"]))
+            self.assertEqual(node["name"], "Varrow")
+            self.assertEqual(node["kala_handle"], "varrow")
+            self.assertEqual(len(list(session.run(ALLIES))), 2)
+
+    def test_plain_cypher_relationship_null_list_order_and_syntax(self):
+        with self.driver.session(database="varrow") as session:
+            row = session.run("MATCH (e {kala_handle: 'edwin'})-[r:present]->(p) AT TICK -240 RETURN r, r.disguised, p.name").single()
+            rel = row[0]
+            self.assertIsInstance(rel, Relationship)
+            self.assertEqual(rel.type, "present")
+            self.assertEqual(rel.element_id, "edge#98")
+            self.assertTrue(rel["disguised"])
+            self.assertEqual(list(row[1:]), [True, "Carnath"])
+            self.assertIsNone(session.run("MATCH (c {kala_handle: 'kael'}) RETURN c.biography").single()[0])
+            self.assertEqual(session.run("MATCH (e {kala_handle: 'edwin'}) AT TICK -210 RETURN e.alias").single()[0],
+                             ["Ed", "Eddie", "the Lost Knight"])
+            names = [r[0] for r in session.run("MATCH (c:CHARACTER) RETURN c.name ORDER BY c.name SKIP 2 LIMIT 2")]
+            self.assertEqual(names, ["Hild", "Lisa"])
+            with self.assertRaises(CypherSyntaxError) as error:
+                list(session.run("OPTIONAL MATCH (c) RETURN c"))
+            self.assertIn("OPTIONAL", error.exception.message)
+            self.assertIn("line", error.exception.message)
+            self.assertEqual(len(list(session.run(ALLIES))), 2)
+
+    def test_cypher_system_secret_refusal_and_node_redaction(self):
+        with self.driver.session(database="system") as session:
+            self.assertIn("root", [r[0] for r in session.run("MATCH (a:ACCOUNT) RETURN a.user")])
+            for query in [
+                "MATCH (a) RETURN a.password_hash",
+                "MATCH (a) RETURN a.`password_hash` AS x",
+                "MATCH (a) WHERE a.password_hash = 'x' RETURN a.user",
+                "MATCH (a) WHERE a.password_hash IS NULL RETURN a.user",
+                "MATCH (a) RETURN a.user ORDER BY a.password_hash LIMIT 1",
+                "MATCH (a {password_hash: 'x'}) RETURN a",
+                "MATCH (a)-[r:missing {password_hash: 'x'}]->(b) RETURN a",
+            ]:
+                with self.subTest(query=query):
+                    with self.assertRaises(ClientError) as error:
+                        list(session.run(query))
+                    self.assertEqual(error.exception.code, "Neo.ClientError.Security.Forbidden")
+                    self.assertNotIn("$argon2", error.exception.message)
+            for row in session.run("MATCH (a:ACCOUNT) RETURN a"):
+                self.assertIsInstance(row[0], Node)
+                self.assertNotIn("password_hash", row[0])
 
     def test_connectivity_and_actual_driver_handshake(self):
         # This byte-transparent proxy records only the public 20-byte handshake,

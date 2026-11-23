@@ -21,3 +21,9 @@ pub use ir::{
     Access, Agg, AggFn, AttrRef, CanonSource, CmpOp, Func, MAX_EXPLAIN_BYTES, Op, OpTerm, Plan,
     Predicate, RelDef, Term, TickSource, Var,
 };
+
+mod prepared;
+pub use prepared::{ParamKind, Prepared};
+
+pub mod rows;
+pub use rows::{Expr, Orientation, OutputSpec, RowAction};

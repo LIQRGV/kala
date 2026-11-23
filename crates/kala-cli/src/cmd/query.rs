@@ -129,8 +129,13 @@ fn prepare(world: &Path, q: &QueryArgs) -> Result<(Ctx, Prepared, Params), CliEr
     let ctx = Ctx::open(world, None)?;
     // Datalog messages escape the input they echo; `main` escapes the
     // whole line again.
-    let prepared = kala_datalog::prepare(&ctx.world, &text)
-        .map_err(|e| CliError::User(format!("query: {e}")))?;
+    let prepared = if q.lang == "cypher" {
+        kala_cypher::prepare(&ctx.world, &text)
+            .map_err(|e| CliError::User(format!("query: {e}")))?
+    } else {
+        kala_datalog::prepare(&ctx.world, &text)
+            .map_err(|e| CliError::User(format!("query: {e}")))?
+    };
     let params = parse_params(&ctx, &prepared.params, &q.params)?;
     Ok((ctx, prepared, params))
 }
@@ -177,6 +182,15 @@ pub(crate) fn parse_params(
 fn parse_param(ctx: &Ctx, name: &str, kind: &ParamKind, s: &str) -> Result<Value, CliError> {
     let whose = format!("parameter `?{}`", escape::value(name));
     match kind {
+        ParamKind::Scalar => Ok(if let Ok(n) = s.parse::<i64>() {
+            Value::I64(n)
+        } else if let Ok(b) = s.parse::<bool>() {
+            Value::Bool(b)
+        } else if let Ok(f) = s.parse::<f64>() {
+            Value::f64(f).map_err(|_| CliError::User("invalid float parameter".into()))?
+        } else {
+            Value::Str(s.to_owned())
+        }),
         ParamKind::Entity | ParamKind::Value(ValueType::Ref) => {
             ctx.defined_entity(s).map(Value::Ref)
         }

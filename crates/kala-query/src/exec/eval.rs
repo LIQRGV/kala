@@ -21,6 +21,8 @@ use fixpoint::{Frame, Read};
 
 mod fixpoint;
 mod read;
+mod rows;
+pub(super) use rows::order;
 
 pub(super) struct Exec<'a, 'w> {
     pub(super) world: &'a World,
@@ -391,6 +393,7 @@ impl Exec<'_, '_> {
     ) -> Result<BTreeSet<Row>, QueryError> {
         let mut out = BTreeSet::new();
         match step {
+            Step::Row(action) => return self.eval_row(action, rows),
             Step::NodeScan {
                 slot,
                 bound,

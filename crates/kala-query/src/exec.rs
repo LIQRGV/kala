@@ -287,8 +287,12 @@ fn execute_inner(
     // Plan constants are interned first, uncharged; the rest of the query's
     // strings and interval sets join the same table.
     let mut interner = Interner::default();
+    let (root, output) = match &plan.root {
+        crate::Op::Output { input, spec } => (input.as_ref(), Some(spec)),
+        root => (root, None),
+    };
     let prog = compile(
-        &plan.root,
+        root,
         world,
         view.canon(),
         params,
@@ -297,7 +301,7 @@ fn execute_inner(
         &mut interner,
     )?;
     let mut find = Vec::with_capacity(plan.find.len());
-    for v in &plan.find {
+    for v in output.map_or(&plan.find, |spec| &spec.vars) {
         match slots.get(v) {
             Some(s) if prog.bound.contains(&s) => find.push(s),
             _ => {
@@ -344,31 +348,26 @@ fn execute_inner(
     // The default tick's read (a walk of the E index at an older canon).
     ex.charge_index_work()?;
     let rows = ex.eval(&prog.steps)?;
-    let mut out = BTreeSet::new();
-    for row in &rows {
-        let r: Vec<Val> = find
-            .iter()
-            .map(|&s| {
-                row[s]
-                    .clone()
-                    .expect("invariant: compile checked every find var is bound")
-            })
-            .collect();
-        out.insert(r);
-    }
-    // The answer is charged at its real size (its strings are copies),
-    // while the root's rows are still held, before it is built.
-    let result_bytes = out.iter().map(|r| result_row_bytes(r)).sum();
-    ex.budget.charge_bytes(result_bytes)?;
-    drop(rows);
-    // `out` is duplicate-free but in the executor's id order: sort it once
-    // into the answer's order, charging long comparisons.
-    let out: Vec<Vec<Val>> = out.into_iter().collect();
-    let order = sort_real(&out, &mut ex.budget)?;
-    let rows = order
-        .into_iter()
-        .map(|i| out[i].iter().map(Val::to_datum).collect())
-        .collect();
+    let rows = if let Some(spec) = output {
+        output_rows(&rows, &find, spec, &slots, params, &mut ex.budget)?
+    } else {
+        let mut out = BTreeSet::new();
+        for row in &rows {
+            let r: Vec<Val> = find
+                .iter()
+                .map(|&s| row[s].clone().expect("checked find binding"))
+                .collect();
+            out.insert(r);
+        }
+        let result_bytes = out.iter().map(|r| result_row_bytes(r)).sum();
+        ex.budget.charge_bytes(result_bytes)?;
+        let out: Vec<Vec<Val>> = out.into_iter().collect();
+        let order = sort_real(&out, &mut ex.budget)?;
+        order
+            .into_iter()
+            .map(|i| out[i].iter().map(Val::to_datum).collect())
+            .collect()
+    };
     check_cancel(cancel)?;
     Ok((
         ResultSet {
@@ -446,3 +445,143 @@ fn type_name(t: ValueType) -> &'static str {
 
 #[cfg(test)]
 mod scan_meter_tests;
+
+fn count_term(
+    term: Option<&crate::Term>,
+    params: &Params,
+    default: usize,
+) -> Result<usize, QueryError> {
+    let Some(term) = term else { return Ok(default) };
+    let value = match term {
+        crate::Term::Const(v) => v,
+        crate::Term::Param(p) => params
+            .get(p)
+            .ok_or_else(|| QueryError::MissingParam(p.clone()))?,
+        _ => {
+            return Err(QueryError::Plan(
+                "pagination needs an integer literal or parameter".into(),
+            ));
+        }
+    };
+    match value {
+        Value::I64(n) if *n >= 0 => Ok(usize::try_from(*n).unwrap_or(usize::MAX)),
+        _ => Err(QueryError::TypeMismatch(
+            "pagination needs a non-negative integer".into(),
+        )),
+    }
+}
+fn output_rows(
+    rows: &BTreeSet<val::Row>,
+    find: &[usize],
+    spec: &crate::OutputSpec,
+    slots: &Slots,
+    params: &Params,
+    budget: &mut Budget,
+) -> Result<Vec<Vec<Datum>>, QueryError> {
+    let skip = count_term(spec.skip.as_ref(), params, 0)?;
+    let limit = count_term(spec.limit.as_ref(), params, usize::MAX)?;
+    let keys = spec
+        .order
+        .iter()
+        .map(|(v, desc)| {
+            slots
+                .get(v)
+                .map(|s| (s, *desc))
+                .ok_or_else(|| QueryError::Plan("unbound order key".into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let mut orders = Vec::new();
+    for row in rows {
+        budget.step(1)?;
+        budget.charge_bytes(tuple_bytes(find.len()))?;
+        let value: Vec<_> = find
+            .iter()
+            .map(|&s| row[s].clone().expect("checked find binding"))
+            .collect();
+        if spec.distinct && !seen.insert(value.clone()) {
+            budget.release_bytes(tuple_bytes(find.len()));
+            continue;
+        }
+        budget.charge_bytes(result_row_bytes(&value).saturating_add(tuple_bytes(keys.len())))?;
+        orders.push(
+            keys.iter()
+                .map(|&(s, _)| {
+                    row[s]
+                        .clone()
+                        .ok_or_else(|| QueryError::Plan("unbound order key".into()))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        out.push(value);
+    }
+    let order = sort_by(out.len(), budget, |a, b, budget| {
+        for (k, (_, desc)) in keys.iter().enumerate() {
+            // Charge list traversal as well as string comparison prefixes.
+            budget.step(
+                (result_row_bytes(std::slice::from_ref(&orders[a][k]))
+                    .saturating_add(result_row_bytes(std::slice::from_ref(&orders[b][k])))
+                    / 64) as u64,
+            )?;
+            let cmp = eval::order(&orders[a][k], &orders[b][k], &mut budget.cmp);
+            budget.charge_cmp()?;
+            if !cmp.is_eq() {
+                return Ok(if *desc { cmp.reverse() } else { cmp });
+            }
+        }
+        Ok(std::cmp::Ordering::Equal)
+    })?;
+    Ok(order
+        .into_iter()
+        .skip(skip)
+        .take(limit)
+        .map(|i| out[i].iter().map(Val::to_datum).collect())
+        .collect())
+}
+fn sort_values(values: &[Val], budget: &mut Budget) -> Result<Vec<usize>, QueryError> {
+    sort_by(values.len(), budget, |a, b, budget| {
+        let cmp = val::cmp_real(&values[a], &values[b], &mut budget.cmp);
+        budget.charge_cmp()?;
+        Ok(cmp)
+    })
+}
+/// Fallible stable merge sort: temporary indices are charged before allocation,
+/// and every comparison checks cancellation and the work budget.
+fn sort_by(
+    n: usize,
+    budget: &mut Budget,
+    mut compare: impl FnMut(usize, usize, &mut Budget) -> Result<std::cmp::Ordering, QueryError>,
+) -> Result<Vec<usize>, QueryError> {
+    budget.charge_bytes(n.saturating_mul(2 * std::mem::size_of::<usize>()))?;
+    let mut a: Vec<_> = (0..n).collect();
+    let mut b = vec![0; n];
+    let mut width: usize = 1;
+    while width < n {
+        let mut lo = 0;
+        while lo < n {
+            let mid = lo.saturating_add(width).min(n);
+            let hi = mid.saturating_add(width).min(n);
+            let (mut i, mut j, mut k) = (lo, mid, lo);
+            while i < mid && j < hi {
+                budget.step(1)?;
+                if compare(a[i], a[j], budget)?.is_le() {
+                    b[k] = a[i];
+                    i += 1;
+                } else {
+                    b[k] = a[j];
+                    j += 1;
+                }
+                k += 1;
+            }
+            b[k..k + mid - i].copy_from_slice(&a[i..mid]);
+            k += mid - i;
+            b[k..hi].copy_from_slice(&a[j..hi]);
+            lo = hi;
+        }
+        std::mem::swap(&mut a, &mut b);
+        width = width.saturating_mul(2);
+    }
+    budget.release_bytes(n.saturating_mul(std::mem::size_of::<usize>()));
+    Ok(a)
+}

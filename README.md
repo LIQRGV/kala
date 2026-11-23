@@ -8,8 +8,8 @@ before last week's retcon?
 The name means "time" in Sanskrit, Javanese and Indonesian.
 
 > **Status: early.** The storage engine, terminal writes, the REPL and Datalog work.
-> Read-only Bolt 5 access supports Datalog through Neo4j drivers. Cypher and
-> Gremlin are not built yet. The
+> Read-only Bolt 5 access supports a Cypher read subset and Datalog through Neo4j drivers.
+> Gremlin is not built yet. The
 > on-disk format may still change without migration.
 
 ## Ideas
@@ -98,7 +98,7 @@ to manage per-database grants. Password accounts use Argon2id; non-loopback
 listeners require `--insecure-allow-plaintext` until TLS is available.
 `--auth none` remains a loopback-only development option. The server is read-only.
 Changes committed by `kala transact` become visible on the next query.
-Ctrl-C stops the server. Cypher comes next; explicit transactions, routing,
+Ctrl-C stops the server. Cypher reads are the default; explicit transactions, routing,
 Neo4j Browser and writes over Bolt are not supported yet. See the
 [Bolt support and limits](crates/kala-bolt/README.md) and the opt-in
 [driver E2E tests](e2e/README.md).
@@ -185,6 +185,7 @@ The native Rust API (`kala-core`) can also write directly. See
 | `kala-core` | The log, indexes (`E`, `R`, `V`), `assert`/`retract`/`correct`, `AsOf`/`History`/`Neighbors`, overlap warnings, doctor, the YAML fixture loader |
 | `kala-query` | A language-neutral query IR and executor, with row, step and memory budgets |
 | `kala-datalog` | The Datalog parser, compiler and planner |
+| `kala-cypher` | Cypher read parser and compiler to the same IR |
 | `kala-bolt` | Read-only Bolt 5 server, authentication boundary and driver value mapping |
 | `kala-cli` | The `kala` command-line tool |
 
@@ -199,7 +200,8 @@ The native Rust API (`kala-core`) can also write directly. See
 - [x] `kala create`, replayable full-history dumps, private server backups and JSON snapshots
 - [x] `kala serve`: read-only Bolt 5 Datalog queries through Neo4j drivers
 - [ ] Neo4j Browser compatibility and routing/procedure stubs
-- [ ] Cypher (a subset first), then Gremlin
+- [x] Cypher reads: MATCH/WHERE/RETURN, bags/NULL, ORDER BY/SKIP/LIMIT and time travel
+- [ ] Broader Cypher (optional matches, aggregates, paths and writes), then Gremlin
 - [x] Accounts, host matching, Argon2id passwords and database privileges
 - [ ] TLS for encrypted Bolt connections
 - [ ] On-disk indexes with checkpoints

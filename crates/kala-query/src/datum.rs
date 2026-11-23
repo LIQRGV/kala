@@ -15,6 +15,10 @@ use kala_core::{IntervalSet, Op, Precision, Value};
 /// [`IntervalSet`]'s order). Equality never holds across kinds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Datum {
+    /// Missing value (never stored).
+    Null,
+    /// Sorted property values; lists preserve their supplied order.
+    List(Vec<Datum>),
     /// A stored value.
     Value(Value),
     /// A change point's op.
@@ -30,13 +34,19 @@ impl Datum {
     pub fn as_value(&self) -> Option<&Value> {
         match self {
             Datum::Value(v) => Some(v),
-            Datum::Op(_) | Datum::Precision(_) | Datum::Intervals(_) => None,
+            Datum::Null
+            | Datum::List(_)
+            | Datum::Op(_)
+            | Datum::Precision(_)
+            | Datum::Intervals(_) => None,
         }
     }
 
     /// The kind's rank in the cross-kind order.
     fn rank(&self) -> u8 {
         match self {
+            Datum::Null => 5,
+            Datum::List(_) => 4,
             Datum::Value(_) => 0,
             Datum::Op(_) => 1,
             Datum::Intervals(_) => 2,
@@ -56,6 +66,7 @@ pub(crate) fn op_rank(op: Op) -> u8 {
 impl Ord for Datum {
     fn cmp(&self, other: &Datum) -> Ordering {
         match (self, other) {
+            (Datum::List(a), Datum::List(b)) => a.cmp(b),
             (Datum::Value(a), Datum::Value(b)) => a.cmp(b),
             (Datum::Precision(a), Datum::Precision(b)) => (*a as u8).cmp(&(*b as u8)),
             (Datum::Op(a), Datum::Op(b)) => op_rank(*a).cmp(&op_rank(*b)),
@@ -76,6 +87,8 @@ impl Hash for Datum {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.rank().hash(state);
         match self {
+            Datum::Null => {}
+            Datum::List(v) => v.hash(state),
             Datum::Value(v) => v.hash(state),
             Datum::Op(op) => op_rank(*op).hash(state),
             Datum::Precision(p) => (*p as u8).hash(state),

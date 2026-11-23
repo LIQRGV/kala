@@ -422,6 +422,7 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "kala-core",
+ "kala-cypher",
  "kala-datalog",
  "kala-query",
  "proptest",
@@ -436,6 +437,7 @@ dependencies = [
  "ctrlc",
  "kala-bolt",
  "kala-core",
+ "kala-cypher",
  "kala-datalog",
  "kala-query",
  "libc",
@@ -459,6 +461,17 @@ dependencies = [
  "serde-saphyr",
  "tempfile",
  "unicode-normalization",
+]
+
+[[package]]
+name = "kala-cypher"
+version = "0.1.0"
+dependencies = [
+ "kala-core",
+ "kala-datalog",
+ "kala-query",
+ "proptest",
+ "tempfile",
 ]
 
 [[package]]

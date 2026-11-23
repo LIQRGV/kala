@@ -1,5 +1,7 @@
 //! The static pass: checks a plan and compiles it into a flat [`Program`].
 
+mod rows;
+
 use std::collections::{BTreeSet, HashMap};
 
 use kala_core::{Tick, TxId, Value, ValueType, World};
@@ -52,7 +54,9 @@ fn post_order(root: &Op) -> Vec<Visit<'_>> {
         // Pushed in reverse: the stack pops them in execution order.
         match op {
             Op::Unit => out.push(Visit::Op(op)),
-            Op::NodeScan { input, .. }
+            Op::Row { input, .. }
+            | Op::Output { input, .. }
+            | Op::NodeScan { input, .. }
             | Op::NodeSeek { input, .. }
             | Op::Expand { input, .. }
             | Op::Filter { input, .. }
@@ -424,6 +428,10 @@ impl Compiler<'_> {
                 Some(seed) => (Step::Seed, seed.clone()),
                 None => (Step::Unit, BTreeSet::new()),
             },
+            Op::Row { action, .. } => self.op_row(action)?,
+            Op::Output { .. } => {
+                return Err(QueryError::Plan("Output must be the plan root".into()));
+            }
             Op::Not { .. } => self.op_not()?,
             Op::Difference { .. } | Op::Intersect { .. } => {
                 let rb = pop(stack);

@@ -23,29 +23,55 @@ pub(crate) fn run(
     max_depth: usize,
 ) -> Result<Output, Failure> {
     let (prefix, rest) = text.split_once('\n').unwrap_or((text, ""));
-    if prefix.trim_end_matches([' ', '\r']) != "// kala:datalog" {
-        return Err(Failure::new(SYNTAX, "query language is not supported yet"));
+    let prefix = prefix.trim_end_matches([' ', '\r']);
+    if prefix == "// kala:gremlin" {
+        return Err(Failure::new(SYNTAX, "Gremlin is not supported yet"));
     }
-    // Keep the prefix's line as an empty line, so error positions count the
-    // lines of the text the client sent.
-    let text = format!("\n{rest}");
-    let syntax = |e: kala_datalog::DatalogError| Failure::new(SYNTAX, e.to_string());
-    let query = kala_datalog::parse(&text).map_err(syntax)?;
     let system = crate::system::is_system(world);
-    // On `system`, refuse before compiling or running: output redaction
-    // alone can't stop `<`, `=`, `min` or `not` from revealing a hash, so
-    // the secret must never enter evaluation. The AST covers what the plan
-    // drops (rules no clause calls); the plan check covers whatever the
-    // compiler resolves.
-    if system
-        && query
-            .attributes()
-            .iter()
-            .any(|a| crate::system::is_secret_attribute(world, &a.name))
-    {
-        return Err(protected());
-    }
-    let prepared = kala_datalog::prepare_parsed(world, &text, &query).map_err(syntax)?;
+    let datalog = prefix == "// kala:datalog";
+    // Retain the first line for client-visible syntax positions.
+    let stripped;
+    let text = if datalog || prefix == "// kala:cypher" {
+        stripped = format!("\n{rest}");
+        stripped.as_str()
+    } else {
+        text
+    };
+    let prepared = if datalog {
+        let syntax = |e: kala_datalog::DatalogError| Failure::new(SYNTAX, e.to_string());
+        let query = kala_datalog::parse(text).map_err(syntax)?;
+        if system
+            && query
+                .attributes()
+                .iter()
+                .any(|a| crate::system::is_secret_attribute(world, &a.name))
+        {
+            return Err(protected());
+        }
+        kala_datalog::prepare_parsed(world, text, &query).map_err(syntax)?
+    } else {
+        let error = |e: kala_cypher::CypherError| {
+            Failure::new(
+                if e.kind == kala_cypher::ErrorKind::Type {
+                    TYPE
+                } else {
+                    SYNTAX
+                },
+                e.to_string(),
+            )
+        };
+        let query = kala_cypher::parse(text).map_err(error)?;
+        // Inspect before compilation, including unreachable/empty-match expressions.
+        if system
+            && query
+                .attributes()
+                .iter()
+                .any(|a| crate::system::is_secret_attribute(world, a))
+        {
+            return Err(protected());
+        }
+        kala_cypher::prepare_parsed(world, text, &query).map_err(error)?
+    };
     if system
         && prepared
             .plan
@@ -55,6 +81,12 @@ pub(crate) fn run(
     {
         return Err(protected());
     }
+    eprintln!(
+        "event=query_prepared language={} columns={} parameters={}",
+        if datalog { "datalog" } else { "cypher" },
+        prepared.plan.find.len(),
+        prepared.params.len()
+    );
     let params = parameters(world, &prepared.params, given)?;
     let limits = Limits::default();
     let result = kala_query::run_with_cancel(world, &prepared.plan, &params, &limits, stop)
@@ -106,6 +138,10 @@ fn parameters(
             .ok_or_else(|| Failure::new(MISSING, format!("missing parameter {name}")))?;
         let bad = || Failure::new(TYPE, format!("wrong type for parameter {name}"));
         let value = match (kind, raw) {
+            (ParamKind::Scalar, Value::Bool(v)) => CoreValue::Bool(*v),
+            (ParamKind::Scalar, Value::Integer(v)) => CoreValue::I64(*v),
+            (ParamKind::Scalar, Value::Float(v)) => CoreValue::f64(*v).map_err(|_| bad())?,
+            (ParamKind::Scalar, Value::String(v)) => CoreValue::Str(v.clone()),
             (ParamKind::Tick | ParamKind::Value(ValueType::I64), Value::Integer(n)) => {
                 CoreValue::I64(*n)
             }
@@ -210,6 +246,12 @@ fn datum_value(
 ) -> Result<Value, Failure> {
     budget.charge(64)?;
     match d {
+        Datum::Null => Ok(Value::Null),
+        Datum::List(values) => values
+            .into_iter()
+            .map(|v| datum_value(v, view, tick, meter, budget))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::List),
         Datum::Value(CoreValue::Ref(id)) => entity_value(id, view, tick, meter, budget),
         Datum::Value(v) => scalar(v, budget),
         Datum::Op(op) => budget.string(
