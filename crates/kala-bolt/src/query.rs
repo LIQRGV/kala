@@ -1,5 +1,5 @@
 //! Language dispatch and bounded result enrichment at the pinned tick and canon.
-use crate::error::{EXECUTION, FORBIDDEN, Failure, MISSING, SYNTAX, TYPE};
+use crate::error::{EXECUTION, FORBIDDEN, Failure, MISSING, TYPE};
 use crate::message::Map;
 use crate::packstream::{self, Value};
 use kala_core::{
@@ -22,72 +22,24 @@ pub(crate) fn run(
     max_message: usize,
     max_depth: usize,
 ) -> Result<Output, Failure> {
-    let (prefix, rest) = text.split_once('\n').unwrap_or((text, ""));
-    let prefix = prefix.trim_end_matches([' ', '\r']);
-    if prefix == "// kala:gremlin" {
-        return Err(Failure::new(SYNTAX, "Gremlin is not supported yet"));
-    }
+    let source = crate::language::detect(text)?;
+    let front_end = source.front_end;
     let system = crate::system::is_system(world);
-    let datalog = prefix == "// kala:datalog";
-    // Retain the first line for client-visible syntax positions.
-    let stripped;
-    let text = if datalog || prefix == "// kala:cypher" {
-        stripped = format!("\n{rest}");
-        stripped.as_str()
-    } else {
-        text
-    };
-    let prepared = if datalog {
-        let syntax = |e: kala_datalog::DatalogError| Failure::new(SYNTAX, e.to_string());
-        let query = kala_datalog::parse(text).map_err(syntax)?;
-        if system
-            && query
-                .attributes()
-                .iter()
-                .any(|a| crate::system::is_secret_attribute(world, &a.name))
-        {
-            return Err(protected());
-        }
-        kala_datalog::prepare_parsed(world, text, &query).map_err(syntax)?
-    } else {
-        let error = |e: kala_cypher::CypherError| {
-            Failure::new(
-                if e.kind == kala_cypher::ErrorKind::Type {
-                    TYPE
-                } else {
-                    SYNTAX
-                },
-                e.to_string(),
-            )
-        };
-        let query = kala_cypher::parse(text).map_err(error)?;
-        // Inspect before compilation, including unreachable/empty-match expressions.
-        if system
-            && query
-                .attributes()
-                .iter()
-                .any(|a| crate::system::is_secret_attribute(world, a))
-        {
-            return Err(protected());
-        }
-        kala_cypher::prepare_parsed(world, text, &query).map_err(error)?
-    };
-    if system
-        && prepared
-            .plan
-            .attribute_names()
-            .into_iter()
-            .any(|a| crate::system::is_secret_attribute(world, a))
-    {
+    // On `system`, refuse before evaluation: output redaction alone can't
+    // stop `<`, `=`, `min` or `IS NULL` from revealing a hash. The front-end
+    // checks its AST; the plan check covers whatever the compiler resolves.
+    let secret = |name: &str| system && crate::system::is_secret_attribute(world, name);
+    let prepared = front_end.prepare(world, &source.text, &secret)?;
+    if prepared.plan.attribute_names().into_iter().any(secret) {
         return Err(protected());
     }
     eprintln!(
         "event=query_prepared language={} columns={} parameters={}",
-        if datalog { "datalog" } else { "cypher" },
+        front_end.name(),
         prepared.plan.find.len(),
         prepared.params.len()
     );
-    let params = parameters(world, &prepared.params, given, !datalog)?;
+    let params = parameters(world, &prepared.params, given, front_end.nullable_params())?;
     let limits = Limits::default();
     let result =
         kala_query::run_with_values_and_cancel(world, &prepared.plan, &params, &limits, stop)
@@ -121,7 +73,7 @@ pub(crate) fn run(
     })
 }
 /// Generic on purpose: says what is refused, nothing about stored values.
-fn protected() -> Failure {
+pub(crate) fn protected() -> Failure {
     Failure::new(
         FORBIDDEN,
         "queries on the system database may not read the protected attribute password_hash",

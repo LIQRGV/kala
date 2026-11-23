@@ -4,6 +4,7 @@ pub mod auth;
 mod chunk;
 mod error;
 mod handshake;
+mod language;
 mod message;
 pub mod packstream;
 mod query;
