@@ -11,7 +11,7 @@ use crate::ir::{Access, CmpOp, Func};
 
 use super::QueryError;
 use super::budget::Budget;
-use super::program::{Attr, Pos, Step, TickPos, pop};
+use super::program::{Pos, Step, TickPos, pop};
 use super::val::{
     CMP_BYTES_PER_STEP, Interner, PAIR_BYTES, Pairs, Points, Row, STRING_OVERHEAD_BYTES, Sets, Val,
     compare, index_entry_bytes, tuple_bytes,
@@ -22,6 +22,7 @@ use fixpoint::{Frame, Read};
 mod fixpoint;
 mod read;
 mod rows;
+use read::Triple;
 pub(super) use rows::order;
 
 pub(super) struct Exec<'a, 'w> {
@@ -448,7 +449,14 @@ impl Exec<'_, '_> {
                 value,
                 tick,
                 access,
-            } => return self.eval_expand(entity, attr, value, tick, access, rows),
+            } => {
+                let read = Triple {
+                    entity,
+                    attr,
+                    value,
+                };
+                return self.eval_expand(read, tick, access, rows);
+            }
             Step::Handle { entity, value } => return self.eval_handle(entity, value, rows),
             Step::History {
                 entity,
@@ -458,8 +466,13 @@ impl Exec<'_, '_> {
                 op,
                 precision,
             } => {
+                let read = Triple {
+                    entity,
+                    attr,
+                    value,
+                };
                 for row in rows {
-                    self.history_row(&row, entity, attr, value, tick, op, precision, &mut out)?;
+                    self.history_row(&row, read, tick, op, precision, &mut out)?;
                 }
             }
             Step::During {
@@ -468,8 +481,13 @@ impl Exec<'_, '_> {
                 value,
                 out: set,
             } => {
+                let read = Triple {
+                    entity,
+                    attr,
+                    value,
+                };
                 for row in rows {
-                    self.during_row(&row, entity, attr, value, set, &mut out)?;
+                    self.during_row(&row, read, set, &mut out)?;
                 }
             }
             Step::Apply {
@@ -573,9 +591,7 @@ impl Exec<'_, '_> {
     /// Runs an `Expand` on its input's rows.
     fn eval_expand(
         &mut self,
-        entity: &Pos,
-        attr: &Attr,
-        value: &Pos,
+        read: Triple<'_>,
         tick: &TickPos,
         access: &Access,
         rows: BTreeSet<Row>,
@@ -593,12 +609,11 @@ impl Exec<'_, '_> {
                     by_tick.entry(t).or_default().push(row);
                 }
                 for (t, rows) in by_tick {
-                    let (all, fresh) = self.scan_once(&attr.name, t)?;
+                    let (all, fresh) = self.scan_once(&read.attr.name, t)?;
                     for row in rows {
-                        let pairs =
-                            self.expand_row(&row, entity, attr, value, t, *access, Some(&all))?;
+                        let pairs = self.expand_row(&row, read, t, *access, Some(&all))?;
                         for (e, v) in pairs {
-                            if let Some(r) = bind(&row, entity, value, Val::Ref(e), v) {
+                            if let Some(r) = bind(&row, read.entity, read.value, Val::Ref(e), v) {
                                 self.budget.emit(&mut out, r)?;
                             }
                         }
@@ -615,9 +630,9 @@ impl Exec<'_, '_> {
                         TickPos::Const(t) => *t,
                         TickPos::Var(s) => tick_of(&row, *s)?,
                     };
-                    let pairs = self.expand_row(&row, entity, attr, value, t, *access, None)?;
+                    let pairs = self.expand_row(&row, read, t, *access, None)?;
                     for (e, v) in pairs {
-                        if let Some(r) = bind(&row, entity, value, Val::Ref(e), v) {
+                        if let Some(r) = bind(&row, read.entity, read.value, Val::Ref(e), v) {
                             self.budget.emit(&mut out, r)?;
                         }
                     }
