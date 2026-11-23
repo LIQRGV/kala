@@ -408,9 +408,23 @@ fn dump_all(directory: &Path, output: &Path) -> Result<String, CliError> {
     // A terminal slash or `/.` would make a symlink an intermediate
     // component, bypassing O_NOFOLLOW. Components removes those spellings
     // without following symlinks or changing the meaning of `..`.
-    let normalized: PathBuf = output.components().collect();
+    let normalized: std::path::PathBuf = output.components().collect();
     let output = normalized.as_path();
-    let worlds = world_files(directory)?;
+    let mut worlds = BTreeMap::new();
+    for entry in fs::read_dir(directory).map_err(transfer::io)? {
+        let entry = entry.map_err(transfer::io)?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(db) = file_name.strip_suffix(".kala") else {
+            continue;
+        };
+        if kala_bolt::valid_database_name(db) && entry.file_type().map_err(transfer::io)?.is_file()
+        {
+            worlds.insert(db.to_owned(), entry.path());
+        }
+    }
     let out_dir = OutDir::prepare(output)?;
     let mut summary = String::new();
     for (name, path) in worlds {
@@ -435,27 +449,6 @@ fn dump_all(directory: &Path, output: &Path) -> Result<String, CliError> {
     }
     out_dir.sync()?;
     Ok(summary)
-}
-
-/// Every `<database>.kala` regular file of the server directory, by
-/// database name.
-fn world_files(directory: &Path) -> Result<BTreeMap<String, PathBuf>, CliError> {
-    let mut worlds = BTreeMap::new();
-    for entry in fs::read_dir(directory).map_err(transfer::io)? {
-        let entry = entry.map_err(transfer::io)?;
-        let file_name = entry.file_name();
-        let Some(file_name) = file_name.to_str() else {
-            continue;
-        };
-        let Some(db) = file_name.strip_suffix(".kala") else {
-            continue;
-        };
-        if kala_bolt::valid_database_name(db) && entry.file_type().map_err(transfer::io)?.is_file()
-        {
-            worlds.insert(db.to_owned(), entry.path());
-        }
-    }
-    Ok(worlds)
 }
 
 /// The private, empty directory `dump --all` writes into.
