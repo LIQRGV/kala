@@ -135,7 +135,7 @@ impl Ctx {
 /// A value argument read as type `ty`, a ref by entity syntax
 /// ([`Ctx::entity`]). `whose` names what has that type, already escaped
 /// (``attribute `name` ``); an error reads "`s` is not an i64 (the type of
-/// <whose>)".
+/// `<whose>`)".
 pub fn parse_value(ctx: &Ctx, ty: ValueType, s: &str, whose: &str) -> Result<Value, CliError> {
     let bad = |what: &str| {
         CliError::User(format!(
