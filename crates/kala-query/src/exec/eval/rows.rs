@@ -78,7 +78,13 @@ fn int_float(i: i64, f: f64) -> std::cmp::Ordering {
         return Greater;
     }
     let integral = f as i64;
-    i.cmp(&integral).then_with(|| (i as f64).total_cmp(&f))
+    i.cmp(&integral).then_with(|| {
+        if f == 0.0 {
+            std::cmp::Ordering::Equal
+        } else {
+            (i as f64).total_cmp(&f)
+        }
+    })
 }
 impl Exec<'_, '_> {
     pub(super) fn eval_row(

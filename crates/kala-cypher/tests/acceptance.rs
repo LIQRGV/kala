@@ -486,3 +486,20 @@ fn parameter_list_equality_propagates_null_until_inequality_is_known() {
         }
     }
 }
+
+#[test]
+fn mixed_integer_float_comparisons_treat_negative_zero_as_zero() {
+    let w = world();
+    for (predicate, expected) in [
+        ("0 = -0.0", 1),
+        ("0 <= -0.0", 1),
+        ("0 >= -0.0", 1),
+        ("0 <> -0.0", 0),
+    ] {
+        let rows = query(
+            &w,
+            &format!("MATCH (n {{kala_handle: 'kael'}}) WHERE {predicate} RETURN n"),
+        );
+        assert_eq!(rows.len(), expected, "{predicate}");
+    }
+}
