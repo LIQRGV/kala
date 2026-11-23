@@ -249,7 +249,10 @@ fn name(run: &str, sigil: &str, what: &str, span: Span) -> Result<String, Datalo
             format!("{what} needs a name after `{sigil}`"),
         ));
     }
-    if let Some(bad) = body.chars().find(|&c| !is_name_char(c)) {
+    if let Some((_, bad)) = body
+        .char_indices()
+        .find(|&(i, c)| !is_name_char(c) && !(sigil == ":" && c == '@' && i > 0))
+    {
         return Err(DatalogError::syntax(
             span,
             format!(
@@ -594,7 +597,7 @@ impl CompletenessScanner {
 /// Incremental validation of a bare token. Do not re-tokenize its growing
 /// prefix: a long token supplied one character at a time must stay linear.
 enum Bare {
-    Name { nonempty: bool },
+    Name { nonempty: bool, keyword: bool },
     Symbol { sign: bool, id_type: bool },
     Id { nonempty: bool },
     Dollar,
@@ -605,7 +608,10 @@ enum Bare {
 impl Bare {
     fn new(c: char) -> Self {
         match c {
-            ':' | '?' => Self::Name { nonempty: false },
+            ':' | '?' => Self::Name {
+                nonempty: false,
+                keyword: c == ':',
+            },
             '$' => Self::Dollar,
             '0'..='9' => Self::Number(NumberScan::new(c)),
             _ if is_name_char(c) => Self::Symbol {
@@ -618,8 +624,8 @@ impl Bare {
 
     fn push(&mut self, c: char) {
         match self {
-            Self::Name { nonempty } => {
-                if is_name_char(c) {
+            Self::Name { nonempty, keyword } => {
+                if is_name_char(c) || (*keyword && *nonempty && c == '@') {
                     *nonempty = true;
                 } else {
                     *self = Self::Bad;
@@ -652,7 +658,7 @@ impl Bare {
 
     fn valid(&self) -> bool {
         match self {
-            Self::Name { nonempty } | Self::Id { nonempty } => *nonempty,
+            Self::Name { nonempty, .. } | Self::Id { nonempty } => *nonempty,
             Self::Symbol { .. } | Self::Dollar => true,
             Self::Number(number) => number.valid(),
             Self::Bad => false,

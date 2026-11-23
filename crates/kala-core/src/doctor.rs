@@ -113,6 +113,8 @@ pub enum IndexName {
 /// One problem doctor found.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Finding {
+    /// Derived schema metadata differs from a replay of the log.
+    SchemaMismatch,
     /// The log ends in a torn or damaged transaction that `World::open`
     /// would cut. `offset` is where the valid prefix ends: the start of that
     /// transaction (or of the zero-filled tail).
@@ -255,7 +257,8 @@ impl Finding {
     /// How serious the finding is.
     pub fn severity(&self) -> Severity {
         match self {
-            Finding::IncompleteTail { .. }
+            Finding::SchemaMismatch
+            | Finding::IncompleteTail { .. }
             | Finding::ChecksumMismatch { .. }
             | Finding::MissingCommit { .. }
             | Finding::TxGap { .. }
@@ -374,6 +377,9 @@ pub fn doctor(world: &World, opts: &DoctorOptions) -> Report {
     let hash = world.content_hash();
     if let Some(rebuilt) = txns.and_then(|txns| rebuild(txns, hash, &mut found)) {
         compare_indexes(world, &rebuilt, &mut found);
+        if !world.schema_matches(&rebuilt) {
+            found.push((None, Finding::SchemaMismatch));
+        }
         schema_rules(&rebuilt, opts, &mut found);
     }
     finish(found, opts)

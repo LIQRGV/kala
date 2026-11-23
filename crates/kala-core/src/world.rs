@@ -6,8 +6,10 @@
 //! the source of truth: a committed [`Txn`] is appended as its `DEFINE`
 //! entries, its facts and a `COMMIT`, and fsynced, before the in-memory
 //! tables change. Every operation first validates into a definition
-//! (`EntityDef`, `FactDef`, `EdgeDef`) without touching the world, then
-//! applies it, so a failed operation changes nothing.
+//! (`EntityDef`, `FactDef`, `EdgeDef`) before applying it. Schema operations
+//! temporarily update metadata under the transaction's exclusive borrow;
+//! dropping or failing the transaction restores that metadata. No failed
+//! operation becomes visible or changes the log.
 //!
 //! **Edges.** The first stored assert of a `ref` fact `(source, attr,
 //! target)` interns the triple as an edge: it gets the next [`EdgeId`]
@@ -39,6 +41,11 @@
 //! one-write transactions that commit at once. Every read goes through a [`View`] pinned to a canon tx;
 //! the world's own reads are the view at its latest tx.
 
+mod migration;
+mod schema_ops;
+
+use crate::schema::{MigrationOptions, MigrationReport, SchemaChange, SchemaEdit};
+use schema_ops::{OrderedEntry, SchemaSnapshot};
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -94,6 +101,8 @@ pub struct WriteResult {
     /// fills it; a [`Txn`] write leaves it empty and its
     /// [`CommitResult::warnings`] carries the transaction's net diff.
     pub warnings: Warnings,
+    /// Schema changes made by this operation.
+    pub schema: Vec<SchemaChange>,
 }
 
 /// The op of a stored fact: whether it starts (`Assert`) or ends
@@ -426,10 +435,6 @@ struct StagedIds {
 }
 
 impl StagedIds {
-    fn is_empty(&self) -> bool {
-        self.defs.is_empty() && self.edges.is_empty()
-    }
-
     fn push(&mut self, def: EntityDef) {
         self.last_seq.insert(def.id.node_type(), def.id.seq());
         if let Some(h) = &def.handle {
@@ -575,6 +580,9 @@ pub struct World {
     handle_by_entity: HashMap<EntityId, String>,
     /// Indexed by `AttrId.0`.
     attributes: Vec<AttrDef>,
+    attribute_history: Vec<Vec<(TxId, AttrDef)>>,
+    node_origins: Vec<Vec<(TxId, bool)>>,
+    settings: Vec<(TxId, String, String)>,
     attr_by_name: HashMap<String, AttrId>,
     /// Inverse name -> the directed attribute it reverses. Not attribute
     /// names: every API except [`View::neighbors`] treats them as unknown
@@ -706,9 +714,7 @@ impl World {
             if i > usize::from(MAX_NODE_TYPE) {
                 return Err(IdError::NodeTypeOutOfRange(MAX_NODE_TYPE + 1).into());
             }
-            if name.is_empty() {
-                return Err(Error::InvalidName(name.clone()));
-            }
+            schema_ops::check_name(name)?;
             let id = NodeTypeId(i as u16); // i <= MAX_NODE_TYPE, checked above
             if node_type_by_name.insert(name.clone(), id).is_some() {
                 return Err(Error::DuplicateName(name.clone()));
@@ -722,8 +728,11 @@ impl World {
         let mut attr_by_name = HashMap::with_capacity(defs.len());
         let mut inverse_by_name = HashMap::new();
         for (i, def) in defs.iter().enumerate() {
-            if def.name.is_empty() {
-                return Err(Error::InvalidName(def.name.clone()));
+            schema_ops::check_name(&def.name)?;
+            if def.inferred || def.deprecated {
+                return Err(Error::Schema(
+                    "genesis attributes must be declared and writable".into(),
+                ));
             }
             // More than u32::MAX attributes can't be keyed; report it as a
             // bad schema rather than wrapping into another attribute's ID.
@@ -735,9 +744,7 @@ impl World {
             }
             check_direction(def)?;
             if let Some(inverse) = &def.inverse {
-                if inverse.is_empty() {
-                    return Err(Error::InvalidName(inverse.clone()));
-                }
+                schema_ops::check_name(inverse)?;
                 // Inverse names share the attribute namespace (in both
                 // directions), so a name always means one thing.
                 if attr_by_name.contains_key(inverse)
@@ -753,6 +760,9 @@ impl World {
             entity_by_handle: HashMap::new(),
             handle_by_entity: HashMap::new(),
             attributes: defs.to_vec(),
+            attribute_history: defs.iter().map(|d| vec![(TxId(0), d.clone())]).collect(),
+            node_origins: names.iter().map(|_| vec![(TxId(0), false)]).collect(),
+            settings: Vec::new(),
             attr_by_name,
             inverse_by_name,
             edges: Vec::new(),
@@ -1214,11 +1224,32 @@ impl World {
         if !matches!(entry.body, EntryBody::Commit { .. }) {
             txn.has_entries = true;
         }
+        let copied = if let Some(expected) = txn.migration_expected.pop_front() {
+            if expected != entry.body {
+                return Err(corrupt(&"migration copy does not match its source history"));
+            }
+            true
+        } else {
+            false
+        };
         // Only the entry right after a DELETED marker may share its rev.
         let prev_deleted = txn.prev_deleted.take();
         match &entry.body {
+            EntryBody::Schema(SchemaEdit::Migration {
+                source,
+                def,
+                skip_unconvertible,
+            }) => {
+                txn.migration_expected = self
+                    .migration_expected(*source, def, *skip_unconvertible)
+                    .map_err(ReplayFault::Refused)?;
+                Ok(())
+            }
+            EntryBody::Schema(edit) => self
+                .apply_schema_edit(edit, self.next_tx(), copied)
+                .map_err(ReplayFault::Refused),
             EntryBody::DefineNodeType { .. } | EntryBody::DefineAttr { .. } => Err(corrupt(
-                &"schema definition outside the genesis transaction",
+                &"genesis definition outside the genesis transaction; use a schema revision",
             )),
             EntryBody::DefineEntity { id, handle } => {
                 // Validate as a live create would, then check the log
@@ -1278,7 +1309,9 @@ impl World {
                 if id.seq() != self.last_edge_seq(&StagedIds::default()) + 1 {
                     return Err(corrupt(&format!("{id:?} out of sequence")));
                 }
-                txn.unasserted_edges.insert(triple, *id);
+                if !copied {
+                    txn.unasserted_edges.insert(triple, *id);
+                }
                 let tx = self.next_tx();
                 self.apply_edge(
                     EdgeDef {
@@ -1347,7 +1380,7 @@ impl World {
                 // Judged like a live write, against everything before it
                 // (the current transaction's earlier facts are already in).
                 let held = holds(&[&self.e_index], &mut prefix, fact.tick, all, Work::NONE);
-                if held == (fact.op == Op::Assert) {
+                if !copied && held == (fact.op == Op::Assert) {
                     return Err(corrupt(&format!(
                         "a no-op {:?} at {:?} (the value {} held there)",
                         fact.op,
@@ -1384,6 +1417,11 @@ impl World {
                     return Err(bad_correction(
                         &"bidirectional DELETED marker with entity > value",
                     ));
+                }
+                if def.deprecated {
+                    return Err(ReplayFault::Refused(Error::DeprecatedAttribute(
+                        def.name.clone(),
+                    )));
                 }
                 let chain = self.replay_chain(*of).map_err(|why| bad_correction(&why))?;
                 let current = chain.current.ok_or_else(|| {
@@ -1453,6 +1491,11 @@ impl World {
                     return Err(corrupt(
                         &"revised ref assert with no edge defined before it",
                     ));
+                }
+                if def.deprecated {
+                    return Err(ReplayFault::Refused(Error::DeprecatedAttribute(
+                        def.name.clone(),
+                    )));
                 }
                 let chain = self.replay_chain(*of).map_err(|why| bad_correction(&why))?;
                 if prev_deleted == Some((*of, *rev)) {
@@ -1997,6 +2040,9 @@ impl World {
             entries: Vec::new(),
             ids: StagedIds::default(),
             poisoned: false,
+            schema_before: None,
+            schema_changes: Vec::new(),
+            order: Vec::new(),
         }
     }
 
@@ -2227,6 +2273,9 @@ impl World {
         op: Op,
     ) -> Result<FactDef, Error> {
         let (attr_id, def) = self.resolve(staged, entity, attr)?;
+        if def.deprecated {
+            return Err(Error::DeprecatedAttribute(attr.to_owned()));
+        }
         check_type(attr, def, v)?;
         // Length check before encoding, so an oversized string isn't copied.
         if def.indexed {
@@ -2969,6 +3018,7 @@ struct TouchedSide {
 struct ReplayTxn {
     /// Whether the transaction has any entry before its `Commit`.
     has_entries: bool,
+    migration_expected: std::collections::VecDeque<EntryBody>,
     /// Edges the transaction defined whose triple it hasn't (yet) asserted.
     unasserted_edges: HashMap<Triple, EdgeId>,
     /// The keys (`E` key without `^tx`) of the transaction's facts,
@@ -3102,6 +3152,11 @@ fn genesis_schema(entries: &[LogEntry]) -> Result<Schema, Error> {
                 schema = schema.node_type(name);
             }
             EntryBody::DefineAttr { id, def } => {
+                if def.inferred || def.deprecated {
+                    return Err(corrupt(
+                        "genesis attributes must be declared and writable".into(),
+                    ));
+                }
                 if usize::try_from(id.0).ok() != Some(attrs) {
                     return Err(corrupt(format!("attribute {id:?} out of sequence")));
                 }
@@ -3190,13 +3245,14 @@ fn as_slice(b: &Bound<Vec<u8>>) -> Bound<&[u8]> {
 /// The result of committing a transaction.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CommitResult {
+    /// Schema changes, in operation order.
+    pub schema: Vec<crate::schema::SchemaChange>,
     /// The transaction's number. If nothing was written (every write was a
     /// no-op and no entity was created), nothing is appended and this is
     /// the unchanged latest tx.
     pub tx: TxId,
-    /// Entries stored by the transaction: facts, `DELETED` markers and
-    /// revised facts
-    /// (no-ops not counted).
+    /// Fact/correction entries plus reported schema actions (no-ops excluded).
+    /// A migration reports its rename, deprecation, declaration and copy action.
     pub changed: usize,
     /// IDs of the fact, `DELETED` and `Revised` entries the transaction appended, in
     /// log order (`DEFINE`s and the `Commit` are not listed): one per stored
@@ -3245,6 +3301,9 @@ pub struct Txn<'w> {
     ids: StagedIds,
     /// Set by the first failed write; the transaction then applies nothing.
     poisoned: bool,
+    schema_before: Option<SchemaSnapshot>,
+    schema_changes: Vec<SchemaChange>,
+    order: Vec<OrderedEntry>,
 }
 
 impl Txn<'_> {
@@ -3274,6 +3333,7 @@ impl Txn<'_> {
         self.guard(|txn| {
             let def = txn.world.prepare_entity(&txn.ids, node_type, handle)?;
             let id = def.id;
+            txn.order.push(OrderedEntry::Entity(txn.ids.defs.len()));
             txn.ids.push(def);
             Ok(id)
         })
@@ -3384,6 +3444,7 @@ impl Txn<'_> {
                     entries: Vec::new(),
                     edges: Vec::new(),
                     warnings: Warnings::default(),
+                    schema: Vec::new(),
                 });
             }
             // A stored retract never needs an edge: it requires a stored
@@ -3396,6 +3457,7 @@ impl Txn<'_> {
                 entries: Vec::new(),
                 edges: Vec::new(),
                 warnings: Warnings::default(),
+                schema: Vec::new(),
             })
         })
     }
@@ -3420,6 +3482,9 @@ impl Txn<'_> {
                 value: current_value,
             } = txn.world.correction_target(entry)?;
             let attr = txn.world.attributes[current.attr.0 as usize].name.clone();
+            if txn.world.attributes[current.attr.0 as usize].deprecated {
+                return Err(Error::DeprecatedAttribute(attr));
+            }
             // Judged against the committed chain: if this transaction already
             // corrected it, that state is stale, so refuse before anything
             // else (a "no-op" against stale state could be a real change).
@@ -3540,6 +3605,7 @@ impl Txn<'_> {
                 self.world
                     .prepare_edge(&self.ids, fact.entity, fact.attr, target)?
         {
+            self.order.push(OrderedEntry::Edge(self.ids.edges.len()));
             self.ids.push_edge(edge);
         }
         Ok(())
@@ -3558,6 +3624,7 @@ impl Txn<'_> {
         }
         let k = key::e_fact_key(fact.entity, fact.attr, fact.key_value(), fact.tick, self.tx);
         self.staged.insert(k, mark);
+        self.order.push(OrderedEntry::Fact(self.entries.len()));
         self.entries.push(entry);
     }
 
@@ -3569,9 +3636,8 @@ impl Txn<'_> {
     /// advance it. Fails with [`Error::TransactionAborted`], applying
     /// nothing, if a write in the transaction failed.
     ///
-    /// In a file-backed world the transaction is appended to the log (entity
-    /// and edge `DEFINE`s, then facts, `DELETED` markers and revised facts in write order,
-    /// then `COMMIT`) in one write and
+    /// In a file-backed world entries are appended in operation order, with
+    /// every ID defined before use and the `COMMIT` last, in one write and
     /// fsynced, and only then applied in memory. If that fails, the commit
     /// returns [`Error::Io`], nothing is applied, and the world refuses
     /// further writes.
@@ -3593,145 +3659,151 @@ impl Txn<'_> {
 
     /// The body of [`Txn::commit`]; `warn` selects whether the overlap
     /// warnings diff is computed. Nothing else depends on it.
-    fn commit_with(self, warn: bool) -> Result<CommitResult, Error> {
+    fn commit_with(mut self, warn: bool) -> Result<CommitResult, Error> {
         if self.poisoned {
             return Err(Error::TransactionAborted);
         }
-        let world = self.world;
-        // Before anything else, an empty transaction included: a read-only
-        // world or an unacknowledged recovery refuses every write.
-        world.accepts_writes()?;
-        let changed = self.entries.len();
-        if changed == 0 && self.ids.is_empty() {
+        self.world.accepts_writes()?;
+        if self.order.is_empty() {
             return Ok(CommitResult {
-                tx: world.latest_tx,
+                tx: self.world.latest_tx,
                 changed: 0,
                 entries: Vec::new(),
                 edges: Vec::new(),
                 warnings: Warnings::default(),
+                schema: Vec::new(),
             });
         }
-        // The overlaps of everything the transaction touches, before it
-        // lands: half of the warnings diff. Read before the append, so a
-        // failed append has nothing to undo.
-        let (touched, before) = if warn {
-            let touched =
-                world.touched_side_values(self.entries.iter().map(|e| e.key_and_mark().0));
-            let before = world.overlaps_of_sides(&touched);
-            (touched, before)
+        let encoded = self.encode_ordered()?;
+        let schema_changed = self.schema_before.is_some();
+        if let Some(before) = self.schema_before.take() {
+            before.restore(self.world);
+        }
+        let touched = if warn && !schema_changed {
+            self.world
+                .touched_side_values(self.entries.iter().map(|e| e.key_and_mark().0))
         } else {
-            (Vec::new(), Vec::new())
+            Vec::new()
         };
-        // Entity DEFINEs, then edge DEFINEs (whose endpoints may be new
-        // entities), precede every fact, so no fact uses an ID before the
-        // log defines it. Both kinds of world encode the transaction, so
-        // they number (and checksum) its entries alike.
-        let entities = self.ids.defs.iter().map(|d| NewEntry::Entity {
-            id: d.id,
-            handle: d.handle.as_deref(),
-        });
-        let edges = self.ids.edges.iter().map(|d| NewEntry::Edge {
-            id: d.id,
-            source: d.source,
-            attr: d.attr,
-            target: d.target,
-        });
-        let facts = self.entries.iter().map(|e| match e {
-            Staged::Revised { of, rev, fact: f } => NewEntry::Revised {
-                of: *of,
-                rev: *rev,
-                entity: f.entity,
-                attr: f.attr,
-                value: &f.value,
-                tick: f.tick,
-                op: f.op,
-                precision: f.precision,
-            },
-            Staged::Fact(f) => NewEntry::Fact {
-                entity: f.entity,
-                attr: f.attr,
-                value: &f.value,
-                tick: f.tick,
-                op: f.op,
-                precision: f.precision,
-            },
-            Staged::Deleted { of, rev, fact: f } => NewEntry::Deleted {
-                of: *of,
-                rev: *rev,
-                entity: f.entity,
-                attr: f.attr,
-                value: &f.value,
-                tick: f.tick,
-            },
-        });
-        let encoded = log::encode_txn(
-            world.next_entry(),
-            self.tx,
-            entities.chain(edges).chain(facts),
-        )?;
-        // Write-ahead: the transaction is durable in the log before anything
-        // in memory changes, so a failed append leaves the world as it was.
-        if let Some(log) = world.log.as_mut() {
+        let old_names = if schema_changed {
+            self.world.attr_by_name.clone()
+        } else {
+            HashMap::new()
+        };
+        let mut before = if !warn {
+            Vec::new()
+        } else if schema_changed {
+            vec![self.world.all_overlaps()]
+        } else {
+            self.world.overlaps_of_sides(&touched)
+        };
+        if let Some(log) = self.world.log.as_mut() {
             log.append(&encoded)?;
         }
-        for def in self.ids.defs {
-            world.apply_entity(def, self.tx);
-        }
+        let mut entries = Vec::new();
         let edges = self.ids.edges.iter().map(|d| d.id).collect();
-        for def in self.ids.edges {
-            world.apply_edge(def, self.tx);
-        }
-        // The staged index holds exactly these entries' E keys (it exists so
-        // judging can see them); applying them rewrites those keys and adds
-        // their R mirrors through the same path as replay.
-        // The staged entries are exactly the encoded Fact / Deleted / Revised
-        // entries, in the same order: that gives each its entry ID.
-        let entries: Vec<EntryId> = encoded
-            .entries
-            .iter()
-            .filter(|e| {
-                matches!(
-                    e.body,
-                    EntryBody::Fact { .. } | EntryBody::Deleted { .. } | EntryBody::Revised { .. }
-                )
-            })
-            .map(|e| e.id)
-            .collect();
-        for (entry, id) in self.entries.iter().zip(&entries) {
-            let (fact, mark) = entry.key_and_mark();
-            world.index_entry(fact, mark, self.tx);
-            match entry {
-                Staged::Fact(_) => {}
-                Staged::Deleted { of, rev, .. } => {
-                    let chain = Chain {
-                        rev: *rev,
-                        current: None,
-                    };
-                    world.chains.insert(*of, chain);
+        let mut migrating = false;
+        for (ordered, logged) in self.order.iter().zip(&encoded.entries) {
+            match ordered {
+                OrderedEntry::Schema(SchemaEdit::Migration { .. }) => {
+                    migrating = true;
                 }
-                Staged::Revised { of, rev, .. } => {
-                    let chain = Chain {
-                        rev: *rev,
-                        current: Some(*id),
-                    };
-                    world.chains.insert(*of, chain);
+                OrderedEntry::Schema(edit) => {
+                    self.world
+                        .apply_schema_edit(edit, self.tx, migrating)
+                        .expect("invariant: staged schema edit was validated in operation order");
+                }
+                OrderedEntry::Entity(i) => {
+                    let d = &self.ids.defs[*i];
+                    self.world.apply_entity(
+                        EntityDef {
+                            id: d.id,
+                            handle: d.handle.clone(),
+                        },
+                        self.tx,
+                    );
+                }
+                OrderedEntry::Edge(i) => {
+                    let d = &self.ids.edges[*i];
+                    self.world.apply_edge(
+                        EdgeDef {
+                            id: d.id,
+                            source: d.source,
+                            attr: d.attr,
+                            target: d.target,
+                        },
+                        self.tx,
+                    );
+                }
+                OrderedEntry::Fact(i) => {
+                    let entry = &self.entries[*i];
+                    let (fact, mark) = entry.key_and_mark();
+                    self.world.index_entry(fact, mark, self.tx);
+                    match entry {
+                        Staged::Fact(_) => {}
+                        Staged::Deleted { of, rev, .. } => {
+                            self.world.chains.insert(
+                                *of,
+                                Chain {
+                                    rev: *rev,
+                                    current: None,
+                                },
+                            );
+                        }
+                        Staged::Revised { of, rev, .. } => {
+                            self.world.chains.insert(
+                                *of,
+                                Chain {
+                                    rev: *rev,
+                                    current: Some(logged.id),
+                                },
+                            );
+                        }
+                    }
+                    entries.push(logged.id);
                 }
             }
         }
-        world.latest_tx = self.tx;
-        world.record(encoded.entries, self.tx);
-        let warnings = if warn {
-            let after = world.overlaps_of_sides(&touched);
+        self.world.latest_tx = self.tx;
+        self.world.record(encoded.entries, self.tx);
+        if !self.schema_changes.is_empty() && self.world.log.is_some() {
+            eprintln!(
+                "event=schema_committed tx={} schema_changes={} fact_entries={}",
+                self.tx.0,
+                self.schema_changes.len(),
+                entries.len()
+            );
+        }
+        let after = if !warn {
+            Vec::new()
+        } else if schema_changed {
+            vec![self.world.all_overlaps()]
+        } else {
+            self.world.overlaps_of_sides(&touched)
+        };
+        let warnings = if warn && schema_changed {
+            for overlap in before.iter_mut().flatten() {
+                if let Some(id) = old_names.get(&overlap.attr) {
+                    overlap.attr = self
+                        .world
+                        .attr_name(*id)
+                        .unwrap_or(&overlap.attr)
+                        .to_owned();
+                }
+            }
+            schema_ops::schema_warnings(before, after)
+        } else if warn {
             overlap_diff(before, after)
         } else {
             Warnings::default()
         };
         Ok(CommitResult {
             tx: self.tx,
-            changed,
+            changed: self.entries.len() + self.schema_changes.len(),
             entries,
             edges,
             warnings,
+            schema: std::mem::take(&mut self.schema_changes),
         })
     }
 }
@@ -4123,6 +4195,9 @@ impl<'w> View<'w> {
             .get(node_type)
             .ok_or_else(|| Error::UnknownNodeType(node_type.to_owned()))?;
         let canon = self.canon;
+        if world.node_origins[usize::from(type_id.0)][0].0 > canon {
+            return Err(Error::UnknownNodeType(node_type.into()));
+        }
         let defined_in = &world.node_types[usize::from(type_id.0)].defined_in;
         // Entities are defined in tx order, so those visible at the canon
         // are a prefix of the type's sequences.
@@ -4174,7 +4249,7 @@ impl View<'_> {
         if !self.id_visible(entity) {
             return Err(Error::UnknownEntity(entity));
         }
-        Ok(resolved)
+        Ok((resolved.0, self.require_definition(resolved.0)?))
     }
 
     /// Whether the edge with ID `id` was defined at this view's canon (its
@@ -4381,9 +4456,11 @@ impl View<'_> {
     /// Fails with [`Error::UnknownAttribute`] for a name that is neither an
     /// attribute nor an inverse name.
     pub fn attr_scan(&self, attr: &str, t: Tick) -> Result<Vec<(EntityId, Value)>, Error> {
+        self.resolve_attribute(attr)?;
         let world = self.world;
         let mut out = Vec::new();
         if let Some(&attr_id) = world.attr_by_name.get(attr) {
+            self.require_definition(attr_id)?;
             // IDs ascend and each entity's values come sorted, so `out` is
             // sorted and duplicate-free as built.
             for id in world.defined_ids() {
@@ -4400,6 +4477,10 @@ impl View<'_> {
             .inverse_by_name
             .get(attr)
             .ok_or_else(|| Error::UnknownAttribute(attr.to_owned()))?;
+        self.require_definition(attr_id)?;
+        if self.require_definition(attr_id)?.inverse.as_deref() != Some(attr) {
+            return Err(Error::UnknownAttribute(attr.into()));
+        }
         // Inverse names belong to directed attributes only, so each stored
         // pair `source -> id` is read once, from `R|id|attr|`.
         for id in world.defined_ids() {
@@ -4564,7 +4645,7 @@ impl View<'_> {
             .attr_by_name
             .get(attr)
             .ok_or_else(|| Error::UnknownAttribute(attr.to_owned()))?;
-        let def = &world.attributes[attr_id.0 as usize];
+        let def = self.require_definition(attr_id)?;
         if def.value_type != ValueType::Ref && !def.indexed {
             return Err(Error::NotIndexed(attr.to_owned()));
         }
@@ -4628,7 +4709,7 @@ impl View<'_> {
             .attr_by_name
             .get(attr)
             .ok_or_else(|| Error::UnknownAttribute(attr.to_owned()))?;
-        let def = &world.attributes[attr_id.0 as usize];
+        let def = self.require_definition(attr_id)?;
         if !def.indexed {
             return Err(Error::NotIndexed(attr.to_owned()));
         }
@@ -4899,11 +4980,13 @@ impl View<'_> {
         t: Tick,
     ) -> Result<Vec<(EntityId, EdgeId)>, Error> {
         let world = self.world;
+        self.resolve_attribute(attr)?;
         let (attr_id, dir) = world.resolve_neighbor_attr(attr, dir)?;
+        self.require_definition(attr_id)?;
         if !self.id_visible(entity) {
             return Err(Error::UnknownEntity(entity));
         }
-        if world.attributes[attr_id.0 as usize].value_type != ValueType::Ref {
+        if self.require_definition(attr_id)?.value_type != ValueType::Ref {
             return Err(Error::NotARef(attr.to_owned()));
         }
         // A bidirectional pair is stored once, under its normalised
@@ -4974,6 +5057,7 @@ impl View<'_> {
     /// [`View::attr_scan`]. Fails with [`Error::UnknownAttribute`] for a
     /// name that is neither an attribute nor an inverse name.
     pub fn history_scan(&self, attr: &str) -> Result<Vec<(EntityId, Change)>, Error> {
+        self.resolve_attribute(attr)?;
         let world = self.world;
         let (attr_id, inverse) = match world.attr_by_name.get(attr) {
             Some(&id) => (id, false),
@@ -4985,6 +5069,10 @@ impl View<'_> {
                 true,
             ),
         };
+        let def = self.require_definition(attr_id)?;
+        if inverse && def.inverse.as_deref() != Some(attr) {
+            return Err(Error::UnknownAttribute(attr.into()));
+        }
         let mut out = Vec::new();
         for id in world.defined_ids() {
             if !self.work.id() {
@@ -5122,6 +5210,7 @@ impl View<'_> {
             .attr_by_name
             .get(attr)
             .ok_or_else(|| Error::UnknownAttribute(attr.to_owned()))?;
+        self.require_definition(attr_id)?;
         let mut out = Vec::new();
         if !self.is_checked(attr_id, Side::Forward) && !self.is_checked(attr_id, Side::Reverse) {
             return Ok(out);
@@ -5140,7 +5229,9 @@ impl View<'_> {
     /// Whether `side` of `attr` is labelled cardinality one on a state
     /// attribute, i.e. has overlaps to check.
     fn is_checked(&self, attr: AttrId, side: Side) -> bool {
-        let def = &self.world.attributes[attr.0 as usize];
+        let Some(def) = self.definition(attr) else {
+            return false;
+        };
         def.kind == Kind::State
             && match side {
                 Side::Forward => def.cardinality == Cardinality::One,
@@ -5242,8 +5333,11 @@ impl View<'_> {
             }
         }
         let mut out = Vec::new();
-        for (i, def) in world.attributes.iter().enumerate() {
+        for (i, _) in world.attributes.iter().enumerate() {
             let attr = AttrId(i as u32);
+            let Some(def) = self.definition(attr) else {
+                continue;
+            };
             let overlaps = self
                 .overlaps(&def.name)
                 .expect("invariant: every schema attribute is known by its name");
@@ -5253,7 +5347,13 @@ impl View<'_> {
                     .get(&(o.entity, attr, o.side))
                     .copied()
                     .unwrap_or(self.canon);
-                (tx, o)
+                let history = &world.attribute_history[attr.0 as usize];
+                let schema_tx = history
+                    .iter()
+                    .rev()
+                    .find(|(tx, _)| *tx <= self.canon)
+                    .map_or(TxId(0), |(tx, _)| *tx);
+                (tx.max(schema_tx), o)
             }));
         }
         out
@@ -5594,6 +5694,7 @@ fn written(changed: usize, tick: Tick) -> WriteResult {
         entries: Vec::new(),
         edges: Vec::new(),
         warnings: Warnings::default(),
+        schema: Vec::new(),
     }
 }
 

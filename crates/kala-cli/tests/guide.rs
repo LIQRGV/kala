@@ -201,3 +201,81 @@ fn guide_load_scene_repl_correct_old_canon_and_doctor_work() {
     let doctor_json: Json = f.json("doctor", &[]);
     assert!(doctor_json["errors"].as_array().unwrap().is_empty());
 }
+
+#[test]
+fn guide_changing_schema_infers_renames_previews_and_migrates() {
+    let prose = normalized(&guide());
+    for command in [
+        "kala transact varrow.kala age.edn",
+        "kala transact varrow.kala rename-age.edn",
+        "kala transact varrow.kala migrate-age.edn --dry-run",
+        "kala transact varrow.kala migrate-age.edn",
+        "kala schema varrow.kala",
+        "kala schema varrow.kala --canon tx#12",
+        "kala asof varrow.kala edwin years --at 0",
+        "kala asof varrow.kala edwin years@old --at 0",
+    ] {
+        assert!(prose.contains(command), "guide command missing: {command}");
+    }
+    const AGE: &str = "[:assert :edwin :age 42 :at 0]";
+    const RENAME: &str = "[:rename :age :years]";
+    const MIGRATE: &str = "[:migrate :years :string]";
+    for form in [AGE, RENAME, MIGRATE] {
+        assert!(prose.contains(form), "guide form missing: {form}");
+    }
+    let f = fixture_through_cli();
+    for (file, source, expected) in [
+        ("age.edn", AGE, "declared :age as i64 (inferred)"),
+        ("rename-age.edn", RENAME, "renamed :age to :years"),
+    ] {
+        let input = f.dir.path().join(file);
+        fs::write(&input, source).unwrap();
+        let o = f.run("transact", &[input.to_str().unwrap()]);
+        assert_eq!(code(&o), 0, "{source}: {}", stderr(&o));
+        assert!(stdout(&o).contains(expected), "{}", stdout(&o));
+    }
+    let input = f.dir.path().join("migrate-age.edn");
+    fs::write(&input, MIGRATE).unwrap();
+    let before = fs::read(&f.path).unwrap();
+    let preview = f.run("transact", &[input.to_str().unwrap(), "--dry-run"]);
+    assert_eq!(code(&preview), 0, "{}", stderr(&preview));
+    assert!(
+        stdout(&preview).contains("1 change points copied"),
+        "{}",
+        stdout(&preview)
+    );
+    assert_eq!(fs::read(&f.path).unwrap(), before);
+    let applied = f.run("transact", &[input.to_str().unwrap()]);
+    assert_eq!(code(&applied), 0, "{}", stderr(&applied));
+    assert!(
+        stdout(&applied).contains("1 change points copied"),
+        "{}",
+        stdout(&applied)
+    );
+    let schema = f.run("schema", &[]);
+    assert_eq!(code(&schema), 0, "{}", stderr(&schema));
+    assert!(stdout(&schema).contains("years@old"), "{}", stdout(&schema));
+    let old_schema = f.run("schema", &["--canon", "tx#12"]);
+    assert_eq!(code(&old_schema), 0, "{}", stderr(&old_schema));
+    assert!(
+        !stdout(&old_schema).contains("years"),
+        "{}",
+        stdout(&old_schema)
+    );
+    let current = f.run("asof", &["edwin", "years", "--at", "0"]);
+    assert_eq!(code(&current), 0, "{}", stderr(&current));
+    assert!(
+        stdout(&current).contains("years = \"42\""),
+        "{}",
+        stdout(&current)
+    );
+    let old = f.run("asof", &["edwin", "years@old", "--at", "0"]);
+    assert_eq!(code(&old), 0, "{}", stderr(&old));
+    assert!(stdout(&old).contains("years@old = 42"), "{}", stdout(&old));
+    assert!(
+        f.json("doctor", &[])["errors"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}

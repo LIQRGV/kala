@@ -11,7 +11,7 @@
 //!   id u32 | name str | value_type u8 | kind u8 | cardinality u8 | indexed u8
 //!   | reverse_cardinality u8 (0 none, 1 one, 2 many)
 //!   | direction u8 (0 none, 1 directed, 2 bidirectional)
-//!   | has_inverse u8 | [inverse str]
+//!   | has_inverse u8 | [inverse str] | inferred u8 | deprecated u8
 //! `neighbors` / `edge_id` (items 3 and 6) are not tested here.
 mod common;
 
@@ -507,6 +507,7 @@ fn attr_body_rc(
             b.extend_from_slice(i.as_bytes());
         }
     }
+    b.extend_from_slice(&[0, 0]); // declared, not deprecated
     b
 }
 
@@ -545,8 +546,8 @@ fn define_attr_body_follows_the_documented_layout() {
 
 #[test]
 fn reopen_rs_body_define_attr_helper_matches_the_current_layout() {
-    // tests/reopen.rs writes `[2, 0, 1, 1, 0, 0, 0]` after the name: i64, state,
-    // many, indexed, reverse none, direction none, no inverse. That is exactly the layout.
+    // tests/reopen.rs writes these flags after the name: i64, state,
+    // many, indexed, reverse none, direction none, no inverse, declared, not deprecated.
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("w.kala");
     let s = base().attribute(AttrDef::new(
@@ -683,7 +684,8 @@ fn replay_unknown_direction_byte_is_corrupt_for_open_and_read_log() {
 #[test]
 fn replay_bad_has_inverse_byte_is_corrupt_for_open_and_read_log() {
     let mut b = attr_body(0, "owns", 5, 0, 1, 1, 1, None);
-    *b.last_mut().unwrap() = 2;
+    let has_inverse = b.len() - 3;
+    b[has_inverse] = 2;
     assert_unparseable(&[b], "has_inverse = 2");
 }
 
@@ -706,6 +708,7 @@ fn replay_v1_shaped_define_attr_without_the_new_bytes_is_corrupt() {
 #[test]
 fn replay_has_inverse_without_the_inverse_string_or_with_trailing_bytes_is_corrupt() {
     let mut b = attr_body(0, "owns", 5, 0, 1, 1, 1, None);
+    b.truncate(b.len() - 2); // remove the format-5 flags after has_inverse
     *b.last_mut().unwrap() = 1; // claims an inverse, none follows
     assert_unparseable(&[b], "missing inverse str");
     let mut b = attr_body(0, "owns", 5, 0, 1, 1, 1, None);

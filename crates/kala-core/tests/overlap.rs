@@ -1524,6 +1524,7 @@ fn attr_body(
             b.extend_from_slice(i.as_bytes());
         }
     }
+    b.extend_from_slice(&[0, 0]); // declared, not deprecated
     b
 }
 

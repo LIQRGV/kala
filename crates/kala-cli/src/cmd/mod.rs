@@ -16,6 +16,7 @@ mod read;
 pub mod repl;
 mod repl_editor;
 mod repl_history;
+pub mod schema;
 pub mod serve;
 pub mod transact;
 pub mod user;
@@ -42,6 +43,7 @@ impl From<String> for Done {
 /// Runs a parsed command.
 pub fn dispatch(cmd: &Command) -> Result<Done, CliError> {
     let text = match cmd {
+        Command::Schema { world, canon, json } => schema::run(world, *canon, *json),
         Command::Serve {
             dir,
             listen,

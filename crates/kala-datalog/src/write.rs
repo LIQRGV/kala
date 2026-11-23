@@ -4,7 +4,10 @@ use crate::error::{DatalogError, Span, show};
 use crate::lex::{Bracket, Lexer, Tok};
 use crate::parse::{Form, item, read_form};
 use crate::{MAX_QUERY_BYTES, MAX_WRITE_FORMS, MAX_WRITE_OPS};
-use kala_core::{EntryId, Op, Precision, Tick};
+use kala_core::{
+    AttrDef, Cardinality, EntryId, Kind, MigrationOptions, Op, Precision, RefDirection, Tick,
+    ValueType,
+};
 
 /// The first element of a form selects its language operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,7 +47,18 @@ pub fn form_kind(text: &str) -> Result<FormKind, DatalogError> {
             Tok::Keyword(k)
                 if matches!(
                     k.as_str(),
-                    "create" | "assert" | "retract" | "correct" | "at"
+                    "create"
+                        | "assert"
+                        | "retract"
+                        | "correct"
+                        | "at"
+                        | "attribute"
+                        | "node-type"
+                        | "rename"
+                        | "deprecate"
+                        | "cardinality"
+                        | "migrate"
+                        | "world-setting"
                 ) =>
             {
                 Ok(FormKind::Write)
@@ -257,6 +271,64 @@ fn operation(items: Vec<Form>, span: Span) -> Result<WriteOp, DatalogError> {
     let missing = || DatalogError::syntax(span, "missing parts of write operation");
     let (kind, ks) = keyword(it.next().ok_or_else(missing)?)?;
     match kind.as_str() {
+        "attribute" | "migrate" => {
+            let (name, _) = keyword(it.next().ok_or_else(missing)?)?;
+            let options = schema_options(it, kind == "migrate", span)?;
+            if kind == "migrate" {
+                return Ok(WriteOp::Migrate {
+                    name,
+                    options,
+                    span,
+                });
+            }
+            let ty = options
+                .value_type
+                .ok_or_else(|| DatalogError::syntax(span, ":attribute needs a value type"))?;
+            let mut def = AttrDef::new(
+                &name,
+                ty,
+                options.kind.unwrap_or(Kind::State),
+                options.cardinality.unwrap_or(Cardinality::One),
+            );
+            if let Some(v) = options.direction {
+                def.direction = Some(v);
+            }
+            if let Some(v) = options.indexed {
+                def.indexed = v;
+            }
+            def.inverse = options.inverse;
+            def.reverse_cardinality = options.reverse_cardinality;
+            Ok(WriteOp::Attribute { def, span })
+        }
+        "node-type" | "deprecate" | "rename" | "cardinality" | "world-setting" => {
+            let (name, _) = keyword(it.next().ok_or_else(missing)?)?;
+            let op = match kind.as_str() {
+                "node-type" => WriteOp::NodeType { name, span },
+                "deprecate" => WriteOp::Deprecate { name, span },
+                "rename" => WriteOp::Rename {
+                    old: name,
+                    new: keyword(it.next().ok_or_else(missing)?)?.0,
+                    span,
+                },
+                "cardinality" => WriteOp::Cardinality {
+                    name,
+                    cardinality: cardinality(it.next().ok_or_else(missing)?)?,
+                    span,
+                },
+                _ => WriteOp::WorldSetting {
+                    key: name,
+                    value: keyword(it.next().ok_or_else(missing)?)?.0,
+                    span,
+                },
+            };
+            if let Some(f) = it.next() {
+                return Err(DatalogError::syntax(
+                    f.span(),
+                    "too many arguments to schema operation",
+                ));
+            }
+            Ok(op)
+        }
         "create" => {
             let (node_type, _) = keyword(it.next().ok_or_else(missing)?)?;
             let (handle, _) = keyword(it.next().ok_or_else(missing)?)?;
@@ -379,6 +451,85 @@ fn options(
                 return Err(DatalogError::syntax(
                     s,
                     format!("unknown write option :{}", show(&k)),
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn cardinality(form: Form) -> Result<Cardinality, DatalogError> {
+    let (name, span) = keyword(form)?;
+    match name.as_str() {
+        "one" => Ok(Cardinality::One),
+        "many" => Ok(Cardinality::Many),
+        _ => Err(DatalogError::syntax(
+            span,
+            "cardinality must be :one or :many",
+        )),
+    }
+}
+fn schema_options(
+    mut it: impl Iterator<Item = Form>,
+    migrate: bool,
+    span: Span,
+) -> Result<MigrationOptions, DatalogError> {
+    let mut out = MigrationOptions::default();
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(form) = it.next() {
+        let (name, s) = keyword(form)?;
+        let category = match name.as_str() {
+            "string" | "i64" | "f64" | "bool" | "ref" => "type",
+            "one" | "many" => "cardinality",
+            "state" | "event" => "kind",
+            "directed" | "bidirectional" => "direction",
+            other => other,
+        };
+        if !seen.insert(category.to_owned()) {
+            return Err(DatalogError::syntax(
+                s,
+                format!("duplicate {category} option"),
+            ));
+        }
+        if !migrate && seen.len() == 1 && category != "type" {
+            return Err(DatalogError::syntax(
+                s,
+                "attribute type must follow its name",
+            ));
+        }
+        match name.as_str() {
+            "string" => out.value_type = Some(ValueType::Str),
+            "i64" => out.value_type = Some(ValueType::I64),
+            "f64" => out.value_type = Some(ValueType::F64),
+            "bool" => out.value_type = Some(ValueType::Bool),
+            "ref" => out.value_type = Some(ValueType::Ref),
+            "one" => out.cardinality = Some(Cardinality::One),
+            "many" => out.cardinality = Some(Cardinality::Many),
+            "state" => out.kind = Some(Kind::State),
+            "event" => out.kind = Some(Kind::Event),
+            "directed" => out.direction = Some(RefDirection::Directed),
+            "bidirectional" => out.direction = Some(RefDirection::Bidirectional),
+            "unindexed" => out.indexed = Some(false),
+            "inverse" => {
+                out.inverse = Some(
+                    keyword(
+                        it.next()
+                            .ok_or_else(|| DatalogError::syntax(span, ":inverse needs a name"))?,
+                    )?
+                    .0,
+                )
+            }
+            "reverse" => {
+                out.reverse_cardinality =
+                    Some(cardinality(it.next().ok_or_else(|| {
+                        DatalogError::syntax(span, ":reverse needs cardinality")
+                    })?)?)
+            }
+            "skip-unconvertible" if migrate => out.skip_unconvertible = true,
+            _ => {
+                return Err(DatalogError::syntax(
+                    s,
+                    format!("unknown schema option :{}", show(&name)),
                 ));
             }
         }

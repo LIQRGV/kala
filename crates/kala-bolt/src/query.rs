@@ -260,7 +260,7 @@ fn properties(
     budget: &mut Budget,
 ) -> Result<Map, Failure> {
     let mut props = BTreeMap::new();
-    for attr in view.world().attributes() {
+    for attr in view.attributes() {
         budget.step(meter)?;
         if attr.value_type == ValueType::Ref {
             continue;

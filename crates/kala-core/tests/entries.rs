@@ -239,9 +239,10 @@ fn txn_with_new_entity_and_edge_lists_only_fact_entries_in_log_order() {
         .unwrap();
     tx.assert(greg, "ally_of", Value::Ref(lisa), t(5)).unwrap();
     let c = tx.commit().unwrap();
-    // DefineEntity(lisa) = last+1, DefineEdge = last+2 (log order: entities,
-    // edges, then facts), Fact name = last+3, Fact ally_of = last+4, Commit = last+5.
-    assert_eq!(c.entries, vec![EntryId(last + 3), EntryId(last + 4)]);
+    // Format 5 follows operation order, defining each ID before its first use:
+    // DefineEntity(lisa) = last+1, Fact name = last+2, DefineEdge = last+3,
+    // Fact ally_of = last+4, Commit = last+5.
+    assert_eq!(c.entries, vec![EntryId(last + 2), EntryId(last + 4)]);
     let log = log_with_tx(&path);
     let facts_of_tx: Vec<EntryId> = log
         .iter()

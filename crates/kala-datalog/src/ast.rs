@@ -336,6 +336,38 @@ pub enum WriteValue {
 /// One write; validation of store rules is left to kala-core's transaction.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WriteOp {
+    Attribute {
+        def: kala_core::AttrDef,
+        span: Span,
+    },
+    NodeType {
+        name: String,
+        span: Span,
+    },
+    Rename {
+        old: String,
+        new: String,
+        span: Span,
+    },
+    Deprecate {
+        name: String,
+        span: Span,
+    },
+    Cardinality {
+        name: String,
+        cardinality: kala_core::Cardinality,
+        span: Span,
+    },
+    Migrate {
+        name: String,
+        options: kala_core::MigrationOptions,
+        span: Span,
+    },
+    WorldSetting {
+        key: String,
+        value: String,
+        span: Span,
+    },
     Create {
         node_type: String,
         handle: String,

@@ -20,6 +20,12 @@ pub enum WorkInterruptReason {
 /// Why a world operation failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
+    /// A schema change cannot preserve the meaning of the stored history.
+    Schema(String),
+    /// The name resolves, but the attribute did not exist at this canon.
+    AttributeNotDefined { name: String, canon: crate::TxId },
+    /// New writes to a deprecated attribute are forbidden.
+    DeprecatedAttribute(String),
     /// A bounded read stopped before producing an answer.
     WorkInterrupted {
         /// Whether the key bound or stop flag interrupted the read.
@@ -172,6 +178,18 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Error::Schema(message) => f.write_str(message),
+            Error::AttributeNotDefined { name, canon } => write!(
+                f,
+                "attribute {} is not defined at canon tx#{}",
+                Quoted(name),
+                canon.0
+            ),
+            Error::DeprecatedAttribute(name) => write!(
+                f,
+                "attribute {} is deprecated; new writes are refused",
+                Quoted(name)
+            ),
             Error::ExpectedScalarAttribute(name) => {
                 write!(f, "expected a non-ref attribute, got {}", Quoted(name))
             }
@@ -250,7 +268,13 @@ impl fmt::Display for Error {
             ),
             Error::Io { kind, message } => write!(f, "log I/O error ({kind:?}): {message}"),
             Error::BadMagic => f.write_str("not a Kala log file (bad magic number)"),
-            Error::UnsupportedVersion(v) => write!(f, "unsupported log format version {v}"),
+            Error::UnsupportedVersion(v) => {
+                write!(f, "unsupported log format version {v}")?;
+                if *v < crate::log::LOG_FORMAT_VERSION {
+                    f.write_str(": written by an older Kala; recreate this world")?;
+                }
+                Ok(())
+            }
             Error::Corrupt(why) => write!(f, "corrupt log: {why}"),
             Error::WorldLocked => f.write_str("world is open elsewhere (its log file is locked)"),
             Error::RecoveryRequired { bytes } => write!(

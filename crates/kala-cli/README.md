@@ -136,7 +136,7 @@ with `[:correct N :delete]` or `[:correct N :replace :at 830]`. Replacement also
 accepts `:value`, `:op` and `:precision`. A no-op prints 0 changed.
 
 `--json` prints one document per successful form, with fields `form`, `dry_run`,
-`tx`, `changed`, `entries`, `edges`, `ops` and `warnings`. Each op has `position`,
+`tx`, `changed`, `entries`, `edges`, `ops`, `schema` and `warnings`. Each op has `position`,
 `kind`, `tick`, `precision`, `changed`, `entries` and `entity` (null unless created).
 Entry IDs are integers; new edges are `edge#N` strings. Warnings have `introduced`
 and `resolved` arrays of the same messages as `kala load`. Errors stay on stderr.
@@ -226,3 +226,102 @@ backups because they retain old password hashes too.
 See [Bolt accounts and listen rules](../kala-bolt/README.md) for host precedence,
 database authorization and the explicit plaintext opt-in needed for a
 non-loopback listener. `--auth none` remains loopback-only.
+
+
+## Changing and inspecting the schema
+
+`kala schema WORLD [--canon tx#N] [--json]` reads without a writer lock. It lists
+node types, attributes and world settings at the requested canon (latest by
+default). Names always use the latest spelling, including at older canons.
+JSON fields are `command`, `canon`, `node_types`, `attributes`, and `settings`.
+Each node type has `name`, `inferred`, `first_tx`; each attribute has `name`,
+`type` (`string|i64|f64|bool|ref`), `kind`, `cardinality`, `direction` (or null),
+`inverse` (or null), `reverse_cardinality` (or null), `indexed`, `deprecated`,
+`inferred`, and `first_tx`. `settings` is a key/value object; `schema` defaults
+to `infer`. Definitions introduced after the requested canon are absent.
+
+Unknown attributes in assertions and unknown node types in creates declare
+themselves. Scalars infer their literal type, `state`, `one`, and indexed;
+entity values infer `ref`, `state`, `many`, directed and indexed. A report says
+`declared :age as i64 (inferred)` or `declared node type FACTION (inferred)`.
+Inference happens in operation order. A later wrong-type value aborts the whole
+transaction. An unknown retract in infer mode is `0 changed` and declares
+nothing; in strict mode it requires a declaration. Indexed strings are limited
+to 256 UTF-8 bytes; declare an unindexed string before writing a longer value.
+
+These forms work alone or inside a transaction vector, through `transact` and
+`repl --write`:
+
+```clojure
+[:attribute :title :string]
+[:attribute :biography :string :unindexed]
+[:attribute :parent_of :ref :many :directed :inverse :child_of :reverse :one]
+[:node-type :FACTION]
+[:world-setting :schema :strict]
+[:world-setting :schema :infer]
+[:rename :titel :title]
+[:deprecate :unused]
+[:cardinality :located_in :many]
+[:migrate :age :string]
+[:migrate :age :i64 :skip-unconvertible]
+```
+
+Attribute options are `:one|:many`, `:state|:event`, `:directed|:bidirectional`,
+`:unindexed`, `:inverse :NAME` and `:reverse :one|:many`. Defaults are state, one,
+indexed, and directed for refs; inverse/reverse options require a directed ref.
+Redeclaring an inferred definition makes it declared. Repeating an identical
+explicit definition or deprecation is a no-op. Cardinality labels can change
+with overlap warnings; doctor uses the label at its requested canon. Structural
+changes (type, kind, direction, indexing) in place require no fact entry ever
+having been logged for that attribute; otherwise use migration. Deprecated
+attributes reject assertions, retractions and corrections but remain readable.
+
+Renaming keeps the attribute ID: only the new name works at every canon, and the
+old name is immediately free. Names containing `@` are reserved for migration;
+`handle` (query pseudo-attribute) and `edge` (ID prefix) are reserved. Attribute
+and inverse names share a namespace. Node type renaming and inverse renaming
+are not supported.
+
+A migration accepts an optional type and the same options; omitted fields retain
+the old definition. It converts every change point of the latest canon, keeping
+its entity, tick, assert/retract operation and precision, including redundant
+assertions. It renames the source to `NAME@old` (then `@old2`, `@old3`, … if needed),
+deprecates it and gives the original name to a newly declared attribute. Old
+canons read the old data through `NAME@old`; the replacement `NAME` is not defined
+before the migration. The original attribute retains its correction trail.
+An inverse name transfers to the replacement attribute.
+
+| Conversion | Rule |
+| --- | --- |
+| i64 → f64 | Exact only for absolute values ≤ 2^53 |
+| f64 → i64 | Finite, integral and within the i64 range |
+| bool → i64 | false = 0; true = 1 |
+| i64 → bool | Only 0 and 1 |
+| Non-ref → string | Unquoted text as printed by `kala asof` |
+| string → i64/f64/bool | Exact text, no whitespace trimming; bool is `true` or `false`; NaN refused |
+| Unindexed → indexed string | Values over 256 UTF-8 bytes are unconvertible |
+| Same type | Values preserved; kind/direction/indexing may change |
+| ref ↔ non-ref | Refused |
+
+Distinct old values of one entity converting to one new value are collisions;
+all their change points are unconvertible. Without `:skip-unconvertible`, the
+whole migration fails with a count and examples. With it, those change points
+are skipped and counted. A state with any logged retract cannot become an event.
+Directed → bidirectional refuses pairs with histories in both directions.
+Bidirectional → directed copies both orientations (self-pairs once). Ref copies
+create new edge IDs and copy edge-property histories to the corresponding edges.
+A deprecated edge-property attribute still refuses copied writes.
+
+Use `kala transact WORLD FILE --dry-run` first: it reports the same schema actions
+and counts on a discarded copy. Migration reports include change points copied,
+edges created, edge-property facts copied and skipped change points. Each form's
+JSON `schema` array is ordered, with `kind` equal to `attribute`, `node_type`,
+`rename`, `deprecate`, `cardinality`, `world_setting` or `migrate`. Records include
+names/types and `inferred`; migration records add `from`, `to`, `change_points`,
+`edges`, `edge_properties`, `skipped`. `changed` counts fact/correction entries and
+reported schema actions; per-op `changed` still counts fact entries.
+
+This release writes **log format 5**. Format-4 and older worlds are refused with
+an older-Kala message and must be recreated from their source fixtures/scripts.
+There is no old-file migration before 1.0. `kala info` reports the format version;
+`kala log` includes schema revisions and world settings in operation order.

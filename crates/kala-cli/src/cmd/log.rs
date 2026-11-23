@@ -49,6 +49,9 @@ struct JFact {
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum JBody {
+    Schema {
+        change: String,
+    },
     DefineNodeType {
         id: u16,
         name: String,
@@ -133,6 +136,7 @@ fn precision_text(p: &str) -> String {
 
 fn body_text(b: &JBody) -> String {
     match b {
+        JBody::Schema { change } => format!("schema {}", escape::value(change)),
         JBody::DefineNodeType { id, name } => {
             format!("define node type {} (id {id})", escape::value(name))
         }
@@ -253,6 +257,9 @@ fn op_str(op: Op) -> &'static str {
 
 fn body(n: &World, b: &EntryBody) -> JBody {
     match b {
+        EntryBody::Schema(edit) => JBody::Schema {
+            change: format!("{edit:?}"),
+        },
         EntryBody::DefineNodeType { id, name } => JBody::DefineNodeType {
             id: id.0,
             name: name.clone(),

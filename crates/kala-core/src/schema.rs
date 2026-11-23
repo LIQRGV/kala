@@ -1,7 +1,4 @@
-//! The world schema, declared once at world creation.
-//!
-//! Create-time only (milestone 0): node types and attributes are fixed when
-//! the world is created. Schema changes as log entries come later.
+//! World schema definitions and append-only revisions, read at a canon.
 
 use crate::value::ValueType;
 
@@ -39,6 +36,10 @@ pub enum RefDirection {
 /// One attribute declaration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttrDef {
+    /// Whether this definition originated from schema-on-write.
+    pub inferred: bool,
+    /// Deprecated attributes remain readable but refuse new writes.
+    pub deprecated: bool,
     /// Exact (case-sensitive) attribute name.
     pub name: String,
     /// The one type every value of this attribute has.
@@ -73,6 +74,8 @@ impl AttrDef {
     /// neither has an inverse or a reverse cardinality.
     pub fn new(name: &str, value_type: ValueType, kind: Kind, cardinality: Cardinality) -> AttrDef {
         AttrDef {
+            inferred: false,
+            deprecated: false,
             name: name.to_owned(),
             value_type,
             kind,
@@ -166,4 +169,95 @@ impl Schema {
     pub(crate) fn attributes(&self) -> &[AttrDef] {
         &self.attributes
     }
+}
+
+/// One schema change reported by a committed transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SchemaChange {
+    /// A new or explicitly confirmed attribute definition.
+    Attribute {
+        name: String,
+        value_type: ValueType,
+        inferred: bool,
+    },
+    /// A new or explicitly confirmed node type.
+    NodeType { name: String, inferred: bool },
+    /// A name change, preserving the attribute ID.
+    Rename { old: String, new: String },
+    /// New writes to the attribute are forbidden.
+    Deprecate { name: String },
+    /// A cardinality label change.
+    Cardinality {
+        name: String,
+        from: Cardinality,
+        to: Cardinality,
+    },
+    /// A world setting, effective for the next operation.
+    Setting { key: String, value: String },
+    /// A copy-forward migration.
+    Migration {
+        name: String,
+        from: ValueType,
+        to: ValueType,
+        report: MigrationReport,
+    },
+}
+
+/// Options omitted from a migration keep the old definition's value.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MigrationOptions {
+    /// Replacement value type; omitted preserves the source type.
+    pub value_type: Option<ValueType>,
+    /// Replacement state/event kind.
+    pub kind: Option<Kind>,
+    /// Replacement forward cardinality label.
+    pub cardinality: Option<Cardinality>,
+    /// Replacement reference direction.
+    pub direction: Option<RefDirection>,
+    /// Whether the replacement has a value index.
+    pub indexed: Option<bool>,
+    /// Replacement inverse name; omitted preserves the source inverse.
+    pub inverse: Option<String>,
+    /// Replacement reverse cardinality label.
+    pub reverse_cardinality: Option<Cardinality>,
+    /// Skip and count unconvertible change points instead of aborting.
+    pub skip_unconvertible: bool,
+}
+
+/// Counts of history copied by a migration.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MigrationReport {
+    /// Copied source history points, counting both orientations when expanded.
+    pub change_points: usize,
+    /// New edges interned by the copy, including reference properties.
+    pub edges: usize,
+    /// Property history points copied onto the new edges.
+    pub edge_properties: usize,
+    /// Unconvertible or colliding source change points skipped.
+    pub skipped: usize,
+}
+
+/// The payload of a schema log entry. IDs are assigned consecutively; an
+/// existing attribute ID revises its definition, never its stored facts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SchemaEdit {
+    Attribute {
+        id: crate::AttrId,
+        def: AttrDef,
+    },
+    NodeType {
+        id: crate::NodeTypeId,
+        name: String,
+        inferred: bool,
+    },
+    Setting {
+        key: String,
+        value: String,
+    },
+    /// Announces a migration; replay regenerates and validates its exact copies.
+    Migration {
+        source: crate::AttrId,
+        def: AttrDef,
+        skip_unconvertible: bool,
+    },
 }

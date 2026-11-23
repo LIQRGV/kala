@@ -104,7 +104,13 @@ fn counts(bodies: impl Iterator<Item = EntryBody>) -> Counts {
             EntryBody::DefineEdge { .. } => c.edges += 1,
             EntryBody::Fact { .. } | EntryBody::Revised { .. } => c.facts += 1,
             EntryBody::Commit { .. } => c.transactions += 1,
-            EntryBody::Deleted { .. } => {}
+            EntryBody::Schema(kala_core::schema::SchemaEdit::Attribute { id, .. }) => {
+                c.attributes = c.attributes.max(id.0 as usize + 1)
+            }
+            EntryBody::Schema(kala_core::schema::SchemaEdit::NodeType { id, .. }) => {
+                c.node_types = c.node_types.max(usize::from(id.0) + 1)
+            }
+            EntryBody::Deleted { .. } | EntryBody::Schema(_) => {}
         }
     }
     c

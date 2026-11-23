@@ -177,8 +177,11 @@ pub struct Labeler<'w> {
 
 impl<'w> Labeler<'w> {
     pub fn new(world: &'w World, canon: TxId, tick: Tick) -> Labeler<'w> {
-        let has_name =
-            world.attribute("name").map(|a| a.value_type) == Some(kala_core::ValueType::Str);
+        let has_name = world
+            .at_canon(canon)
+            .attribute("name")
+            .map(|a| a.value_type)
+            == Some(kala_core::ValueType::Str);
         Labeler {
             world,
             view: world.at_canon(canon),
@@ -247,7 +250,7 @@ impl<'w> Labeler<'w> {
     /// Every schema attribute (schema order) holding at least one value.
     pub fn attributes(&self, entity: EntityId) -> Result<Vec<JAttr>, kala_core::Error> {
         let mut out = Vec::new();
-        for a in self.world.attributes() {
+        for a in self.view.attributes() {
             let j = self.attr(entity, &a.name)?;
             if !j.values.is_empty() {
                 out.push(j);

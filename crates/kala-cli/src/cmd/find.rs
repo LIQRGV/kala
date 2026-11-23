@@ -67,11 +67,7 @@ pub fn run(
         let ids = view.lookup_ci(attr, value, tick).map_err(core_err)?;
         (Value::Str(value.to_string()), ids)
     } else {
-        let ty = ctx
-            .world
-            .attribute(attr)
-            .map(|a| a.value_type)
-            .ok_or_else(|| core_err(kala_core::Error::UnknownAttribute(attr.to_string())))?;
+        let ty = view.require_attribute(attr).map_err(core_err)?.value_type;
         let v = parse_value(
             &ctx,
             ty,

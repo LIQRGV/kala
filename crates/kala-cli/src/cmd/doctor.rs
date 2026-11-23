@@ -419,6 +419,7 @@ fn kind(f: &Finding) -> &'static str {
         Finding::BadCorrection { .. } => "bad_correction",
         Finding::RevisionSkip { .. } => "revision_skip",
         Finding::InvalidEntry { .. } => "invalid_entry",
+        Finding::SchemaMismatch => "schema_mismatch",
         Finding::IndexMismatch { .. } => "index_mismatch",
         Finding::IndexDecode { .. } => "index_decode",
         Finding::LogUnreadable { .. } => "log_unreadable",
@@ -477,6 +478,7 @@ fn message(n: &dyn Names, f: &Finding) -> String {
         Finding::InvalidEntry { entry, reason: r } => {
             format!("entry#{}: {}", entry.0, reason(r))
         }
+        Finding::SchemaMismatch => "derived schema does not match the log".to_owned(),
         Finding::IndexMismatch { index, detail } => {
             format!("index {}: {}", index_name(*index), reason(detail))
         }

@@ -67,6 +67,14 @@ fn parse_param(s: &str) -> Result<(String, String), String> {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Show schema definitions and settings at a canon.
+    Schema {
+        world: PathBuf,
+        #[arg(long, value_name="C", value_parser=parse_canon)]
+        canon: Option<Canon>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Serve read-only Datalog queries over Bolt 5 with account authentication.
     Serve {
         /// Directory containing <database>.kala world files.

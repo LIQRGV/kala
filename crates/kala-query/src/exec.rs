@@ -398,6 +398,7 @@ fn execute_inner(
     let prog = compile(
         &plan.root,
         world,
+        view.canon(),
         params,
         default_tick,
         &mut slots,
@@ -1256,6 +1257,7 @@ struct Program {
 fn compile(
     root: &Op,
     world: &World,
+    canon: TxId,
     params: &Params,
     default_tick: Tick,
     slots: &mut Slots,
@@ -1264,6 +1266,7 @@ fn compile(
     let walk = post_order(root);
     let mut c = Compiler {
         world,
+        canon,
         params,
         default_tick,
         slots,
@@ -1329,6 +1332,7 @@ struct FixScope {
 /// open `Union`s and `Fixpoint`s, and every relation seen so far.
 struct Compiler<'c> {
     world: &'c World,
+    canon: TxId,
     params: &'c Params,
     default_tick: Tick,
     slots: &'c mut Slots,
@@ -1652,7 +1656,7 @@ impl Compiler<'_> {
                                 "handle access is only for :handle, not :{name}"
                             )));
                         }
-                        let a = resolve_attr(world, name)?;
+                        let a = resolve_attr(world, self.canon, name)?;
                         let t = a.value_type;
                         (Some(a), t)
                     }
@@ -1810,7 +1814,7 @@ impl Compiler<'_> {
                 ..
             } => {
                 let mut bound = pop(stack);
-                let attr = resolve_attr(world, attr)?;
+                let attr = resolve_attr(world, self.canon, attr)?;
                 let e = entity_pos(entity, params, slots, &bound, "entity")?;
                 let v = value_pos(value, attr.value_type, params, interner, slots, &bound)?;
                 let t = tick_term_pos(tick, params, slots, &bound)?;
@@ -1859,7 +1863,7 @@ impl Compiler<'_> {
                 ..
             } => {
                 let mut bound = pop(stack);
-                let attr = resolve_attr(world, attr)?;
+                let attr = resolve_attr(world, self.canon, attr)?;
                 let e = entity_pos(entity, params, slots, &bound, "entity")?;
                 let v = value_pos(value, attr.value_type, params, interner, slots, &bound)?;
                 let o = var_pos(out, slots, &bound);
@@ -2058,31 +2062,15 @@ fn bind_free(bound: &mut BTreeSet<usize>, e: &Pos, v: &Pos) {
     }
 }
 
-fn resolve_attr(world: &World, name: &str) -> Result<Attr, QueryError> {
-    if let Some(def) = world.attribute(name) {
-        return Ok(Attr {
-            name: name.to_owned(),
-            value_type: def.value_type,
-            inverse: false,
-            indexed: def.indexed,
-            base: name.to_owned(),
-        });
-    }
-    match world
-        .attributes()
-        .find(|d| d.inverse.as_deref() == Some(name))
-    {
-        Some(def) => Ok(Attr {
-            name: name.to_owned(),
-            value_type: ValueType::Ref,
-            inverse: true,
-            indexed: def.indexed,
-            base: def.name.clone(),
-        }),
-        None => Err(QueryError::Core(CoreError::UnknownAttribute(
-            name.to_owned(),
-        ))),
-    }
+fn resolve_attr(world: &World, canon: TxId, name: &str) -> Result<Attr, QueryError> {
+    let (def, inverse) = world.at_canon(canon).resolve_attribute(name)?;
+    Ok(Attr {
+        name: name.into(),
+        value_type: def.value_type,
+        inverse,
+        indexed: def.indexed,
+        base: def.name.clone(),
+    })
 }
 
 /// Whether `access` can serve a read with these positions bound.
