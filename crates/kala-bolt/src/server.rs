@@ -1,7 +1,7 @@
 //! Loopback listener, bounded connection threads and cooperative shutdown.
 use crate::{
-    auth::{Authenticator, NoAuth},
-    registry::Registry,
+    auth::{Accounts, Authenticator, NoAuth, Plugin},
+    registry::{Registry, SystemDb},
     session,
 };
 use std::io;
@@ -17,10 +17,12 @@ use std::time::Duration;
 /// Listener settings. All durations and bounds must be nonzero.
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
-    /// Loopback endpoint; port zero asks the OS for a free port.
+    /// Listen endpoint; port zero asks the OS for a free port.
     pub listen: SocketAddr,
     /// Default world name; inferred when exactly one world is registered.
     pub default_db: Option<String>,
+    /// Explicitly permit unencrypted account authentication on a non-loopback listener.
+    pub insecure_allow_plaintext: bool,
     /// Most simultaneously active client threads.
     pub max_connections: usize,
     /// Deadline for the whole 20-byte handshake.
@@ -39,6 +41,7 @@ impl Default for ServerConfig {
         Self {
             listen: SocketAddr::from(([127, 0, 0, 1], 7687)),
             default_db: None,
+            insecure_allow_plaintext: false,
             max_connections: 64,
             handshake_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(600),
@@ -48,7 +51,7 @@ impl Default for ServerConfig {
         }
     }
 }
-/// A bound server; constructing it starts no threads and writes no worlds.
+/// A bound server; account authentication bootstraps the system world if absent.
 pub struct Server {
     listener: TcpListener,
     config: ServerConfig,
@@ -61,21 +64,64 @@ struct Client {
 }
 impl Server {
     /// Bind a loopback-only, no-auth server and discover its databases.
+    /// Never creates, opens or reads `system.kala`, and never serves the
+    /// `system` database; writes nothing to `directory`.
     pub fn bind(directory: impl AsRef<Path>, config: ServerConfig) -> io::Result<Self> {
-        Self::bind_with_auth(directory, config, Arc::new(NoAuth))
+        Self::require_loopback(&config)?;
+        Self::bind_inner(directory.as_ref(), config, Arc::new(NoAuth), SystemDb::Skip)
     }
-    /// Supply an authenticator. Listening remains loopback-only in this slice.
+    /// Bind with persisted accounts, bootstrapping root@localhost when needed.
+    pub fn bind_accounts(directory: impl AsRef<Path>, config: ServerConfig) -> io::Result<Self> {
+        if !config.listen.ip().is_loopback() && !config.insecure_allow_plaintext {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "accounts require a loopback listen address unless --insecure-allow-plaintext is given",
+            ));
+        }
+        if config.insecure_allow_plaintext {
+            eprintln!(
+                "kala serve: WARNING: passwords travel unencrypted; --insecure-allow-plaintext is enabled"
+            );
+        }
+        let directory = directory.as_ref();
+        if crate::system::ensure(directory).map_err(io::Error::other)? {
+            eprintln!("kala serve: created system.kala with root@localhost");
+        }
+        for account in crate::system::list(directory).map_err(io::Error::other)? {
+            if account.plugin == Plugin::Trust {
+                eprintln!(
+                    "kala serve: account {}@{} uses trust (no password)",
+                    account.user, account.host
+                );
+            }
+        }
+        let auth = Accounts::open(directory).map_err(io::Error::other)?;
+        Self::bind_inner(directory, config, Arc::new(auth), SystemDb::Serve)
+    }
+    /// Supply an authenticator on a loopback-only listener.
     pub fn bind_with_auth(
         directory: impl AsRef<Path>,
         config: ServerConfig,
         auth: Arc<dyn Authenticator>,
     ) -> io::Result<Self> {
+        Self::require_loopback(&config)?;
+        Self::bind_inner(directory.as_ref(), config, auth, SystemDb::Serve)
+    }
+    fn require_loopback(config: &ServerConfig) -> io::Result<()> {
         if !config.listen.ip().is_loopback() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "no-auth server requires a loopback listen address",
             ));
         }
+        Ok(())
+    }
+    fn bind_inner(
+        directory: &Path,
+        config: ServerConfig,
+        auth: Arc<dyn Authenticator>,
+        system: SystemDb,
+    ) -> io::Result<Self> {
         if config.max_connections == 0
             || config.max_message_bytes == 0
             || config.max_depth == 0
@@ -93,9 +139,14 @@ impl Server {
                 "invalid Bolt resource limits",
             ));
         }
+        // The server directory is never created, in any auth mode.
+        if !directory.is_dir() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "no such directory"));
+        }
         let registry = Arc::new(Registry::open(
-            directory.as_ref(),
+            directory,
             config.default_db.clone(),
+            system,
         )?);
         let listener = TcpListener::bind(config.listen)?;
         listener.set_nonblocking(true)?;

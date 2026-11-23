@@ -373,3 +373,77 @@ pub struct Or {
     pub branches: Vec<Not>,
     pub span: Span,
 }
+
+impl Query {
+    /// Every attribute the query text names, in no particular order and
+    /// possibly repeated: patterns in `:where`, inside `(at ..)`, history
+    /// patterns, `(during ..)`, `(not ..)`, `(or ..)` branches and every
+    /// `:rules` body, including rules no clause calls.
+    ///
+    /// For callers that refuse queries by attribute (before compiling, so a
+    /// refused query is never run). The attribute position is always a
+    /// constant keyword today; if a non-constant attribute position is ever
+    /// added, it must be reported here so such callers can fail closed.
+    pub fn attributes(&self) -> Vec<&Attr> {
+        let mut out = Vec::new();
+        let body = Body {
+            clauses: &self.clauses,
+            nots: &self.nots,
+            ors: &self.ors,
+            durings: &self.durings,
+        };
+        body.attributes(&mut out);
+        for rule in &self.rules {
+            Body {
+                clauses: &rule.clauses,
+                nots: &rule.nots,
+                ors: &rule.ors,
+                durings: &rule.durings,
+            }
+            .attributes(&mut out);
+        }
+        out
+    }
+}
+
+/// The attribute-carrying parts of a query, rule or negation body. Rule
+/// calls, predicates and set functions name no attribute.
+struct Body<'q> {
+    clauses: &'q [Clause],
+    nots: &'q [Not],
+    ors: &'q [Or],
+    durings: &'q [During],
+}
+
+impl<'q> Body<'q> {
+    fn of(n: &'q Not) -> Self {
+        Body {
+            clauses: &n.clauses,
+            nots: &n.nots,
+            ors: &n.ors,
+            durings: &n.durings,
+        }
+    }
+
+    /// Walks with an explicit stack: nesting depth is bounded by the parser,
+    /// but this keeps the walk off the native stack regardless.
+    fn attributes(self, out: &mut Vec<&'q Attr>) {
+        let mut stack = vec![self];
+        while let Some(body) = stack.pop() {
+            for clause in body.clauses {
+                match clause {
+                    Clause::Pattern(p) => out.push(&p.a),
+                    Clause::At { patterns, .. } => out.extend(patterns.iter().map(|p| &p.a)),
+                    Clause::Pred(_) => {}
+                }
+            }
+            out.extend(body.durings.iter().map(|d| &d.pattern.a));
+            stack.extend(body.nots.iter().map(Body::of));
+            stack.extend(
+                body.ors
+                    .iter()
+                    .flat_map(|o| o.branches.iter().map(Body::of)),
+            );
+        }
+    }
+}

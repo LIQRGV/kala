@@ -81,7 +81,7 @@ pub fn run(
                     Op::Assert => "assert",
                     Op::Retract => "retract",
                 },
-                value: l.value(&c.value),
+                value: l.attribute_value(attr, &c.value),
             })
             .collect(),
     };

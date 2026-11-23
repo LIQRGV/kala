@@ -69,19 +69,33 @@ fn stamp(path: &Path) -> Result<Stamp, Failure> {
         tail,
     })
 }
+/// Whether a registry serves the reserved `system` database.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SystemDb {
+    /// Register `system.kala` (account authentication reads it; admins query it).
+    Serve,
+    /// Never register, open or read `system.kala` (`--auth none`): the file is
+    /// skipped by name, whatever it contains or whoever may read it.
+    Skip,
+}
 pub(crate) struct Registry {
     databases: BTreeMap<String, Database>,
     default: Option<String>,
 }
 impl Registry {
-    pub fn open(directory: &Path, default: Option<String>) -> io::Result<Self> {
+    pub fn open(directory: &Path, default: Option<String>, system: SystemDb) -> io::Result<Self> {
         let mut databases = BTreeMap::new();
         for entry in std::fs::read_dir(directory)? {
             let entry = entry?;
             let name = entry.file_name();
             let text = name.to_string_lossy();
             let db = text.strip_suffix(".kala");
-            if entry.file_type()?.is_file() && db.is_some_and(valid_name) {
+            if system == SystemDb::Skip && db == Some("system") {
+                // Decided by name only, before any metadata or content is read.
+                eprintln!(
+                    "kala serve: skipping system.kala: the system database is never served without account authentication"
+                );
+            } else if entry.file_type()?.is_file() && db.is_some_and(valid_name) {
                 databases.insert(
                     db.unwrap_or_default().to_string(),
                     Database {
@@ -100,17 +114,19 @@ impl Registry {
                 "default database is not a registered world",
             ));
         }
-        let default = default.or_else(|| {
-            (databases.len() == 1)
-                .then(|| databases.keys().next().cloned())
-                .flatten()
-        });
+        // The reserved system world is never an implicit user database.
+        let user_names: Vec<_> = databases.keys().filter(|name| *name != "system").collect();
+        let default = default.or_else(|| (user_names.len() == 1).then(|| user_names[0].clone()));
         Ok(Self { databases, default })
     }
+    /// Resolve the name before loading a world, so authorization precedes I/O.
+    pub fn name<'a>(&'a self, requested: Option<&'a str>) -> Result<&'a str, Failure> {
+        requested
+            .or(self.default.as_deref())
+            .ok_or_else(|| Failure::new(DATABASE, "no default database; specify a database name"))
+    }
     pub fn get(&self, requested: Option<&str>) -> Result<(String, Arc<World>), Failure> {
-        let name = requested.or(self.default.as_deref()).ok_or_else(|| {
-            Failure::new(DATABASE, "no default database; specify a database name")
-        })?;
+        let name = self.name(requested)?;
         let db = self
             .databases
             .get(name)
@@ -143,6 +159,11 @@ impl Registry {
             return Ok((name.into(), Arc::clone(world)));
         }
         let world = Arc::new(World::open_read_only(&db.path).map_err(Failure::store)?);
+        // Content, not a filename, identifies privileged worlds. A renamed
+        // system file must never become readable using an ordinary read grant.
+        if crate::system::is_system(&world) != (name == "system") {
+            return Err(Failure::store("reserved system database marker mismatch"));
+        }
         eprintln!(
             "event=bolt_database_loaded db={name} canon={}",
             world.latest_tx().0

@@ -17,14 +17,18 @@ fn credential_formatting_is_redacted_and_no_auth_accepts_every_scheme() {
             principal: "tester".into(),
             credentials: credentials.clone(),
         };
-        assert!(NoAuth.authenticate(&token).is_ok());
+        assert!(
+            NoAuth
+                .authenticate(&token, "127.0.0.1".parse().unwrap())
+                .is_ok()
+        );
         assert!(!format!("{token:?}").contains("fake-test-secret"));
     }
 }
 
 struct Reject;
 impl Authenticator for Reject {
-    fn authenticate(&self, _: &AuthToken) -> Result<Identity, AuthFailure> {
+    fn authenticate(&self, _: &AuthToken, _: std::net::IpAddr) -> Result<Identity, AuthFailure> {
         Err(AuthFailure)
     }
 }

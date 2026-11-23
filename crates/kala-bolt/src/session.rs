@@ -1,6 +1,6 @@
 //! One connection's Bolt state. Authentication failures are terminal.
 use crate::{
-    auth::{AuthToken, Authenticator, Credentials},
+    auth::{AuthToken, Authenticator, Credentials, Identity},
     chunk,
     error::{Failure, INVALID},
     handshake,
@@ -11,7 +11,7 @@ use crate::{
     server::ServerConfig,
 };
 use std::io;
-use std::net::TcpStream;
+use std::net::{IpAddr, TcpStream};
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
@@ -38,10 +38,12 @@ struct Session<'a> {
     state: State,
     minor: u8,
     authenticated: bool,
+    identity: Option<Identity>,
     registry: &'a Registry,
     auth: &'a dyn Authenticator,
     config: &'a ServerConfig,
     id: u64,
+    peer: IpAddr,
     output: Option<query::Output>,
     db: String,
     started: Instant,
@@ -54,6 +56,7 @@ pub(crate) fn serve(
     id: u64,
     stop: &AtomicBool,
 ) -> io::Result<()> {
+    let peer = stream.peer_addr()?.ip();
     stream.set_write_timeout(Some(config.write_timeout))?;
     let Some(minor) = handshake::negotiate(&mut stream, config.handshake_timeout)? else {
         return Ok(());
@@ -63,10 +66,12 @@ pub(crate) fn serve(
         state: State::Connected,
         minor,
         authenticated: false,
+        identity: None,
         registry,
         auth,
         config,
         id,
+        peer,
         output: None,
         db: String::new(),
         started: Instant::now(),
@@ -146,7 +151,7 @@ impl Session<'_> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "response size limit exceeded"))?;
         chunk::write_message(stream, &bytes, deadline)
     }
-    fn authenticate(&self, mut map: Map) -> Result<(), Failure> {
+    fn authenticate(&mut self, mut map: Map) -> Result<(), Failure> {
         fn field(map: &mut Map, name: &str) -> Result<String, Failure> {
             match map.remove(name) {
                 None => Ok(String::new()),
@@ -154,17 +159,35 @@ impl Session<'_> {
                 _ => Err(Failure::invalid()),
             }
         }
+        // The official Python driver's auth=None is an empty auth map.
+        // Only absence of every auth field means none; incomplete basic
+        // tokens must not accidentally select the local root/trust account.
+        let scheme = if !["scheme", "principal", "credentials"]
+            .iter()
+            .any(|key| map.contains_key(*key))
+        {
+            "none".into()
+        } else {
+            field(&mut map, "scheme")?
+        };
         let token = AuthToken {
-            scheme: field(&mut map, "scheme")?,
+            scheme,
             principal: field(&mut map, "principal")?,
             credentials: Credentials::new(field(&mut map, "credentials")?),
         };
-        self.auth.authenticate(&token).map_err(|_| {
+        let identity = self.auth.authenticate(&token, self.peer).map_err(|_| {
             Failure::new(
                 "Neo.ClientError.Security.Unauthorized",
                 "authentication failed",
             )
         })?;
+        eprintln!(
+            "event=bolt_authenticated connection_id={} user={:?} client_ip={}",
+            self.id,
+            crate::error::escape(&identity.principal),
+            self.peer
+        );
+        self.identity = Some(identity);
         Ok(())
     }
     fn handle(
@@ -216,6 +239,7 @@ impl Session<'_> {
             }
             Message::Logoff if self.minor >= 1 && self.state == State::Ready => {
                 self.authenticated = false;
+                self.identity = None;
                 self.state = State::Authentication;
                 success([])
             }
@@ -238,7 +262,19 @@ impl Session<'_> {
                     Some(Value::String(s)) => Some(s.as_str()),
                     _ => return Err(Failure::invalid().into()),
                 };
-                let (db, world) = self.registry.get(requested)?;
+                let name = self.registry.name(requested)?;
+                if !self
+                    .identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.permits_read(name))
+                {
+                    return Err(Failure::new(
+                        crate::error::FORBIDDEN,
+                        format!("access to database {name:?} is forbidden"),
+                    )
+                    .into());
+                }
+                let (db, world) = self.registry.get(Some(name))?;
                 self.started = Instant::now();
                 eprintln!("event=bolt_query_started connection_id={} db={db}", self.id);
                 let output = query::run(

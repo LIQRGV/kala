@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 import neo4j
 from neo4j import GraphDatabase
-from neo4j.exceptions import ClientError
+from neo4j.exceptions import AuthError, ClientError
 from neo4j.graph import Node, Relationship
 
 URI = os.environ["KALA_BOLT_URI"]
@@ -28,6 +28,80 @@ def read_exact(stream, count):
             raise EOFError("connection closed during handshake")
         data.extend(block)
     return bytes(data)
+
+
+AUTH_PASSWORD = "unique-e2e-test-only-password-928164"
+
+
+def account_command(action, *args, password=None):
+    result = subprocess.run(
+        [os.environ["KALA_BINARY"], "user", action, os.path.dirname(os.environ["KALA_WORLD"]), *args],
+        input=(password + "\n") if password is not None else None,
+        text=True, capture_output=True, timeout=30,
+    )
+    if AUTH_PASSWORD in result.stdout + result.stderr or "$argon2" in result.stdout + result.stderr:
+        raise AssertionError("account command leaked a credential")
+    if result.returncode:
+        raise AssertionError("account command failed: " + result.stderr)
+    return result.stdout
+
+
+class AccountsTests(unittest.TestCase):
+    def test_password_grants_revocation_and_root_switch(self):
+        with GraphDatabase.driver(URI, auth=None, connection_timeout=5) as driver:
+            driver.verify_connectivity()
+        account_command("add", "alice@127.0.0.1", "--password-stdin", password=AUTH_PASSWORD)
+        account_command("grant", "alice@127.0.0.1", "read", "varrow")
+        with GraphDatabase.driver(URI, auth=neo4j.basic_auth("alice", AUTH_PASSWORD), connection_timeout=5) as driver:
+            driver.verify_connectivity()
+            with driver.session(database="varrow") as session:
+                self.assertEqual(len(list(session.run(ALLIES))), 2)
+            for database in ["system", "ungranted"]:
+                with driver.session(database=database) as session:
+                    with self.assertRaises(ClientError) as error:
+                        list(session.run(ALLIES))
+                    self.assertEqual(error.exception.code, "Neo.ClientError.Security.Forbidden")
+            account_command("revoke", "alice@127.0.0.1", "read", "varrow")
+            # A logged-in session keeps its grants until it logs off.
+            with driver.session(database="varrow") as session:
+                self.assertEqual(len(list(session.run(ALLIES))), 2)
+        with GraphDatabase.driver(URI, auth=neo4j.basic_auth("alice", AUTH_PASSWORD), connection_timeout=5) as driver:
+            with driver.session(database="varrow") as session:
+                with self.assertRaises(ClientError) as error:
+                    list(session.run(ALLIES))
+                self.assertEqual(error.exception.code, "Neo.ClientError.Security.Forbidden")
+        with GraphDatabase.driver(URI, auth=neo4j.basic_auth("alice", "incorrect-test-password"), connection_timeout=5) as driver:
+            with self.assertRaises(AuthError) as error:
+                driver.verify_connectivity()
+            self.assertEqual(error.exception.code, "Neo.ClientError.Security.Unauthorized")
+        account_command("set", "root@localhost", "--password-stdin", password=AUTH_PASSWORD)
+        try:
+            with GraphDatabase.driver(URI, auth=None, connection_timeout=5) as driver:
+                with self.assertRaises(AuthError):
+                    driver.verify_connectivity()
+            with GraphDatabase.driver(URI, auth=neo4j.basic_auth("root", AUTH_PASSWORD), connection_timeout=5) as driver:
+                with driver.session(database="system") as session:
+                    names = [row[0] for row in session.run(PREFIX + "[:find ?u :where [?e :user ?u]]")]
+                    self.assertIn("root", names)
+                    for query in [
+                        "[:find ?p :where [?e :password_hash ?p]]",
+                        '[:find ?u :where [?e :user ?u] [?e :password_hash ?p] [(< ?p "$argon2z")]]',
+                    ]:
+                        with self.assertRaises(ClientError) as error:
+                            list(session.run(PREFIX + query))
+                        self.assertEqual(error.exception.code, "Neo.ClientError.Security.Forbidden")
+                    rows = list(session.run(PREFIX + '[:find ?e :where [?e :user "alice"]]'))
+                    self.assertTrue(bool(rows))
+                    self.assertTrue("$argon2" not in repr(rows), "hash leaked in query result")
+        finally:
+            account_command("set", "root@localhost", "--trust")
+        with GraphDatabase.driver(URI, auth=None, connection_timeout=5) as driver:
+            driver.verify_connectivity()
+        for name in ["KALA_SERVER_STDOUT", "KALA_SERVER_STDERR"]:
+            with open(os.environ[name], encoding="utf-8") as captured:
+                output = captured.read()
+            self.assertTrue(AUTH_PASSWORD not in output, "password leaked in server output")
+            self.assertTrue("$argon2" not in output, "hash leaked in server output")
 
 
 class DriverTests(unittest.TestCase):

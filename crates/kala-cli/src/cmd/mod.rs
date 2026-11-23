@@ -18,6 +18,7 @@ mod repl_editor;
 mod repl_history;
 pub mod serve;
 pub mod transact;
+pub mod user;
 
 use crate::cli::Command;
 use crate::error::CliError;
@@ -44,17 +45,21 @@ pub fn dispatch(cmd: &Command) -> Result<Done, CliError> {
         Command::Serve {
             dir,
             listen,
-            auth: _,
+            auth,
+            insecure_allow_plaintext,
             default_db,
             max_connections,
             idle_timeout,
         } => serve::run(
             dir,
             listen,
+            auth,
+            *insecure_allow_plaintext,
             default_db.clone(),
             *max_connections,
             *idle_timeout,
         ),
+        Command::User { command } => user::run(command),
         Command::Load {
             fixture,
             world,

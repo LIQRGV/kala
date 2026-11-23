@@ -1,20 +1,19 @@
 # kala-bolt
 
-A read-only, loopback Bolt 5.0–5.4 server over Kala's existing Datalog front-end
+A read-only Bolt 5.0–5.4 server over Kala's existing Datalog front-end
 and shared query executor. `kala serve DIR` exposes each regular
 `DIR/<name>.kala` file as a database (`[a-z0-9_-]+` names only). Symlinks and
 invalid names are skipped with a startup diagnostic. Files are discovered at
-startup and opened read-only on first RUN. Length changes trigger a reload of
+startup and opened read-only on first RUN. File stamps (length, modification time, file identity and commit tail) trigger a reload of
 committed transactions; each result pins one snapshot. A torn tail is never
-served or repaired by this server. Replacing a file without changing its length
-is outside this append-only reload contract. The served directory and its files
+served or repaired by this server. The served directory and its files
 are trusted local input: concurrent replacement of directory entries is outside
 the network security boundary.
 
 ## Using it
 
 ```sh
-kala serve worlds --listen 127.0.0.1:7687 --auth none \
+kala serve worlds --listen 127.0.0.1:7687 --auth accounts \
   --default-db varrow --max-connections 64 --idle-timeout 600
 ```
 
@@ -22,19 +21,80 @@ Port 0 selects a free port, reported by the single stdout startup line
 `kala serve: listening on <address>`. Other diagnostics use structured stderr
 lines; neither queries, parameters nor credentials are logged. `localhost`
 resolves to `127.0.0.1`; `127.0.0.0/8` and `::1` are accepted. Other listen
-addresses fail before binding. SIGINT closes the listener and client sockets,
+addresses require accounts and `--insecure-allow-plaintext`; `--auth none`
+always requires loopback. SIGINT closes the listener and client sockets,
 cancels queries and joins connection threads.
 
-A single discovered database is the implicit default. With multiple databases,
+A single discovered user database is the implicit default (`system` is excluded). With multiple databases,
 set `--default-db` or supply the driver's session database. The library exports
 `Server`, `ServerConfig`, PackStream values/codecs and `auth::Authenticator`.
+`Server::bind_accounts` implements the default CLI policy.
+`Server::bind` retains its loopback-only `NoAuth` library behavior; it never
+creates, opens or reads `system.kala` (skipping it with one stderr line) and never
+serves the `system` database;
 `Server::bind_with_auth` accepts a custom authenticator but still restricts
-binding to loopback. `NoAuth` accepts none/basic tokens. Credentials format as
+binding to loopback. Authenticators receive the peer IP and return an identity
+with a matched host and grants. `NoAuth` accepts all well-formed tokens with a `read:*` identity (a
+development mode, not an administrator). Credentials format as
 `<redacted>` and are dropped after the authentication callback.
 
 Query text must start with exactly `// kala:datalog` followed by a newline;
 trailing ASCII spaces on that line are allowed. Unprefixed Cypher and
 `// kala:gremlin` receive SyntaxError. Cypher is the next slice.
+
+## Accounts and privileges
+
+On first startup, `kala serve DIR` creates `DIR/system.kala`, a private account
+store with the `_KALA_SYSTEM` schema marker and schema version 1. The initial
+account is `root@localhost`, plugin `trust`, grant `admin:*`. Startup warns for
+every trust account. `scheme: none` (or the official driver's empty auth map) logs in as root; `basic` uses the supplied
+principal and password; other schemes fail. Authentication failures always
+return `Neo.ClientError.Security.Unauthorized` / `authentication failed` and
+close the connection. After setting root's password, `auth=None` stops working.
+
+Accounts are `USER@HOST`; users are 1–64 ASCII letters, digits, `_`, `.` or `-`.
+Hosts are matched without DNS, in this order:
+
+1. Exact IP (IPv4 or IPv6).
+2. `localhost` (`127.0.0.1` or `::1`).
+3. CIDR, longest prefix first, e.g. `10.0.0.0/8` or `fd00::/8`.
+4. IPv4 patterns with whole trailing wildcard octets, most literal octets first,
+   e.g. `192.168.1.%` or `10.%`.
+5. `%` (any peer).
+
+IPv4-mapped IPv6 peers match IPv4 patterns. The most specific account is selected
+before checking credentials; a failed password never falls back to a broader
+account. Ties use the canonical host's lexical order.
+
+`kala_password` stores a salted Argon2id PHC hash (v19, 19 MiB, two iterations,
+one lane). At most four verifications run simultaneously; unknown users perform
+a dummy verification too. `trust` ignores credentials and is allowed only for
+`localhost`, `127.0.0.1` or `::1`, with an independent loopback check at login.
+**Behind a local reverse proxy every client can appear as 127.0.0.1.** Set
+passwords on local accounts before exposing such a proxy.
+
+Grants are `read`, `write` or `admin`, on a database name or `*`. Every RUN checks
+the authenticated identity's grants before loading the database. `admin` implies
+read and write; `write` is stored for future Bolt writes and does not imply read.
+Denied queries return `Neo.ClientError.Security.Forbidden`. `system` requires
+`admin:system` or `admin:*`, even if the account has a read grant on it.
+
+The reserved system database is queryable with Datalog by an admin. Password
+hash values and node properties are redacted in Bolt results and CLI reads,
+including history. Account changes are native append-only retract/assert
+transactions on increasing logical ticks, so their audit history is retained.
+Only `kala user` commands may write this world through the CLI; renamed copies
+are protected by the marker too. A user world cannot be named `system`.
+
+Account snapshots reload using the same file-stamp cache as worlds. Grants and
+password changes take effect at the next login; an existing session retains its
+identity until LOGOFF or disconnect. `kala user` takes a writer lock only for its
+command and works while the server is running. The last `admin:*` account cannot
+be dropped or have that grant revoked.
+
+TLS is not implemented. Non-loopback account listeners need the explicit
+`--insecure-allow-plaintext` opt-in, which prints a warning that passwords travel
+unencrypted. This opt-in never permits `--auth none` on a non-loopback address.
 
 ## Protocol
 
@@ -106,6 +166,8 @@ ignored. Fields omit the variable's `?`; aggregate names retain their text.
 | Missing parameter | `Neo.ClientError.Statement.ParameterMissing` |
 | Parameter type mismatch | `Neo.ClientError.Statement.TypeError` |
 | Query/enrichment limits or cancellation | `Neo.ClientError.Statement.ExecutionFailed` |
+| Authentication failure | `Neo.ClientError.Security.Unauthorized` (connection closes) |
+| Missing database privilege | `Neo.ClientError.Security.Forbidden` |
 | Unknown or ambiguous database | `Neo.ClientError.Database.DatabaseNotFound` |
 | Invalid message/state or unsupported operation | `Neo.ClientError.Request.Invalid` |
 | Store error | `Neo.DatabaseError.General.UnknownError`: "the world could not be read" |
@@ -128,8 +190,8 @@ the core's 16-MiB log-entry limit. Oversized records fail RUN before streaming.
 
 Pure Rust tests run with `cargo test -p kala-bolt`; the real official Python
 driver is exercised separately with `./e2e/run.sh` (see `e2e/README.md`).
-No Python, async runtime or new third-party runtime dependency is needed by
-Rust tests or the server.
+Rust tests and the server need no Python or async runtime. Account password
+hashing uses the pinned RustCrypto `argon2` dependency.
 
 Implementation references: [handshake](https://neo4j.com/docs/bolt/current/bolt/handshake/),
 [messages](https://neo4j.com/docs/bolt/current/bolt/message/),

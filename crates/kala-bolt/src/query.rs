@@ -1,5 +1,5 @@
 //! Datalog dispatch and bounded result enrichment at the pinned tick and canon.
-use crate::error::{EXECUTION, Failure, MISSING, SYNTAX, TYPE};
+use crate::error::{EXECUTION, FORBIDDEN, Failure, MISSING, SYNTAX, TYPE};
 use crate::message::Map;
 use crate::packstream::{self, Value};
 use kala_core::{
@@ -29,8 +29,32 @@ pub(crate) fn run(
     // Keep the prefix's line as an empty line, so error positions count the
     // lines of the text the client sent.
     let text = format!("\n{rest}");
-    let prepared =
-        kala_datalog::prepare(world, &text).map_err(|e| Failure::new(SYNTAX, e.to_string()))?;
+    let syntax = |e: kala_datalog::DatalogError| Failure::new(SYNTAX, e.to_string());
+    let query = kala_datalog::parse(&text).map_err(syntax)?;
+    let system = crate::system::is_system(world);
+    // On `system`, refuse before compiling or running: output redaction
+    // alone can't stop `<`, `=`, `min` or `not` from revealing a hash, so
+    // the secret must never enter evaluation. The AST covers what the plan
+    // drops (rules no clause calls); the plan check covers whatever the
+    // compiler resolves.
+    if system
+        && query
+            .attributes()
+            .iter()
+            .any(|a| crate::system::is_secret_attribute(world, &a.name))
+    {
+        return Err(protected());
+    }
+    let prepared = kala_datalog::prepare_parsed(world, &text, &query).map_err(syntax)?;
+    if system
+        && prepared
+            .plan
+            .attribute_names()
+            .into_iter()
+            .any(|a| crate::system::is_secret_attribute(world, a))
+    {
+        return Err(protected());
+    }
     let params = parameters(world, &prepared.params, given)?;
     let limits = Limits::default();
     let result = kala_query::run_with_cancel(world, &prepared.plan, &params, &limits, stop)
@@ -41,6 +65,7 @@ pub(crate) fn run(
         bytes: 0,
         steps: 0,
         limits,
+        system,
     };
     let mut rows = VecDeque::new();
     for row in result.rows {
@@ -61,6 +86,13 @@ pub(crate) fn run(
         fields: result.columns.into_iter().map(|v| v.0).collect(),
         rows,
     })
+}
+/// Generic on purpose: says what is refused, nothing about stored values.
+fn protected() -> Failure {
+    Failure::new(
+        FORBIDDEN,
+        "queries on the system database may not read the protected attribute password_hash",
+    )
 }
 fn parameters(
     world: &World,
@@ -137,6 +169,7 @@ struct Budget {
     bytes: usize,
     steps: u64,
     limits: Limits,
+    system: bool,
 }
 impl Budget {
     fn charge(&mut self, n: usize) -> Result<(), Failure> {
@@ -209,7 +242,13 @@ fn scalar(value: CoreValue, budget: &mut Budget) -> Result<Value, Failure> {
         CoreValue::Bool(v) => Value::Bool(v),
         CoreValue::I64(v) => Value::Integer(v),
         CoreValue::F64(v) => Value::Float(v),
-        CoreValue::Str(s) => return budget.string(s),
+        CoreValue::Str(s) => {
+            return budget.string(if budget.system && s.starts_with("$argon2") {
+                "<redacted>".into()
+            } else {
+                s
+            });
+        }
         CoreValue::Ref(_) => return Err(Failure::new(EXECUTION, "unexpected reference property")),
     })
 }
@@ -240,7 +279,11 @@ fn properties(
                     reason: kala_core::WorkInterruptReason::Limit,
                 });
             }
-            values.push(value);
+            values.push(if budget.system && attr.name == "password_hash" {
+                CoreValue::Str("<redacted>".into())
+            } else {
+                value
+            });
             Ok(())
         })
         .map_err(|e| failure.unwrap_or_else(|| core_error(e)))?;

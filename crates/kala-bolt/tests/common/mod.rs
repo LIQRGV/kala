@@ -48,7 +48,7 @@ impl Running {
         Self::from_server(dir, server)
     }
 
-    fn from_server(dir: tempfile::TempDir, server: Server) -> Self {
+    pub fn from_server(dir: tempfile::TempDir, server: Server) -> Self {
         let addr = server.local_addr().unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
         let stop = shutdown.clone();

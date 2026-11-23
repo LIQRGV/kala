@@ -1594,7 +1594,7 @@ impl LogWriter {
             // Keep the cut bytes before cutting: if the tail was misjudged
             // torn, nothing committed is lost for good.
             let tail = &bytes[valid_len..];
-            report.quarantine = Some(quarantine(path, valid_len, tail)?);
+            report.quarantine = Some(quarantine(path, &file, valid_len, tail)?);
             // `valid_len <= bytes.len()`, a `usize` that came from an
             // in-memory buffer, so it fits a `u64`. The size change is
             // metadata: `sync_all` makes it durable. Appends (O_APPEND) then
@@ -1736,7 +1736,18 @@ fn lock(file: &File) -> Result<(), Error> {
 /// its directory entry are fsynced before this returns, so the log may be
 /// cut afterwards. Returns the new file's path. On failure the new file is
 /// removed (best effort).
-fn quarantine(path: &Path, valid_len: usize, tail: &[u8]) -> Result<PathBuf, Error> {
+fn quarantine(path: &Path, source: &File, valid_len: usize, tail: &[u8]) -> Result<PathBuf, Error> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    // Recovery copies potentially private data. Apply the locked source's
+    // permissions at creation, before any bytes reach the quarantine file.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(source.metadata()?.permissions().mode() & 0o777);
+    }
+    #[cfg(not(unix))]
+    let _ = source;
     let base = {
         let mut s = OsString::from(path.as_os_str());
         s.push(format!(".torn-{valid_len}"));
@@ -1749,11 +1760,7 @@ fn quarantine(path: &Path, valid_len: usize, tail: &[u8]) -> Result<PathBuf, Err
             candidate.push(format!("-{suffix}"));
         }
         let candidate = PathBuf::from(candidate);
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
+        match options.open(&candidate) {
             Ok(f) => break (candidate, f),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 suffix = suffix.checked_add(1).ok_or_else(|| {

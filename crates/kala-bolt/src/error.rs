@@ -6,6 +6,7 @@ pub(crate) const SYNTAX: &str = "Neo.ClientError.Statement.SyntaxError";
 pub(crate) const TYPE: &str = "Neo.ClientError.Statement.TypeError";
 pub(crate) const MISSING: &str = "Neo.ClientError.Statement.ParameterMissing";
 pub(crate) const EXECUTION: &str = "Neo.ClientError.Statement.ExecutionFailed";
+pub(crate) const FORBIDDEN: &str = "Neo.ClientError.Security.Forbidden";
 pub(crate) const DATABASE: &str = "Neo.ClientError.Database.DatabaseNotFound";
 pub(crate) const STORE: &str = "Neo.DatabaseError.General.UnknownError";
 #[derive(Debug)]

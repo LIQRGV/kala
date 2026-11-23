@@ -44,6 +44,8 @@ pub struct Report {
 /// checksum fails) may have been acknowledged to a writer, so it is never
 /// cut without `acknowledge`: kala-core refuses it under the writer lock,
 /// before anything is cut or quarantined, so retrying can't get past it.
+/// System worlds are refused once the writer has opened (so a system world
+/// with an acknowledged damaged tail is recovered before it is refused).
 pub fn open_write(path: &Path, acknowledge: bool) -> Result<World, CliError> {
     let opened = if acknowledge {
         World::open(path)
@@ -63,10 +65,18 @@ pub fn open_write(path: &Path, acknowledge: bool) -> Result<World, CliError> {
         )),
         e => CliError::at_path(path, &e),
     })?;
+    refuse_system(&w)?;
     if w.recovery().cause == Some(kala_core::CutCause::Damaged) {
         w.acknowledge_recovery();
     }
     Ok(w)
+}
+/// System worlds can be changed only through account management.
+pub(crate) fn refuse_system(world: &World) -> Result<(), CliError> {
+    if kala_bolt::system::is_system(world) {
+        return Err(user("system world is managed only by `kala user`"));
+    }
+    Ok(())
 }
 fn user(s: impl Into<String>) -> CliError {
     CliError::User(s.into())
@@ -148,6 +158,7 @@ fn value(
 /// Stage every op, then commit once. A resolution or native write error drops
 /// the transaction, so even newly allocated handles are rolled back.
 pub fn execute(w: &mut World, form: &WriteTxn, default: Option<Tick>) -> Result<Report, CliError> {
+    refuse_system(w)?;
     let default = form.at.or(default);
     let fallback = default.unwrap_or_else(|| w.latest_tick());
     let mut refs = HashMap::new();
@@ -384,6 +395,7 @@ pub fn run(
     } else {
         open_write(path, acknowledge_recovery)?
     };
+    refuse_system(&w)?;
     if dry_run && w.recovery().cause == Some(kala_core::CutCause::Damaged) {
         return Err(user(
             "dry-run refused: damaged log needs recovery acknowledgement before writes",
