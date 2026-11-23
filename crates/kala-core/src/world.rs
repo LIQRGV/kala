@@ -43,12 +43,14 @@
 //!
 //! **Layout.** This file holds the public value types, the [`World`] struct
 //! and its facade. The rest of the module is split by concern into private
-//! submodules that share its scope: `ids` (node types, entities, handles,
-//! edges), `index` (the index maps and the seeks reads are built from),
+//! submodules that share its scope: `catalog` (the `Catalog` struct: schema
+//! and ID tables), `ids` (node types, entities, handles, edges), `index`
+//! (the `Indexes` struct: the index maps and the seeks reads are built from),
 //! `open` (replaying a log), `txn` (the write path and [`Txn`]), `meter`
 //! (bounded reads), `view` ([`View`]), `schema_ops` and `migration`. The
 //! indexes themselves sit behind the `store` module's ordered-map seam.
 
+mod catalog;
 mod ids;
 mod index;
 mod meter;
@@ -92,7 +94,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering as AtomicOrdering};
 pub use txn::{CommitResult, Txn};
 pub use view::View;
-use {ids::*, index::*, meter::*, open::*, txn::*};
+use {catalog::*, ids::*, index::*, meter::*, open::*, txn::*};
 
 /// A position on the author timeline: the number of the transaction that
 /// wrote a fact. Each committed transaction advances it by one.
@@ -398,92 +400,12 @@ impl AttrCounts {
 /// A world: schema, entities and (later) their facts over story time.
 #[derive(Debug)]
 pub struct World {
-    /// Indexed by `NodeTypeId.0`.
-    node_types: Vec<NodeType>,
-    node_type_by_name: HashMap<String, NodeTypeId>,
-    entity_by_handle: HashMap<String, EntityId>,
-    /// The reverse of `entity_by_handle`, for [`World::handle_of`].
-    handle_by_entity: HashMap<EntityId, String>,
-    /// Indexed by `AttrId.0`.
-    attributes: Vec<AttrDef>,
-    attribute_history: Vec<Vec<(TxId, AttrDef)>>,
-    node_origins: Vec<Vec<(TxId, bool)>>,
-    settings: Vec<(TxId, String, String)>,
-    attr_by_name: HashMap<String, AttrId>,
-    /// Inverse name -> the directed attribute it reverses. Not attribute
-    /// names: every API except [`View::neighbors`] treats them as unknown
-    /// attributes.
-    inverse_by_name: HashMap<String, AttrId>,
-    /// Interned edges: entry `i` is the triple of the edge with seq `i + 1`
-    /// (edge sequences are assigned without gaps).
-    edges: Vec<Triple>,
-    /// The transaction that defined each edge, parallel to `edges` (so
-    /// ascending): what [`View::edge`] checks against its canon.
-    edges_defined_in: Vec<TxId>,
-    edge_by_triple: HashMap<Triple, EdgeId>,
+    /// The schema and ID tables: what names and IDs mean (see [`Catalog`]).
+    catalog: Catalog,
+    /// Every index and derived table over the stored facts (see [`Indexes`]).
+    indexes: Indexes,
     /// The last committed transaction (0 = none yet).
     latest_tx: TxId,
-    /// Forward index `E|entity|attr|value|^tick|^tx -> mark` (layout in
-    /// [`crate::key`]): every stored fact and `DELETED` marker. With
-    /// `r_index`, the in-memory copy of the log's entries (milestone 0);
-    /// both are rebuilt from the log on open.
-    e_index: Index,
-    /// Reverse index `R|target|attr|source|^tick|^tx -> mark`: one entry
-    /// per stored entry at a `ref` key, written by [`World::index_entry`]
-    /// together with its `E` entry. Read by [`View::neighbors`] for
-    /// [`Direction::In`].
-    r_index: Index,
-    /// `E_latest`: every `E` key's current entry at the latest canon, keys
-    /// whose current entry is a `DELETED` marker left out (see
-    /// [`LatestIndex`]). Derived from `e_index`; written only by
-    /// [`World::index_entry`]. Serves every read at the latest canon.
-    /// Crate-visible so doctor can compare it against a rebuild.
-    pub(crate) e_latest: LatestIndex,
-    /// `R_latest`: the same for `r_index`.
-    pub(crate) r_latest: LatestIndex,
-    /// The precision of every `E` entry that is a fact with a vague tick,
-    /// by its `E` key (see [`Precisions`]): the payload half of an `E` row.
-    /// Written only by [`World::index_entry`], derived and rebuilt with `E`;
-    /// doctor compares it as part of `E`.
-    e_precision: Precisions,
-    /// The same for `E_latest`: the precision of each key's current fact at
-    /// the latest canon, if vague. Compared by doctor as part of `E_latest`.
-    e_latest_precision: Precisions,
-    /// Value index `V|attr|value|entity|^tick|^tx -> mark`: a copy of every
-    /// `E` entry of an indexed, non-ref attribute (see
-    /// [`World::value_indexed`]), keyed by value so "every entity with
-    /// `attr = v`" is a prefix walk. Written only by [`World::index_entry`]
-    /// next to its `E` entry, so it is derived and rebuilt with `E`.
-    v_index: Index,
-    /// `V_latest`: the same for `v_index` as `E_latest` is for `e_index`.
-    /// Serves [`View::lookup`] at the latest canon.
-    pub(crate) v_latest: LatestIndex,
-    /// Folded value index `F|attr|fold|original|entity|^tick|^tx -> mark`
-    /// (layout in [`crate::key`]): a copy of every `V` entry of a string
-    /// attribute, keyed by the value's [`fold_for_search`] form, so "every
-    /// entity named edwin, in any case" is a prefix walk. Written only by
-    /// [`World::index_entry`] next to its `V` entry; derived and rebuilt
-    /// with `E`.
-    vfold_index: Index,
-    /// `VFold_latest`: the same for `vfold_index` as `E_latest` is for
-    /// `e_index`. Serves [`View::lookup_ci`] at the latest canon.
-    pub(crate) vfold_latest: LatestIndex,
-    /// Every unindexed string value an `E` key refers to, by reference and
-    /// by content (see [`crate::value_table`]). Derived like the indexes:
-    /// filled only by [`World::index_entry`] on commit and replay.
-    values: ValueTable,
-    /// The content hash of the value references ([`fnv1a64`]; a test hook
-    /// may replace it, see `World::set_content_hash`).
-    content_hash: ContentHash,
-    /// How many keys hold a fact (assert or retract) at the latest canon,
-    /// per tick: a key whose current entry is a `DELETED` marker isn't
-    /// counted. The last tick is the world's latest tick. Derived from the
-    /// indexes; maintained by [`World::index_entry`] on commit and replay.
-    tick_counts: BTreeMap<Tick, u64>,
-    /// The planner's per-attribute estimates behind [`World::attr_stats`].
-    /// Derived from the log like the indexes (never written to it):
-    /// maintained by [`World::index_entry`] on commit and replay.
-    attr_counts: HashMap<AttrId, AttrCounts>,
     /// The correction state of every revision chain a correction touched,
     /// by base entry. Derived from the log; maintained on commit and replay.
     chains: HashMap<EntryId, Chain>,
@@ -581,34 +503,23 @@ impl World {
             }
         }
         let mut world = World {
-            node_types,
-            node_type_by_name,
-            entity_by_handle: HashMap::new(),
-            handle_by_entity: HashMap::new(),
-            attributes: defs.to_vec(),
-            attribute_history: defs.iter().map(|d| vec![(TxId(0), d.clone())]).collect(),
-            node_origins: names.iter().map(|_| vec![(TxId(0), false)]).collect(),
-            settings: Vec::new(),
-            attr_by_name,
-            inverse_by_name,
-            edges: Vec::new(),
-            edges_defined_in: Vec::new(),
-            edge_by_triple: HashMap::new(),
+            catalog: Catalog {
+                node_types,
+                node_type_by_name,
+                entity_by_handle: HashMap::new(),
+                handle_by_entity: HashMap::new(),
+                attributes: defs.to_vec(),
+                attribute_history: defs.iter().map(|d| vec![(TxId(0), d.clone())]).collect(),
+                node_origins: names.iter().map(|_| vec![(TxId(0), false)]).collect(),
+                settings: Vec::new(),
+                attr_by_name,
+                inverse_by_name,
+                edges: Vec::new(),
+                edges_defined_in: Vec::new(),
+                edge_by_triple: HashMap::new(),
+            },
+            indexes: Indexes::new(fnv1a64),
             latest_tx: TxId(0),
-            e_index: OrderedMap::new(),
-            r_index: OrderedMap::new(),
-            e_latest: OrderedMap::new(),
-            r_latest: OrderedMap::new(),
-            e_precision: OrderedMap::new(),
-            e_latest_precision: OrderedMap::new(),
-            v_index: OrderedMap::new(),
-            v_latest: OrderedMap::new(),
-            vfold_index: OrderedMap::new(),
-            vfold_latest: OrderedMap::new(),
-            values: ValueTable::default(),
-            content_hash: fnv1a64,
-            tick_counts: BTreeMap::new(),
-            attr_counts: HashMap::new(),
             chains: HashMap::new(),
             entries: Vec::new(),
             log: None,
@@ -627,16 +538,19 @@ impl World {
         for edit in &settings {
             world.apply_schema_edit(edit, TxId(0), false)?;
         }
-        let node_types = world
-            .node_types
-            .iter()
-            .enumerate()
-            .map(|(i, nt)| NewEntry::NodeType {
-                // In range: refused above if more than MAX_NODE_TYPE + 1 types.
-                id: NodeTypeId(i as u16),
-                name: &nt.name,
-            });
+        let node_types =
+            world
+                .catalog
+                .node_types
+                .iter()
+                .enumerate()
+                .map(|(i, nt)| NewEntry::NodeType {
+                    // In range: refused above if more than MAX_NODE_TYPE + 1 types.
+                    id: NodeTypeId(i as u16),
+                    name: &nt.name,
+                });
         let attrs = world
+            .catalog
             .attributes
             .iter()
             .enumerate()
@@ -734,7 +648,7 @@ impl World {
             .collect();
         let mut rebuilt = World::from_genesis(&genesis)?;
         // Same value interning as this world, as the doctor rebuild does.
-        rebuilt.set_rebuild_hash(self.content_hash);
+        rebuilt.set_rebuild_hash(self.indexes.content_hash);
         let mut txn = ReplayTxn::default();
         for entry in self.entries.iter().filter(|e| e.tx != TxId(0)) {
             if !txn.migration_expected.is_empty() {
@@ -823,7 +737,8 @@ impl World {
     /// no-op or a failed write leaves it as it is; deleting the fact(s) at
     /// the highest tick lowers it to the next highest.
     pub fn latest_tick(&self) -> Tick {
-        self.tick_counts
+        self.indexes
+            .tick_counts
             .last_key_value()
             .map_or(Tick(0), |(tick, _)| *tick)
     }
@@ -967,13 +882,14 @@ impl World {
         attr: &str,
     ) -> Result<(AttrId, &AttrDef), Error> {
         let attr_id = *self
+            .catalog
             .attr_by_name
             .get(attr)
             .ok_or_else(|| Error::UnknownAttribute(attr.to_owned()))?;
         if !self.is_defined_staged(staged, entity) {
             return Err(Error::UnknownEntity(entity));
         }
-        Ok((attr_id, &self.attributes[attr_id.0 as usize]))
+        Ok((attr_id, &self.catalog.attributes[attr_id.0 as usize]))
     }
 
     /// A read-only view of the world as of canon `tx`: only transactions
@@ -1081,11 +997,13 @@ impl World {
     /// name that is neither an attribute nor an inverse name.
     pub fn attr_stats(&self, attr: &str) -> Result<AttrStats, Error> {
         let attr_id = self
+            .catalog
             .attr_by_name
             .get(attr)
-            .or_else(|| self.inverse_by_name.get(attr))
+            .or_else(|| self.catalog.inverse_by_name.get(attr))
             .ok_or_else(|| Error::UnknownAttribute(attr.to_owned()))?;
         Ok(self
+            .indexes
             .attr_counts
             .get(attr_id)
             .map_or_else(AttrStats::default, AttrCounts::stats))
@@ -1141,10 +1059,10 @@ impl World {
         attr: &str,
         dir: Direction,
     ) -> Result<(AttrId, Direction), Error> {
-        if let Some(id) = self.attr_by_name.get(attr) {
+        if let Some(id) = self.catalog.attr_by_name.get(attr) {
             return Ok((*id, dir));
         }
-        match self.inverse_by_name.get(attr) {
+        match self.catalog.inverse_by_name.get(attr) {
             Some(id) => Ok((*id, dir.flipped())),
             None => Err(Error::UnknownAttribute(attr.to_owned())),
         }
@@ -1154,26 +1072,26 @@ impl World {
     /// aren't attributes and aren't listed (they are on their attribute's
     /// [`AttrDef::inverse`]).
     pub fn attributes(&self) -> impl Iterator<Item = &AttrDef> {
-        self.attributes.iter()
+        self.catalog.attributes.iter()
     }
 
     /// The declaration of attribute `name`, matched exactly. `None` for an
     /// unknown name and for an inverse name (see [`World::attributes`]).
     pub fn attribute(&self, name: &str) -> Option<&AttrDef> {
-        let id = self.attr_by_name.get(name)?;
-        self.attributes.get(id.0 as usize)
+        let id = self.catalog.attr_by_name.get(name)?;
+        self.catalog.attributes.get(id.0 as usize)
     }
 
     /// The name of attribute `id` (as stored in a log entry), or `None` if
     /// the schema declares no attribute with that ID.
     pub fn attr_name(&self, id: AttrId) -> Option<&str> {
         let i = usize::try_from(id.0).ok()?;
-        self.attributes.get(i).map(|a| a.name.as_str())
+        self.catalog.attributes.get(i).map(|a| a.name.as_str())
     }
 
     /// Every declared node type name, in ID (= declaration) order.
     pub fn node_types(&self) -> impl Iterator<Item = &str> {
-        self.node_types.iter().map(|nt| nt.name.as_str())
+        self.catalog.node_types.iter().map(|nt| nt.name.as_str())
     }
 
     /// Every committed log entry, in entry-ID order: the same items
@@ -1294,13 +1212,13 @@ mod tests {
             .assert(mara, "ally_of", Value::Ref(greg), Some(Tick(5)))
             .unwrap();
         w.correct(a.entries[0], Correction::Delete).unwrap();
-        assert_eq!(w.e_latest, rebuilt(&w.e_index, w.latest_tx));
-        assert_eq!(w.r_latest, rebuilt(&w.r_index, w.latest_tx));
+        assert_eq!(w.indexes.e_latest, rebuilt(&w.indexes.e_index, w.latest_tx));
+        assert_eq!(w.indexes.r_latest, rebuilt(&w.indexes.r_index, w.latest_tx));
         // the deleted -250 key and the deleted pair are absent, the main
         // indexes still hold their entries
-        assert_eq!(w.e_latest.len(), 2);
-        assert_eq!(w.r_latest.len(), 2);
-        assert!(w.e_index.len() > w.e_latest.len());
+        assert_eq!(w.indexes.e_latest.len(), 2);
+        assert_eq!(w.indexes.r_latest.len(), 2);
+        assert!(w.indexes.e_index.len() > w.indexes.e_latest.len());
     }
 
     #[test]
@@ -1311,7 +1229,7 @@ mod tests {
             .unwrap();
         // Tamper with E_latest only: the latest path now disagrees with the
         // main indexes, which proves which one each route reads.
-        for op in w.e_latest.values_mut() {
+        for op in w.indexes.e_latest.values_mut() {
             *op = Op::Retract;
         }
         let at = Tick(0);
@@ -1334,7 +1252,7 @@ mod tests {
         let (mut w, greg, _, varrow) = world();
         w.assert(greg, "located_in", Value::Ref(varrow), Some(Tick(1)))
             .unwrap();
-        w.r_latest.clear();
+        w.indexes.r_latest.clear();
         let at = Tick(1);
         assert!(
             w.neighbors(varrow, "located_in", Direction::In, at)
@@ -1359,7 +1277,7 @@ mod tests {
         let first = w.latest_tx;
         w.assert(greg, "located_in", Value::Ref(greg), Some(Tick(2)))
             .unwrap();
-        w.e_latest.clear();
+        w.indexes.e_latest.clear();
         assert!(
             w.at_canon(first)
                 .as_of_value(greg, "located_in", &v, Tick(1))
@@ -1389,15 +1307,15 @@ mod tests {
                 .iter()
                 .any(|f| matches!(f, Finding::IndexMismatch { index, .. } if *index == want))
         };
-        let mut main = w.e_precision.clone();
-        for p in w.e_precision.values_mut() {
+        let mut main = w.indexes.e_precision.clone();
+        for p in w.indexes.e_precision.values_mut() {
             *p = Precision::Day;
         }
         assert!(mismatch_in(&w, IndexName::E));
-        w.e_precision.clear();
+        w.indexes.e_precision.clear();
         assert!(mismatch_in(&w, IndexName::E));
-        std::mem::swap(&mut w.e_precision, &mut main);
-        for p in w.e_latest_precision.values_mut() {
+        std::mem::swap(&mut w.indexes.e_precision, &mut main);
+        for p in w.indexes.e_latest_precision.values_mut() {
             *p = Precision::Century;
         }
         assert!(mismatch_in(&w, IndexName::ELatest));

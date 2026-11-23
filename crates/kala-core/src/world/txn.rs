@@ -263,7 +263,7 @@ impl Txn<'_> {
     /// [`World::edge_id`] but also seeing edges interned earlier in this
     /// transaction.
     pub fn edge_id(&self, source: EntityId, attr: &str, target: EntityId) -> Option<EdgeId> {
-        let attr = *self.world.attr_by_name.get(attr)?;
+        let attr = *self.world.catalog.attr_by_name.get(attr)?;
         self.world.edge_of(&self.ids, source, attr, target)
     }
 
@@ -286,7 +286,8 @@ impl Txn<'_> {
             // A payload only: judged below exactly as an exact fact.
             fact.precision = precision;
             check_entry_size(attr, &fact)?;
-            if judge(&txn.world.e_index, &txn.staged, &fact, entity, attr)? == Verdict::Noop {
+            if judge(&txn.world.indexes.e_index, &txn.staged, &fact, entity, attr)? == Verdict::Noop
+            {
                 // Find-then-act: nothing to change, so nothing is staged.
                 return Ok(WriteResult {
                     changed: 0,
@@ -331,7 +332,9 @@ impl Txn<'_> {
                 fact: current,
                 value: current_value,
             } = txn.world.correction_target(entry)?;
-            let attr = txn.world.attributes[current.attr.0 as usize].name.clone();
+            let attr = txn.world.catalog.attributes[current.attr.0 as usize]
+                .name
+                .clone();
             // Judged against the committed chain: if this transaction already
             // corrected it, that state is stale, so refuse before anything
             // else (a "no-op" against stale state could be a real change).
@@ -404,7 +407,7 @@ impl Txn<'_> {
             // A moved key: the same-tick rule at the new key, judged at the
             // latest canon plus the staged entries. The hold-based no-op
             // rules don't apply: this changes what canon says, not the story.
-            let layers = [&txn.world.e_index, &txn.staged];
+            let layers = [&txn.world.indexes.e_index, &txn.staged];
             let mut prefix = key::e_value_prefix(new.entity, new.attr, new.key_value());
             let there = op_at_tick(&layers, &mut prefix, new.tick, TxId(u64::MAX));
             match there {
@@ -466,7 +469,7 @@ impl Txn<'_> {
         let (fact, mark) = entry.key_and_mark();
         // A value new to the world is held here until the commit applies it.
         if let Some(r) = fact.value_ref()
-            && self.world.values.get(&fact.value).is_none()
+            && self.world.indexes.values.get(&fact.value).is_none()
         {
             self.ids.values.insert(&fact.value, r);
         }
@@ -548,7 +551,7 @@ impl Txn<'_> {
             before.restore(self.world);
         }
         let old_names = if schema_changed {
-            self.world.attr_by_name.clone()
+            self.world.catalog.attr_by_name.clone()
         } else {
             HashMap::new()
         };
@@ -972,15 +975,17 @@ impl World {
             return Ok(None);
         }
         if let Some(r) = self
+            .indexes
             .values
             .get(encoding)
             .or_else(|| staged.values.get(encoding))
         {
             return Ok(Some(r.to_key_bytes()));
         }
-        let hash = (self.content_hash)(text.as_bytes());
+        let hash = (self.indexes.content_hash)(text.as_bytes());
         // Staged values of a hash continue the committed ordinals.
         let next = self
+            .indexes
             .values
             .next_ordinal(hash)
             .max(staged.values.next_ordinal(hash));
@@ -999,7 +1004,7 @@ impl World {
         op: Op,
     ) -> Result<FactDef, Error> {
         let encoded = value.encode()?;
-        let vref = match self.attributes.get(attr.0 as usize) {
+        let vref = match self.catalog.attributes.get(attr.0 as usize) {
             Some(def) => self.value_ref(&StagedIds::default(), def, value, &encoded)?,
             None => None,
         };
@@ -1097,7 +1102,7 @@ impl World {
             Side::Forward => 0u8,
             Side::Reverse => 1,
         };
-        let name = |a: AttrId| self.attributes[a.0 as usize].name.as_str();
+        let name = |a: AttrId| self.catalog.attributes[a.0 as usize].name.as_str();
         items.sort_by(|x, y| {
             let (x, y) = (side(x), side(y));
             (x.0.raw(), name(x.1), rank(x.2)).cmp(&(y.0.raw(), name(y.1), rank(y.2)))

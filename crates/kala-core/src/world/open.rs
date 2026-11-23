@@ -319,7 +319,7 @@ impl World {
                 body: e.body.clone(),
             })
             .collect();
-        World::replay_with_hash(&entries, self.content_hash)
+        World::replay_with_hash(&entries, self.indexes.content_hash)
     }
 
     /// Rebuilds a world from the entries of a log's committed transactions.
@@ -492,6 +492,7 @@ impl World {
                 // Validate as a live create would, then check the log
                 // assigned exactly the ID a live create assigns.
                 let name = self
+                    .catalog
                     .node_types
                     .get(usize::from(id.node_type().0))
                     .filter(|_| !id.is_edge())
@@ -521,6 +522,7 @@ impl World {
                 // endpoints defined by earlier entries, a triple not yet
                 // interned, and the next edge sequence.
                 let def = self
+                    .catalog
                     .attributes
                     .get(attr.0 as usize)
                     .ok_or_else(|| unknown_attr(attr))?;
@@ -540,7 +542,7 @@ impl World {
                     return Err(corrupt(&"bidirectional edge with source > target"));
                 }
                 let triple = (*source, *attr, *target);
-                if let Some(existing) = self.edge_by_triple.get(&triple) {
+                if let Some(existing) = self.catalog.edge_by_triple.get(&triple) {
                     return Err(corrupt(&format!("triple already interned as {existing:?}")));
                 }
                 if id.seq() != self.last_edge_seq(&StagedIds::default()) + 1 {
@@ -570,6 +572,7 @@ impl World {
                 precision,
             } => {
                 let def = self
+                    .catalog
                     .attributes
                     .get(attr.0 as usize)
                     .ok_or_else(|| unknown_attr(attr))?;
@@ -620,7 +623,8 @@ impl World {
                 // already in.
                 let mut prefix = key::e_value_prefix(fact.entity, fact.attr, fact.key_value());
                 let all = TxId(u64::MAX);
-                if let Some(stored) = op_at_tick(&[&self.e_index], &mut prefix, fact.tick, all)
+                if let Some(stored) =
+                    op_at_tick(&[&self.indexes.e_index], &mut prefix, fact.tick, all)
                     && stored != fact.op
                 {
                     return Err(corrupt(&format!(
@@ -632,7 +636,13 @@ impl World {
                 // that holds at its tick, or a retract of one that doesn't.
                 // Judged like a live write, against everything before it
                 // (the current transaction's earlier facts are already in).
-                let held = holds(&[&self.e_index], &mut prefix, fact.tick, all, Work::NONE);
+                let held = holds(
+                    &[&self.indexes.e_index],
+                    &mut prefix,
+                    fact.tick,
+                    all,
+                    Work::NONE,
+                );
                 if !copied && held == (fact.op == Op::Assert) {
                     return Err(corrupt(&format!(
                         "a no-op {:?} at {:?} (the value {} held there)",
@@ -660,6 +670,7 @@ impl World {
                 tick,
             } => {
                 let def = self
+                    .catalog
                     .attributes
                     .get(attr.0 as usize)
                     .ok_or_else(|| unknown_attr(attr))?;
@@ -710,6 +721,7 @@ impl World {
                 precision,
             } => {
                 let def = self
+                    .catalog
                     .attributes
                     .get(attr.0 as usize)
                     .ok_or_else(|| unknown_attr(attr))?;
@@ -757,7 +769,8 @@ impl World {
                     // entry there means no live writer wrote this.
                     let mut prefix = key::e_value_prefix(fact.entity, fact.attr, fact.key_value());
                     let all = TxId(u64::MAX);
-                    if let Some(stored) = op_at_tick(&[&self.e_index], &mut prefix, fact.tick, all)
+                    if let Some(stored) =
+                        op_at_tick(&[&self.indexes.e_index], &mut prefix, fact.tick, all)
                     {
                         return Err(corrupt(&format!(
                             "a moved revision onto {:?} where {stored:?} is current",
