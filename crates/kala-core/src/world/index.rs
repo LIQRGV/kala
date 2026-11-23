@@ -405,7 +405,7 @@ pub(super) struct Indexes {
     pub(super) e_latest_precision: Precisions,
     /// Value index `V|attr|value|entity|^tick|^tx -> mark`: a copy of every
     /// `E` entry of an indexed, non-ref attribute (see
-    /// [`World::value_indexed`]), keyed by value so "every entity with
+    /// [`Catalog::value_indexed`]), keyed by value so "every entity with
     /// `attr = v`" is a prefix walk. Written only by [`World::index_entry`]
     /// next to its `E` entry, so it is derived and rebuilt with `E`.
     pub(super) v_index: Index,
@@ -493,6 +493,48 @@ impl Indexes {
         self.content_hash = hash;
     }
 
+    /// The value reference the `E` keys of value `v` (encoded as
+    /// `encoding`) of attribute `def` carry: `None` unless `def` is an
+    /// unindexed string attribute. A value the table (or the
+    /// writing transaction, `staged`) already holds keeps its reference; a
+    /// new one gets the next ordinal of its content hash, counting the
+    /// values `staged` adds, which is exactly what it gets when its entry
+    /// is applied (commit and replay assign in log order). A new value has
+    /// no stored history, so judging it under that reference finds nothing,
+    /// as it should.
+    ///
+    /// Fails with [`Error::Id`] only if every ordinal of the hash is spent
+    /// (`u32::MAX + 1` distinct values sharing one content hash).
+    pub(super) fn value_ref(
+        &self,
+        staged: &StagedIds,
+        def: &AttrDef,
+        v: &Value,
+        encoding: &[u8],
+    ) -> Result<Option<[u8; key::VALUE_REF_LEN]>, Error> {
+        let Value::Str(text) = v else {
+            return Ok(None);
+        };
+        if def.indexed || def.value_type != ValueType::Str {
+            return Ok(None);
+        }
+        if let Some(r) = self
+            .values
+            .get(encoding)
+            .or_else(|| staged.values.get(encoding))
+        {
+            return Ok(Some(r.to_key_bytes()));
+        }
+        let hash = (self.content_hash)(text.as_bytes());
+        // Staged values of a hash continue the committed ordinals.
+        let next = self
+            .values
+            .next_ordinal(hash)
+            .max(staged.values.next_ordinal(hash));
+        let ordinal = u32::try_from(next).map_err(|_| IdError::SeqOutOfRange(next))?;
+        Ok(Some(ValueRef { hash, ordinal }.to_key_bytes()))
+    }
+
     /// The stored index maps, borrowed for doctor's comparison.
     fn stored(&self) -> StoredIndexes<'_> {
         StoredIndexes {
@@ -515,7 +557,7 @@ impl Indexes {
     /// decides, not the indexes.
     fn insert(&mut self, fact: &FactDef, mark: Mark, tx: TxId, value_indexed: bool) {
         // A new unindexed value enters the table with the reference its
-        // keys were built with (see `World::value_ref`).
+        // keys were built with (see `Indexes::value_ref`).
         if let Some(r) = fact.value_ref() {
             self.values.insert(&fact.value, r);
         }

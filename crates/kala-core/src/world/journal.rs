@@ -100,18 +100,18 @@ impl Journal {
             self.next_entry(),
             "invariant: entries are kept in log order without gaps"
         );
-        self.keep(&e, tx);
+        self.keep(e, tx);
     }
 
     /// Keeps `entry` as part of transaction `tx` without checking its ID
     /// continues the kept ones: for genesis entries as a file has them and
     /// for doctor's collecting replay, whose kept entries may have ID gaps
     /// (see [`Journal::kept_entry`]).
-    pub(super) fn keep(&mut self, entry: &LogEntry, tx: TxId) {
+    pub(super) fn keep(&mut self, entry: LogEntry, tx: TxId) {
         self.entries.push(EntryInfo {
             id: entry.id,
             tx,
-            body: entry.body.clone(),
+            body: entry.body,
         });
     }
 
@@ -273,7 +273,7 @@ pub(super) fn as_fact(body: &EntryBody) -> Option<FactFields<'_>> {
 }
 
 /// A kept entry as the log entry it was read from or appended as.
-fn as_log_entry(e: &EntryInfo) -> LogEntry {
+pub(super) fn as_log_entry(e: &EntryInfo) -> LogEntry {
     LogEntry {
         id: e.id,
         body: e.body.clone(),

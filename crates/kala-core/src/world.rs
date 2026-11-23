@@ -279,7 +279,7 @@ pub(crate) struct FactDef {
     /// The target of a `ref` fact (its `R` key), `None` for other values.
     pub(crate) target: Option<EntityId>,
     /// For an unindexed string value, the value reference its `E` keys
-    /// carry instead of `value` (see [`World::value_ref`]); `None` for
+    /// carry instead of `value` (see `Indexes::value_ref`); `None` for
     /// every other value, whose `E` keys carry `value` itself.
     pub(crate) vref: Option<[u8; key::VALUE_REF_LEN]>,
 }
@@ -525,18 +525,20 @@ impl World {
         {
             return Ok(copies);
         }
-        // Genesis entries are the kept ones of tx#0: a prefix.
-        let genesis_len = kept.iter().take_while(|e| e.tx == TxId(0)).count();
-        let entries = self.journal.log_entries();
-        let mut rebuilt = World::from_genesis(&entries[..genesis_len])?;
+        let genesis: Vec<_> = kept
+            .iter()
+            .take_while(|e| e.tx == TxId(0))
+            .map(as_log_entry)
+            .collect();
+        let mut rebuilt = World::from_genesis(&genesis)?;
         // Same value interning as this world, as the doctor rebuild does.
         rebuilt.set_rebuild_hash(self.indexes.content_hash);
         let mut txn = ReplayTxn::default();
-        for (info, entry) in kept.iter().zip(&entries).filter(|(e, _)| e.tx != TxId(0)) {
+        for entry in kept.iter().filter(|e| e.tx != TxId(0)) {
             if !txn.migration_expected.is_empty() {
-                copies.insert(info.id);
+                copies.insert(entry.id);
             }
-            rebuilt.replay_entry(entry, &mut txn)?;
+            rebuilt.replay_entry(&as_log_entry(entry), &mut txn)?;
         }
         Ok(copies)
     }
