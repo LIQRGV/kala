@@ -265,14 +265,10 @@ impl fmt::Display for Error {
                     crate::world::value_type_name(*from),
                     crate::world::value_type_name(*to)
                 )?;
-                for (i, e) in examples.iter().enumerate() {
-                    if i > 0 {
-                        f.write_str(", ")?;
-                    }
+                write_list(f, examples, |f, e| {
                     write!(f, "{} @{} ", Echo(&e.entity.formatted), e.tick.0)?;
-                    write_value(f, &e.value)?;
-                }
-                Ok(())
+                    write_value(f, &e.value)
+                })
             }
             Error::PairsBothWays { attr, pairs } => {
                 write!(
@@ -280,13 +276,9 @@ impl fmt::Display for Error {
                     "cannot migrate :{}: pairs have history in both directions: ",
                     Echo(attr)
                 )?;
-                for (i, (a, b)) in pairs.iter().enumerate() {
-                    if i > 0 {
-                        f.write_str(", ")?;
-                    }
-                    write!(f, "{} and {}", Echo(&a.formatted), Echo(&b.formatted))?;
-                }
-                Ok(())
+                write_list(f, pairs, |f, (a, b)| {
+                    write!(f, "{} and {}", Echo(&a.formatted), Echo(&b.formatted))
+                })
             }
             Error::ReservedName(name) => write!(
                 f,
@@ -383,6 +375,21 @@ impl fmt::Display for Error {
             Error::ReadOnly => f.write_str("world is open read-only; writes are refused"),
         }
     }
+}
+
+/// Writes `items` separated by `", "`, each as `write_item` writes it.
+fn write_list<T>(
+    f: &mut fmt::Formatter<'_>,
+    items: &[T],
+    write_item: impl Fn(&mut fmt::Formatter<'_>, &T) -> fmt::Result,
+) -> fmt::Result {
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            f.write_str(", ")?;
+        }
+        write_item(f, item)?;
+    }
+    Ok(())
 }
 
 /// A value as `kala asof` shows it: strings quoted (escaped and cut, see
