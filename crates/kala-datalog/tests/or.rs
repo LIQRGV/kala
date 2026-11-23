@@ -166,6 +166,49 @@ fn branch_and_depth_limits_are_bounded() {
     assert_eq!(prepare(&w, &q).unwrap_err().kind, ErrorKind::Limit);
 }
 
+#[test]
+fn nested_negation_before_disjunction_respects_expanded_plan_limit() {
+    let w = world();
+    let mut body = String::from("[:greg :name \"Greg\"]");
+    for _ in 0..6 {
+        body = format!(
+            "(not {body}) (or [:greg :name \"x\"] [:greg :name \"y\"]) (or [:greg :name \"x\"] [:greg :name \"y\"])"
+        );
+    }
+    let query = format!("[:find ?e :where [?e :name \"Greg\"] {body}]");
+    let e = match prepare(&w, &query) {
+        Err(e) => e,
+        Ok(_) => panic!("nested negations cloned into every branch must be included in plan cost"),
+    };
+    assert_eq!(e.kind, ErrorKind::Limit, "{e}");
+}
+
+#[test]
+fn variables_inside_not_do_not_count_as_disjunction_bindings() {
+    let w = world();
+    let query =
+        "[:find ?e :where [?e :name \"Greg\"] (or [?x :name \"a\"] (not [?x :name \"b\"]))]";
+    let e = prepare(&w, query).expect_err(
+        "a positive binding and an existential inside not are different branch binding sets",
+    );
+    assert!(
+        e.message.contains("variable") || e.message.contains("bind"),
+        "{e}"
+    );
+}
+
+#[test]
+fn repeated_independent_disjunctions_cannot_expand_exponentially() {
+    let w = world();
+    let branches = "(or [?c :name \"Greg\"] [?c :name \"Greg\"]) ".repeat(14);
+    let query = format!("[:find ?c :where {branches}]");
+    let e = match prepare(&w, &query) {
+        Err(e) => e,
+        Ok(_) => panic!("many individually small disjunctions need a combined plan limit"),
+    };
+    assert_eq!(e.kind, ErrorKind::Limit, "{e}");
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(32))]
     #[test]

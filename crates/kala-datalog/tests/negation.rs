@@ -10,7 +10,7 @@
 //! pattern/call inside, else `ErrorKind::UnboundVariable`. A `not` that
 //! (transitively) calls a rule of its own recursive component is
 //! `ErrorKind::Stratification` (new), naming the rule; a `not` over a
-//! lower-stratum rule, recursive or not, is fine. `not-join` and `or` stay
+//! lower-stratum rule, recursive or not, is fine. `not-join` and `or-join` stay
 //! `Unsupported`.
 //!
 //! World (built through kala-core), all facts at -500 unless noted:

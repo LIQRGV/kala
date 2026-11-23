@@ -4,7 +4,7 @@ use kala_core::{
     load_fixture,
 };
 use kala_datalog::prepare;
-use kala_query::{Limits, Params, run};
+use kala_query::{Datum, Limits, Params, run};
 
 const VARROW: &str = include_str!("../../kala-core/tests/fixtures/varrow.yaml");
 
@@ -14,21 +14,17 @@ fn sixth_history_position_exposes_year_and_exact() {
     for (query, expected) in [
         (
             "[:find ?prec :where [:battle_of_ashford :name \"Battle of Ashford\" ?t ?op ?prec]]",
-            "Year",
+            Precision::Year,
         ),
         (
             "[:find ?prec :where [:greg :located_in :varrow 200 :assert ?prec]]",
-            "Exact",
+            Precision::Exact,
         ),
     ] {
         let p = prepare(&w, query).unwrap_or_else(|e| panic!("precision query failed: {e}"));
         let r = run(&w, &p.plan, &Params::new(), &Limits::default()).unwrap();
         assert_eq!(r.rows.len(), 1);
-        assert!(
-            format!("{:?}", r.rows[0][0]).contains(expected),
-            "{:?}",
-            r.rows
-        );
+        assert_eq!(r.rows[0][0], Datum::Precision(expected));
     }
 }
 
@@ -39,7 +35,7 @@ fn precision_binds_in_rules() {
     let p = prepare(&w, q).unwrap();
     let r = run(&w, &p.plan, &Params::new(), &Limits::default()).unwrap();
     assert_eq!(r.rows.len(), 1);
-    assert!(format!("{:?}", r.rows[0][0]).contains("Year"));
+    assert_eq!(r.rows[0][0], Datum::Precision(Precision::Year));
 }
 
 #[test]
@@ -82,12 +78,20 @@ fn every_precision_and_older_canon_survive_a_correction() {
         .unwrap()
         .rows;
     assert_eq!(rows.len(), 6);
-    for name in ["Exact", "Day", "Month", "Year", "Decade", "Century"] {
-        assert!(
-            rows.iter().any(|r| format!("{:?}", r[0]).contains(name)),
-            "{name}: {rows:?}"
-        );
-    }
+    assert_eq!(
+        rows,
+        [
+            Precision::Exact,
+            Precision::Day,
+            Precision::Month,
+            Precision::Year,
+            Precision::Decade,
+            Precision::Century
+        ]
+        .into_iter()
+        .map(|p| vec![Datum::Precision(p)])
+        .collect::<Vec<_>>()
+    );
     w.correct(
         last.unwrap(),
         Correction::Replace {
@@ -98,7 +102,10 @@ fn every_precision_and_older_canon_survive_a_correction() {
         },
     )
     .unwrap();
-    for (canon, expected) in [(old.0, "Century"), (w.latest_tx().0, "Year")] {
+    for (canon, expected) in [
+        (old.0, Precision::Century),
+        (w.latest_tx().0, Precision::Year),
+    ] {
         let p = prepare(
             &w,
             &format!("[:find ?p :canon {canon} :where [:greg :age 5 ?t ?op ?p]]"),
@@ -108,7 +115,7 @@ fn every_precision_and_older_canon_survive_a_correction() {
             .unwrap()
             .rows;
         assert_eq!(rows.len(), 1);
-        assert!(format!("{:?}", rows[0][0]).contains(expected));
+        assert_eq!(rows[0][0], Datum::Precision(expected));
     }
 }
 
@@ -121,5 +128,20 @@ fn precision_variable_can_join_across_histories_and_negation() {
         .unwrap()
         .rows;
     assert_eq!(rows.len(), 1);
-    assert!(format!("{:?}", rows[0][0]).contains("Year"));
+    assert_eq!(rows[0][0], Datum::Precision(Precision::Year));
+}
+
+#[test]
+fn precision_literal_matches_the_same_keyword_as_a_bound_variable() {
+    let w = load_fixture(VARROW).unwrap();
+    for q in [
+        "[:find ?t :where [:battle_of_ashford :name _ ?t _ :year]]",
+        "[:find ?t :where [:battle_of_ashford :name _ ?t _ ?p] [(= ?p :year)]]",
+    ] {
+        let p = prepare(&w, q).unwrap();
+        let rows = run(&w, &p.plan, &Params::new(), &Limits::default())
+            .unwrap()
+            .rows;
+        assert_eq!(rows, vec![vec![Datum::Value(Value::I64(600))]]);
+    }
 }

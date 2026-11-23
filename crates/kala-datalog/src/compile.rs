@@ -576,14 +576,14 @@ impl<'w> Compiler<'w> {
                     .filter(|v| !self.is_param(scope, v))
                     .map(str::to_owned)
                     .collect();
-                if let Some(first) = vars.first() {
-                    if first != &names {
-                        return Err(DatalogError::new(
-                            ErrorKind::UnboundVariable,
-                            Some(o.span),
-                            "every or branch must bind the same set of variables",
-                        ));
-                    }
+                if let Some(first) = vars.first()
+                    && first != &names
+                {
+                    return Err(DatalogError::new(
+                        ErrorKind::UnboundVariable,
+                        Some(o.span),
+                        "every or branch must bind the same set of variables",
+                    ));
                 }
                 vars.push(names);
                 let mut sub = scope.clone();
@@ -602,8 +602,16 @@ impl<'w> Compiler<'w> {
                     }
                 }
             }
-            // Only variables bound in every branch may escape the union.
-            binds.retain(|name| branches.iter().all(|(s, _)| s.bound.contains(name)));
+            // Mentioning a variable inside `not` does not bind it outside.
+            // Reject unequal output schemas here, before emitting a Union.
+            if let Some((first, _)) = branches.first()
+                && branches.iter().any(|(s, _)| s.bound != first.bound)
+            {
+                return Err(unbound(
+                    o.span,
+                    "every or branch must bind the same set of variables",
+                ));
+            }
             let uses = names
                 .intersection(&inherited)
                 .map(|n| scope.var(n).0)
@@ -1945,7 +1953,20 @@ fn precision_constant(item: &Item) -> Option<kala_core::Precision> {
 // carries its input bindings; successive disjunctions can multiply plan size.
 fn check_or_cost(q: &Query) -> Result<(), DatalogError> {
     fn cost(c: Clauses<'_>, span: Span) -> Result<usize, DatalogError> {
-        let mut n = 1 + c.clauses.len() * 2 + c.calls.len() + c.durings.len() + c.fns.len();
+        let patterns = c
+            .clauses
+            .iter()
+            .map(|c| match c {
+                Clause::At { patterns, .. } => patterns.len(),
+                _ => 1,
+            })
+            .sum::<usize>();
+        let mut n = 1 + patterns + c.calls.len() + c.durings.len() + c.fns.len();
+        // The planner may place any ready negation before the first union,
+        // so every branch can copy its complete subtree along with the prefix.
+        for b in c.nots {
+            n = n.saturating_add(1 + cost(Clauses::of_not(b), b.span)?);
+        }
         for o in c.ors {
             let mut sum = 0usize;
             for b in &o.branches {
@@ -1958,9 +1979,6 @@ fn check_or_cost(q: &Query) -> Result<(), DatalogError> {
                     "or expansion exceeds the 4096-node planning budget",
                 ));
             }
-        }
-        for b in c.nots {
-            n = n.saturating_add(cost(Clauses::of_not(b), b.span)?);
         }
         if n > 4096 {
             Err(DatalogError::limit(

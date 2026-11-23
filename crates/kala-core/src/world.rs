@@ -844,6 +844,20 @@ impl World {
         self.kept_entry(id).cloned()
     }
 
+    /// The current fact in an entry's correction chain, at the latest canon.
+    /// Accepts the same entry IDs as [`World::correct`] and returns the same
+    /// target errors (including a chain already deleted). This is a read only;
+    /// it does not validate or stage a proposed replacement.
+    pub fn current_change(&self, entry: EntryId) -> Result<Change, Error> {
+        let target = self.correction_target(entry)?;
+        Ok(Change {
+            tick: target.fact.tick,
+            op: target.fact.op,
+            precision: target.fact.precision,
+            value: target.value,
+        })
+    }
+
     /// The kept entry with ID `id` (see [`World::entry`]), borrowed.
     fn kept_entry(&self, id: EntryId) -> Option<&EntryInfo> {
         let i = usize::try_from(id.0.checked_sub(1)?).ok()?;

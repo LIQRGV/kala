@@ -232,6 +232,27 @@ fn correction_delete_and_value_op_precision_replacements() {
 }
 
 #[test]
+fn correction_noop_and_delete_report_current_precision() {
+    let f = build(EMPTY);
+    let j = json_write(&f, "[:assert :greg :age 18 :at -300 :precision :year]");
+    let entry = j["ops"][0]["entries"][0].as_u64().unwrap();
+    let no_op = json_write(&f, &format!("[:correct {entry} :replace]"));
+    assert_eq!(no_op["changed"], 0);
+    assert_eq!(no_op["ops"][0]["tick"], -300);
+    assert_eq!(no_op["ops"][0]["precision"], "year");
+    json_write(
+        &f,
+        &format!("[:correct {entry} :replace :at -280 :precision :decade]"),
+    );
+    let no_op = json_write(&f, &format!("[:correct {entry} :replace]"));
+    assert_eq!(no_op["ops"][0]["tick"], -280);
+    assert_eq!(no_op["ops"][0]["precision"], "decade");
+    let deleted = json_write(&f, &format!("[:correct {entry} :delete]"));
+    assert_eq!(deleted["ops"][0]["tick"], -280);
+    assert_eq!(deleted["ops"][0]["precision"], "decade");
+}
+
+#[test]
 fn created_handle_and_new_edge_resolve_inside_one_transaction() {
     let f = build(EMPTY);
     let j = json_write(
@@ -394,9 +415,41 @@ fn dry_run_never_recovers_or_quarantines_a_torn_log() {
 }
 
 #[test]
-fn held_write_lock_is_exit_three() {
+fn dry_run_refuses_damaged_tail_needing_acknowledgement_without_touching_it() {
     let f = build(EMPTY);
-    let _held = World::open(&f.path).unwrap();
+    ok(&f, "[:assert :greg :age 18 :at -300]");
+    let mut bytes = fs::read(&f.path).unwrap();
+    let last = damage::spans(&bytes).pop().unwrap();
+    bytes[last.body_start + 6] ^= 0x01;
+    fs::write(&f.path, bytes).unwrap();
+    let source = f.dir.path().join("writes.edn");
+    fs::write(&source, "[:assert :greg :age 20 :at -280]").unwrap();
+    let before = damage::dir_snapshot(f.dir.path());
+    let o = f.run(
+        "transact",
+        &[source.to_str().unwrap(), "--dry-run", "--json"],
+    );
+    assert!(
+        !o.status.success(),
+        "preview must refuse a write that needs recovery acknowledgement: {}",
+        stdout(&o)
+    );
+    assert!(stderr(&o).contains("acknowledg"), "{}", stderr(&o));
+    assert_eq!(damage::dir_snapshot(f.dir.path()), before);
+}
+
+#[test]
+fn held_write_lock_is_exit_three() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("w.kala");
+    // Retain the fixture writer: no unlock/reopen window while other test
+    // threads spawn children, briefly inheriting a file descriptor at fork.
+    let _held = kala_core::load_fixture_to(EMPTY, &path).unwrap();
+    let f = Fx {
+        dir,
+        path,
+        mem: kala_core::load_fixture(EMPTY).unwrap(),
+    };
     let o = transact(&f, "[:assert :greg :age 18]", &[]);
     assert_eq!(code(&o), 3, "{}", stderr(&o));
     assert!(stderr(&o).to_lowercase().contains("lock"), "{}", stderr(&o));

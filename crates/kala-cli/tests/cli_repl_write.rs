@@ -253,3 +253,26 @@ fn initial_at_flag_applies_to_writes_and_precision_prints() {
         stdout(&o)
     );
 }
+
+#[test]
+fn session_rules_can_use_or_and_observe_later_commits() {
+    let f = build(EMPTY);
+    let o = repl(
+        &f,
+        ".json on\n.rule [[(named ?c) (or [?c :name \"Greg\"] [?c :name \"Kael\"])]]\n[:assert :greg :name \"Greg\"]\n[:find ?c :where (named ?c)]\n[[:create :CHARACTER :kael] [:assert :kael :name \"Kael\"]]\n[:find ?c :where (named ?c)]\n",
+        &["--write"],
+    );
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let docs = documents(&o);
+    assert_eq!(docs.len(), 4);
+    assert_eq!(docs[1]["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(docs[3]["rows"].as_array().unwrap().len(), 2);
+    let mut handles = docs[3]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r[0]["value"]["handle"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    handles.sort();
+    assert_eq!(handles, ["greg", "kael"]);
+}

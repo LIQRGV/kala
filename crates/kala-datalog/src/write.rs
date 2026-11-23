@@ -274,13 +274,13 @@ fn operation(items: Vec<Form>, span: Span) -> Result<WriteOp, DatalogError> {
         }
         "assert" | "retract" => {
             let subject = value(it.next().ok_or_else(missing)?)?;
-            if let WriteValue::Scalar(i) = &subject {
-                if !matches!(i, Item::Keyword(..) | Item::Id(..)) {
-                    return Err(DatalogError::syntax(
-                        i.span(),
-                        "subject must be a handle, ID or edge triple",
-                    ));
-                }
+            if let WriteValue::Scalar(i) = &subject
+                && !matches!(i, Item::Keyword(..) | Item::Id(..))
+            {
+                return Err(DatalogError::syntax(
+                    i.span(),
+                    "subject must be a handle, ID or edge triple",
+                ));
             }
             let (name, aspan) = keyword(it.next().ok_or_else(missing)?)?;
             let value = value(it.next().ok_or_else(missing)?)?;

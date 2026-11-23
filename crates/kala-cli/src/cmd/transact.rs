@@ -145,6 +145,16 @@ pub fn execute(w: &mut World, form: &WriteTxn, default: Option<Tick>) -> Result<
             _ => {}
         }
     }
+    // Corrections retain omitted precision, including deletions and no-ops.
+    // Use the core's chain resolver; a bad target is still reported by its op.
+    let precisions: Vec<_> = form
+        .ops
+        .iter()
+        .map(|op| match op {
+            WriteOp::Correct { entry, .. } => w.current_change(*entry).ok().map(|c| c.precision),
+            _ => None,
+        })
+        .collect();
     let mut tx = w.begin();
     if let Some(t) = default {
         tx.set_default_tick(t);
@@ -202,14 +212,20 @@ pub fn execute(w: &mut World, form: &WriteTxn, default: Option<Tick>) -> Result<
                         replacement
                             .as_ref()
                             .and_then(|r| r.precision)
+                            .or(precisions[index])
                             .unwrap_or(Precision::Exact),
                         None,
                     ))
                 }
             }
         };
-        let (changed, tick, precision, entity) = run()
-            .map_err(|e| user(format!("op {} (:{}): {}", index + 1, kind(op), e.message())))?;
+        let (changed, tick, precision, entity) = run().map_err(|e| {
+            let msg = format!("op {} (:{}): {}", index + 1, kind(op), e.message());
+            match e {
+                CliError::Store(_) => CliError::Store(msg),
+                _ => user(msg),
+            }
+        })?;
         created.push(entity);
         ops.push(Operation {
             position: index + 1,
@@ -226,17 +242,6 @@ pub fn execute(w: &mut World, form: &WriteTxn, default: Option<Tick>) -> Result<
     for (op, entity) in ops.iter_mut().zip(created) {
         op.entity = entity.map(|e| w.format_id(e));
         op.entries = ids.by_ref().take(op.changed).map(|id| id.0).collect();
-        // A correction can retain the previous precision; read its actual payload.
-        if op.kind == "correct" {
-            for id in op.entries.iter().rev() {
-                if let Some(e) = w.entry(kala_core::EntryId(*id)) {
-                    if let kala_core::log::EntryBody::Revised { precision, .. } = e.body {
-                        op.precision = out::precision_str(precision);
-                        break;
-                    }
-                }
-            }
-        }
     }
     Ok(Report {
         form: 1,
@@ -327,6 +332,11 @@ pub fn run(path: &Path, input: &Path, dry_run: bool, json: bool) -> Result<Done,
     } else {
         open_write(path)?
     };
+    if dry_run && w.recovery().cause == Some(kala_core::CutCause::Damaged) {
+        return Err(user(
+            "dry-run refused: damaged log needs recovery acknowledgement before writes",
+        ));
+    }
     let forms = kala_datalog::write_forms(&text).map_err(|e| user(e.to_string()))?;
     let mut count = 0;
     for (i, form) in forms.enumerate() {

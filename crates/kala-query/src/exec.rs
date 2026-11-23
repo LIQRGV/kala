@@ -577,8 +577,8 @@ impl Slots {
 enum ValKind {
     Value(ValueType),
     Op,
-    Precision,
     Intervals,
+    Precision,
 }
 
 impl ValKind {
