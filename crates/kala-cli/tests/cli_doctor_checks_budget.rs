@@ -9,9 +9,13 @@ const PRODUCT: &str = "[:find ?a ?b ?c :at 0 :where [?a :label \"Villager\"] [?b
 fn checks_stop_once_when_the_shared_budget_is_exhausted() {
     let fx = varrow();
     let prepared = kala_datalog::prepare(&fx.mem, PRODUCT).unwrap();
-    let (_, usage) =
-        kala_query::run_with_usage(&fx.mem, &prepared.plan, &Params::new(), &Limits::default())
-            .unwrap();
+    let (_, usage) = kala_query::run_with(
+        &fx.mem,
+        &prepared.plan,
+        &Params::new(),
+        kala_query::RunOptions::new(Limits::default()),
+    )
+    .unwrap();
     let limit = Limits::default();
     // Steps are shared across checks; memory is released after each check,
     // so only the step budget decides how many checks complete (review round 1).
@@ -90,8 +94,13 @@ fn checks_share_steps_even_when_the_byte_budget_is_not_exhausted() {
     );
     let prepared = kala_datalog::prepare(&fx.mem, &query).unwrap();
     let limits = Limits::default();
-    let (_, usage) =
-        kala_query::run_with_usage(&fx.mem, &prepared.plan, &Params::new(), &limits).unwrap();
+    let (_, usage) = kala_query::run_with(
+        &fx.mem,
+        &prepared.plan,
+        &Params::new(),
+        kala_query::RunOptions::new(limits),
+    )
+    .unwrap();
     let completed = (limits.max_steps / usage.steps) as usize;
     assert!((1..64).contains(&completed), "{usage:?}");
     assert!(

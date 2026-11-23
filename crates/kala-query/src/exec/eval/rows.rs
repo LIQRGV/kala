@@ -119,6 +119,20 @@ fn int_float(i: i64, f: f64) -> std::cmp::Ordering {
         }
     })
 }
+/// One relationship pattern read at one tick: the row slots of its two
+/// ends and of the edge, in `attr`'s named orientation (`Out`: `x` is the
+/// source, `In`: `x` is the target; `Either`: both, for a directed
+/// attribute).
+#[derive(Clone, Copy)]
+struct EdgePattern<'s> {
+    x: usize,
+    y: usize,
+    edge: usize,
+    attr: &'s str,
+    direction: Orientation,
+    t: Tick,
+}
+
 impl Exec<'_, '_> {
     pub(super) fn eval_row(
         &mut self,
@@ -174,34 +188,41 @@ impl Exec<'_, '_> {
                     attr,
                     direction,
                     tick: t,
-                } => self.edge_row(
-                    row,
-                    (*source, *target, *edge),
-                    attr,
-                    *direction,
-                    tick(t),
-                    &mut out,
-                )?,
+                } => {
+                    let pattern = EdgePattern {
+                        x: *source,
+                        y: *target,
+                        edge: *edge,
+                        attr,
+                        direction: *direction,
+                        t: tick(t),
+                    };
+                    self.edge_row(row, pattern, &mut out)?
+                }
             }
         }
         Ok(out)
     }
-    /// Emits `row` extended with each relationship of `attr` holding at `t`
-    /// that fits its bound ends. `x`/`y` are the pattern's ends in `attr`'s
-    /// named orientation (`Out`: x is the source, `In`: x is the target;
-    /// `Either`: both, for a directed attribute). With an end bound this is
-    /// one `neighbors` seek (which reads inverse names and both sides of a
-    /// bidirectional pair, and returns the stored edge's ID); with neither
-    /// bound, the query's cached scan of `attr` at `t`, read once per tick.
+    /// Emits `row` extended with each relationship of the pattern's `attr`
+    /// holding at `t` that fits its bound ends (see [`EdgePattern`]). With
+    /// an end bound this is one `neighbors` seek (which reads inverse names
+    /// and both sides of a bidirectional pair, and returns the stored edge's
+    /// ID); with neither bound, the query's cached scan of `attr` at `t`,
+    /// read once per tick.
     fn edge_row(
         &mut self,
         row: Row,
-        (x, y, edge): (usize, usize, usize),
-        attr: &str,
-        direction: Orientation,
-        t: Tick,
+        pattern: EdgePattern<'_>,
         out: &mut BTreeSet<Row>,
     ) -> Result<(), QueryError> {
+        let EdgePattern {
+            x,
+            y,
+            edge,
+            attr,
+            direction,
+            t,
+        } = pattern;
         let schema = self.world.at_canon(self.view.canon());
         let Ok((def, inverse)) = schema.resolve_attribute(attr) else {
             return Ok(());
@@ -231,7 +252,7 @@ impl Exec<'_, '_> {
                 },
             ),
             (None, None) => {
-                return self.edge_scan(row, (x, y, edge), attr, inverse, def, direction, t, out);
+                return self.edge_scan(row, pattern, inverse, def, out);
             }
         };
         // `Both` on a directed attribute reads `Out` and `In`; a self loop is
@@ -259,18 +280,22 @@ impl Exec<'_, '_> {
     /// scan, one step each. The edge ID is looked up under the base
     /// attribute in stored order: `(c child_of p)` is the edge `(p parent_of
     /// c)`, and kala-core finds a bidirectional pair in either order.
-    #[allow(clippy::too_many_arguments)]
     fn edge_scan(
         &mut self,
         row: Row,
-        (x, y, edge): (usize, usize, usize),
-        attr: &str,
+        pattern: EdgePattern<'_>,
         inverse: bool,
         def: &kala_core::AttrDef,
-        direction: Orientation,
-        t: Tick,
         out: &mut BTreeSet<Row>,
     ) -> Result<(), QueryError> {
+        let EdgePattern {
+            x,
+            y,
+            edge,
+            attr,
+            direction,
+            t,
+        } = pattern;
         // `View::edge_id` resolves names in the latest name table, so the
         // base is named there too (the canon's definition may predate a rename).
         let base = if inverse {

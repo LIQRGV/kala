@@ -1,7 +1,7 @@
 //! Slice 13 polish: named relationship rows (inverse names, cost) and ordering comparisons.
 use kala_core::{Value, World};
 use kala_fixture::load_fixture;
-use kala_query::{Datum, Limits, Params, run, run_with_usage};
+use kala_query::{Datum, Limits, Params, RunOptions, run, run_with};
 
 fn prep_run(w: &World, text: &str) -> Vec<Vec<Datum>> {
     let p = kala_cypher::prepare(w, text).unwrap_or_else(|e| panic!("{text}: {e}"));
@@ -170,8 +170,13 @@ fn named_relationship_from_bound_rows_does_not_rescan_all_pairs_per_row() {
     let w = load_fixture(&y).unwrap();
     let text = "MATCH (a:NODE) WHERE a.tag = 'hot' MATCH (a)-[r:x]->(b) RETURN r";
     let p = kala_cypher::prepare(&w, text).unwrap();
-    let (rs, usage) = run_with_usage(&w, &p.plan, &Params::new(), &Limits::default())
-        .unwrap_or_else(|e| panic!("{e}"));
+    let (rs, usage) = run_with(
+        &w,
+        &p.plan,
+        &Params::new(),
+        RunOptions::new(Limits::default()),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(rs.rows.len(), 300 * 5);
     let (rows, pairs) = (300u64, 3000u64);
     eprintln!("measured steps = {}", usage.steps);

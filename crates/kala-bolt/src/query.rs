@@ -41,9 +41,14 @@ pub(crate) fn run(
     );
     let params = parameters(world, &prepared.params, given, front_end.nullable_params())?;
     let limits = Limits::default();
-    let result =
-        kala_query::run_with_values_and_cancel(world, &prepared.plan, &params, &limits, stop)
-            .map_err(query_error)?;
+    let result = kala_query::run_with(
+        world,
+        &prepared.plan,
+        &params,
+        kala_query::RunOptions::new(limits).with_cancel(stop),
+    )
+    .map(|(rs, _)| rs)
+    .map_err(query_error)?;
     let meter = WorkMeter::bounded(limits.max_steps, Some(stop));
     let view = world.at_canon(result.canon).metered(&meter);
     let mut budget = Budget {

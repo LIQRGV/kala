@@ -600,8 +600,8 @@ fn migrate_err(tx: &Txn, e: kala_core::Error) -> CliError {
             format!(
                 "{count} unconvertible change points migrating :{} ({} -> {}): {}",
                 escape::value(attr),
-                super::schema::type_name(*from),
-                super::schema::type_name(*to),
+                from.name(),
+                to.name(),
                 examples.join(", ")
             )
         }

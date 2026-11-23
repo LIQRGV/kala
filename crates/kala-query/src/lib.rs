@@ -14,8 +14,8 @@ pub mod ir;
 
 pub use datum::Datum;
 pub use exec::{
-    Limits, MAX_PLAN_DEPTH, Params, QueryError, ResultSet, Usage, execute, run, run_with_cancel,
-    run_with_usage, run_with_values, run_with_values_and_cancel,
+    Limits, MAX_PLAN_DEPTH, Params, QueryError, ResultSet, RunOptions, Usage, execute, run,
+    run_with,
 };
 pub use ir::{
     Access, Agg, AggFn, AttrRef, CanonSource, CmpOp, Func, MAX_EXPLAIN_BYTES, Op, OpTerm, Plan,

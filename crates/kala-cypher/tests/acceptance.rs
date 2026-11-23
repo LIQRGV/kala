@@ -1,7 +1,7 @@
 //! Read-subset behavior, including semantic differences from Datalog.
 use kala_core::{Value, World};
 use kala_fixture::load_fixture;
-use kala_query::{Datum, Limits, Params, QueryError, run, run_with_cancel};
+use kala_query::{Datum, Limits, Params, QueryError, run, run_with};
 use std::sync::atomic::AtomicBool;
 
 const VARROW: &str = include_str!("../../kala-core/tests/fixtures/varrow.yaml");
@@ -364,13 +364,13 @@ fn new_operators_respect_row_step_memory_and_cancellation_limits() {
             "{text}"
         );
         assert!(
-            run_with_cancel(
+            run_with(
                 &w,
                 &plan,
                 &Params::new(),
-                &Limits::default(),
-                &AtomicBool::new(true)
+                kala_query::RunOptions::new(Limits::default()).with_cancel(&AtomicBool::new(true))
             )
+            .map(|(rs, _)| rs)
             .is_err()
         );
     }
@@ -394,14 +394,14 @@ fn embedded_nullable_and_list_parameters_keep_cypher_semantics() {
     params.insert("aliases".into(), aliases.clone());
     params.insert("value".into(), Datum::Null);
     assert_eq!(
-        kala_query::run_with_values(&w, &p.plan, &params, &Limits::default())
+        kala_query::run(&w, &p.plan, &params, &Limits::default())
             .unwrap()
             .rows,
         vec![vec![Datum::Null]]
     );
     params.insert("value".into(), aliases.clone());
     assert_eq!(
-        kala_query::run_with_values(&w, &p.plan, &params, &Limits::default())
+        kala_query::run(&w, &p.plan, &params, &Limits::default())
             .unwrap()
             .rows,
         vec![vec![aliases]]
@@ -416,7 +416,7 @@ fn embedded_nullable_and_list_parameters_keep_cypher_semantics() {
         ),
     );
     assert!(
-        kala_query::run_with_values(&w, &p.plan, &params, &Limits::default())
+        kala_query::run(&w, &p.plan, &params, &Limits::default())
             .unwrap()
             .rows
             .is_empty()
@@ -477,8 +477,7 @@ fn parameter_list_equality_propagates_null_until_inequality_is_known() {
                 &format!("MATCH (e {{kala_handle: 'edwin'}}) WHERE {expression} RETURN e"),
             )
             .unwrap();
-            let result =
-                kala_query::run_with_values(&w, &p.plan, &params, &Limits::default()).unwrap();
+            let result = kala_query::run(&w, &p.plan, &params, &Limits::default()).unwrap();
             assert_eq!(
                 result.rows.len(),
                 usize::from(want),

@@ -11,10 +11,10 @@ use crate::ir::{Access, CmpOp, Func};
 
 use super::QueryError;
 use super::budget::Budget;
-use super::program::{Attr, Pos, Step, TickPos, pop};
+use super::program::{Pos, Step, TickPos, pop};
 use super::val::{
     CMP_BYTES_PER_STEP, Interner, PAIR_BYTES, Pairs, Points, Row, STRING_OVERHEAD_BYTES, Sets, Val,
-    compare, index_entry_bytes,
+    compare, index_entry_bytes, tuple_bytes,
 };
 pub(super) use fixpoint::Relation;
 use fixpoint::{Frame, Read};
@@ -22,6 +22,7 @@ use fixpoint::{Frame, Read};
 mod fixpoint;
 mod read;
 mod rows;
+use read::Triple;
 pub(super) use rows::order;
 
 pub(super) struct Exec<'a, 'w> {
@@ -53,6 +54,43 @@ pub(super) struct Exec<'a, 'w> {
     pub(super) node_types: Option<HashSet<String>>,
     /// Every relation of the plan, by id (empty outside its `Fixpoint`).
     pub(super) rels: Vec<Relation>,
+}
+
+impl<'a, 'w> Exec<'a, 'w> {
+    /// The state of a query about to run: no scans cached, and one empty
+    /// relation per entry of `rels` (each relation's columns, by id).
+    pub(super) fn new(
+        world: &'a World,
+        view: &'a MeteredView<'w>,
+        meter: &'a WorkMeter<'a>,
+        width: usize,
+        budget: Budget<'a>,
+        interner: Interner,
+        rels: &[Vec<usize>],
+    ) -> Exec<'a, 'w> {
+        Exec {
+            world,
+            view,
+            meter,
+            width,
+            budget,
+            interner,
+            scans: HashMap::new(),
+            history_scans: HashMap::new(),
+            during_scans: HashMap::new(),
+            checked_types: HashSet::new(),
+            node_types: None,
+            rels: rels
+                .iter()
+                .map(|cols| Relation {
+                    tuples: BTreeSet::new(),
+                    delta: BTreeSet::new(),
+                    new: BTreeSet::new(),
+                    tuple_bytes: tuple_bytes(cols.len()),
+                })
+                .collect(),
+        }
+    }
 }
 
 impl Exec<'_, '_> {
@@ -217,12 +255,7 @@ impl Exec<'_, '_> {
                     for &id in rels {
                         self.clear_rel(id);
                     }
-                    frames.push(Frame {
-                        loop_pc: 0,
-                        round: 0,
-                        variant: 0,
-                        delta_occ: None,
-                    });
+                    frames.push(Frame::new());
                 }
                 Step::RuleEnd { rel, cols } => {
                     let rows = pop(&mut stack);
@@ -232,19 +265,8 @@ impl Exec<'_, '_> {
                     let f = frames
                         .last_mut()
                         .expect("invariant: a RuleEnd runs inside its Fixpoint");
-                    if f.round > 0 {
-                        // A variant is done: the next one, or the round's end.
-                        let Step::FixLoop { variants, .. } = &prog[f.loop_pc] else {
-                            unreachable!("invariant: loop_pc is its Fixpoint's FixLoop")
-                        };
-                        pc = match self.next_variant(variants, f.variant + 1) {
-                            Some(i) => {
-                                f.variant = i;
-                                f.delta_occ = Some(variants[i].occ);
-                                variants[i].start
-                            }
-                            None => f.loop_pc,
-                        };
+                    if let Some(next) = self.after_rule(prog, f) {
+                        pc = next;
                     }
                 }
                 Step::FixLoop { rels, variants } => {
@@ -252,22 +274,9 @@ impl Exec<'_, '_> {
                         .last_mut()
                         .expect("invariant: a FixLoop runs inside its Fixpoint");
                     f.loop_pc = pc - 1;
-                    for &id in rels {
-                        self.merge_new(id, !variants.is_empty())?;
-                    }
-                    f.round += 1;
-                    // Only variants reading a non-empty delta can derive
-                    // anything new; with none, the relations are complete.
-                    match self.next_variant(variants, 0) {
-                        Some(i) => {
-                            f.variant = i;
-                            f.delta_occ = Some(variants[i].occ);
-                            pc = variants[i].start;
-                        }
+                    match self.next_round(f, rels, variants)? {
+                        Some(start) => pc = start,
                         None => {
-                            for &id in rels {
-                                self.clear_delta(id);
-                            }
                             frames.pop();
                         }
                     }
@@ -275,18 +284,10 @@ impl Exec<'_, '_> {
                 Step::Rel { rel, args, occ } => {
                     let read = match occ {
                         None => Read::All,
-                        Some(o) => {
-                            let f = frames
-                                .last()
-                                .expect("invariant: a recursive Rel runs inside its Fixpoint");
-                            if f.round == 0 {
-                                Read::Nothing
-                            } else if f.delta_occ == Some(*o) {
-                                Read::Delta
-                            } else {
-                                Read::All
-                            }
-                        }
+                        Some(o) => frames
+                            .last()
+                            .expect("invariant: a recursive Rel runs inside its Fixpoint")
+                            .read_of(*o),
                     };
                     let rows = pop(&mut stack);
                     let n = rows.len();
@@ -411,7 +412,14 @@ impl Exec<'_, '_> {
                 value,
                 tick,
                 access,
-            } => return self.eval_expand(entity, attr, value, tick, access, rows),
+            } => {
+                let read = Triple {
+                    entity,
+                    attr,
+                    value,
+                };
+                return self.eval_expand(read, tick, access, rows);
+            }
             Step::Handle { entity, value } => return self.eval_handle(entity, value, rows),
             Step::History {
                 entity,
@@ -421,8 +429,13 @@ impl Exec<'_, '_> {
                 op,
                 precision,
             } => {
+                let read = Triple {
+                    entity,
+                    attr,
+                    value,
+                };
                 for row in rows {
-                    self.history_row(&row, entity, attr, value, tick, op, precision, &mut out)?;
+                    self.history_row(&row, read, tick, op, precision, &mut out)?;
                 }
             }
             Step::During {
@@ -431,8 +444,13 @@ impl Exec<'_, '_> {
                 value,
                 out: set,
             } => {
+                let read = Triple {
+                    entity,
+                    attr,
+                    value,
+                };
                 for row in rows {
-                    self.during_row(&row, entity, attr, value, set, &mut out)?;
+                    self.during_row(&row, read, set, &mut out)?;
                 }
             }
             Step::Apply {
@@ -536,9 +554,7 @@ impl Exec<'_, '_> {
     /// Runs an `Expand` on its input's rows.
     fn eval_expand(
         &mut self,
-        entity: &Pos,
-        attr: &Attr,
-        value: &Pos,
+        read: Triple<'_>,
         tick: &TickPos,
         access: &Access,
         rows: BTreeSet<Row>,
@@ -556,12 +572,11 @@ impl Exec<'_, '_> {
                     by_tick.entry(t).or_default().push(row);
                 }
                 for (t, rows) in by_tick {
-                    let (all, fresh) = self.scan_once(&attr.name, t)?;
+                    let (all, fresh) = self.scan_once(&read.attr.name, t)?;
                     for row in rows {
-                        let pairs =
-                            self.expand_row(&row, entity, attr, value, t, *access, Some(&all))?;
+                        let pairs = self.expand_row(&row, read, t, *access, Some(&all))?;
                         for (e, v) in pairs {
-                            if let Some(r) = bind(&row, entity, value, Val::Ref(e), v) {
+                            if let Some(r) = bind(&row, read.entity, read.value, Val::Ref(e), v) {
                                 self.budget.emit(&mut out, r)?;
                             }
                         }
@@ -578,9 +593,9 @@ impl Exec<'_, '_> {
                         TickPos::Const(t) => *t,
                         TickPos::Var(s) => tick_of(&row, *s)?,
                     };
-                    let pairs = self.expand_row(&row, entity, attr, value, t, *access, None)?;
+                    let pairs = self.expand_row(&row, read, t, *access, None)?;
                     for (e, v) in pairs {
-                        if let Some(r) = bind(&row, entity, value, Val::Ref(e), v) {
+                        if let Some(r) = bind(&row, read.entity, read.value, Val::Ref(e), v) {
                             self.budget.emit(&mut out, r)?;
                         }
                     }

@@ -741,13 +741,7 @@ impl Txn<'_> {
 
 /// The stable spelling shared by write reports and explicit schema forms.
 pub fn type_name(ty: ValueType) -> &'static str {
-    match ty {
-        ValueType::Bool => "bool",
-        ValueType::I64 => "i64",
-        ValueType::F64 => "f64",
-        ValueType::Str => "string",
-        ValueType::Ref => "ref",
-    }
+    ty.name()
 }
 
 impl<'w> View<'w> {

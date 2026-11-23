@@ -3,7 +3,7 @@ mod common;
 
 use common::*;
 use kala_core::{Schema, World};
-use kala_query::{Limits, Op, Params, QueryError, run, run_with_cancel};
+use kala_query::{Limits, Op, Params, QueryError, RunOptions, run, run_with};
 use proptest::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -12,7 +12,13 @@ fn a_pre_set_flag_cancels_before_execution() {
     let w = World::in_memory(Schema::new()).unwrap();
     let p = plan(&[], Op::Unit);
     let flag = AtomicBool::new(true);
-    let result = run_with_cancel(&w, &p, &Params::new(), &Limits::default(), &flag);
+    let result = run_with(
+        &w,
+        &p,
+        &Params::new(),
+        RunOptions::new(Limits::default()).with_cancel(&flag),
+    )
+    .map(|(rs, _)| rs);
     assert!(matches!(result, Err(QueryError::Cancelled)), "{result:?}");
 }
 
@@ -22,12 +28,25 @@ fn an_unset_flag_preserves_results_and_can_be_reused_after_cancel() {
     let p = plan(&[], Op::Unit);
     let flag = AtomicBool::new(true);
     assert!(matches!(
-        run_with_cancel(&w, &p, &Params::new(), &Limits::default(), &flag),
+        run_with(
+            &w,
+            &p,
+            &Params::new(),
+            RunOptions::new(Limits::default()).with_cancel(&flag)
+        )
+        .map(|(rs, _)| rs),
         Err(QueryError::Cancelled)
     ));
     flag.store(false, Ordering::Relaxed);
     let expected = run(&w, &p, &Params::new(), &Limits::default()).unwrap();
-    let actual = run_with_cancel(&w, &p, &Params::new(), &Limits::default(), &flag).unwrap();
+    let actual = run_with(
+        &w,
+        &p,
+        &Params::new(),
+        RunOptions::new(Limits::default()).with_cancel(&flag),
+    )
+    .map(|(rs, _)| rs)
+    .unwrap();
     assert_eq!(actual.rows, expected.rows);
     assert_eq!(actual.columns, expected.columns);
     assert_eq!(actual.tick, expected.tick);
@@ -63,7 +82,13 @@ fn another_thread_can_cancel_a_query_that_would_exhaust_steps() {
             flag.store(true, Ordering::Release);
         });
         start.wait();
-        let result = run_with_cancel(&world, &p, &Params::new(), &limits, &flag);
+        let result = run_with(
+            &world,
+            &p,
+            &Params::new(),
+            RunOptions::new(limits).with_cancel(&flag),
+        )
+        .map(|(rs, _)| rs);
         assert!(matches!(result, Err(QueryError::Cancelled)), "{result:?}");
     });
 }
@@ -78,7 +103,7 @@ proptest! {
         let root = if cross { node_scan(root, "b", "N") } else { root };
         let p = plan(&["a"], project(root, &["a"]));
         let expected = run(&world, &p, &Params::new(), &Limits::default()).unwrap();
-        let actual = run_with_cancel(&world, &p, &Params::new(), &Limits::default(), &AtomicBool::new(false)).unwrap();
+        let actual = run_with(&world, &p, &Params::new(), RunOptions::new(Limits::default()).with_cancel(&AtomicBool::new(false))).map(|(rs, _)| rs).unwrap();
         prop_assert_eq!(actual.rows, expected.rows);
         prop_assert_eq!(actual.columns, expected.columns);
     }

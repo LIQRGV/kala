@@ -23,7 +23,7 @@ use std::mem::size_of;
 
 use super::{Exec, resolve};
 use crate::exec::QueryError;
-use crate::exec::program::{Pos, Variant};
+use crate::exec::program::{Pos, Step, Variant};
 use crate::exec::val::{Row, Val, index_entry_bytes};
 
 /// Which tuples of a relation a `Rel` reads.
@@ -45,6 +45,38 @@ pub(super) struct Frame {
     pub(super) variant: usize,
     /// The recursive read that reads the delta in the running variant.
     pub(super) delta_occ: Option<usize>,
+}
+
+impl Frame {
+    /// A `Fixpoint` about to run its first round.
+    pub(super) fn new() -> Frame {
+        Frame {
+            loop_pc: 0,
+            round: 0,
+            variant: 0,
+            delta_occ: None,
+        }
+    }
+
+    /// What the recursive read numbered `occ` reads now: nothing in the
+    /// first round, the delta when its variant runs, else the whole relation.
+    pub(super) fn read_of(&self, occ: usize) -> Read {
+        if self.round == 0 {
+            Read::Nothing
+        } else if self.delta_occ == Some(occ) {
+            Read::Delta
+        } else {
+            Read::All
+        }
+    }
+
+    /// Makes variant `i` the running one; returns the program counter of
+    /// its first step.
+    fn start_variant(&mut self, variants: &[Variant], i: usize) -> usize {
+        self.variant = i;
+        self.delta_occ = Some(variants[i].occ);
+        variants[i].start
+    }
 }
 
 /// A relation's tuples while its `Fixpoint` runs: sets, keyed by position.
@@ -101,6 +133,50 @@ impl Exec<'_, '_> {
     /// non-empty delta to read.
     pub(super) fn next_variant(&self, variants: &[Variant], from: usize) -> Option<usize> {
         (from..variants.len()).find(|&i| !self.rels[variants[i].rel].delta.is_empty())
+    }
+
+    /// A rule of `f`'s `Fixpoint` is done (its rows folded in). In the first
+    /// round the next rule simply follows (`None`); in a later round a
+    /// variant is done, and the program goes on at the next variant to run,
+    /// or at the `FixLoop` if this was the round's last.
+    pub(super) fn after_rule(&self, prog: &[Step], f: &mut Frame) -> Option<usize> {
+        if f.round == 0 {
+            return None;
+        }
+        let Step::FixLoop { variants, .. } = &prog[f.loop_pc] else {
+            unreachable!("invariant: loop_pc is its Fixpoint's FixLoop")
+        };
+        Some(match self.next_variant(variants, f.variant + 1) {
+            Some(i) => f.start_variant(variants, i),
+            None => f.loop_pc,
+        })
+    }
+
+    /// The end of a round of `f`'s `Fixpoint`: its relations' new tuples
+    /// join them and become the deltas. Returns the program counter of the
+    /// first variant to run in the next round, or `None` (the deltas
+    /// dropped) once the relations are complete.
+    pub(super) fn next_round(
+        &mut self,
+        f: &mut Frame,
+        rels: &[usize],
+        variants: &[Variant],
+    ) -> Result<Option<usize>, QueryError> {
+        for &id in rels {
+            self.merge_new(id, !variants.is_empty())?;
+        }
+        f.round += 1;
+        // Only variants reading a non-empty delta can derive
+        // anything new; with none, the relations are complete.
+        match self.next_variant(variants, 0) {
+            Some(i) => Ok(Some(f.start_variant(variants, i))),
+            None => {
+                for &id in rels {
+                    self.clear_delta(id);
+                }
+                Ok(None)
+            }
+        }
     }
 
     /// Folds one rule's rows into relation `id`'s tuples new this round as

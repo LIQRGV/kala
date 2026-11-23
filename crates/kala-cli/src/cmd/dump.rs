@@ -82,7 +82,7 @@ fn value(world: &World, v: &Value) -> String {
 fn options(def: &AttrDef) -> String {
     let mut s = format!(
         ":{} :{} :{} :{}",
-        schema::type_name(def.value_type),
+        def.value_type.name(),
         if def.kind == Kind::State {
             "state"
         } else {

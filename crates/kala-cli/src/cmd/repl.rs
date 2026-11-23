@@ -174,13 +174,13 @@ impl Session<'_> {
         if explain {
             return Ok(prepared.plan.explain(&self.ctx.world));
         }
-        let rs = kala_query::run_with_cancel(
+        let rs = kala_query::run_with(
             &self.ctx.world,
             &prepared.plan,
             &params,
-            &Limits::default(),
-            &self.cancel,
+            kala_query::RunOptions::new(Limits::default()).with_cancel(&self.cancel),
         )
+        .map(|(rs, _)| rs)
         .map_err(|e| query_err(e, "query"))?;
         Ok(render_result(&self.ctx.world, &rs, self.json))
     }
