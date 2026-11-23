@@ -186,9 +186,12 @@ impl Session<'_> {
     }
 
     fn form(&mut self, text: &str) -> Result<String, CliError> {
-        match kala_datalog::form_kind(text).map_err(|e| user(e.to_string()))? {
-            kala_datalog::FormKind::Query => self.query(text, false),
-            kala_datalog::FormKind::Write => {
+        // Only a recognised write form goes to the write path; anything
+        // else is parsed as a query, so a malformed query keeps the query
+        // parser's own (more specific) message.
+        match kala_datalog::form_kind(text) {
+            Ok(kala_datalog::FormKind::Query) | Err(_) => self.query(text, false),
+            Ok(kala_datalog::FormKind::Write) => {
                 if !self.write {
                     return Err(user("write form refused; start with --write"));
                 }
@@ -502,9 +505,10 @@ pub fn run(
     canon: Option<Canon>,
     history_path: Option<&Path>,
     write: bool,
+    acknowledge_recovery: bool,
 ) -> Result<Done, CliError> {
     let ctx = if write {
-        let world = super::transact::open_write(world)?;
+        let world = super::transact::open_write(world, acknowledge_recovery)?;
         Ctx {
             canon: world.latest_tx(),
             world,

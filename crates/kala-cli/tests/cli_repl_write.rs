@@ -276,3 +276,12 @@ fn session_rules_can_use_or_and_observe_later_commits() {
     handles.sort();
     assert_eq!(handles, ["greg", "kael"]);
 }
+
+// PR #3 review round 1: a malformed query keeps the parser's own message.
+#[test]
+fn malformed_query_keeps_the_parsers_specific_error() {
+    let f = build(EMPTY);
+    let o = repl(&f, "[:where [?e :name ?n]]\n", &[]);
+    assert!(stderr(&o).contains(":find"), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("or a write"), "{}", stderr(&o));
+}

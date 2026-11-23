@@ -223,11 +223,16 @@ pub enum Command {
     Transact {
         world: PathBuf,
         input: PathBuf,
-        /// Preview each form independently without changing the log.
+        /// Preview the forms in order (each sees the ones before it)
+        /// without changing the log.
         #[arg(long)]
         dry_run: bool,
         #[arg(long)]
         json: bool,
+        /// Accept cutting a damaged last transaction (see `kala info`) to a
+        /// quarantine file before writing.
+        #[arg(long)]
+        acknowledge_recovery: bool,
     },
     /// Ask Datalog questions, optionally holding the world open for writing.
     Repl {
@@ -245,6 +250,10 @@ pub enum Command {
         /// Opt in to private, bounded query history at this path.
         #[arg(long, value_name = "FILE")]
         history: Option<PathBuf>,
+        /// With --write: accept cutting a damaged last transaction (see
+        /// `kala info`) to a quarantine file.
+        #[arg(long, requires = "write")]
+        acknowledge_recovery: bool,
     },
     /// Print a Datalog query's plan without running it.
     Explain {

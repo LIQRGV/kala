@@ -14,7 +14,9 @@ struct Operation {
     position: usize,
     kind: &'static str,
     tick: i64,
-    precision: &'static str,
+    /// The precision stored; `null` for a no-op, which stores nothing (a
+    /// precision change on a held fact needs `:correct`).
+    precision: Option<&'static str>,
     changed: usize,
     entries: Vec<u64>,
     entity: Option<String>,
@@ -28,7 +30,9 @@ struct Warnings {
 pub struct Report {
     form: usize,
     dry_run: bool,
-    tx: u64,
+    /// The committed transaction; `null` when the form changed nothing, so
+    /// nothing was appended.
+    tx: Option<u64>,
     changed: usize,
     entries: Vec<u64>,
     edges: Vec<String>,
@@ -36,14 +40,39 @@ pub struct Report {
     warnings: Warnings,
 }
 
-pub fn open_write(path: &Path) -> Result<World, CliError> {
-    World::open(path).map_err(|e| match e {
+/// Opens `path` for writing. A damaged last transaction (fully present,
+/// checksum fails) may have been acknowledged to a writer, so it is never
+/// cut without `acknowledge`: the log is checked read-only first and left
+/// untouched (no cut, no quarantine), so retrying can't get past it.
+pub fn open_write(path: &Path, acknowledge: bool) -> Result<World, CliError> {
+    let damaged = |bytes: u64| {
+        CliError::Store(format!(
+            "{}: the last transaction is damaged ({bytes} bytes); opening the world \
+             for writing would cut it to a quarantine file. Inspect it with \
+             `kala info`, then rerun with --acknowledge-recovery",
+            escape::path(path)
+        ))
+    };
+    let probe = World::open_read_only(path).map_err(|e| CliError::at_path(path, &e))?;
+    if probe.recovery().cause == Some(kala_core::CutCause::Damaged) && !acknowledge {
+        return Err(damaged(probe.recovery().bytes_cut));
+    }
+    drop(probe);
+    let mut w = World::open(path).map_err(|e| match e {
         kala_core::Error::WorldLocked => CliError::Store(format!(
             "{}: world is locked by another writer",
             escape::path(path)
         )),
         e => CliError::at_path(path, &e),
-    })
+    })?;
+    if w.recovery().cause == Some(kala_core::CutCause::Damaged) {
+        // Damaged between the probe and the open: same rule.
+        if !acknowledge {
+            return Err(damaged(w.recovery().bytes_cut));
+        }
+        w.acknowledge_recovery();
+    }
+    Ok(w)
 }
 fn user(s: impl Into<String>) -> CliError {
     CliError::User(s.into())
@@ -162,7 +191,7 @@ pub fn execute(w: &mut World, form: &WriteTxn, default: Option<Tick>) -> Result<
     let mut ops = Vec::new();
     let mut created = Vec::new();
     for (index, op) in form.ops.iter().enumerate() {
-        let mut run = || -> Result<(usize, Tick, Precision, Option<EntityId>), CliError> {
+        let mut run = || -> Result<(usize, Tick, Option<Precision>, Option<EntityId>), CliError> {
             match op {
                 WriteOp::Create {
                     node_type, handle, ..
@@ -173,7 +202,7 @@ pub fn execute(w: &mut World, form: &WriteTxn, default: Option<Tick>) -> Result<
                     refs.insert(format!(":{handle}"), id);
                     // Numeric IDs may also refer to entities created earlier in this transaction.
                     refs.insert(format!("{node_type}#{}", id.seq()), id);
-                    Ok((0, fallback, Precision::Exact, Some(id)))
+                    Ok((0, fallback, None, Some(id)))
                 }
                 WriteOp::Fact {
                     op,
@@ -191,7 +220,14 @@ pub fn execute(w: &mut World, form: &WriteTxn, default: Option<Tick>) -> Result<
                         Op::Retract => tx.retract_with_precision(e, &attr.name, v, *at, *precision),
                     }
                     .map_err(core_err)?;
-                    Ok((r.changed, r.tick, *precision, None))
+                    // A no-op stores nothing, so it reports no precision (changing a
+                    // held fact's precision needs `:correct`).
+                    Ok((
+                        r.changed,
+                        r.tick,
+                        (r.changed > 0).then_some(*precision),
+                        None,
+                    ))
                 }
                 WriteOp::Correct {
                     entry, replacement, ..
@@ -206,14 +242,18 @@ pub fn execute(w: &mut World, form: &WriteTxn, default: Option<Tick>) -> Result<
                         },
                     };
                     let r = tx.correct(*entry, c).map_err(core_err)?;
+                    // The chain's stored precision, so a no-op or delete
+                    // still reports the truth.
                     Ok((
                         r.changed,
                         r.tick,
-                        replacement
-                            .as_ref()
-                            .and_then(|r| r.precision)
-                            .or(precisions[index])
-                            .unwrap_or(Precision::Exact),
+                        Some(
+                            replacement
+                                .as_ref()
+                                .and_then(|r| r.precision)
+                                .or(precisions[index])
+                                .unwrap_or(Precision::Exact),
+                        ),
                         None,
                     ))
                 }
@@ -231,12 +271,13 @@ pub fn execute(w: &mut World, form: &WriteTxn, default: Option<Tick>) -> Result<
             position: index + 1,
             kind: kind(op),
             tick: tick.0,
-            precision: out::precision_str(precision),
+            precision: precision.map(out::precision_str),
             changed,
             entries: Vec::new(),
             entity: None,
         });
     }
+    let created_any = created.iter().any(Option::is_some);
     let result = tx.commit().map_err(core_err)?;
     let mut ids = result.entries.iter();
     for (op, entity) in ops.iter_mut().zip(created) {
@@ -246,7 +287,8 @@ pub fn execute(w: &mut World, form: &WriteTxn, default: Option<Tick>) -> Result<
     Ok(Report {
         form: 1,
         dry_run: false,
-        tx: result.tx.0,
+        tx: (!result.entries.is_empty() || !result.edges.is_empty() || created_any)
+            .then_some(result.tx.0),
         changed: result.changed,
         entries: result.entries.iter().map(|e| e.0).collect(),
         edges: result
@@ -276,21 +318,31 @@ pub fn render(report: &Report, json: bool) -> String {
     if json {
         return out::to_json(report);
     }
-    let mut s = format!(
-        "form {}: {}tx#{}: {} changed\n",
-        report.form,
-        if report.dry_run {
-            "dry-run "
-        } else {
-            "committed "
-        },
-        report.tx,
-        report.changed
-    );
+    let mut s = match report.tx {
+        Some(tx) => format!(
+            "form {}: {}tx#{tx}: {} changed\n",
+            report.form,
+            if report.dry_run {
+                "dry-run "
+            } else {
+                "committed "
+            },
+            report.changed
+        ),
+        None => format!(
+            "form {}: {}: 0 changed\n",
+            report.form,
+            if report.dry_run {
+                "dry-run, nothing to commit"
+            } else {
+                "nothing committed"
+            }
+        ),
+    };
     for op in &report.ops {
         let _ = write!(s, "  op {} (:{}): tick {}", op.position, op.kind, op.tick);
-        if op.precision != "exact" {
-            let _ = write!(s, " ({})", op.precision);
+        if let Some(p) = op.precision.filter(|p| *p != "exact") {
+            let _ = write!(s, " ({p})");
         }
         let _ = write!(s, ", {} changed", op.changed);
         if let Some(e) = &op.entity {
@@ -313,7 +365,13 @@ pub fn render(report: &Report, json: bool) -> String {
     s
 }
 
-pub fn run(path: &Path, input: &Path, dry_run: bool, json: bool) -> Result<Done, CliError> {
+pub fn run(
+    path: &Path,
+    input: &Path,
+    dry_run: bool,
+    json: bool,
+    acknowledge_recovery: bool,
+) -> Result<Done, CliError> {
     let text = if input == Path::new("-") {
         let mut bytes = Vec::new();
         io::stdin()
@@ -330,7 +388,7 @@ pub fn run(path: &Path, input: &Path, dry_run: bool, json: bool) -> Result<Done,
     let mut w = if dry_run {
         World::open_read_only(path).map_err(|e| CliError::at_path(path, &e))?
     } else {
-        open_write(path)?
+        open_write(path, acknowledge_recovery)?
     };
     if dry_run && w.recovery().cause == Some(kala_core::CutCause::Damaged) {
         return Err(user(
@@ -338,20 +396,31 @@ pub fn run(path: &Path, input: &Path, dry_run: bool, json: bool) -> Result<Done,
         ));
     }
     let forms = kala_datalog::write_forms(&text).map_err(|e| user(e.to_string()))?;
+    // A dry run previews every form on one discarded copy, so later forms
+    // see earlier ones exactly as a real run would.
+    let mut preview = if dry_run {
+        Some(w.preview_copy().map_err(core_err)?)
+    } else {
+        None
+    };
     let mut count = 0;
     for (i, form) in forms.enumerate() {
         let action = || -> Result<Report, CliError> {
             let form = form.map_err(|e| user(e.to_string()))?;
-            if dry_run {
-                execute(&mut w.preview_copy().map_err(core_err)?, &form, None)
-            } else {
-                execute(&mut w, &form, None)
+            match &mut preview {
+                Some(copy) => execute(copy, &form, None),
+                None => execute(&mut w, &form, None),
             }
         };
         let mut report = action().map_err(|e| match e {
             CliError::Store(s) => CliError::Store(format!(
-                "form {} failed; {count} prior forms committed: {s}",
-                i + 1
+                "form {} failed; {count} prior forms {}: {s}",
+                i + 1,
+                if dry_run {
+                    "previewed (nothing committed)"
+                } else {
+                    "committed"
+                }
             )),
             e => user(format!(
                 "form {} failed; {count} prior forms {}: {}",

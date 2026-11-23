@@ -108,8 +108,9 @@ pub fn dispatch(cmd: &Command) -> Result<Done, CliError> {
             input,
             dry_run,
             json,
+            acknowledge_recovery,
         } => {
-            return transact::run(world, input, *dry_run, *json);
+            return transact::run(world, input, *dry_run, *json, *acknowledge_recovery);
         }
         Command::Repl {
             write,
@@ -117,8 +118,16 @@ pub fn dispatch(cmd: &Command) -> Result<Done, CliError> {
             at,
             canon,
             history,
+            acknowledge_recovery,
         } => {
-            return repl::run(world, *at, *canon, history.as_deref(), *write);
+            return repl::run(
+                world,
+                *at,
+                *canon,
+                history.as_deref(),
+                *write,
+                *acknowledge_recovery,
+            );
         }
         Command::Doctor {
             world,

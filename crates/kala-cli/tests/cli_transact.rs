@@ -503,3 +503,92 @@ fn input_limit_and_errors_escape_controls() {
     no_raw_controls(&stderr(&o));
     assert!(!stderr(&o).contains('\u{202e}'));
 }
+
+// ---- PR #3 review round 1 ----
+
+fn damaged(f: &Fx) {
+    ok(f, "[:assert :greg :age 18 :at -300]");
+    let mut bytes = fs::read(&f.path).unwrap();
+    let last = damage::spans(&bytes).pop().unwrap();
+    bytes[last.body_start + 6] ^= 0x01;
+    fs::write(&f.path, bytes).unwrap();
+}
+
+// A damaged last transaction is never cut by a CLI write without an explicit
+// acknowledgement; retrying must not get past it.
+#[test]
+fn damaged_tail_is_refused_until_acknowledged_and_retry_does_not_bypass() {
+    let f = build(EMPTY);
+    damaged(&f);
+    let before = damage::dir_snapshot(f.dir.path());
+    let w = "[:assert :greg :age 20 :at -280]";
+    for _ in 0..2 {
+        let o = transact(&f, w, &[]);
+        assert_eq!(code(&o), 3, "{}", stdout(&o));
+        assert!(
+            stderr(&o).contains("--acknowledge-recovery"),
+            "{}",
+            stderr(&o)
+        );
+        // The input file is rewritten by `transact`; compare everything else.
+        let mut now = damage::dir_snapshot(f.dir.path());
+        now.retain(|(name, _)| name != "writes.edn");
+        let mut was = before.clone();
+        was.retain(|(name, _)| name != "writes.edn");
+        assert_eq!(now, was, "a refused write must not cut or quarantine");
+    }
+    let o = transact(&f, w, &["--acknowledge-recovery"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("committed"), "{}", stdout(&o));
+}
+
+#[test]
+fn repl_write_mode_refuses_a_damaged_tail_without_acknowledgement() {
+    let f = build(EMPTY);
+    damaged(&f);
+    let len = fs::metadata(&f.path).unwrap().len();
+    let o = f.run("repl", &["--write"]);
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("--acknowledge-recovery"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(fs::metadata(&f.path).unwrap().len(), len);
+}
+
+// Dry-run previews build on each other like real commits.
+#[test]
+fn dry_run_forms_see_earlier_forms() {
+    let f = build(EMPTY);
+    let before = fs::read(&f.path).unwrap();
+    let o = transact(
+        &f,
+        "[:at 800 [:create :CHARACTER :nerys]]\n[:assert :nerys :name \"Nerys\"]",
+        &["--dry-run"],
+    );
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(fs::read(&f.path).unwrap(), before);
+}
+
+// A transaction that changes nothing commits nothing and says so.
+#[test]
+fn a_no_op_transaction_reports_nothing_committed() {
+    let f = build(EMPTY);
+    ok(&f, "[:assert :greg :age 18 :at -300]");
+    let out = ok(&f, "[:assert :greg :age 18 :at -300]");
+    assert!(out.contains("nothing committed"), "{out}");
+    assert!(!out.contains("committed tx#"), "{out}");
+    let o = transact(&f, "[:assert :greg :age 18 :at -300]", &["--json"]);
+    let j: Json = serde_json::from_str(stdout(&o).lines().next().unwrap()).unwrap();
+    assert!(j["tx"].is_null(), "{j}");
+}
+
+// A no-op doesn't claim a precision it didn't store.
+#[test]
+fn a_no_op_does_not_report_the_requested_precision() {
+    let f = build(EMPTY);
+    ok(&f, "[:assert :greg :age 18 :at -300]");
+    let out = ok(&f, "[:assert :greg :age 18 :at -300 :precision :year]");
+    assert!(!out.contains("(year)"), "{out}");
+}

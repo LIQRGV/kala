@@ -141,12 +141,19 @@ accepts `:value`, `:op` and `:precision`. A no-op prints 0 changed.
 Entry IDs are integers; new edges are `edge#N` strings. Warnings have `introduced`
 and `resolved` arrays of the same messages as `kala load`. Errors stay on stderr.
 
-`--dry-run` previews each form independently against the original committed
-world, including native overlap warnings. It discards each in-memory simulation;
-later forms cannot use entities created by earlier previews. IDs and tx numbers
-are provisional. It opens a read-only snapshot, takes no writer lock, and never
-changes the log, even if it has an incomplete recovery tail. A damaged tail that requires
-recovery acknowledgement is refused, also without changing the file.
+`--dry-run` previews the forms in order on one discarded in-memory copy,
+including native overlap warnings, so later forms see what earlier ones would
+create, exactly as a real run. IDs and tx numbers are provisional. It opens a
+read-only snapshot, takes no writer lock, and never changes the log, even if it
+has an incomplete recovery tail. A form that changes nothing reports `nothing
+committed` (JSON `"tx": null`).
+
+A damaged last transaction (all its bytes present, checksum failing; `kala info`
+reports it) may be a write that was acknowledged, so `kala transact` and
+`kala repl --write` refuse to open the world, without changing the file, until
+rerun with `--acknowledge-recovery`. That cuts the damaged bytes to a
+`<world>.torn-N` quarantine file and continues. A torn tail (a write cut short,
+never acknowledged) is cut without asking.
 
 `kala repl WORLD --write` holds the exclusive writer lock until exit and queries
 see each successful commit immediately. Another writer gets exit 3 with a locked
