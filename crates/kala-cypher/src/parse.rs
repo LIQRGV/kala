@@ -12,6 +12,7 @@ pub(crate) fn parse(text: &str) -> Result<Query, CypherError> {
         tokens: lex::lex(text)?,
         at: 0,
         elements: 0,
+        copied: 0,
     };
     p.query()
 }
@@ -20,7 +21,14 @@ struct Parser<'a> {
     tokens: Vec<Token>,
     at: usize,
     elements: usize,
+    /// Nodes plus string bytes duplicated by comparison chains (see
+    /// [`Parser::comparison`]), bounded by [`MAX_CHAIN_COPY`].
+    copied: usize,
 }
+/// How much a query's comparison chains may duplicate in total: a middle
+/// operand is copied into two comparisons, and nested chains would otherwise
+/// double the copy per level. Real middles are a property or a parameter.
+const MAX_CHAIN_COPY: usize = crate::MAX_QUERY_BYTES;
 impl Parser<'_> {
     fn token(&self) -> &Token {
         &self.tokens[self.at]
@@ -422,27 +430,70 @@ impl Parser<'_> {
         }
     }
     /// A comparison chain: `a < b <= c` means `a < b AND b <= c` (openCypher).
-    /// Each middle operand is copied once, so the tree stays linear in the input,
-    /// and the chain is read iteratively; the element and depth limits bound it.
+    /// A middle operand is copied into both comparisons. Each copy is charged
+    /// (nodes plus string bytes) before it is made, against one budget for the
+    /// whole query, so nested chains can't double their copies per level: the
+    /// parse output stays linear in the input.
     fn comparison(&mut self, depth: usize) -> Result<Expr<String>, CypherError> {
-        let first = self.postfix(depth)?;
-        let Some(op) = self.comparison_op() else {
-            return Ok(first);
+        let mut left = self.postfix(depth)?;
+        let Some(mut op) = self.comparison_op() else {
+            return Ok(left);
         };
         self.bump();
         let mut right = self.postfix(depth)?;
-        let mut chain = Expr::Compare(op, Box::new(first), Box::new(right.clone()));
-        while let Some(op) = self.comparison_op() {
+        let mut chain: Option<Expr<String>> = None;
+        loop {
+            let Some(next) = self.comparison_op() else {
+                let compare = Expr::Compare(op, Box::new(left), Box::new(right));
+                let chain = match chain {
+                    None => compare,
+                    Some(c) => Expr::And(Box::new(c), Box::new(compare)),
+                };
+                self.check_depth(&chain)?;
+                return Ok(chain);
+            };
             self.bump();
             self.element()?;
-            let next = self.postfix(depth)?;
-            let compare = Expr::Compare(op, Box::new(right), Box::new(next.clone()));
-            chain = Expr::And(Box::new(chain), Box::new(compare));
-            self.check_depth(&chain)?;
-            right = next;
+            self.charge_copy(&right)?;
+            let compare = Expr::Compare(op, Box::new(left), Box::new(right.clone()));
+            let joined = match chain {
+                None => compare,
+                Some(c) => Expr::And(Box::new(c), Box::new(compare)),
+            };
+            self.check_depth(&joined)?;
+            chain = Some(joined);
+            left = right;
+            op = next;
+            right = self.postfix(depth)?;
         }
-        self.check_depth(&chain)?;
-        Ok(chain)
+    }
+    /// Charges a copy of `e` to the query's chain-copy budget, walking it
+    /// iteratively (it is already depth-checked, but this stays stack-free).
+    fn charge_copy(&mut self, e: &Expr<String>) -> Result<(), CypherError> {
+        let mut stack = vec![e];
+        while let Some(e) = stack.pop() {
+            let bytes = match e {
+                Expr::Var(v) => v.len(),
+                Expr::Value(Value::Str(s)) => s.len(),
+                Expr::Param(p) => p.len(),
+                Expr::Property { entity, key, .. } => entity.len() + key.len(),
+                Expr::Value(_) | Expr::Null => 0,
+                Expr::Not(e) | Expr::IsNull(e) => {
+                    stack.push(e);
+                    0
+                }
+                Expr::Compare(_, a, b) | Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+                    stack.push(a);
+                    stack.push(b);
+                    0
+                }
+            };
+            self.copied = self.copied.saturating_add(1 + bytes);
+            if self.copied > MAX_CHAIN_COPY {
+                return Err(self.err("comparison chain operands are too large to repeat"));
+            }
+        }
+        Ok(())
     }
     /// An operand with its `IS [NOT] NULL` suffixes, which bind tighter than comparisons.
     fn postfix(&mut self, depth: usize) -> Result<Expr<String>, CypherError> {

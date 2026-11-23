@@ -119,3 +119,33 @@ fn large_reused_parameters_are_budgeted_even_when_match_is_empty() {
         "parameter compilation must account for retained values before empty-match execution: {result:?}"
     );
 }
+
+/// Nested comparison chains used to clone each middle operand into the AND
+/// tree at every level, doubling it per level: a 64 KiB query reached
+/// gigabytes before any limit fired. Copies are now charged before cloning.
+#[test]
+fn nested_comparison_chains_cannot_multiply_a_long_literal() {
+    let mut q = format!("n.a < '{}' < n.b", "x".repeat(30_000));
+    for _ in 0..12 {
+        q = format!("n.a < ({q}) < n.b");
+    }
+    let text = format!("MATCH (n) WHERE {q} RETURN n");
+    assert!(text.len() < kala_cypher::MAX_QUERY_BYTES);
+    let start = std::time::Instant::now();
+    let Err(err) = kala_cypher::parse(&text) else {
+        panic!("copying the middle operand must be budgeted");
+    };
+    assert!(err.to_string().contains("comparison chain"), "{err}");
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+}
+
+#[test]
+fn ordinary_comparison_chains_still_parse() {
+    for q in [
+        "MATCH (n) WHERE 1 < n.a <= $x < 10 RETURN n",
+        "MATCH (n) WHERE n.a < (n.b < n.c < n.d) < n.e RETURN n",
+        "MATCH (n) WHERE n.name = 'Greg' RETURN n",
+    ] {
+        kala_cypher::parse(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+    }
+}

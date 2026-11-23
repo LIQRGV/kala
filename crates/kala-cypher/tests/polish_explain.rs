@@ -160,3 +160,35 @@ fn guard_datalog_explain_is_unchanged() {
         "Find ?a  at -210  canon latest\n  Project ?a\n    Expand [?e :ally_of ?a] @latest via E\n      Expand [?e :kala_handle \"edwin\"] via handle\n        Unit\n"
     );
 }
+
+/// Explain renders IR from any front-end: schema names in NodeScan and
+/// Expand lines are escaped like Row/Output names (security review, low).
+#[test]
+fn explain_escapes_control_characters_in_scan_and_expand_names() {
+    use kala_query::{Access, AttrRef, CanonSource, Op, Plan, Term, TickSource, Var};
+    let world = kala_core::load_fixture(include_str!("../../kala-core/tests/fixtures/varrow.yaml"))
+        .unwrap();
+    let scan = Op::NodeScan {
+        input: Box::new(Op::Unit),
+        var: Var("n".into()),
+        node_type: "A\u{1b}[2J".into(),
+    };
+    let plan = Plan {
+        find: vec![Var("n".into())],
+        params: vec![],
+        default_tick: TickSource::Default,
+        canon: CanonSource::Latest,
+        root: Op::Expand {
+            input: Box::new(scan),
+            entity: Term::Var(Var("n".into())),
+            attr: AttrRef::Named("b\nc".into()),
+            value: Term::Var(Var("v".into())),
+            tick: TickSource::Default,
+            access: Access::E,
+        },
+    };
+    let text = plan.explain(&world);
+    assert!(!text.contains('\u{1b}'), "{text:?}");
+    assert!(text.contains(":b\\nc"), "{text:?}");
+    assert_eq!(text.lines().count(), 4, "{text:?}");
+}

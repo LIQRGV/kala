@@ -937,6 +937,13 @@ fn param_text(p: &str) -> String {
     out
 }
 
+/// `name` with control characters escaped, for `format!` arguments.
+fn name_text(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    push_name(&mut out, name);
+    out
+}
+
 /// Appends `name` with its control characters escaped (`\n`, `\u{1}`).
 fn push_name(out: &mut String, name: &str) {
     for c in name.chars() {
@@ -1179,7 +1186,7 @@ fn explain_op(root: &Op, world: &World, indent: usize, out: &mut String) {
             Item::Op(op) => op,
             Item::Define(rel) => {
                 out.push_str("Define ");
-                out.push_str(&rel.name);
+                push_name(out, &rel.name);
                 for v in &rel.vars {
                     out.push(' ');
                     out.push_str(&var_text(v));
@@ -1206,7 +1213,7 @@ fn explain_op(root: &Op, world: &World, indent: usize, out: &mut String) {
                 var,
                 node_type,
             } => {
-                let _ = writeln!(out, "NodeScan {} {node_type}", var_text(var));
+                let _ = writeln!(out, "NodeScan {} {}", var_text(var), name_text(node_type));
                 todo.push((Item::Op(input), child));
             }
             Op::NodeSeek { input, var, entity } => {
@@ -1232,7 +1239,8 @@ fn explain_op(root: &Op, world: &World, indent: usize, out: &mut String) {
                     AttrRef::Named(name) => {
                         let _ = writeln!(
                             out,
-                            "Expand [{e} :{name} {v}] @{} via {}",
+                            "Expand [{e} :{} {v}] @{} via {}",
+                            name_text(name),
                             tick_text(tick),
                             access_text(*access)
                         );
@@ -1296,8 +1304,9 @@ fn explain_op(root: &Op, world: &World, indent: usize, out: &mut String) {
                 };
                 let _ = writeln!(
                     out,
-                    "History [{} :{attr} {} {} {op}{prec}]",
+                    "History [{} :{} {} {} {op}{prec}]",
                     term_text(entity, world),
+                    name_text(attr),
                     term_text(value, world),
                     term_text(tick, world)
                 );
@@ -1312,8 +1321,9 @@ fn explain_op(root: &Op, world: &World, indent: usize, out: &mut String) {
             } => {
                 let _ = writeln!(
                     out,
-                    "During [{} :{attr} {}] -> {}",
+                    "During [{} :{} {}] -> {}",
                     term_text(entity, world),
+                    name_text(attr),
                     term_text(value, world),
                     var_text(var)
                 );
