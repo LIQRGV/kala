@@ -164,88 +164,15 @@ impl Server {
     /// Accept until `shutdown` is set, then close sockets, cancel queries and
     /// join the bounded client threads. No detached connections survive return.
     pub fn run(self, shutdown: Arc<AtomicBool>) -> io::Result<()> {
-        let mut clients: Vec<Client> = Vec::new();
-        let mut next_id = 0u64;
-        let (mut refused, mut dropped, mut accept_failed) =
-            (LogLimit::new(), LogLimit::new(), LogLimit::new());
+        let mut clients = Clients::new();
+        let mut accept_failed = LogLimit::new();
         let result = loop {
-            let mut i = 0;
-            while i < clients.len() {
-                if clients[i].thread.is_finished() {
-                    let client = clients.swap_remove(i);
-                    let _ = client.thread.join();
-                } else {
-                    i += 1;
-                }
-            }
+            clients.reap();
             if shutdown.load(Ordering::Relaxed) {
                 break Ok(());
             }
             match self.listener.accept() {
-                Ok((stream, _)) => {
-                    if clients.len() >= self.config.max_connections {
-                        let _ = stream.shutdown(Shutdown::Both);
-                        refused.log(format_args!(
-                            "event=bolt_connection_refused reason=connection_cap"
-                        ));
-                        continue;
-                    }
-                    // The listener is non-blocking, and on macOS/BSD and
-                    // Windows an accepted socket inherits that; sessions use
-                    // blocking reads with timeouts. A failure on one socket
-                    // (reset by the peer, fd pressure) drops that client
-                    // only, never the server.
-                    let prepared = stream
-                        .set_nonblocking(false)
-                        .and_then(|()| stream.set_nodelay(true))
-                        .and_then(|()| stream.try_clone());
-                    let socket = match prepared {
-                        Ok(s) => s,
-                        Err(e) => {
-                            dropped.log(format_args!(
-                                "event=bolt_connection_dropped error={:?}",
-                                e.kind()
-                            ));
-                            let _ = stream.shutdown(Shutdown::Both);
-                            continue;
-                        }
-                    };
-                    let registry = Arc::clone(&self.registry);
-                    let auth = Arc::clone(&self.auth);
-                    let config = self.config.clone();
-                    let stop = Arc::clone(&shutdown);
-                    next_id = next_id.wrapping_add(1);
-                    let id = next_id;
-                    let thread =
-                        match thread::Builder::new()
-                            .name(format!("bolt-{id}"))
-                            .spawn(move || {
-                                eprintln!("event=bolt_connected connection_id={id}");
-                                let result = session::serve(
-                                    stream,
-                                    &registry,
-                                    auth.as_ref(),
-                                    &config,
-                                    id,
-                                    &stop,
-                                );
-                                eprintln!(
-                                    "event=bolt_disconnected connection_id={id} reason={:?}",
-                                    result.err().map(|e| e.kind())
-                                );
-                            }) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                dropped.log(format_args!(
-                                    "event=bolt_connection_dropped error={:?}",
-                                    e.kind()
-                                ));
-                                let _ = socket.shutdown(Shutdown::Both);
-                                continue;
-                            }
-                        };
-                    clients.push(Client { socket, thread });
-                }
+                Ok((stream, _)) => self.admit(stream, &mut clients, &shutdown),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(5))
                 }
@@ -264,13 +191,122 @@ impl Server {
             }
         };
         shutdown.store(true, Ordering::Relaxed);
-        for client in &clients {
+        clients.close();
+        result
+    }
+    /// Gives an accepted connection its session thread, or closes it: over
+    /// the connection cap, or when its socket or thread can't be set up.
+    fn admit(&self, stream: TcpStream, clients: &mut Clients, shutdown: &Arc<AtomicBool>) {
+        if clients.active.len() >= self.config.max_connections {
+            let _ = stream.shutdown(Shutdown::Both);
+            clients.refused.log(format_args!(
+                "event=bolt_connection_refused reason=connection_cap"
+            ));
+            return;
+        }
+        // The listener is non-blocking, and on macOS/BSD and
+        // Windows an accepted socket inherits that; sessions use
+        // blocking reads with timeouts. A failure on one socket
+        // (reset by the peer, fd pressure) drops that client
+        // only, never the server.
+        let prepared = stream
+            .set_nonblocking(false)
+            .and_then(|()| stream.set_nodelay(true))
+            .and_then(|()| stream.try_clone());
+        let socket = match prepared {
+            Ok(s) => s,
+            Err(e) => {
+                clients.dropped.log(format_args!(
+                    "event=bolt_connection_dropped error={:?}",
+                    e.kind()
+                ));
+                let _ = stream.shutdown(Shutdown::Both);
+                return;
+            }
+        };
+        clients.next_id = clients.next_id.wrapping_add(1);
+        match self.spawn_session(stream, clients.next_id, shutdown) {
+            Ok(thread) => clients.active.push(Client { socket, thread }),
+            Err(e) => {
+                clients.dropped.log(format_args!(
+                    "event=bolt_connection_dropped error={:?}",
+                    e.kind()
+                ));
+                let _ = socket.shutdown(Shutdown::Both);
+            }
+        }
+    }
+    /// Starts the thread that serves one connection until it ends.
+    fn spawn_session(
+        &self,
+        stream: TcpStream,
+        id: u64,
+        shutdown: &Arc<AtomicBool>,
+    ) -> io::Result<JoinHandle<()>> {
+        let registry = Arc::clone(&self.registry);
+        let auth = Arc::clone(&self.auth);
+        let config = self.config.clone();
+        let stop = Arc::clone(shutdown);
+        thread::Builder::new()
+            .name(format!("bolt-{id}"))
+            .spawn(move || {
+                eprintln!("event=bolt_connected connection_id={id}");
+                let shared = session::Shared {
+                    registry: &registry,
+                    auth: auth.as_ref(),
+                    config: &config,
+                    stop: &stop,
+                };
+                let result = session::serve(stream, id, &shared);
+                eprintln!(
+                    "event=bolt_disconnected connection_id={id} reason={:?}",
+                    result.err().map(|e| e.kind())
+                );
+            })
+    }
+}
+
+/// The connections being served, and the accept loop's rate-limited logs
+/// about the ones it turned away.
+struct Clients {
+    active: Vec<Client>,
+    /// The last connection ID given out.
+    next_id: u64,
+    refused: LogLimit,
+    dropped: LogLimit,
+}
+
+impl Clients {
+    fn new() -> Self {
+        Self {
+            active: Vec::new(),
+            next_id: 0,
+            refused: LogLimit::new(),
+            dropped: LogLimit::new(),
+        }
+    }
+
+    /// Joins the threads of connections that have ended.
+    fn reap(&mut self) {
+        let mut i = 0;
+        while i < self.active.len() {
+            if self.active[i].thread.is_finished() {
+                let client = self.active.swap_remove(i);
+                let _ = client.thread.join();
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Closes every socket, then joins every thread.
+    fn close(self) {
+        for client in &self.active {
             let _ = client.socket.shutdown(Shutdown::Both);
         }
-        for client in clients {
+        for client in self.active {
             let _ = client.thread.join();
         }
-        result
     }
 }
 

@@ -12,6 +12,7 @@ use crate::{
 };
 use std::io;
 use std::net::{IpAddr, TcpStream};
+use std::ops::ControlFlow;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
@@ -48,14 +49,16 @@ struct Session<'a> {
     db: String,
     started: Instant,
 }
-pub(crate) fn serve(
-    mut stream: TcpStream,
-    registry: &Registry,
-    auth: &dyn Authenticator,
-    config: &ServerConfig,
-    id: u64,
-    stop: &AtomicBool,
-) -> io::Result<()> {
+/// What every connection of one server shares.
+pub(crate) struct Shared<'a> {
+    pub registry: &'a Registry,
+    pub auth: &'a dyn Authenticator,
+    pub config: &'a ServerConfig,
+    /// Set at shutdown; cancels running queries.
+    pub stop: &'a AtomicBool,
+}
+pub(crate) fn serve(mut stream: TcpStream, id: u64, shared: &Shared<'_>) -> io::Result<()> {
+    let config = shared.config;
     let peer = stream.peer_addr()?.ip();
     stream.set_write_timeout(Some(config.write_timeout))?;
     let Some(minor) = handshake::negotiate(&mut stream, config.handshake_timeout)? else {
@@ -67,8 +70,8 @@ pub(crate) fn serve(
         minor,
         authenticated: false,
         identity: None,
-        registry,
-        auth,
+        registry: shared.registry,
+        auth: shared.auth,
         config,
         id,
         peer,
@@ -77,36 +80,9 @@ pub(crate) fn serve(
         started: Instant::now(),
     };
     loop {
-        let bytes =
-            match chunk::read_message(&mut stream, config.max_message_bytes, config.idle_timeout) {
-                Ok(bytes) => bytes,
-                Err(e) if e.kind() == io::ErrorKind::InvalidData => {
-                    let _ = session.send(
-                        &mut stream,
-                        &Failure::new(INVALID, "message size limit exceeded").value(),
-                        Instant::now() + config.write_timeout,
-                    );
-                    return Ok(());
-                }
-                Err(e) => return Err(e),
-            };
-        let value =
-            packstream::decode_with_limits(&bytes, config.max_message_bytes, config.max_depth);
-        // Input may carry credentials. Drop the original bytes before dispatch,
-        // never format them or the decoded request, even on malformed input.
-        drop(bytes);
-        let value = match value {
-            Ok(v) => v,
-            Err(_) => {
-                let _ = session.send(
-                    &mut stream,
-                    &Failure::new(INVALID, "malformed PackStream message").value(),
-                    Instant::now() + config.write_timeout,
-                );
-                return Ok(());
-            }
+        let Some(message) = session.receive(&mut stream)? else {
+            return Ok(());
         };
-        let message = Message::parse(value);
         let deadline = Instant::now() + config.write_timeout;
         if matches!(message, Ok(Message::Goodbye)) {
             return Ok(());
@@ -116,32 +92,77 @@ pub(crate) fn serve(
             continue;
         }
         let result = match message {
-            Ok(msg) => session.handle(&mut stream, msg, stop),
+            Ok(msg) => session.handle(&mut stream, msg, shared.stop),
             Err(e) => Err(RequestError::Client(e)),
         };
-        if let Err(error) = result {
-            let failure = match error {
-                RequestError::Transport(error) => return Err(error),
-                RequestError::Client(failure) => failure,
-            };
-            eprintln!(
-                "event=bolt_request_failed connection_id={id} code={}",
-                failure.code
-            );
-            session.output = None;
-            session.send(
-                &mut stream,
-                &failure.value(),
-                Instant::now() + config.write_timeout,
-            )?;
-            if !session.authenticated {
-                return Ok(());
-            }
-            session.state = State::Failed;
+        if let Err(error) = result
+            && session.fail(&mut stream, error)?.is_break()
+        {
+            return Ok(());
         }
     }
 }
 impl Session<'_> {
+    /// Reads and parses the next request. `None` ends the connection: the
+    /// message was over the size limit or not PackStream, and the client
+    /// has been told so (if it is still listening).
+    fn receive(&self, stream: &mut TcpStream) -> io::Result<Option<Result<Message, Failure>>> {
+        let config = self.config;
+        let bytes = match chunk::read_message(stream, config.max_message_bytes, config.idle_timeout)
+        {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                let _ = self.send(
+                    stream,
+                    &Failure::new(INVALID, "message size limit exceeded").value(),
+                    Instant::now() + config.write_timeout,
+                );
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let value =
+            packstream::decode_with_limits(&bytes, config.max_message_bytes, config.max_depth);
+        // Input may carry credentials. Drop the original bytes before dispatch,
+        // never format them or the decoded request, even on malformed input.
+        drop(bytes);
+        let value = match value {
+            Ok(v) => v,
+            Err(_) => {
+                let _ = self.send(
+                    stream,
+                    &Failure::new(INVALID, "malformed PackStream message").value(),
+                    Instant::now() + config.write_timeout,
+                );
+                return Ok(None);
+            }
+        };
+        Ok(Some(Message::parse(value)))
+    }
+    /// Reports a failed request. Breaks (the connection ends) if the client
+    /// never authenticated; otherwise the session ignores requests until
+    /// RESET.
+    fn fail(&mut self, stream: &mut TcpStream, error: RequestError) -> io::Result<ControlFlow<()>> {
+        let failure = match error {
+            RequestError::Transport(error) => return Err(error),
+            RequestError::Client(failure) => failure,
+        };
+        eprintln!(
+            "event=bolt_request_failed connection_id={} code={}",
+            self.id, failure.code
+        );
+        self.output = None;
+        self.send(
+            stream,
+            &failure.value(),
+            Instant::now() + self.config.write_timeout,
+        )?;
+        if !self.authenticated {
+            return Ok(ControlFlow::Break(()));
+        }
+        self.state = State::Failed;
+        Ok(ControlFlow::Continue(()))
+    }
     fn send(&self, stream: &mut TcpStream, value: &Value, deadline: Instant) -> io::Result<()> {
         let bytes = packstream::encode_with_limits(
             value,
@@ -190,6 +211,8 @@ impl Session<'_> {
         self.identity = Some(identity);
         Ok(())
     }
+    /// Runs one request and sends its response. Each message is accepted
+    /// only in the states the guards name; anything else is invalid.
     fn handle(
         &mut self,
         stream: &mut TcpStream,
@@ -197,57 +220,12 @@ impl Session<'_> {
         stop: &AtomicBool,
     ) -> Result<(), RequestError> {
         let response = match msg {
-            Message::Hello(extra) if self.state == State::Connected => {
-                if self.minor == 0 {
-                    self.authenticate(extra)?;
-                    self.authenticated = true;
-                    self.state = State::Ready;
-                } else {
-                    self.state = State::Authentication;
-                }
-                // Drivers require an agent starting with `Neo4j/` and may
-                // read its version for feature checks, so it names the Bolt-5
-                // compatibility level, not Kala's own version (which is
-                // `kala_version`; drivers ignore unknown keys).
-                let mut hints = Map::new();
-                // Lets pooled drivers retire connections before the idle
-                // timeout closes them. Drivers also use it as a read timeout
-                // while waiting for a response, so it is only sent for a
-                // whole number of seconds (0 means "none" to some drivers).
-                let secs = self.config.idle_timeout.as_secs();
-                if secs >= 1 {
-                    hints.insert(
-                        "connection.recv_timeout_seconds".into(),
-                        Value::Integer(i64::try_from(secs).unwrap_or(i64::MAX)),
-                    );
-                }
-                success([
-                    ("server", Value::String("Neo4j/5.0.0".into())),
-                    (
-                        "kala_version",
-                        Value::String(env!("CARGO_PKG_VERSION").into()),
-                    ),
-                    ("connection_id", Value::String(format!("kala-{}", self.id))),
-                    ("hints", Value::Map(hints)),
-                ])
-            }
+            Message::Hello(extra) if self.state == State::Connected => self.hello(extra)?,
             Message::Logon(extra) if self.minor >= 1 && self.state == State::Authentication => {
-                self.authenticate(extra)?;
-                self.authenticated = true;
-                self.state = State::Ready;
-                success([])
+                self.logon(extra)?
             }
-            Message::Logoff if self.minor >= 1 && self.state == State::Ready => {
-                self.authenticated = false;
-                self.identity = None;
-                self.state = State::Authentication;
-                success([])
-            }
-            Message::Reset if self.authenticated => {
-                self.output = None;
-                self.state = State::Ready;
-                success([])
-            }
+            Message::Logoff if self.minor >= 1 && self.state == State::Ready => self.logoff(),
+            Message::Reset if self.authenticated => self.reset(),
             Message::Telemetry if self.minor >= 4 && self.state == State::Ready => success([]),
             Message::Unsupported if self.authenticated => {
                 return Err(Failure::new(INVALID, "not supported yet").into());
@@ -256,83 +234,9 @@ impl Session<'_> {
                 text,
                 params,
                 extra,
-            } if self.state == State::Ready => {
-                let requested = match extra.get("db") {
-                    None => None,
-                    Some(Value::String(s)) => Some(s.as_str()),
-                    _ => return Err(Failure::invalid().into()),
-                };
-                let name = self.registry.name(requested)?;
-                if !self
-                    .identity
-                    .as_ref()
-                    .is_some_and(|identity| identity.permits_read(name))
-                {
-                    return Err(Failure::new(
-                        crate::error::FORBIDDEN,
-                        format!("access to database {name:?} is forbidden"),
-                    )
-                    .into());
-                }
-                let (db, world) = self.registry.get(Some(name))?;
-                self.started = Instant::now();
-                eprintln!("event=bolt_query_started connection_id={} db={db}", self.id);
-                let output = query::run(
-                    &world,
-                    &text,
-                    &params,
-                    stop,
-                    self.config.max_message_bytes,
-                    self.config.max_depth,
-                )?;
-                let fields =
-                    Value::List(output.fields.iter().cloned().map(Value::String).collect());
-                eprintln!(
-                    "event=bolt_query_completed connection_id={} rows={}",
-                    self.id,
-                    output.rows.len()
-                );
-                self.db = db;
-                self.output = Some(output);
-                self.state = State::Streaming;
-                success([
-                    ("fields", fields),
-                    ("t_first", Value::Integer(elapsed(self.started))),
-                    ("qid", Value::Integer(0)),
-                ])
-            }
+            } if self.state == State::Ready => self.run(&text, &params, &extra, stop)?,
             Message::Pull { n, qid, discard } if self.state == State::Streaming => {
-                if qid != -1 && qid != 0 {
-                    return Err(Failure::invalid().into());
-                }
-                let output = self.output.as_mut().ok_or_else(Failure::invalid)?;
-                let count = if n == -1 {
-                    output.rows.len()
-                } else {
-                    usize::try_from(n)
-                        .unwrap_or(usize::MAX)
-                        .min(output.rows.len())
-                };
-                let deadline = Instant::now() + self.config.write_timeout;
-                for _ in 0..count {
-                    if let Some(bytes) = output.rows.pop_front()
-                        && !discard
-                    {
-                        chunk::write_message(stream, &bytes, deadline)
-                            .map_err(RequestError::Transport)?;
-                    }
-                }
-                if output.rows.is_empty() {
-                    self.output = None;
-                    self.state = State::Ready;
-                    success([
-                        ("t_last", Value::Integer(elapsed(self.started))),
-                        ("type", Value::String("r".into())),
-                        ("db", Value::String(self.db.clone())),
-                    ])
-                } else {
-                    success([("has_more", Value::Bool(true))])
-                }
+                self.pull(stream, n, qid, discard)?
             }
             _ => return Err(Failure::invalid().into()),
         };
@@ -342,6 +246,152 @@ impl Session<'_> {
             Instant::now() + self.config.write_timeout,
         )
         .map_err(RequestError::Transport)
+    }
+    /// HELLO: Bolt 5.0 authenticates here; from 5.1 on LOGON does.
+    fn hello(&mut self, extra: Map) -> Result<Value, Failure> {
+        if self.minor == 0 {
+            self.authenticate(extra)?;
+            self.authenticated = true;
+            self.state = State::Ready;
+        } else {
+            self.state = State::Authentication;
+        }
+        // Drivers require an agent starting with `Neo4j/` and may
+        // read its version for feature checks, so it names the Bolt-5
+        // compatibility level, not Kala's own version (which is
+        // `kala_version`; drivers ignore unknown keys).
+        let mut hints = Map::new();
+        // Lets pooled drivers retire connections before the idle
+        // timeout closes them. Drivers also use it as a read timeout
+        // while waiting for a response, so it is only sent for a
+        // whole number of seconds (0 means "none" to some drivers).
+        let secs = self.config.idle_timeout.as_secs();
+        if secs >= 1 {
+            hints.insert(
+                "connection.recv_timeout_seconds".into(),
+                Value::Integer(i64::try_from(secs).unwrap_or(i64::MAX)),
+            );
+        }
+        Ok(success([
+            ("server", Value::String("Neo4j/5.0.0".into())),
+            (
+                "kala_version",
+                Value::String(env!("CARGO_PKG_VERSION").into()),
+            ),
+            ("connection_id", Value::String(format!("kala-{}", self.id))),
+            ("hints", Value::Map(hints)),
+        ]))
+    }
+    /// LOGON (Bolt 5.1+).
+    fn logon(&mut self, extra: Map) -> Result<Value, Failure> {
+        self.authenticate(extra)?;
+        self.authenticated = true;
+        self.state = State::Ready;
+        Ok(success([]))
+    }
+    /// LOGOFF (Bolt 5.1+): back to waiting for a LOGON.
+    fn logoff(&mut self) -> Value {
+        self.authenticated = false;
+        self.identity = None;
+        self.state = State::Authentication;
+        success([])
+    }
+    /// RESET: drops any unsent result and clears a failure.
+    fn reset(&mut self) -> Value {
+        self.output = None;
+        self.state = State::Ready;
+        success([])
+    }
+    /// RUN: checks access to the database, runs the whole query and keeps
+    /// its encoded rows for PULL / DISCARD.
+    fn run(
+        &mut self,
+        text: &str,
+        params: &Map,
+        extra: &Map,
+        stop: &AtomicBool,
+    ) -> Result<Value, Failure> {
+        let requested = match extra.get("db") {
+            None => None,
+            Some(Value::String(s)) => Some(s.as_str()),
+            _ => return Err(Failure::invalid()),
+        };
+        let name = self.registry.name(requested)?;
+        if !self
+            .identity
+            .as_ref()
+            .is_some_and(|identity| identity.permits_read(name))
+        {
+            return Err(Failure::new(
+                crate::error::FORBIDDEN,
+                format!("access to database {name:?} is forbidden"),
+            ));
+        }
+        let (db, world) = self.registry.get(Some(name))?;
+        self.started = Instant::now();
+        eprintln!("event=bolt_query_started connection_id={} db={db}", self.id);
+        let output = query::run(
+            &world,
+            text,
+            params,
+            stop,
+            self.config.max_message_bytes,
+            self.config.max_depth,
+        )?;
+        let fields = Value::List(output.fields.iter().cloned().map(Value::String).collect());
+        eprintln!(
+            "event=bolt_query_completed connection_id={} rows={}",
+            self.id,
+            output.rows.len()
+        );
+        self.db = db;
+        self.output = Some(output);
+        self.state = State::Streaming;
+        Ok(success([
+            ("fields", fields),
+            ("t_first", Value::Integer(elapsed(self.started))),
+            ("qid", Value::Integer(0)),
+        ]))
+    }
+    /// PULL, or DISCARD (`discard`): sends or drops the next `n` rows (-1 =
+    /// all of them) and says whether more remain.
+    fn pull(
+        &mut self,
+        stream: &mut TcpStream,
+        n: i64,
+        qid: i64,
+        discard: bool,
+    ) -> Result<Value, RequestError> {
+        if qid != -1 && qid != 0 {
+            return Err(Failure::invalid().into());
+        }
+        let output = self.output.as_mut().ok_or_else(Failure::invalid)?;
+        let count = if n == -1 {
+            output.rows.len()
+        } else {
+            usize::try_from(n)
+                .unwrap_or(usize::MAX)
+                .min(output.rows.len())
+        };
+        let deadline = Instant::now() + self.config.write_timeout;
+        for _ in 0..count {
+            if let Some(bytes) = output.rows.pop_front()
+                && !discard
+            {
+                chunk::write_message(stream, &bytes, deadline).map_err(RequestError::Transport)?;
+            }
+        }
+        if output.rows.is_empty() {
+            self.output = None;
+            self.state = State::Ready;
+            Ok(success([
+                ("t_last", Value::Integer(elapsed(self.started))),
+                ("type", Value::String("r".into())),
+                ("db", Value::String(self.db.clone())),
+            ]))
+        } else {
+            Ok(success([("has_more", Value::Bool(true))]))
+        }
     }
 }
 fn elapsed(start: Instant) -> i64 {
