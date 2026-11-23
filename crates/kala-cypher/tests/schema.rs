@@ -1,5 +1,6 @@
 //! Schema mapping: inverse/bidirectional edges, old canons, nullable lists.
-use kala_core::{Tick, Value, World, load_fixture};
+use kala_core::{Tick, Value, World};
+use kala_fixture::load_fixture;
 use kala_query::{Datum, Limits, Params, run};
 const FIXTURE: &str = r#"
 schema:

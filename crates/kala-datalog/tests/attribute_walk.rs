@@ -2,8 +2,9 @@
 //! every attribute a query names, however deeply nested, so a caller can
 //! refuse a query by attribute before running it.
 
-use kala_core::{World, load_fixture};
+use kala_core::World;
 use kala_datalog::{parse, prepare};
+use kala_fixture::load_fixture;
 use std::collections::BTreeSet;
 
 const VARROW: &str = include_str!("../../kala-core/tests/fixtures/varrow.yaml");

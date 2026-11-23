@@ -12,11 +12,15 @@ workspace = true
 
 [dependencies]
 kala-core = { path = "../kala-core" }
+# `kala load` (internal crate).
+kala-fixture = { path = "../kala-fixture" }
 # `kala query` / `kala explain` (internal crates).
 kala-query = { path = "../kala-query" }
 kala-datalog = { path = "../kala-datalog" }
-kala-cypher = { path = "../kala-cypher" }
+kala-lang = { path = "../kala-lang" }
+# `kala serve` only; accounts and the `system` database are kala-system.
 kala-bolt = { path = "../kala-bolt" }
+kala-system = { path = "../kala-system" }
 # Argument parsing; no `color` (no ANSI in output), no argfiles, no env args
 # (security-consultant approved, slice 5).
 clap = { version = "4.6.9", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }

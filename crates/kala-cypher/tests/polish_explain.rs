@@ -1,6 +1,7 @@
 //! Polish fix H: `Plan::explain` renders `Row` and `Output` stably (no Rust Debug,
 //! no control characters, generated variables as `?#N`).
-use kala_core::{World, load_fixture};
+use kala_core::World;
+use kala_fixture::load_fixture;
 
 const VARROW: &str = include_str!("../../kala-core/tests/fixtures/varrow.yaml");
 fn world() -> World {
@@ -166,8 +167,9 @@ fn guard_datalog_explain_is_unchanged() {
 #[test]
 fn explain_escapes_control_characters_in_scan_and_expand_names() {
     use kala_query::{Access, AttrRef, CanonSource, Op, Plan, Term, TickSource, Var};
-    let world = kala_core::load_fixture(include_str!("../../kala-core/tests/fixtures/varrow.yaml"))
-        .unwrap();
+    let world =
+        kala_fixture::load_fixture(include_str!("../../kala-core/tests/fixtures/varrow.yaml"))
+            .unwrap();
     let scan = Op::NodeScan {
         input: Box::new(Op::Unit),
         var: Var("n".into()),

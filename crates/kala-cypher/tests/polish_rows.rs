@@ -1,5 +1,6 @@
 //! Slice 13 polish: named relationship rows (inverse names, cost) and ordering comparisons.
-use kala_core::{Value, World, load_fixture};
+use kala_core::{Value, World};
+use kala_fixture::load_fixture;
 use kala_query::{Datum, Limits, Params, run, run_with_usage};
 
 fn prep_run(w: &World, text: &str) -> Vec<Vec<Datum>> {

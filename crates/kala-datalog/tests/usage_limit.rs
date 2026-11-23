@@ -6,8 +6,9 @@
 // usage it reports; ID walks are real work and count as steps.
 #[test]
 fn a_query_fits_a_limit_equal_to_its_own_usage() {
-    let world = kala_core::load_fixture(include_str!("../../kala-core/tests/fixtures/varrow.yaml"))
-        .unwrap();
+    let world =
+        kala_fixture::load_fixture(include_str!("../../kala-core/tests/fixtures/varrow.yaml"))
+            .unwrap();
     let q = "[:find ?c ?d :where [?x :located_in ?q ?t] (at ?t [?c :disguised ?d])]";
     let p = kala_datalog::prepare(&world, q).unwrap();
     let (rows, usage) = kala_query::run_with_usage(

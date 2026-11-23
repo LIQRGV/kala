@@ -12,7 +12,8 @@ mod common;
 use client::{Client, map, string};
 use common::Running;
 use kala_bolt::packstream::Value;
-use kala_bolt::{Server, ServerConfig, auth::Accounts, system};
+use kala_bolt::{Server, ServerConfig, auth::Accounts};
+use kala_system::system;
 use std::sync::Arc;
 
 const PASSWORD: &str = "test-only-secret-password";
@@ -34,8 +35,8 @@ transactions:
 
 fn server() -> Running {
     let dir = tempfile::tempdir().unwrap();
-    drop(kala_core::load_fixture_to(common::VARROW, &dir.path().join("varrow.kala")).unwrap());
-    drop(kala_core::load_fixture_to(USERS_YAML, &dir.path().join("users.kala")).unwrap());
+    drop(kala_fixture::load_fixture_to(common::VARROW, &dir.path().join("varrow.kala")).unwrap());
+    drop(kala_fixture::load_fixture_to(USERS_YAML, &dir.path().join("users.kala")).unwrap());
     system::add(dir.path(), "carol@127.0.0.1", Some(PASSWORD)).unwrap();
     system::grant(dir.path(), "carol@127.0.0.1", "read", "varrow").unwrap();
     let config = ServerConfig {

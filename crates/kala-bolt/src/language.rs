@@ -2,31 +2,25 @@
 //!
 //! [`detect`] reads the optional first-line prefix once (`// kala:datalog`,
 //! `// kala:cypher`, `// kala:gremlin`; anything else is Cypher, as drivers
-//! assume) and returns the [`FrontEnd`] with the text it should parse. Every
-//! front-end is then driven the same way by `query::run`.
+//! assume) and returns the [`FrontEnd`] (kala-lang) with the text it should
+//! parse. Every front-end is then driven the same way by `query::run`, and
+//! its errors become Bolt failures here.
 use std::borrow::Cow;
 
 use crate::error::{Failure, SYNTAX, TYPE};
-use kala_core::World;
-use kala_query::Prepared;
+use kala_lang::{Cypher, Datalog, ErrorKind, FrontEnd, LangError};
 
-/// A query language Kala parses: parse, refuse secrets in the AST, compile.
-pub(crate) trait FrontEnd: Sync {
-    /// The language's name, for logs.
-    fn name(&self) -> &'static str;
-    /// Whether parameters may be NULL or lists (Cypher), or must be scalars
-    /// of their inferred kind (Datalog).
-    fn nullable_params(&self) -> bool;
-    /// Parses and compiles `text`. `secret` names attributes that must not be
-    /// read: it is checked on the AST before compiling, so it also covers
-    /// parts of the query the compiler drops (unused rules, empty matches).
-    /// The caller checks the compiled plan as well.
-    fn prepare(
-        &self,
-        world: &World,
-        text: &str,
-        secret: &dyn Fn(&str) -> bool,
-    ) -> Result<Prepared, Failure>;
+/// A front-end error on the wire: a syntax or type failure with the
+/// front-end's message, or the protected-attribute refusal (the hook passed
+/// to [`FrontEnd::prepare`] names the secret attributes).
+impl From<LangError> for Failure {
+    fn from(e: LangError) -> Self {
+        match e.kind {
+            ErrorKind::Syntax => Failure::new(SYNTAX, e.message),
+            ErrorKind::Type => Failure::new(TYPE, e.message),
+            ErrorKind::Refused => crate::query::protected(),
+        }
+    }
 }
 
 /// The front-end a query selected, and the text to give it.
@@ -56,61 +50,6 @@ pub(crate) fn detect(text: &str) -> Result<Source<'_>, Failure> {
         front_end,
         text: Cow::Owned(format!("\n{rest}")),
     })
-}
-
-struct Datalog;
-
-impl FrontEnd for Datalog {
-    fn name(&self) -> &'static str {
-        "datalog"
-    }
-    fn nullable_params(&self) -> bool {
-        false
-    }
-    fn prepare(
-        &self,
-        world: &World,
-        text: &str,
-        secret: &dyn Fn(&str) -> bool,
-    ) -> Result<Prepared, Failure> {
-        let syntax = |e: kala_datalog::DatalogError| Failure::new(SYNTAX, e.to_string());
-        let query = kala_datalog::parse(text).map_err(syntax)?;
-        if query.attributes().iter().any(|a| secret(&a.name)) {
-            return Err(crate::query::protected());
-        }
-        kala_datalog::prepare_parsed(world, text, &query).map_err(syntax)
-    }
-}
-
-struct Cypher;
-
-impl FrontEnd for Cypher {
-    fn name(&self) -> &'static str {
-        "cypher"
-    }
-    fn nullable_params(&self) -> bool {
-        true
-    }
-    fn prepare(
-        &self,
-        world: &World,
-        text: &str,
-        secret: &dyn Fn(&str) -> bool,
-    ) -> Result<Prepared, Failure> {
-        let error = |e: kala_cypher::CypherError| {
-            let code = if e.kind == kala_cypher::ErrorKind::Type {
-                TYPE
-            } else {
-                SYNTAX
-            };
-            Failure::new(code, e.to_string())
-        };
-        let query = kala_cypher::parse(text).map_err(error)?;
-        if query.attributes().iter().any(|a| secret(a)) {
-            return Err(crate::query::protected());
-        }
-        kala_cypher::prepare_parsed(world, text, &query).map_err(error)
-    }
 }
 
 #[cfg(test)]

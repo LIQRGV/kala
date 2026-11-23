@@ -2,8 +2,9 @@
 //! handle *string* belongs) is a TypeMismatch whose message tells the author
 //! what to write instead, using the handle from the query.
 
-use kala_core::{World, load_fixture};
+use kala_core::World;
 use kala_datalog::{ErrorKind, prepare};
+use kala_fixture::load_fixture;
 
 const VARROW: &str = include_str!("../../kala-core/tests/fixtures/varrow.yaml");
 

@@ -11,7 +11,7 @@ use kala_bolt::{ServerConfig, packstream::Value};
 fn renamed_properties_and_relationships_use_new_names_at_old_canon() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("varrow.kala");
-    let mut world = kala_core::load_fixture_to(VARROW, &path).unwrap();
+    let mut world = kala_fixture::load_fixture_to(VARROW, &path).unwrap();
     let mut tx = world.begin();
     let renamed = tx.rename_attribute("name", "title");
     assert!(

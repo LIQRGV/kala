@@ -1,6 +1,7 @@
 //! Disjunction is set union, including inside rules and correlated negation.
-use kala_core::{Value, World, load_fixture};
+use kala_core::{Value, World};
 use kala_datalog::{ErrorKind, prepare};
+use kala_fixture::load_fixture;
 use kala_query::{Datum, Limits, Params, run};
 use proptest::prelude::*;
 use std::collections::BTreeSet;

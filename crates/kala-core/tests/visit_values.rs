@@ -1,6 +1,7 @@
 //! Incremental property reads let protocol adapters enforce output budgets
 //! before collecting a cardinality-many attribute.
-use kala_core::{Error, Tick, TxId, Value, WorkInterruptReason, WorkMeter, load_fixture};
+use kala_core::{Error, Tick, TxId, Value, WorkInterruptReason, WorkMeter};
+use kala_fixture::load_fixture;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const WORLD: &str = r#"

@@ -21,14 +21,14 @@ impl Process {
     fn with_options(listen: &str, options: &[&str], test_user: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         drop(
-            kala_core::load_fixture_to(
+            kala_fixture::load_fixture_to(
                 include_str!("../../kala-core/tests/fixtures/varrow.yaml"),
                 &dir.path().join("varrow.kala"),
             )
             .unwrap(),
         );
         if test_user {
-            kala_bolt::system::add(dir.path(), "test-user@localhost", None).unwrap();
+            kala_system::system::add(dir.path(), "test-user@localhost", None).unwrap();
         }
         let stderr = std::fs::File::create(dir.path().join("stderr.txt")).unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_kala"))

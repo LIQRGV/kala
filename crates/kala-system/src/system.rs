@@ -151,7 +151,7 @@ pub fn is_system(world: &World) -> bool {
 const SECRET_ATTR: &str = "password_hash";
 /// Whether a query on the system world may not name `attr`: the secret
 /// attribute itself, or any name that resolves to it (an inverse name).
-pub(crate) fn is_secret_attribute(world: &World, attr: &str) -> bool {
+pub fn is_secret_attribute(world: &World, attr: &str) -> bool {
     attr == SECRET_ATTR
         || world
             .attributes()

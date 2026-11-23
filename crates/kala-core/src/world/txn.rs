@@ -504,7 +504,7 @@ impl Txn<'_> {
     /// rescans each touched cardinality-one side's whole history and is
     /// quadratic in the overlapping values one transaction touches
     /// (security review H1/H2).
-    pub(crate) fn commit_quiet(self) -> Result<CommitResult, Error> {
+    pub fn commit_quiet(self) -> Result<CommitResult, Error> {
         self.commit_with(false)
     }
 

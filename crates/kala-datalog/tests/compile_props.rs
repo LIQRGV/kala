@@ -2,6 +2,7 @@
 //! queries match the native API at random ticks.
 use kala_core::*;
 use kala_datalog::prepare;
+use kala_fixture::load_fixture;
 use kala_query::{Limits, Params, run};
 use proptest::prelude::*;
 use std::collections::BTreeSet;

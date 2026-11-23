@@ -4,8 +4,9 @@
 //! count (patterns, predicates, nested clauses inside `(at ..)`) above it is
 //! `ErrorKind::Limit`; `MAX_PATTERNS` (256) is unchanged.
 
-use kala_core::{World, load_fixture};
+use kala_core::World;
 use kala_datalog::{ErrorKind, MAX_CLAUSES, MAX_PATTERNS, parse, prepare};
+use kala_fixture::load_fixture;
 
 const VARROW: &str = include_str!("../../kala-core/tests/fixtures/varrow.yaml");
 

@@ -13,7 +13,7 @@ fn loaded_varrow() -> Fx {
     let path = dir.path().join("world.kala");
     let output = kala(["load", VARROW, path.to_str().unwrap()]);
     assert_eq!(code(&output), 0, "{}", stderr(&output));
-    let mem = kala_core::load_fixture(&fs::read_to_string(VARROW).unwrap()).unwrap();
+    let mem = kala_fixture::load_fixture(&fs::read_to_string(VARROW).unwrap()).unwrap();
     Fx { dir, path, mem }
 }
 
@@ -569,7 +569,7 @@ fn repl_write_reports_schema_and_reads_new_attribute() {
 #[test]
 fn schema_forms_cannot_write_the_system_world_even_after_rename() {
     let dir = tempfile::tempdir().unwrap();
-    kala_bolt::system::add(dir.path(), "author@localhost", None).unwrap();
+    kala_system::system::add(dir.path(), "author@localhost", None).unwrap();
     let path = dir.path().join("ordinary.kala");
     fs::rename(dir.path().join("system.kala"), &path).unwrap();
     let before = fs::read(&path).unwrap();

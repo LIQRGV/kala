@@ -182,10 +182,13 @@ The native Rust API (`kala-core`) can also write directly. See
 
 | Crate | What it is |
 |---|---|
-| `kala-core` | The log, indexes (`E`, `R`, `V`), `assert`/`retract`/`correct`, `AsOf`/`History`/`Neighbors`, overlap warnings, doctor, the YAML fixture loader |
+| `kala-core` | The log, indexes (`E`, `R`, `V`), `assert`/`retract`/`correct`, `AsOf`/`History`/`Neighbors`, overlap warnings, doctor |
+| `kala-fixture` | The YAML fixture loader |
 | `kala-query` | A language-neutral query IR and executor, with row, step and memory budgets |
 | `kala-datalog` | The Datalog parser, compiler and planner |
 | `kala-cypher` | Cypher read parser and compiler to the same IR |
+| `kala-lang` | One `FrontEnd` interface over the query languages |
+| `kala-system` | The `system` database: accounts, privileges, password hashing, database names |
 | `kala-bolt` | Read-only Bolt 5 server, authentication boundary and driver value mapping |
 | `kala-cli` | The `kala` command-line tool |
 

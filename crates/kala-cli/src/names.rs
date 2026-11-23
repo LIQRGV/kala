@@ -27,7 +27,7 @@ pub trait Names {
 
 impl Names for World {
     fn is_system(&self) -> bool {
-        kala_bolt::system::is_system(self)
+        kala_system::is_system(self)
     }
     fn handle(&self, id: EntityId) -> Option<&str> {
         self.handle_of(id)
@@ -72,7 +72,7 @@ impl Names for LogNames {
     fn is_system(&self) -> bool {
         self.node_types
             .values()
-            .any(|name| name == kala_bolt::system::SYSTEM_MARKER)
+            .any(|name| name == kala_system::SYSTEM_MARKER)
     }
     fn handle(&self, id: EntityId) -> Option<&str> {
         self.handles.get(&id).map(String::as_str)

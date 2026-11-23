@@ -10,11 +10,12 @@ workspace = true
 kala-core = { path = "../kala-core" }
 kala-query = { path = "../kala-query" }
 kala-datalog = { path = "../kala-datalog" }
-kala-cypher = { path = "../kala-cypher" }
-
-# Security-consultant approved: Argon2id PHC hashing and OS-random salts.
-argon2 = { version = "=0.5.3", default-features = false, features = ["std", "password-hash", "rand"] }
+# The query front-ends behind one interface.
+kala-lang = { path = "../kala-lang" }
+# The `system` database: accounts, privileges and password verification.
+kala-system = { path = "../kala-system" }
 
 [dev-dependencies]
+kala-fixture = { path = "../kala-fixture" }
 tempfile = "3.27.0"
 proptest = "1.12.0"

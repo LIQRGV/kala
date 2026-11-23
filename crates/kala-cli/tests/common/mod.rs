@@ -168,9 +168,8 @@ transactions:
 // computed through the kala-core API on an in-memory twin of the world file.
 // ---------------------------------------------------------------------------
 
-use kala_core::{
-    Direction, EntityId, Precision, Tick, TxId, Value, ValueType, load_fixture, load_fixture_to,
-};
+use kala_core::{Direction, EntityId, Precision, Tick, TxId, Value, ValueType};
+use kala_fixture::{load_fixture, load_fixture_to};
 use serde_json::{Value as Json, json};
 use std::path::PathBuf;
 

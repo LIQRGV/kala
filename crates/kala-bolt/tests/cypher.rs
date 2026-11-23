@@ -177,7 +177,7 @@ transactions:
       - assert: [di, name, Di]
       - assert: [di, height, 9007199254740994.0]
 "#;
-    drop(kala_core::load_fixture_to(yaml, &dir.path().join("typed.kala")).unwrap());
+    drop(kala_fixture::load_fixture_to(yaml, &dir.path().join("typed.kala")).unwrap());
     Running::in_dir(
         dir,
         kala_bolt::ServerConfig {

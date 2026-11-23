@@ -1,5 +1,6 @@
 //! The neutral row IR independently of any language compiler.
-use kala_core::{Value, load_fixture};
+use kala_core::Value;
+use kala_fixture::load_fixture;
 use kala_query::{
     CanonSource, Datum, Expr, Limits, Op, OutputSpec, Params, Plan, QueryError, RowAction, Term,
     TickSource, Var, run, run_with_cancel, run_with_usage,

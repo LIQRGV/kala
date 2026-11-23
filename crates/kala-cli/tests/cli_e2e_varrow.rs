@@ -15,7 +15,8 @@ mod damage;
 
 use common::*;
 use damage::*;
-use kala_core::{Direction, EntityId, Op, Tick, TxId, Value, World, load_fixture};
+use kala_core::{Direction, EntityId, Op, Tick, TxId, Value, World};
+use kala_fixture::load_fixture;
 use serde_json::Value as Json;
 use std::path::PathBuf;
 

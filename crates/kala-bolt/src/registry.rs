@@ -95,7 +95,9 @@ impl Registry {
                 eprintln!(
                     "kala serve: skipping system.kala: the system database is never served without account authentication"
                 );
-            } else if entry.file_type()?.is_file() && db.is_some_and(valid_name) {
+            } else if entry.file_type()?.is_file()
+                && db.is_some_and(kala_system::valid_database_name)
+            {
                 databases.insert(
                     db.unwrap_or_default().to_string(),
                     Database {
@@ -171,11 +173,4 @@ impl Registry {
         *lock()? = Some((stamp, Arc::clone(&world)));
         Ok((name.into(), world))
     }
-}
-/// Whether a filename stem is eligible for server database discovery.
-pub fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-')
 }
