@@ -91,9 +91,7 @@ pub fn run(world: &Path, args: &[String], read: &ReadAt) -> Result<String, CliEr
         }
         Spec::Triple(s, a, t) => {
             let (src, tgt) = (ctx.entity(s)?, ctx.entity(t)?);
-            if ctx.world.attribute(a).is_none() {
-                return Err(core_err(kala_core::Error::UnknownAttribute(a.to_string())));
-            }
+            ctx.view().require_attribute(a).map_err(core_err)?;
             let edge = ctx.view().edge_id(src, a, tgt).ok_or_else(|| {
                 CliError::User(format!(
                     "no edge `{} {} {}`: nothing was asserted between them up to canon tx#{}",

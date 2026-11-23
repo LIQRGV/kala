@@ -43,9 +43,7 @@
 //!
 //! [`View::overlaps`]: crate::View::overlaps
 
-use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::ops::Bound;
 use std::path::Path;
 
 use crate::error::Error;
@@ -53,6 +51,7 @@ use crate::id::{AttrId, EdgeId, EntityId};
 use crate::key;
 use crate::log::{self, EntryId, SurveyedTxn, TaggedFinding};
 use crate::overlap::Overlap;
+use crate::store::OrderedMap;
 use crate::tick::Tick;
 use crate::value::{Value, ValueType};
 use crate::value_table::{ContentHash, fnv1a64};
@@ -113,6 +112,8 @@ pub enum IndexName {
 /// One problem doctor found.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Finding {
+    /// Derived schema metadata differs from a replay of the log.
+    SchemaMismatch,
     /// The log ends in a torn or damaged transaction that `World::open`
     /// would cut. `offset` is where the valid prefix ends: the start of that
     /// transaction (or of the zero-filled tail).
@@ -255,7 +256,8 @@ impl Finding {
     /// How serious the finding is.
     pub fn severity(&self) -> Severity {
         match self {
-            Finding::IncompleteTail { .. }
+            Finding::SchemaMismatch
+            | Finding::IncompleteTail { .. }
             | Finding::ChecksumMismatch { .. }
             | Finding::MissingCommit { .. }
             | Finding::TxGap { .. }
@@ -374,6 +376,9 @@ pub fn doctor(world: &World, opts: &DoctorOptions) -> Report {
     let hash = world.content_hash();
     if let Some(rebuilt) = txns.and_then(|txns| rebuild(txns, hash, &mut found)) {
         compare_indexes(world, &rebuilt, &mut found);
+        if !world.schema_matches(&rebuilt) {
+            found.push((None, Finding::SchemaMismatch));
+        }
         schema_rules(&rebuilt, opts, &mut found);
     }
     finish(found, opts)
@@ -649,10 +654,10 @@ fn compare_indexes(world: &World, rebuilt: &World, found: &mut Vec<TaggedFinding
 fn resolved<'i, V: Clone>(
     index: IndexName,
     w: &World,
-    keys: &'i BTreeMap<Vec<u8>, V>,
+    keys: &'i OrderedMap<V>,
     main: bool,
     found: &mut Vec<TaggedFinding>,
-) -> std::borrow::Cow<'i, BTreeMap<Vec<u8>, V>> {
+) -> std::borrow::Cow<'i, OrderedMap<V>> {
     let (rows, bad) = w.resolved_e_index(keys, main);
     for key in bad {
         found.push((None, Finding::IndexDecode { index, key }));
@@ -666,20 +671,20 @@ fn resolved<'i, V: Clone>(
 /// [`Finding::IndexMismatch`], tagged with `tx_of` its key.
 fn compare<V: PartialEq + Debug>(
     index: IndexName,
-    stored: &BTreeMap<Vec<u8>, V>,
-    rebuilt: &BTreeMap<Vec<u8>, V>,
+    stored: &OrderedMap<V>,
+    rebuilt: &OrderedMap<V>,
     describe: fn(&[u8]) -> Option<String>,
     tx_of: impl Fn(&[u8]) -> Option<TxId>,
     found: &mut Vec<TaggedFinding>,
 ) {
     let mismatch = |detail: String| Finding::IndexMismatch { index, detail };
-    for (k, v) in stored {
+    for (k, v) in stored.iter() {
         let Some(row) = describe(k) else {
             found.push((
                 None,
                 Finding::IndexDecode {
                     index,
-                    key: k.clone(),
+                    key: k.to_vec(),
                 },
             ));
             continue;
@@ -696,7 +701,7 @@ fn compare<V: PartialEq + Debug>(
             Some(_) => {}
         }
     }
-    for (k, want) in rebuilt {
+    for (k, want) in rebuilt.iter() {
         if !stored.contains_key(k) {
             // Rebuilt keys are built by the key encoders, so they decode.
             let row = describe(k).unwrap_or_else(|| format!("{k:02x?}"));
@@ -709,9 +714,7 @@ fn compare<V: PartialEq + Debug>(
 /// key without its `^tx`) in a main index; `None` if it has none.
 fn newest_tx(main: &Index, at_key: &[u8]) -> Option<TxId> {
     // Within one key, `^tx` sorts the newest entry first.
-    let (k, _) = main
-        .range::<[u8], _>((Bound::Included(at_key), Bound::Unbounded))
-        .next()?;
+    let (k, _) = main.scan_from(at_key).next()?;
     let exact = k.starts_with(at_key) && k.len() == at_key.len() + 8;
     exact.then(|| key::e_key_tx(k)).flatten()
 }

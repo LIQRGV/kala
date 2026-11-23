@@ -3,6 +3,9 @@ name = "kala-bolt"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 kala-core = { path = "../kala-core" }
 kala-query = { path = "../kala-query" }

@@ -3,7 +3,7 @@
 //! Everything else (ID tables, schema, indexes) is a copy rebuilt from it.
 //! Only committed transactions count; [`read_log`] returns exactly those.
 //!
-//! # Byte layout (format version 4)
+//! # Byte layout (format version 5)
 //!
 //! All integers are little-endian. A `str` is `u32 len | len bytes of UTF-8`.
 //!
@@ -22,6 +22,7 @@
 //!                         | cardinality u8 | indexed u8 | reverse_cardinality u8
 //!                         | direction u8 | has_inverse u8
 //!                         | [inverse str, if has_inverse = 1]
+//!                         | inferred u8 | deprecated u8
 //! kind 3  DefineEntity    id u64 | has_handle u8 | [handle str, if has_handle = 1]
 //! kind 4  Fact            entity u64 | attr u32 | tick i64 | op u8
 //!                         | precision u8
@@ -34,6 +35,20 @@
 //!                         | op u8 | precision u8
 //!                         | value (Value encoding, the rest of the payload)
 //!
+//! kind 9  Schema          edit u8 | fields (below)
+//!
+//! Schema edit 0: attribute id u32 | definition
+//! Schema edit 1: node type id u16 | name str | inferred u8
+//! Schema edit 2: setting key str | setting value str
+//! Genesis may also contain Schema edit 2 world settings, validated exactly
+//! like live settings and effective at tx#0. Existing genesis encodings are unchanged.
+//!
+//! Schema edit 3: migration source attr id u32 | definition | skip_unconvertible u8
+//! `definition` is precisely the kind-2 fields after its id, including name,
+//! inferred and deprecated. Edit 0 declares the next attribute ID or revises an
+//! existing ID. Edit 1 declares the next node type ID or confirms its origin.
+//! Genesis kind-1 node types are always explicitly declared.
+//!
 //! value_type: 1 bool, 2 i64, 3 f64, 4 str, 5 ref (the Value tags)
 //! kind:       0 state, 1 event
 //! cardinality 0 one,   1 many
@@ -41,7 +56,7 @@
 //! op:         0 assert, 1 retract
 //! precision:  0 exact, 1 day, 2 month, 3 year, 4 decade, 5 century
 //! direction:  0 none (non-ref), 1 directed, 2 bidirectional
-//! has_handle, indexed, has_inverse: 0 no, 1 yes
+//! has_handle, indexed, has_inverse, inferred, deprecated, skip_unconvertible: 0 no, 1 yes
 //! ```
 //!
 //! Every byte of a payload must be consumed and every enum byte must be one
@@ -49,11 +64,14 @@
 //! id must have the edge tag (bit 63) set and a non-zero sequence.
 //!
 //! **IDs are defined before use.** Inside a transaction the entries come in
-//! this order: `DefineEntity`s, then `DefineEdge`s, then `Fact`s,
-//! `Deleted` markers and `Revised` facts in write order, then the `Commit`.
+//! operation order: schema revisions, entity definitions, edge definitions and
+//! facts may interleave; an ID is always defined before use. A newly interned
+//! edge precedes its fact. A moved correction's Deleted/Revised pair is adjacent.
+//! The Commit is last. Genesis contains kinds 1 and 2 and optional kind 9/edit 2 settings, then Commit.
 //! An edge `(source, attr, target)` is defined (with the next edge
 //! sequence, counted across the whole log) in the transaction that first
-//! stores an assert (a `Fact` or a `Revised`) of that `ref` triple, so every
+//! stores an assert (a `Fact` or a `Revised`) of that `ref` triple, or a
+//! verified migration copies its retract-only history (see below), so every
 //! asserted `ref` triple and every fact on an edge (an edge property)
 //! follows its edge's `DefineEdge`.
 //!
@@ -75,9 +93,24 @@
 //! payload, never part of the entry's key: two entries that differ only in
 //! precision are at the same key.
 //!
-//! **Versions.** Format version 2 had no corrections and version 3 no
-//! precision; a version 1, 2 or 3 file is [`Error::UnsupportedVersion`]
-//! (no migration).
+//! **Schema validation.** Names resolve through the latest table at every canon;
+//! definitions, origins, deprecation and settings are revisioned by transaction.
+//! A structural redefinition is refused after any fact entry for that ID. New
+//! inferred definitions require infer mode and the exact inference defaults.
+//! New names containing `@` are refused except the migration-generated suffix.
+//!
+//! **Migration.** Edit 3 announces a copy-forward operation. Replay regenerates
+//! the exact marker and following edit-0 definitions, edge definitions and Fact
+//! entries from the history visible immediately before the marker (including
+//! earlier operations of its transaction). Every generated payload must match,
+//! in order, before Commit. Only these verified copies may contain a Fact that
+//! normal write judgement would call a no-op, or an edge with only retracts.
+//! This preserves original change points after corrections, without permitting
+//! arbitrary copies or schema sequences. Deprecated attributes refuse facts and
+//! corrections, including properties copied by a migration.
+//!
+//! **Versions.** Versions 1 through 4 are [`Error::UnsupportedVersion`]; worlds
+//! written by older Kala builds must be recreated (no migration before 1.0).
 //!
 //! **Transactions.** Every transaction is a begin record followed by its
 //! body. The begin record is framing, not a log entry: it has no entry ID
@@ -141,7 +174,7 @@ use std::path::{Path, PathBuf};
 use crate::doctor::Finding;
 use crate::error::Error;
 use crate::id::{AttrId, EdgeId, EntityId, NodeTypeId};
-use crate::schema::{AttrDef, Cardinality, Kind, RefDirection};
+use crate::schema::{AttrDef, Cardinality, Kind, RefDirection, SchemaEdit};
 use crate::tick::{Precision, Tick};
 use crate::value::{Value, ValueType};
 use crate::world::{CutCause, Op, RecoveryReport, TxId};
@@ -150,7 +183,7 @@ use crate::world::{CutCause, Op, RecoveryReport, TxId};
 pub const LOG_MAGIC: [u8; 8] = *b"KALALOG\0";
 
 /// The log format version this build writes and reads (header bytes 8..12).
-pub const LOG_FORMAT_VERSION: u32 = 4;
+pub const LOG_FORMAT_VERSION: u32 = 5;
 
 /// The longest entry payload a log frame may hold: 16 MiB. A write whose
 /// entry would be longer is refused before anything is written
@@ -193,6 +226,8 @@ pub struct EntryId(pub u64);
 /// What one log entry says.
 #[derive(Clone, Debug, PartialEq)]
 pub enum EntryBody {
+    /// A schema revision or world setting, in operation order.
+    Schema(SchemaEdit),
     /// Declares a node type.
     DefineNodeType {
         /// Its ID.
@@ -318,7 +353,7 @@ pub struct LogEntry {
 ///
 /// Only a regular file (or a symlink to one) is read: a directory, FIFO,
 /// device or socket is refused with [`Error::Io`] of kind `InvalidInput`
-/// before anything is read (see [`read_log_file`]).
+/// before anything is read (see `read_log_file`).
 pub fn read_log(path: &Path) -> Result<Vec<LogEntry>, Error> {
     let bytes = read_log_file(path)?;
     Ok(scan(&bytes)?.entries)
@@ -935,56 +970,85 @@ impl<'a> Cursor<'a> {
     }
 }
 
+fn parse_attr(c: &mut Cursor<'_>) -> Result<AttrDef, String> {
+    let name = c.string()?;
+    let value_type = value_type_from(c.u8()?)?;
+    let kind = match c.u8()? {
+        0 => Kind::State,
+        1 => Kind::Event,
+        b => return Err(format!("unknown attribute kind {b}")),
+    };
+    let cardinality = match c.u8()? {
+        0 => Cardinality::One,
+        1 => Cardinality::Many,
+        b => return Err(format!("unknown cardinality {b}")),
+    };
+    let indexed = c.flag()?;
+    let reverse_cardinality = match c.u8()? {
+        0 => None,
+        1 => Some(Cardinality::One),
+        2 => Some(Cardinality::Many),
+        b => return Err(format!("unknown reverse cardinality {b}")),
+    };
+    let direction = match c.u8()? {
+        0 => None,
+        1 => Some(RefDirection::Directed),
+        2 => Some(RefDirection::Bidirectional),
+        b => return Err(format!("unknown direction {b}")),
+    };
+    let inverse = if c.flag()? { Some(c.string()?) } else { None };
+    let inferred = c.flag()?;
+    let deprecated = c.flag()?;
+    Ok(AttrDef {
+        name,
+        value_type,
+        kind,
+        cardinality,
+        indexed,
+        direction,
+        inverse,
+        reverse_cardinality,
+        inferred,
+        deprecated,
+    })
+}
+
 /// Parses one frame payload strictly.
 fn parse_payload(payload: &[u8]) -> Result<LogEntry, String> {
     let mut c = Cursor { bytes: payload };
     let kind = c.u8()?;
     let id = EntryId(c.u64()?);
     let body = match kind {
+        9 => EntryBody::Schema(match c.u8()? {
+            0 => SchemaEdit::Attribute {
+                id: AttrId(c.u32()?),
+                def: parse_attr(&mut c)?,
+            },
+            1 => SchemaEdit::NodeType {
+                id: NodeTypeId(c.u16()?),
+                name: c.string()?,
+                inferred: c.flag()?,
+            },
+            2 => SchemaEdit::Setting {
+                key: c.string()?,
+                value: c.string()?,
+            },
+            3 => SchemaEdit::Migration {
+                source: AttrId(c.u32()?),
+                def: parse_attr(&mut c)?,
+                skip_unconvertible: c.flag()?,
+            },
+            b => return Err(format!("unknown schema edit {b}")),
+        }),
         KIND_DEFINE_NODE_TYPE => EntryBody::DefineNodeType {
             id: NodeTypeId(c.u16()?),
             name: c.string()?,
         },
         KIND_DEFINE_ATTR => {
             let id = AttrId(c.u32()?);
-            let name = c.string()?;
-            let value_type = value_type_from(c.u8()?)?;
-            let kind = match c.u8()? {
-                0 => Kind::State,
-                1 => Kind::Event,
-                b => return Err(format!("unknown attribute kind {b}")),
-            };
-            let cardinality = match c.u8()? {
-                0 => Cardinality::One,
-                1 => Cardinality::Many,
-                b => return Err(format!("unknown cardinality {b}")),
-            };
-            let indexed = c.flag()?;
-            let reverse_cardinality = match c.u8()? {
-                0 => None,
-                1 => Some(Cardinality::One),
-                2 => Some(Cardinality::Many),
-                b => return Err(format!("unknown reverse cardinality {b}")),
-            };
-            let direction = match c.u8()? {
-                0 => None,
-                1 => Some(RefDirection::Directed),
-                2 => Some(RefDirection::Bidirectional),
-                b => return Err(format!("unknown direction {b}")),
-            };
-            let inverse = if c.flag()? { Some(c.string()?) } else { None };
             EntryBody::DefineAttr {
                 id,
-                def: AttrDef {
-                    name,
-                    value_type,
-                    kind,
-                    cardinality,
-                    indexed,
-                    direction,
-                    inverse,
-                    reverse_cardinality,
-                },
+                def: parse_attr(&mut c)?,
             }
         }
         KIND_DEFINE_ENTITY => {
@@ -1111,6 +1175,7 @@ fn value_type_byte(t: ValueType) -> u8 {
 /// and `Revised` values are already encoded.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum NewEntry<'a> {
+    Schema(&'a SchemaEdit),
     NodeType {
         id: NodeTypeId,
         name: &'a str,
@@ -1196,11 +1261,80 @@ fn push_frame(
     Ok(())
 }
 
+fn push_attr(b: &mut Vec<u8>, def: &AttrDef) -> Result<(), Error> {
+    push_str(b, &def.name)?;
+    b.push(value_type_byte(def.value_type));
+    b.push(match def.kind {
+        Kind::State => 0,
+        Kind::Event => 1,
+    });
+    b.push(match def.cardinality {
+        Cardinality::One => 0,
+        Cardinality::Many => 1,
+    });
+    b.push(u8::from(def.indexed));
+    b.push(match def.reverse_cardinality {
+        None => 0,
+        Some(Cardinality::One) => 1,
+        Some(Cardinality::Many) => 2,
+    });
+    b.push(match def.direction {
+        None => 0,
+        Some(RefDirection::Directed) => 1,
+        Some(RefDirection::Bidirectional) => 2,
+    });
+    match &def.inverse {
+        Some(inverse) => {
+            b.push(1);
+            push_str(b, inverse)?
+        }
+        None => {
+            b.push(0);
+        }
+    }
+    b.push(u8::from(def.inferred));
+    b.push(u8::from(def.deprecated));
+    Ok(())
+}
+
+fn push_schema(b: &mut Vec<u8>, edit: &SchemaEdit) -> Result<(), Error> {
+    match edit {
+        SchemaEdit::Attribute { id, def } => {
+            b.push(0);
+            b.extend_from_slice(&id.0.to_le_bytes());
+            push_attr(b, def)?;
+        }
+        SchemaEdit::NodeType { id, name, inferred } => {
+            b.push(1);
+            b.extend_from_slice(&id.0.to_le_bytes());
+            push_str(b, name)?;
+            b.push(u8::from(*inferred));
+        }
+        SchemaEdit::Setting { key, value } => {
+            b.push(2);
+            push_str(b, key)?;
+            push_str(b, value)?;
+        }
+        SchemaEdit::Migration {
+            source,
+            def,
+            skip_unconvertible,
+        } => {
+            b.push(3);
+            b.extend_from_slice(&source.0.to_le_bytes());
+            push_attr(b, def)?;
+            b.push(u8::from(*skip_unconvertible));
+        }
+    }
+    Ok(())
+}
+
 impl NewEntry<'_> {
     /// What the entry says once appended: the [`EntryBody`] [`read_log`]
     /// returns for it.
     fn to_body(self) -> EntryBody {
         match self {
+            NewEntry::Schema(edit) => EntryBody::Schema(edit.clone()),
             NewEntry::NodeType { id, name } => EntryBody::DefineNodeType {
                 id,
                 name: name.to_owned(),
@@ -1320,6 +1454,7 @@ pub(crate) fn encode_txn<'a>(
             body: entry.to_body(),
         });
         match entry {
+            NewEntry::Schema(edit) => push_frame(buf, 9, id, |b| push_schema(b, edit))?,
             NewEntry::NodeType { id: t, name } => {
                 push_frame(buf, KIND_DEFINE_NODE_TYPE, id, |b| {
                     b.extend_from_slice(&t.0.to_le_bytes());
@@ -1328,37 +1463,7 @@ pub(crate) fn encode_txn<'a>(
             }
             NewEntry::Attr { id: a, def } => push_frame(buf, KIND_DEFINE_ATTR, id, |b| {
                 b.extend_from_slice(&a.0.to_le_bytes());
-                push_str(b, &def.name)?;
-                b.push(value_type_byte(def.value_type));
-                b.push(match def.kind {
-                    Kind::State => 0,
-                    Kind::Event => 1,
-                });
-                b.push(match def.cardinality {
-                    Cardinality::One => 0,
-                    Cardinality::Many => 1,
-                });
-                b.push(u8::from(def.indexed));
-                b.push(match def.reverse_cardinality {
-                    None => 0,
-                    Some(Cardinality::One) => 1,
-                    Some(Cardinality::Many) => 2,
-                });
-                b.push(match def.direction {
-                    None => 0,
-                    Some(RefDirection::Directed) => 1,
-                    Some(RefDirection::Bidirectional) => 2,
-                });
-                match &def.inverse {
-                    Some(inverse) => {
-                        b.push(1);
-                        push_str(b, inverse)
-                    }
-                    None => {
-                        b.push(0);
-                        Ok(())
-                    }
-                }
+                push_attr(b, def)
             })?,
             NewEntry::Entity { id: e, handle } => push_frame(buf, KIND_DEFINE_ENTITY, id, |b| {
                 b.extend_from_slice(&e.raw().to_le_bytes());

@@ -5,3 +5,13 @@ members = ["crates/kala-core", "crates/kala-cli", "crates/kala-query", "crates/k
 [workspace.package]
 edition = "2024"
 version = "0.1.0"
+
+# One lint policy for every crate (each opts in with `[lints] workspace = true`);
+# CI runs clippy with `-D warnings`, so a warning here fails the build.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"

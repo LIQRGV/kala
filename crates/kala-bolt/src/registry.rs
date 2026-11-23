@@ -172,7 +172,8 @@ impl Registry {
         Ok((name.into(), world))
     }
 }
-fn valid_name(name: &str) -> bool {
+/// Whether a filename stem is eligible for server database discovery.
+pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()

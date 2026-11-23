@@ -201,6 +201,7 @@ struct NotC<'q> {
 
 struct Compiler<'w> {
     world: &'w World,
+    schema_canon: kala_core::TxId,
     /// Parameters by name.
     params: HashMap<String, Param>,
     /// `:in` order.
@@ -213,6 +214,7 @@ impl<'w> Compiler<'w> {
     fn new(world: &'w World) -> Compiler<'w> {
         Compiler {
             world,
+            schema_canon: world.latest_tx(),
             params: HashMap::new(),
             param_order: Vec::new(),
             types: HashMap::new(),
@@ -228,6 +230,9 @@ impl<'w> Compiler<'w> {
     /// checked; only rules reachable from `:where` are planned.
     fn run(mut self, q: &Query) -> Result<Prepared, DatalogError> {
         check_or_cost(q)?;
+        if let Some(CanonExpr::Int(canon, _)) = q.canon {
+            self.schema_canon = kala_core::TxId(canon);
+        }
         for input in &q.inputs {
             if let Input::Var(s) = input {
                 if self.params.contains_key(&s.name) {
@@ -836,11 +841,16 @@ impl<'w> Compiler<'w> {
         let (attr, info, value_type) = if p.a.name == "handle" {
             (AttrRef::Handle, PatAttr::Handle, ValueType::Str)
         } else {
-            let (value_type, indexed) = self.resolve_attr(&p.a.name).ok_or_else(|| {
+            let (value_type, indexed) = self.resolve_attr(&p.a.name).map_err(|e| {
                 DatalogError::new(
                     ErrorKind::UnknownAttribute,
                     Some(p.a.span),
-                    format!("unknown attribute `:{}`", show(&p.a.name)),
+                    match e {
+                        kala_core::Error::UnknownAttribute(_) => {
+                            format!("unknown attribute `:{}`", show(&p.a.name))
+                        }
+                        other => other.to_string(),
+                    },
                 )
             })?;
             let info = PatAttr::Named {
@@ -942,14 +952,12 @@ impl<'w> Compiler<'w> {
 
     /// An attribute's value type and `indexed` flag; an inverse name reads
     /// `ref` values.
-    fn resolve_attr(&self, name: &str) -> Option<(ValueType, bool)> {
-        if let Some(def) = self.world.attribute(name) {
-            return Some((def.value_type, def.indexed));
-        }
-        self.world
-            .attributes()
-            .find(|d| d.inverse.as_deref() == Some(name))
-            .map(|d| (ValueType::Ref, d.indexed))
+    fn resolve_attr(&self, name: &str) -> Result<(ValueType, bool), kala_core::Error> {
+        let (def, _) = self
+            .world
+            .at_canon(self.schema_canon)
+            .resolve_attribute(name)?;
+        Ok((def.value_type, def.indexed))
     }
 
     /// A pattern position whose values have type `ty` (`Ref` for the entity

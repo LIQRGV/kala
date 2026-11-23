@@ -185,10 +185,10 @@ impl<'a> Lexer<'a> {
                         'n' => out.push('\n'),
                         't' => out.push('\t'),
                         'r' => out.push('\r'),
-                        'u' => {
+                        'u' | 'U' => {
                             let mut code = 0u32;
                             let mut end = after;
-                            for _ in 0..4 {
+                            for _ in 0..if e == 'u' { 4 } else { 8 } {
                                 let Some((k, h)) = chars.next() else {
                                     self.unfinished_string = true;
                                     return Err(unterminated());
@@ -197,7 +197,7 @@ impl<'a> Lexer<'a> {
                                 let Some(d) = h.to_digit(16) else {
                                     return Err(DatalogError::syntax(
                                         Span::new(i, end),
-                                        "`\\u` needs exactly 4 hex digits (`\\uXXXX`)",
+                                        "Unicode escape needs 4 (\\u) or 8 (\\U) hex digits",
                                     ));
                                 };
                                 code = code * 16 + d;
@@ -207,7 +207,9 @@ impl<'a> Lexer<'a> {
                                 None => {
                                     return Err(DatalogError::syntax(
                                         Span::new(i, end),
-                                        format!("`\\u{code:04X}` is a surrogate, not a character"),
+                                        format!(
+                                            "Unicode value {code:08X} is not a scalar character"
+                                        ),
                                     ));
                                 }
                             }
@@ -216,7 +218,7 @@ impl<'a> Lexer<'a> {
                             return Err(DatalogError::syntax(
                                 Span::new(i, after),
                                 format!(
-                                    "unknown escape `\\{}` (use \\\" \\\\ \\n \\t \\r or \\uXXXX)",
+                                    "unknown escape `\\{}` (use \\\" \\\\ \\n \\t \\r or \\uXXXX or \\UXXXXXXXX)",
                                     show(other.encode_utf8(&mut [0; 4]))
                                 ),
                             ));
@@ -249,7 +251,10 @@ fn name(run: &str, sigil: &str, what: &str, span: Span) -> Result<String, Datalo
             format!("{what} needs a name after `{sigil}`"),
         ));
     }
-    if let Some(bad) = body.chars().find(|&c| !is_name_char(c)) {
+    if let Some((_, bad)) = body
+        .char_indices()
+        .find(|&(i, c)| !is_name_char(c) && !(sigil == ":" && c == '@' && i > 0))
+    {
         return Err(DatalogError::syntax(
             span,
             format!(
@@ -514,6 +519,7 @@ impl CompletenessScanner {
                 self.mode = match c {
                     '"' | '\\' | 'n' | 't' | 'r' => ScanMode::String,
                     'u' => ScanMode::Unicode { code: 0, left: 4 },
+                    'U' => ScanMode::Unicode { code: 0, left: 8 },
                     _ => {
                         self.invalid = true;
                         ScanMode::Trivia
@@ -594,7 +600,7 @@ impl CompletenessScanner {
 /// Incremental validation of a bare token. Do not re-tokenize its growing
 /// prefix: a long token supplied one character at a time must stay linear.
 enum Bare {
-    Name { nonempty: bool },
+    Name { nonempty: bool, keyword: bool },
     Symbol { sign: bool, id_type: bool },
     Id { nonempty: bool },
     Dollar,
@@ -605,7 +611,10 @@ enum Bare {
 impl Bare {
     fn new(c: char) -> Self {
         match c {
-            ':' | '?' => Self::Name { nonempty: false },
+            ':' | '?' => Self::Name {
+                nonempty: false,
+                keyword: c == ':',
+            },
             '$' => Self::Dollar,
             '0'..='9' => Self::Number(NumberScan::new(c)),
             _ if is_name_char(c) => Self::Symbol {
@@ -618,8 +627,8 @@ impl Bare {
 
     fn push(&mut self, c: char) {
         match self {
-            Self::Name { nonempty } => {
-                if is_name_char(c) {
+            Self::Name { nonempty, keyword } => {
+                if is_name_char(c) || (*keyword && *nonempty && c == '@') {
                     *nonempty = true;
                 } else {
                     *self = Self::Bad;
@@ -652,7 +661,7 @@ impl Bare {
 
     fn valid(&self) -> bool {
         match self {
-            Self::Name { nonempty } | Self::Id { nonempty } => *nonempty,
+            Self::Name { nonempty, .. } | Self::Id { nonempty } => *nonempty,
             Self::Symbol { .. } | Self::Dollar => true,
             Self::Number(number) => number.valid(),
             Self::Bad => false,

@@ -466,3 +466,48 @@ fn malformed_auth_does_not_fall_back_to_none() {
         assert_closed(&mut client.stream);
     }
 }
+
+#[test]
+fn backup_only_grant_never_authorizes_bolt_read() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(kala_core::load_fixture_to(VARROW, &dir.path().join("varrow.kala")).unwrap());
+    system::add(dir.path(), "alice@127.0.0.1", Some(PASSWORD)).unwrap();
+    system::grant(dir.path(), "alice@127.0.0.1", "backup", "varrow").unwrap();
+    let auth = Arc::new(Accounts::open(dir.path()).unwrap());
+    let server = Server::bind_with_auth(
+        dir.path(),
+        ServerConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            ..ServerConfig::default()
+        },
+        auth,
+    )
+    .unwrap();
+    let server = Running::from_server(dir, server);
+    let mut alice = login(&server, "alice", PASSWORD);
+    alice.success();
+    alice.send(
+        0x10,
+        vec![string(ALLIES), map(&[]), map(&[("db", string("varrow"))])],
+    );
+    alice.failure(FORBIDDEN);
+}
+
+#[test]
+fn backup_grants_never_cover_the_accounts_database() {
+    let id = |grants: &[&str]| kala_bolt::auth::Identity {
+        principal: "bob".into(),
+        host: "%".into(),
+        grants: grants.iter().map(|g| (*g).to_owned()).collect(),
+    };
+    let wildcard = id(&["backup:*"]);
+    assert!(wildcard.permits_backup("varrow"));
+    assert!(
+        !wildcard.permits_backup("system"),
+        "backup:* must not copy hashes"
+    );
+    assert!(!id(&["backup:system"]).permits_backup("system"));
+    assert!(id(&["admin:*"]).permits_backup("system"));
+    assert!(id(&["backup:varrow"]).permits_backup("varrow"));
+    assert!(!id(&["backup:varrow"]).permits_backup("other"));
+}

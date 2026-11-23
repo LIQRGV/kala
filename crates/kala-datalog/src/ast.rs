@@ -317,6 +317,8 @@ pub struct Pred {
 /// One transaction authored as EDN, with an optional default tick.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WriteTxn {
+    /// True only for a top-level restore-mode `[:genesis ...]`.
+    pub genesis: bool,
     pub at: Option<kala_core::Tick>,
     pub ops: Vec<WriteOp>,
     pub span: Span,
@@ -336,9 +338,48 @@ pub enum WriteValue {
 /// One write; validation of store rules is left to kala-core's transaction.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WriteOp {
+    /// `[:attribute NAME TYPE OPTION*]`. Options left out are `None`, so an
+    /// existing attribute keeps its labels (resolved by the transaction, see
+    /// `kala_core::Txn::declare_attribute_with`).
+    Attribute {
+        inferred: bool,
+        name: String,
+        value_type: kala_core::ValueType,
+        options: kala_core::AttributeOptions,
+        span: Span,
+    },
+    NodeType {
+        inferred: bool,
+        name: String,
+        span: Span,
+    },
+    Rename {
+        old: String,
+        new: String,
+        span: Span,
+    },
+    Deprecate {
+        name: String,
+        span: Span,
+    },
+    Cardinality {
+        name: String,
+        cardinality: kala_core::Cardinality,
+        span: Span,
+    },
+    Migrate {
+        name: String,
+        options: kala_core::MigrationOptions,
+        span: Span,
+    },
+    WorldSetting {
+        key: String,
+        value: String,
+        span: Span,
+    },
     Create {
         node_type: String,
-        handle: String,
+        handle: Option<String>,
         span: Span,
     },
     Fact {

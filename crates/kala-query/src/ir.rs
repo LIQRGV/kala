@@ -13,7 +13,7 @@ use kala_core::{Tick, Value, World};
 
 /// The most bytes [`Plan::explain`] prints for the plan's lines. Once the
 /// next line would pass it, the output ends with the line
-/// [`TRUNCATED_LINE`] instead (so it is never longer than this plus that
+/// `TRUNCATED_LINE` instead (so it is never longer than this plus that
 /// line). A plan deep enough to need the cap prints quadratic indentation:
 /// 4,000 nested operators would otherwise be ~32 MB of text.
 pub const MAX_EXPLAIN_BYTES: usize = 1 << 20;

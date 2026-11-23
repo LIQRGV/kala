@@ -440,9 +440,9 @@ fn wrong_magic_is_bad_magic() {
 fn unknown_version_is_unsupported_version() {
     let b = built();
     let mut d = bytes(&b.path);
-    d[8..12].copy_from_slice(&5u32.to_le_bytes());
+    d[8..12].copy_from_slice(&6u32.to_le_bytes());
     std::fs::write(&b.path, &d).unwrap();
-    assert_eq!(open_err(&b.path), Error::UnsupportedVersion(5));
+    assert_eq!(open_err(&b.path), Error::UnsupportedVersion(6));
     assert_eq!(bytes(&b.path), d);
 }
 
@@ -623,8 +623,9 @@ fn body_define_attr(id: u32, name: &str) -> (u8, Vec<u8>) {
     let mut b = id.to_le_bytes().to_vec();
     b.extend_from_slice(&(name.len() as u32).to_le_bytes());
     b.extend_from_slice(name.as_bytes());
-    // i64, state, many, indexed, reverse_cardinality none, direction none, no inverse
-    b.extend_from_slice(&[2, 0, 1, 1, 0, 0, 0]);
+    // i64, state, many, indexed, reverse none, direction none, no inverse,
+    // declared, not deprecated.
+    b.extend_from_slice(&[2, 0, 1, 1, 0, 0, 0, 0, 0]);
     (2, b)
 }
 

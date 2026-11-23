@@ -38,6 +38,9 @@ pub struct Report {
     edges: Vec<String>,
     ops: Vec<Operation>,
     warnings: Warnings,
+    schema: Vec<serde_json::Value>,
+    #[serde(skip)]
+    schema_text: Vec<String>,
 }
 
 /// Opens `path` for writing. A damaged last transaction (fully present,
@@ -83,6 +86,13 @@ fn user(s: impl Into<String>) -> CliError {
 }
 fn kind(op: &WriteOp) -> &'static str {
     match op {
+        WriteOp::Attribute { .. } => "attribute",
+        WriteOp::NodeType { .. } => "node-type",
+        WriteOp::Rename { .. } => "rename",
+        WriteOp::Deprecate { .. } => "deprecate",
+        WriteOp::Cardinality { .. } => "cardinality",
+        WriteOp::Migrate { .. } => "migrate",
+        WriteOp::WorldSetting { .. } => "world-setting",
         WriteOp::Create { .. } => "create",
         WriteOp::Fact { op: Op::Assert, .. } => "assert",
         WriteOp::Fact {
@@ -126,6 +136,9 @@ fn subject(
     refs: &HashMap<String, EntityId>,
 ) -> Result<EntityId, CliError> {
     match v {
+        WriteValue::Scalar(Item::Id(s, _)) => tx
+            .parse_id(s)
+            .ok_or_else(|| user(format!("unknown entity `{}`", escape::value(s)))),
         WriteValue::Scalar(i) => reference(i, refs),
         WriteValue::Edge {
             source,
@@ -159,6 +172,19 @@ fn value(
 /// the transaction, so even newly allocated handles are rolled back.
 pub fn execute(w: &mut World, form: &WriteTxn, default: Option<Tick>) -> Result<Report, CliError> {
     refuse_system(w)?;
+    execute_restore(w, form, default)
+}
+
+/// The create-mode caller owns a private, unplaced file; system restores are
+/// allowed only here, and every op still uses the ordinary native transaction.
+pub(super) fn execute_restore(
+    w: &mut World,
+    form: &WriteTxn,
+    default: Option<Tick>,
+) -> Result<Report, CliError> {
+    if form.genesis {
+        return Err(user(":genesis must be first; use kala transact --create"));
+    }
     let default = form.at.or(default);
     let fallback = default.unwrap_or_else(|| w.latest_tick());
     let mut refs = HashMap::new();
@@ -198,13 +224,69 @@ pub fn execute(w: &mut World, form: &WriteTxn, default: Option<Tick>) -> Result<
     for (index, op) in form.ops.iter().enumerate() {
         let mut run = || -> Result<(usize, Tick, Option<Precision>, Option<EntityId>), CliError> {
             match op {
+                WriteOp::Attribute {
+                    name,
+                    value_type,
+                    options,
+                    inferred,
+                    ..
+                } => {
+                    if *inferred {
+                        tx.infer_attribute_with(name, *value_type, options)
+                            .map_err(core_err)?;
+                    } else {
+                        tx.declare_attribute_with(name, *value_type, options)
+                            .map_err(core_err)?;
+                    }
+                    Ok((0, fallback, None, None))
+                }
+                WriteOp::NodeType { name, inferred, .. } => {
+                    if *inferred {
+                        tx.infer_node_type(name).map_err(core_err)?;
+                    } else {
+                        tx.declare_node_type(name).map_err(core_err)?;
+                    }
+                    Ok((0, fallback, None, None))
+                }
+                WriteOp::Rename { old, new, .. } => {
+                    tx.rename_attribute(old, new).map_err(core_err)?;
+                    Ok((0, fallback, None, None))
+                }
+                WriteOp::Deprecate { name, .. } => {
+                    tx.deprecate_attribute(name).map_err(core_err)?;
+                    Ok((0, fallback, None, None))
+                }
+                WriteOp::Cardinality {
+                    name, cardinality, ..
+                } => {
+                    tx.set_cardinality(name, *cardinality).map_err(core_err)?;
+                    Ok((0, fallback, None, None))
+                }
+                WriteOp::WorldSetting { key, value, .. } => {
+                    tx.world_setting(key, value).map_err(core_err)?;
+                    Ok((0, fallback, None, None))
+                }
+                WriteOp::Migrate { name, options, .. } => {
+                    let report = tx
+                        .migrate_attribute(name, options.clone())
+                        .map_err(|e| migrate_err(&tx, e))?;
+                    Ok((
+                        report.change_points + report.edge_properties,
+                        fallback,
+                        None,
+                        None,
+                    ))
+                }
                 WriteOp::Create {
                     node_type, handle, ..
                 } => {
+                    tx.infer_node_type(node_type).map_err(core_err)?;
                     let id = tx
-                        .create_entity(node_type, Some(handle))
+                        .create_entity(node_type, handle.as_deref())
                         .map_err(core_err)?;
-                    refs.insert(format!(":{handle}"), id);
+                    if let Some(handle) = handle {
+                        refs.insert(format!(":{handle}"), id);
+                    }
                     // Numeric IDs may also refer to entities created earlier in this transaction.
                     refs.insert(format!("{node_type}#{}", id.seq()), id);
                     Ok((0, fallback, None, Some(id)))
@@ -220,6 +302,12 @@ pub fn execute(w: &mut World, form: &WriteTxn, default: Option<Tick>) -> Result<
                 } => {
                     let e = subject(&tx, s, &refs)?;
                     let v = value(&tx, v, &refs)?;
+                    if !tx
+                        .infer_write_attribute(&attr.name, &v, *op)
+                        .map_err(core_err)?
+                    {
+                        return Ok((0, at.unwrap_or(fallback), None, None));
+                    }
                     let r = match op {
                         Op::Assert => tx.assert_with_precision(e, &attr.name, v, *at, *precision),
                         Op::Retract => tx.retract_with_precision(e, &attr.name, v, *at, *precision),
@@ -292,8 +380,21 @@ pub fn execute(w: &mut World, form: &WriteTxn, default: Option<Tick>) -> Result<
     Ok(Report {
         form: 1,
         dry_run: false,
-        tx: (!result.entries.is_empty() || !result.edges.is_empty() || created_any)
+        tx: (!result.entries.is_empty()
+            || !result.edges.is_empty()
+            || !result.schema.is_empty()
+            || created_any)
             .then_some(result.tx.0),
+        schema: result
+            .schema
+            .iter()
+            .map(super::schema::change_json)
+            .collect(),
+        schema_text: result
+            .schema
+            .iter()
+            .map(super::schema::change_text)
+            .collect(),
         changed: result.changed,
         entries: result.entries.iter().map(|e| e.0).collect(),
         edges: result
@@ -344,6 +445,9 @@ pub fn render(report: &Report, json: bool) -> String {
             }
         ),
     };
+    for change in &report.schema_text {
+        let _ = writeln!(s, "  {change}");
+    }
     for op in &report.ops {
         let _ = write!(s, "  op {} (:{}): tick {}", op.position, op.kind, op.tick);
         if let Some(p) = op.precision.filter(|p| *p != "exact") {
@@ -452,6 +556,73 @@ pub fn run(
         return Err(user("expected at least one write transaction"));
     }
     Ok(String::new().into())
+}
+
+/// [`core_err`], with a migration refusal's entities shown by handle (else
+/// `TYPE#n`) and its values as `kala asof` prints them (strings quoted and
+/// escaped, cut like any echoed value). kala-core's own message has only IDs.
+fn migrate_err(tx: &Txn, e: kala_core::Error) -> CliError {
+    use kala_core::{Error as E, ErrorEntity};
+    let entity = |e: &ErrorEntity| escape::label(tx.handle_of(e.id).unwrap_or(&e.formatted));
+    let msg = match &e {
+        E::Unconvertible {
+            attr,
+            from,
+            to,
+            count,
+            examples,
+        } => {
+            let examples: Vec<String> = examples
+                .iter()
+                .map(|x| {
+                    let value = message_value(&x.value, |id| {
+                        entity(&ErrorEntity {
+                            id,
+                            formatted: tx.format_id(id),
+                        })
+                    });
+                    format!("{} @{} {value}", entity(&x.entity), x.tick.0)
+                })
+                .collect();
+            format!(
+                "{count} unconvertible change points migrating :{} ({} -> {}): {}",
+                escape::value(attr),
+                super::schema::type_name(*from),
+                super::schema::type_name(*to),
+                examples.join(", ")
+            )
+        }
+        E::PairsBothWays { attr, pairs } => {
+            let pairs: Vec<String> = pairs
+                .iter()
+                .map(|(a, b)| format!("{} and {}", entity(a), entity(b)))
+                .collect();
+            format!(
+                "cannot migrate :{}: pairs have history in both directions: {}",
+                escape::value(attr),
+                pairs.join(", ")
+            )
+        }
+        _ => return core_err(e),
+    };
+    CliError::core(&e, msg)
+}
+
+/// A value for a one-line message, as `kala asof` shows it (refs by
+/// `entity`); a string over [`escape::MAX_VALUE_CHARS`] chars is cut and
+/// gets `...`.
+fn message_value(v: &Value, entity: impl Fn(EntityId) -> String) -> String {
+    match v {
+        Value::Str(s) => match s.char_indices().nth(escape::MAX_VALUE_CHARS) {
+            Some((cut, _)) => format!("{}...", escape::quoted(&s[..cut])),
+            None => escape::quoted(s),
+        },
+        Value::Ref(id) => entity(*id),
+        Value::F64(f) if f.is_infinite() => (if *f > 0.0 { "inf" } else { "-inf" }).into(),
+        Value::F64(f) => f.to_string(),
+        Value::I64(i) => i.to_string(),
+        Value::Bool(b) => b.to_string(),
+    }
 }
 
 fn core_err(e: kala_core::Error) -> CliError {

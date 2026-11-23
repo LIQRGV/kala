@@ -12,6 +12,9 @@ name = "kala_core"
 # the supported API.
 test-hooks = []
 
+[lints]
+workspace = true
+
 [dependencies]
 # Case-insensitive search (`value::fold_for_search`): Unicode default full
 # case folding and NFC/NFD (security-consultant approved, slice 4).

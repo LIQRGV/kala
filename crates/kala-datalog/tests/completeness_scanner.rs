@@ -176,3 +176,34 @@ proptest! {
         prop_assert_eq!(scanner.push(&text[boundaries[at]..]), completeness(&text));
     }
 }
+
+#[test]
+fn eight_digit_unicode_escapes_preserve_incremental_completeness_and_depth_limits() {
+    use Completeness::{Complete, Incomplete, Invalid};
+    for (source, expected) in [
+        (r#"["\U0010FFFF"]"#, Complete),
+        (r#"["\U000e0001\U000e007f"]"#, Complete),
+        (r#"["\U0000D800"]"#, Invalid),
+        (r#"["\U00110000"]"#, Invalid),
+        (r#"["\UFFFFFFFF"]"#, Invalid),
+        (r#"["\U000e00g1"]"#, Invalid),
+        (r#"["\U000e00"#, Incomplete),
+    ] {
+        assert_eq!(completeness(source), expected, "{source}");
+        for split in 0..=source.len() {
+            let mut scanner = CompletenessScanner::new();
+            scanner.push(&source[..split]);
+            assert_eq!(
+                scanner.push(&source[split..]),
+                expected,
+                "split {split}: {source}"
+            );
+        }
+    }
+    let too_deep = format!(
+        "{}\"\\U0010FFFF\"{}",
+        "[".repeat(MAX_DEPTH + 1),
+        "]".repeat(MAX_DEPTH + 1)
+    );
+    assert_eq!(completeness(&too_deep), Invalid);
+}

@@ -655,7 +655,7 @@ fn second_assert_of_the_same_triple_logs_no_define_edge() {
 }
 
 #[test]
-fn entry_order_in_one_txn_is_entities_then_edges_then_facts() {
+fn entry_order_in_one_txn_follows_operations_with_definitions_before_use() {
     let (_d, p, mut w, [a, _b, pl, _q, sword]) = file_world();
     let mut txn = w.begin();
     let c = txn.create_entity("CHARACTER", Some("c")).unwrap();
@@ -676,7 +676,7 @@ fn entry_order_in_one_txn_is_entities_then_edges_then_facts() {
         .collect();
     assert_eq!(
         kinds,
-        vec!["entity", "edge", "edge", "fact", "fact", "fact", "commit"]
+        vec!["entity", "edge", "fact", "fact", "edge", "fact", "commit"]
     );
     let ids: Vec<EdgeId> = body
         .iter()

@@ -13,8 +13,8 @@ kala load crates/kala-core/tests/fixtures/varrow.yaml varrow.kala
 
 The sample has 50 entities, 309 fact entries, latest canon tx#12 and latest tick
 700. To start your own world, load a fixture containing just `schema` (node types
-and attributes), optionally `entities`. Schema changes still come from fixtures;
-the terminal writes below create entities and edit facts in that schema.
+and attributes), optionally `entities`. Terminal writes can infer new attributes
+and node types, or change the schema explicitly.
 
 ## Write a scene
 
@@ -289,3 +289,85 @@ preview IDs are provisional and later previews cannot use earlier previews' new
 entities. `--json` produces one document per form. Input is UTF-8, limited to
 65,536 bytes, 256 forms, 256 ops per form, and 32 nested brackets. Strings,
 escapes, commas and `;` comments follow the same syntax as queries.
+
+
+## Changing the schema
+
+Start this example with a fresh fixture world from the opening `kala load` command.
+Save `age.edn`:
+
+```clojure
+[:assert :edwin :age 42 :at 0]
+```
+
+```sh
+kala transact varrow.kala age.edn
+```
+
+The report includes `declared :age as i64 (inferred)`. The first value determines
+its type; later values must have that type. Save `rename-age.edn`:
+
+```clojure
+[:rename :age :years]
+```
+
+```sh
+kala transact varrow.kala rename-age.edn
+```
+
+Only `years` now resolves, at every canon; the old name `age` is free to reuse.
+To change its value type, save `migrate-age.edn`:
+
+```clojure
+[:migrate :years :string]
+```
+
+Preview the migration, then commit it:
+
+```sh
+kala transact varrow.kala migrate-age.edn --dry-run
+kala transact varrow.kala migrate-age.edn
+kala schema varrow.kala
+kala schema varrow.kala --canon tx#12
+kala asof varrow.kala edwin years --at 0
+kala asof varrow.kala edwin years@old --at 0
+```
+
+Both migration reports say `1 change points copied`. The preview leaves the file
+unchanged. `years` now holds the string `"42"`; deprecated `years@old` still holds
+the integer `42`. Its original correction trail remains readable. The schema at
+tx#12 lists neither attribute, because neither existed then. To read a canon
+before migration but after the original write, use `years@old`; the replacement
+`years` is not defined at that canon.
+
+For explicit declarations use `[:attribute :age :i64]` or
+`[:node-type :FACTION]`. `[:world-setting :schema :strict]` requires declarations
+before writes; `[:world-setting :schema :infer]` restores inference. Schema forms
+also work in `kala repl --write` and inside an atomic vector of operations.
+
+## Backing up and moving a world
+
+Keep a replayable copy of the whole history before moving a world or upgrading
+Kala. The dump includes the schema, original transaction boundaries, and retcons:
+
+```sh
+kala dump world.kala -o world.dump.edn
+kala transact --create moved.kala world.dump.edn
+kala doctor moved.kala
+```
+
+`moved.kala` must not exist. A successful replay preserves the original log bytes
+in the same format; a failed replay leaves no destination. Dumps are read-only
+and can run while a writer has the world open. A partial tail is omitted with a
+warning. For one scene's state in another tool, export a JSON snapshot instead:
+
+```sh
+kala export world.kala --at -208 -o snapshot.json
+```
+
+The snapshot contains entities, active edges and their typed values at that tick;
+it does not contain the full history. To back up a server's accounts too, use
+`kala dump --all worlds -o private-backup`. That directory must be new or empty.
+Its `system.dump.edn` contains password hashes: keep the private permissions and
+protect it like the original server directory. Restore each file with
+`kala transact --create`, including `system.kala`, into a new server directory.

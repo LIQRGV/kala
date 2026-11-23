@@ -2,7 +2,7 @@
 #[path = "common/client.rs"]
 mod client;
 mod common;
-use client::{ALLIES, Client, map, metadata, string, structure};
+use client::{ALLIES, Client, map, string};
 use common::Running;
 use kala_bolt::{ServerConfig, packstream::Value};
 use kala_core::{AttrDef, Cardinality, Kind, Schema, Tick, Value as KValue, ValueType, World};
@@ -133,10 +133,10 @@ fn same_length_different_content_reloads() {
     assert_eq!(c.query(q), [vec![string("bbbb")]]);
 }
 
-// A user attribute called `handle` keeps its value; the world handle is
-// not written over it.
+// `handle` is reserved for entity identity in the query and Bolt adapters.
+// Rejecting the declaration prevents a property from shadowing that identity.
 #[test]
-fn a_handle_attribute_is_not_overwritten_by_the_world_handle() {
+fn reserved_handle_attribute_is_refused_before_creating_the_world_file() {
     let dir = tempfile::tempdir().unwrap();
     let schema = Schema::new().node_type("THING").attribute(AttrDef::new(
         "handle",
@@ -144,24 +144,16 @@ fn a_handle_attribute_is_not_overwritten_by_the_world_handle() {
         Kind::State,
         Cardinality::One,
     ));
-    let mut w = World::create(&dir.path().join("w.kala"), schema).unwrap();
-    let e = w.create_entity("THING", Some("edwin")).unwrap();
-    w.assert(e, "handle", KValue::Str("greywolf".into()), Some(Tick(0)))
-        .unwrap();
-    drop(w);
-    let config = ServerConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        ..ServerConfig::default()
-    };
-    let server = Running::in_dir(dir, config);
-    let mut c = Client::ready(&server);
-    let rows = c.query("// kala:datalog\n[:find ?e :where [?e :handle \"edwin\"]]");
-    let fields = structure(rows[0][0].clone(), 0x4e);
-    let Value::Map(props) = &fields[2] else {
-        panic!()
-    };
-    assert_eq!(props.get("handle"), Some(&string("greywolf")));
-    let _ = metadata;
+    assert!(matches!(
+        World::in_memory(schema.clone()),
+        Err(kala_core::Error::InvalidName(name)) if name == "handle"
+    ));
+    let path = dir.path().join("w.kala");
+    assert!(matches!(
+        World::create(&path, schema),
+        Err(kala_core::Error::InvalidName(name)) if name == "handle"
+    ));
+    assert!(!path.exists(), "a refused schema must not create a log");
 }
 
 // Review round 2: a sub-second idle timeout sends no recv-timeout hint (0

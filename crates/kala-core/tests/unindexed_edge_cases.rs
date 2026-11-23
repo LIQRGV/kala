@@ -193,6 +193,7 @@ fn a_refused_correction_of_a_crafted_max_size_value_inside_a_txn_commits_nothing
     // refused either when staged or at commit, never half-applied
     let staged = txn.correct(id, Correction::Delete);
     let outcome = if staged.is_err() {
+        drop(txn);
         Err(())
     } else {
         txn.commit().map(|_| ()).map_err(|_| ())

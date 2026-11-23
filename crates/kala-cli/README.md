@@ -136,7 +136,7 @@ with `[:correct N :delete]` or `[:correct N :replace :at 830]`. Replacement also
 accepts `:value`, `:op` and `:precision`. A no-op prints 0 changed.
 
 `--json` prints one document per successful form, with fields `form`, `dry_run`,
-`tx`, `changed`, `entries`, `edges`, `ops` and `warnings`. Each op has `position`,
+`tx`, `changed`, `entries`, `edges`, `ops`, `schema` and `warnings`. Each op has `position`,
 `kind`, `tick`, `precision`, `changed`, `entries` and `entity` (null unless created).
 Entry IDs are integers; new edges are `edge#N` strings. Warnings have `introduced`
 and `resolved` arrays of the same messages as `kala load`. Errors stay on stderr.
@@ -204,7 +204,7 @@ password-on-argv option. `--trust` is restricted to `localhost`, `127.0.0.1` and
 local. Lists show accounts, plugins and grants, never hashes.
 
 Grant/revoke syntax is `kala user grant|revoke DIR USER@HOST PRIV DB`, where
-PRIV is `read`, `write` or `admin`, and DB is a database name or `*` (quote it in
+PRIV is `read`, `write`, `backup` or `admin`, and DB is a database name or `*` (quote it in
 a shell). The final `admin:*` account is protected against removal/demotion.
 Changes take effect at the next Bolt login without restarting the server;
 existing sessions keep their granted identity until LOGOFF or disconnect.
@@ -226,3 +226,267 @@ backups because they retain old password hashes too.
 See [Bolt accounts and listen rules](../kala-bolt/README.md) for host precedence,
 database authorization and the explicit plaintext opt-in needed for a
 non-loopback listener. `--auth none` remains loopback-only.
+
+
+## Changing and inspecting the schema
+
+`kala schema WORLD [--canon tx#N] [--json]` reads without a writer lock. It lists
+node types, attributes and world settings at the requested canon (latest by
+default). Names always use the latest spelling, including at older canons.
+JSON fields are `command`, `canon`, `node_types`, `attributes`, and `settings`.
+Each node type has `name`, `inferred`, `first_tx`; each attribute has `name`,
+`type` (`string|i64|f64|bool|ref`), `kind`, `cardinality`, `direction` (or null),
+`inverse` (or null), `reverse_cardinality` (or null), `indexed`, `deprecated`,
+`inferred`, and `first_tx`. `settings` is a key/value object; `schema` defaults
+to `infer`. Definitions introduced after the requested canon are absent.
+
+Unknown attributes in assertions and unknown node types in creates declare
+themselves. Scalars infer their literal type, `state`, `one`, and indexed;
+entity values infer `ref`, `state`, `many`, directed and indexed. A report says
+`declared :age as i64 (inferred)` or `declared node type FACTION (inferred)`.
+Inference happens in operation order. A later wrong-type value aborts the whole
+transaction. An unknown retract in infer mode is `0 changed` and declares
+nothing; in strict mode it requires a declaration. Indexed strings are limited
+to 256 UTF-8 bytes; declare an unindexed string before writing a longer value.
+
+These forms work alone or inside a transaction vector, through `transact` and
+`repl --write`:
+
+```clojure
+[:attribute :title :string]
+[:attribute :biography :string :unindexed]
+[:attribute :parent_of :ref :many :directed :inverse :child_of :reverse :one]
+[:node-type :FACTION]
+[:world-setting :schema :strict]
+[:world-setting :schema :infer]
+[:rename :titel :title]
+[:deprecate :unused]
+[:cardinality :located_in :many]
+[:migrate :age :string]
+[:migrate :age :i64 :skip-unconvertible]
+```
+
+Attribute options are `:one|:many`, `:state|:event`, `:directed|:bidirectional`,
+`:unindexed`, `:inverse :NAME` and `:reverse :one|:many`. For a new attribute the
+defaults are state, one, indexed, and directed for refs; inverse/reverse options
+require a directed ref. For an existing attribute of the same type, options left
+out keep the current labels: `[:attribute :owns :ref]` on an inferred `owns`
+(ref, many) only marks it declared. A named label change is reported, e.g.
+`cardinality of :owns: many -> one` for `[:attribute :owns :ref :one]`. Naming a
+different type starts from the new-attribute defaults. Repeating an identical
+explicit definition or deprecation is a no-op. Cardinality labels can change
+with overlap warnings; doctor uses the label at its requested canon. Structural
+changes (type, kind, direction, indexing) in place require no fact entry ever
+having been logged for that attribute; otherwise use migration. Deprecated
+attributes reject assertions, retractions and corrections but remain readable.
+
+Renaming keeps the attribute ID: only the new name works at every canon, and the
+old name is immediately free. Names containing `@` are reserved for migration;
+`handle` (query pseudo-attribute) and `edge` (ID prefix) are reserved. Attribute
+and inverse names share a namespace. Node type renaming and inverse renaming
+are not supported.
+
+A migration accepts an optional type and the same options; omitted fields retain
+the old definition. It converts every change point of the latest canon, keeping
+its entity, tick, assert/retract operation and precision, including redundant
+assertions. It renames the source to `NAME@old` (then `@old2`, `@old3`, … if needed),
+deprecates it and gives the original name to a newly declared attribute. Old
+canons read the old data through `NAME@old`; the replacement `NAME` is not defined
+before the migration. The original attribute retains its correction trail.
+An inverse name transfers to the replacement attribute.
+
+| Conversion | Rule |
+| --- | --- |
+| i64 → f64 | Exact only for absolute values ≤ 2^53 |
+| f64 → i64 | Finite, integral and within the i64 range |
+| bool → i64 | false = 0; true = 1 |
+| i64 → bool | Only 0 and 1 |
+| Non-ref → string | Unquoted text as printed by `kala asof` |
+| string → i64/f64/bool | Exact text, no whitespace trimming; bool is `true` or `false`; NaN refused |
+| Unindexed → indexed string | Values over 256 UTF-8 bytes are unconvertible |
+| Same type | Values preserved; kind/direction/indexing may change |
+| ref ↔ non-ref | Refused |
+
+Distinct old values of one entity converting to one new value are collisions;
+all their change points are unconvertible. Without `:skip-unconvertible`, the
+whole migration fails with a count and examples. With it, those change points
+are skipped and counted. A state with any logged retract cannot become an event.
+Directed → bidirectional refuses pairs with histories in both directions.
+Bidirectional → directed copies both orientations (self-pairs once). Ref copies
+create new edge IDs and copy edge-property histories to the corresponding edges,
+including the histories of deprecated edge-property attributes (such as
+`disguised@old` from an earlier migration); users still cannot write to those.
+Directed → bidirectional drops the source's inverse name (freeing it) and its
+reverse cardinality, since a bidirectional attribute has neither; the report
+line ends with e.g. `; dropped inverse :child_of and reverse cardinality one`.
+
+Use `kala transact WORLD FILE --dry-run` first: it reports the same schema actions
+and counts on a discarded copy. Migration reports include change points copied,
+edges created, edge-property facts copied and skipped change points. Each form's
+JSON `schema` array is ordered, with `kind` equal to `attribute`, `node_type`,
+`rename`, `deprecate`, `cardinality`, `world_setting` or `migrate`. Records include
+names/types and `inferred`; migration records add `from`, `to`, `change_points`,
+`edges`, `edge_properties`, `skipped`, `dropped_inverse` (the inverse name or
+`null`) and `dropped_reverse_cardinality` (`"one"`, `"many"` or `null`). `changed` counts fact/correction entries and
+reported schema actions; per-op `changed` still counts fact entries.
+
+This release writes **log format 5**. Format-4 and older worlds are refused with
+an older-Kala message and must be recreated from their source fixtures/scripts.
+There is no old-file migration before 1.0. `kala info` reports the format version;
+`kala log` includes schema revisions and world settings in operation order.
+In `kala log --json` a schema entry is `{"entry": N, "kind": "schema", "change":
+{...}}`, where `change` uses the write report's field names: `kind` is
+`attribute`, `node_type`, `world_setting` or `migrate`, with `name`, `type` and
+`inferred`. Attribute and migrate records carry the full definition the entry
+logs (`id` for attributes, `attribute_kind` = `state`/`event`, `cardinality`,
+`direction`, `inverse`, `reverse_cardinality`, `indexed`, `deprecated`); a
+rename or deprecation is logged as an `attribute` record with the new name or
+`deprecated: true`. Migrate records add `source` (the source attribute's latest
+name, e.g. `age@old`), `from`, `to` and `skip_unconvertible`; world settings
+have `key` and `value`. Text `kala log` prints the same with names, e.g.
+`schema attribute :age i64 state one indexed (inferred)`.
+
+Preparation of a query with `:canon ?parameter` happens before parameter values
+are bound, so static schema-dependent typing and access planning use the latest
+schema. Execution rechecks the definition at the bound canon. For an attribute
+whose type or indexing changed while it was still empty, use a literal `:canon N`
+to prepare against that historical definition. Attributes with stored facts
+cannot change these fields in place, so their historical data is unaffected.
+Declarations and migrations take `:indexed` or `:unindexed`; converting an
+unindexed attribute back to indexed is `[:migrate :bio :string :indexed]`.
+
+## Creating, backing up, and exporting worlds
+
+`kala create WORLD [--schema FILE]` creates an empty world without a YAML fixture.
+Without a schema file it has no node types or attributes and infers them on write.
+A schema file contains `[:node-type :CHARACTER]`,
+`[:attribute :name :string :state :one :indexed]`, and world-setting forms such as
+`[:world-setting :schema :strict]`. An optional `[:genesis ...]` wraps them.
+These declarations become tx#0; node types precede attributes, then settings.
+Existing destinations, including dangling symlinks, are refused (exit 2).
+`[:create :CHARACTER]` allocates an entity without a handle.
+
+```sh
+kala create new.kala
+kala create strict.kala --schema schema.edn
+kala dump world.kala -o world.dump.edn
+kala transact --create restored.kala world.dump.edn
+kala doctor restored.kala
+```
+
+`kala dump WORLD [-o FILE] [--force]` writes a deterministic, replayable script.
+Without `-o` it writes to stdout; an existing output requires `--force`.
+The source is opened read-only without a writer lock. A torn or damaged tail is
+omitted with a stderr warning; only committed transactions are dumped.
+The header records Kala's version, source log format, latest tx, entry count and
+restore command. The first form is `[:genesis ...]`; each subsequent vector is
+one original transaction, preceded by `;; tx#N`. Entry IDs, transaction numbers,
+corrections, inferred declarations and migrations survive replay. Within the
+same log format, the restored committed log is byte-identical to its source.
+Dump before upgrading when moving data across a pre-1.0 format change.
+
+`kala transact --create NEW.kala DUMP` requires a leading genesis and refuses an
+existing target (exit 2). It validates every operation through the native store,
+stages the file privately on the destination filesystem, then publishes it
+atomically without overwriting anything. Failure leaves no destination. The
+summary is one line: `replayed N transactions, M entries into NEW.kala`; N excludes
+genesis and M includes all committed entries, including commits. `--json` returns
+one object with `command`, `create`, `transactions`, `entries`, and `world`.
+A failed restore of an ordinary world names the failing transaction form and its
+reason. An accounts database dump (and any input that fails before its genesis is
+known) gets diagnostics without content, because it may contain account hashes.
+A restore refuses `_KALA_` names unless the dump is Kala's accounts database.
+Restored worlds get the default file mode, like `kala load`; a restored accounts
+database is always private (0600).
+`--create` conflicts with `--dry-run` and `--acknowledge-recovery`.
+Normal `transact` and the REPL reject genesis with a `--create` hint.
+
+Create-mode input has no byte, form or operation cap; memory use scales with the
+input and reconstructed world. The 32-level nesting limit and native 16 MiB
+per-entry limit remain. Normal `transact` retains its 64 KiB input, 256 operations
+per transaction and 256 forms per file limits. Regular input files or explicit
+`-` for stdin are supported; device files and FIFOs are refused.
+
+Dumps spell all declaration options explicitly. `:reverse :none` on an attribute
+declaration removes its reverse cardinality label. `:inferred` (an option of
+a node-type or attribute declaration) preserves inference origin, and is checked
+against native inference rules (including strict mode and default definitions).
+Entities are named by handle where they have one, else by ID; edges by `edge#N`.
+`[:genesis ...]` holds operation vectors only. Names outside the keyword alphabet
+are quoted in name positions;
+`[:id "A type#1"]` references an ID with such a type name. String escapes include
+`\"`, `\\`, `\n`, `\r`, `\t`, `\uXXXX`, and `\UXXXXXXXX` for non-BMP characters.
+`[:f64 :inf]` and `[:f64 :-inf]` preserve native infinities; finite floats use
+round-trip decimal notation, and integers retain their full signed 64-bit range.
+
+### A whole server directory, including accounts
+
+```sh
+kala dump --all worlds -o private-backup
+mkdir restored-worlds
+kala transact --create restored-worlds/system.kala private-backup/system.dump.edn
+kala transact --create restored-worlds/varrow.kala private-backup/varrow.dump.edn
+kala user list restored-worlds
+kala serve restored-worlds
+```
+
+`--all` requires `-o OUTDIR`, which must be absent or empty; `--force` is refused.
+It uses the server's discovery rules: regular `<name>.kala` files, lowercase
+ASCII letters, digits, `_` or `-`, with a nonempty name. Symlinks are skipped.
+Each becomes `<name>.dump.edn`, including `system.dump.edn`. OUTDIR is private
+(mode 0700 on Unix), and files are created mode 0600 before writing. Output
+symlinks and nonempty directories are refused. Each completed world gets one
+summary line; a failure can leave earlier completed dump files in OUTDIR.
+On Linux, writes are anchored to the opened OUTDIR descriptor. On other platforms,
+keep its parent directory trusted: a concurrent pathname replacement is not
+prevented there. On Unix new files use private permissions; elsewhere files
+inherit OUTDIR's access control, so make OUTDIR private first.
+Publication never clobbers: a new file is hard-linked into place, or on file
+systems without hard links (FAT, exFAT, some network mounts) created exclusively
+and copied (except an accounts database restore, which needs hard links so it
+is never visible half-written). Each world is a committed snapshot at its own open time, not a cross-world
+transactional snapshot.
+
+The accounts dump starts with a password-hash warning. Protect it like the
+server directory: it includes current **and historical** password hashes.
+Single-world `dump` and JSON `export` refuse any world with the system marker,
+even under another filename. Only create-mode restore may restore an accounts
+database, always to a new private file (0600), with a stderr warning. It validates
+accounts before publication. Normal `transact`, `repl --write` and `load --force`
+continue to refuse the system world.
+
+`kala user grant DIR USER@HOST backup DB` (or `'*'`) stores a backup grant, and
+`kala user list` shows it. `admin` implies backup. Like `read`, `backup` never
+covers the accounts database (`system`): neither `backup:*` nor `backup:system`
+reaches its password hashes; only `admin` does. Backup alone grants no Bolt
+read access. There is no server-side dump yet: local backups are authorized by
+filesystem access; the privilege is stored for the future server operation.
+
+### JSON snapshots
+
+```sh
+kala export world.kala --at -208 --canon tx#10 -o snapshot.json
+```
+
+`kala export WORLD [--at T] [--canon tx#N] [-o FILE]` writes one JSON document to
+stdout or a new file. It is read-only and takes no writer lock. Defaults are the
+latest canon and its latest tick. The document has:
+
+- `kala_version`, `format_version`, `tick`, `canon`.
+- `schema`: `node_types`, `attributes`, `settings`, with the same definitions and
+  fields as `kala schema --json`. Definitions are pinned to the requested canon;
+  names follow the latest name table, as other Kala reads do.
+- `entities`: all entities defined by that canon, ordered by ID, with `id`,
+  `node_type`, `handle` (or null), and an `attributes` object containing values
+  holding at T. Cardinality-many attributes use arrays; cardinality-one uses a
+  single typed value unless several values overlap, in which case it uses an
+  array. Attributes with no held values are omitted.
+- `edges`: only edges asserted at T, ordered by ID, with `id`, `source`,
+  `attribute`, `target`, and `properties` holding at T. Source and target are
+  entity objects (`id`, `handle`, `name`, `label`). Edge properties follow the
+  same scalar/array rule as entity attributes.
+
+Values use `kala query --json`'s `{type,value}` representation: bool, i64, f64,
+string or ref. A ref's value is an entity object. Infinite floats are the strings
+`"inf"` / `"-inf"`. Ordering is deterministic. JSON snapshots are for external
+tools, not for restoring history; this slice provides no JSON import.

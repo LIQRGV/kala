@@ -162,8 +162,8 @@ fn precision_has_six_distinct_copy_hashable_variants_and_defaults_to_exact() {
 }
 
 #[test]
-fn log_format_version_is_four() {
-    assert_eq!(LOG_FORMAT_VERSION, 4);
+fn log_format_version_is_five() {
+    assert_eq!(LOG_FORMAT_VERSION, 5);
 }
 
 // ================================================================ defaults

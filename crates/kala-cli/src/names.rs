@@ -51,7 +51,8 @@ impl LogNames {
         let mut n = LogNames::default();
         for e in entries {
             match &e.body {
-                EntryBody::DefineNodeType { id, name } => {
+                EntryBody::DefineNodeType { id, name }
+                | EntryBody::Schema(kala_core::schema::SchemaEdit::NodeType { id, name, .. }) => {
                     n.node_types.insert(id.0, name.clone());
                 }
                 EntryBody::DefineEntity {

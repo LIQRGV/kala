@@ -4,7 +4,10 @@ use crate::error::{DatalogError, Span, show};
 use crate::lex::{Bracket, Lexer, Tok};
 use crate::parse::{Form, item, read_form};
 use crate::{MAX_QUERY_BYTES, MAX_WRITE_FORMS, MAX_WRITE_OPS};
-use kala_core::{EntryId, Op, Precision, Tick};
+use kala_core::{
+    AttributeOptions, Cardinality, EntryId, Kind, MigrationOptions, Op, Precision, RefDirection,
+    Tick, ValueType,
+};
 
 /// The first element of a form selects its language operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,7 +47,19 @@ pub fn form_kind(text: &str) -> Result<FormKind, DatalogError> {
             Tok::Keyword(k)
                 if matches!(
                     k.as_str(),
-                    "create" | "assert" | "retract" | "correct" | "at"
+                    "genesis"
+                        | "create"
+                        | "assert"
+                        | "retract"
+                        | "correct"
+                        | "at"
+                        | "attribute"
+                        | "node-type"
+                        | "rename"
+                        | "deprecate"
+                        | "cardinality"
+                        | "migrate"
+                        | "world-setting"
                 ) =>
             {
                 Ok(FormKind::Write)
@@ -82,10 +97,21 @@ pub fn write_forms(
     text: &str,
 ) -> Result<impl Iterator<Item = Result<WriteTxn, DatalogError>> + '_, DatalogError> {
     size(text)?;
+    Ok(forms(text, false))
+}
+
+/// Parse a local restore script without byte, operation or form limits.
+/// Bracket depth remains bounded by `MAX_DEPTH`; execution must require a
+/// leading genesis and validate every operation through the native store.
+pub fn restore_forms(text: &str) -> impl Iterator<Item = Result<WriteTxn, DatalogError>> + '_ {
+    forms(text, true)
+}
+
+fn forms(text: &str, restore: bool) -> impl Iterator<Item = Result<WriteTxn, DatalogError>> + '_ {
     let mut lex = Lexer::new(text);
     let mut count = 0;
     let mut done = false;
-    Ok(std::iter::from_fn(move || {
+    std::iter::from_fn(move || {
         if done {
             return None;
         }
@@ -103,17 +129,17 @@ pub fn write_forms(
             Ok(Some(_)) => {}
         }
         count += 1;
-        let result = if count > MAX_WRITE_FORMS {
+        let result = if !restore && count > MAX_WRITE_FORMS {
             Err(DatalogError::limit(
                 None,
                 format!("more than {MAX_WRITE_FORMS} transaction forms"),
             ))
         } else {
-            read_form(&mut lex, text.len()).and_then(transaction)
+            read_form(&mut lex, text.len()).and_then(|f| transaction(f, restore))
         };
         done = result.is_err();
         Some(result.map_err(|e| e.locate(text)))
-    }))
+    })
 }
 
 fn vector(f: Form) -> Result<(Vec<Form>, Span), DatalogError> {
@@ -133,6 +159,17 @@ fn keyword(f: Form) -> Result<(String, Span), DatalogError> {
             span,
         } => Ok((k, span)),
         f => Err(DatalogError::syntax(f.span(), "expected a keyword")),
+    }
+}
+// Schema and handle names are opaque store strings. Quoted names make native
+// names outside the bare keyword alphabet representable in a dump.
+fn named(f: Form) -> Result<(String, Span), DatalogError> {
+    match f {
+        Form::Atom {
+            tok: Tok::Str(s),
+            span,
+        } => Ok((s, span)),
+        f => keyword(f),
     }
 }
 fn tick(f: Form) -> Result<Tick, DatalogError> {
@@ -182,6 +219,40 @@ fn reference(f: Form) -> Result<Item, DatalogError> {
 fn value(f: Form) -> Result<WriteValue, DatalogError> {
     if matches!(&f, Form::Seq { .. }) {
         let (items, span) = vector(f)?;
+        if items.len() == 2 {
+            match (&items[0], &items[1]) {
+                (
+                    Form::Atom {
+                        tok: Tok::Keyword(k),
+                        ..
+                    },
+                    Form::Atom {
+                        tok: Tok::Str(id),
+                        span,
+                    },
+                ) if k == "id" => return Ok(WriteValue::Scalar(Item::Id(id.clone(), *span))),
+                (
+                    Form::Atom {
+                        tok: Tok::Keyword(k),
+                        ..
+                    },
+                    Form::Atom {
+                        tok: Tok::Keyword(v),
+                        span,
+                    },
+                ) if k == "f64" && matches!(v.as_str(), "inf" | "-inf") => {
+                    return Ok(WriteValue::Scalar(Item::Float(
+                        if v == "inf" {
+                            f64::INFINITY
+                        } else {
+                            f64::NEG_INFINITY
+                        },
+                        *span,
+                    )));
+                }
+                _ => {}
+            }
+        }
         let mut it = items.into_iter();
         let (Some(s), Some(a), Some(t), None) = (it.next(), it.next(), it.next(), it.next()) else {
             return Err(DatalogError::syntax(
@@ -189,7 +260,7 @@ fn value(f: Form) -> Result<WriteValue, DatalogError> {
                 "an edge reference is [source :attribute target]",
             ));
         };
-        let (name, span) = keyword(a)?;
+        let (name, span) = named(a)?;
         Ok(WriteValue::Edge {
             source: reference(s)?,
             attr: Attr { name, span },
@@ -210,11 +281,29 @@ fn value(f: Form) -> Result<WriteValue, DatalogError> {
         }
     }
 }
-fn transaction(f: Form) -> Result<WriteTxn, DatalogError> {
-    let (items, span) = vector(f)?;
+fn transaction(f: Form, restore: bool) -> Result<WriteTxn, DatalogError> {
+    let (mut items, span) = vector(f)?;
+    let genesis =
+        matches!(items.first(), Some(Form::Atom { tok: Tok::Keyword(k), .. }) if k == "genesis");
+    if genesis {
+        if !restore {
+            return Err(DatalogError::syntax(
+                span,
+                ":genesis requires kala transact --create",
+            ));
+        }
+        items.remove(0);
+    }
     let single = matches!(items.first(),Some(Form::Atom{tok:Tok::Keyword(k),..}) if k!="at");
+    if single && genesis {
+        return Err(DatalogError::syntax(
+            span,
+            "genesis holds operation vectors: [:genesis [:node-type ...] [:attribute ...]]",
+        ));
+    }
     if single {
         return Ok(WriteTxn {
+            genesis: false,
             at: None,
             ops: vec![operation(items, span)?],
             span,
@@ -235,7 +324,7 @@ fn transaction(f: Form) -> Result<WriteTxn, DatalogError> {
         }
     }
     for f in it {
-        if ops.len() >= MAX_WRITE_OPS {
+        if !restore && ops.len() >= MAX_WRITE_OPS {
             return Err(DatalogError::limit(
                 Some(f.span()),
                 format!("more than {MAX_WRITE_OPS} operations in a transaction"),
@@ -244,22 +333,125 @@ fn transaction(f: Form) -> Result<WriteTxn, DatalogError> {
         let (items, s) = vector(f)?;
         ops.push(operation(items, s)?);
     }
-    if ops.is_empty() {
+    if ops.is_empty() && !genesis {
         return Err(DatalogError::syntax(
             span,
             "a transaction needs at least one op",
         ));
     }
-    Ok(WriteTxn { at, ops, span })
+    if genesis
+        && (at.is_some()
+            || ops.iter().any(|op| {
+                !matches!(
+                    op,
+                    WriteOp::Attribute {
+                        inferred: false,
+                        ..
+                    } | WriteOp::NodeType {
+                        inferred: false,
+                        ..
+                    } | WriteOp::WorldSetting { .. }
+                )
+            }))
+    {
+        return Err(DatalogError::syntax(
+            span,
+            "genesis accepts only declared schema forms and world settings",
+        ));
+    }
+    Ok(WriteTxn {
+        genesis,
+        at,
+        ops,
+        span,
+    })
 }
 fn operation(items: Vec<Form>, span: Span) -> Result<WriteOp, DatalogError> {
     let mut it = items.into_iter();
     let missing = || DatalogError::syntax(span, "missing parts of write operation");
     let (kind, ks) = keyword(it.next().ok_or_else(missing)?)?;
     match kind.as_str() {
+        "attribute" | "migrate" => {
+            let (name, _) = named(it.next().ok_or_else(missing)?)?;
+            let (options, clear_reverse_cardinality, inferred) =
+                schema_options(it, kind == "migrate", span)?;
+            if kind == "migrate" {
+                return Ok(WriteOp::Migrate {
+                    name,
+                    options,
+                    span,
+                });
+            }
+            let value_type = options
+                .value_type
+                .ok_or_else(|| DatalogError::syntax(span, ":attribute needs a value type"))?;
+            Ok(WriteOp::Attribute {
+                inferred,
+                name,
+                value_type,
+                options: AttributeOptions {
+                    kind: options.kind,
+                    cardinality: options.cardinality,
+                    direction: options.direction,
+                    indexed: options.indexed,
+                    inverse: options.inverse,
+                    reverse_cardinality: options.reverse_cardinality,
+                    clear_reverse_cardinality,
+                },
+                span,
+            })
+        }
+        "node-type" | "deprecate" | "rename" | "cardinality" | "world-setting" => {
+            let (name, _) = named(it.next().ok_or_else(missing)?)?;
+            let op = match kind.as_str() {
+                "node-type" => {
+                    let inferred = if let Some(f) = it.next() {
+                        let (k, s) = keyword(f)?;
+                        if k != "inferred" {
+                            return Err(DatalogError::syntax(s, "expected :inferred"));
+                        }
+                        true
+                    } else {
+                        false
+                    };
+                    WriteOp::NodeType {
+                        name,
+                        inferred,
+                        span,
+                    }
+                }
+                "deprecate" => WriteOp::Deprecate { name, span },
+                "rename" => WriteOp::Rename {
+                    old: name,
+                    new: named(it.next().ok_or_else(missing)?)?.0,
+                    span,
+                },
+                "cardinality" => WriteOp::Cardinality {
+                    name,
+                    cardinality: cardinality(it.next().ok_or_else(missing)?)?,
+                    span,
+                },
+                _ => WriteOp::WorldSetting {
+                    key: name,
+                    value: named(it.next().ok_or_else(missing)?)?.0,
+                    span,
+                },
+            };
+            if let Some(f) = it.next() {
+                return Err(DatalogError::syntax(
+                    f.span(),
+                    "too many arguments to schema operation",
+                ));
+            }
+            Ok(op)
+        }
+        "genesis" => Err(DatalogError::syntax(
+            span,
+            ":genesis must be the first top-level form of kala transact --create",
+        )),
         "create" => {
-            let (node_type, _) = keyword(it.next().ok_or_else(missing)?)?;
-            let (handle, _) = keyword(it.next().ok_or_else(missing)?)?;
+            let (node_type, _) = named(it.next().ok_or_else(missing)?)?;
+            let handle = it.next().map(named).transpose()?.map(|(name, _)| name);
             if let Some(f) = it.next() {
                 return Err(DatalogError::syntax(
                     f.span(),
@@ -282,7 +474,7 @@ fn operation(items: Vec<Form>, span: Span) -> Result<WriteOp, DatalogError> {
                     "subject must be a handle, ID or edge triple",
                 ));
             }
-            let (name, aspan) = keyword(it.next().ok_or_else(missing)?)?;
+            let (name, aspan) = named(it.next().ok_or_else(missing)?)?;
             let value = value(it.next().ok_or_else(missing)?)?;
             let options = options(it, false, span)?;
             Ok(WriteOp::Fact {
@@ -384,4 +576,94 @@ fn options(
         }
     }
     Ok(out)
+}
+
+fn cardinality(form: Form) -> Result<Cardinality, DatalogError> {
+    let (name, span) = keyword(form)?;
+    match name.as_str() {
+        "one" => Ok(Cardinality::One),
+        "many" => Ok(Cardinality::Many),
+        _ => Err(DatalogError::syntax(
+            span,
+            "cardinality must be :one or :many",
+        )),
+    }
+}
+fn schema_options(
+    mut it: impl Iterator<Item = Form>,
+    migrate: bool,
+    span: Span,
+) -> Result<(MigrationOptions, bool, bool), DatalogError> {
+    let mut out = MigrationOptions::default();
+    let mut clear_reverse = false;
+    let mut inferred = false;
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(form) = it.next() {
+        let (name, s) = keyword(form)?;
+        let category = match name.as_str() {
+            "string" | "i64" | "f64" | "bool" | "ref" => "type",
+            "one" | "many" => "cardinality",
+            "state" | "event" => "kind",
+            "directed" | "bidirectional" => "direction",
+            other => other,
+        };
+        if !seen.insert(category.to_owned()) {
+            return Err(DatalogError::syntax(
+                s,
+                format!("duplicate {category} option"),
+            ));
+        }
+        if !migrate && seen.len() == 1 && category != "type" {
+            return Err(DatalogError::syntax(
+                s,
+                "attribute type must follow its name",
+            ));
+        }
+        match name.as_str() {
+            "string" => out.value_type = Some(ValueType::Str),
+            "i64" => out.value_type = Some(ValueType::I64),
+            "f64" => out.value_type = Some(ValueType::F64),
+            "bool" => out.value_type = Some(ValueType::Bool),
+            "ref" => out.value_type = Some(ValueType::Ref),
+            "one" => out.cardinality = Some(Cardinality::One),
+            "many" => out.cardinality = Some(Cardinality::Many),
+            "state" => out.kind = Some(Kind::State),
+            "event" => out.kind = Some(Kind::Event),
+            "directed" => out.direction = Some(RefDirection::Directed),
+            "bidirectional" => out.direction = Some(RefDirection::Bidirectional),
+            "indexed" => out.indexed = Some(true),
+            "unindexed" => out.indexed = Some(false),
+            "inverse" => {
+                out.inverse = Some(
+                    named(
+                        it.next()
+                            .ok_or_else(|| DatalogError::syntax(span, ":inverse needs a name"))?,
+                    )?
+                    .0,
+                )
+            }
+            "reverse" => {
+                let form = it
+                    .next()
+                    .ok_or_else(|| DatalogError::syntax(span, ":reverse needs cardinality"))?;
+                if !migrate
+                    && matches!(&form, Form::Atom { tok: Tok::Keyword(k), .. } if k == "none")
+                {
+                    clear_reverse = true;
+                } else {
+                    out.reverse_cardinality = Some(cardinality(form)?);
+                }
+            }
+            "skip-unconvertible" if migrate => out.skip_unconvertible = true,
+            // A dump's inferred declaration; validated like live inference.
+            "inferred" if !migrate => inferred = true,
+            _ => {
+                return Err(DatalogError::syntax(
+                    s,
+                    format!("unknown schema option :{}", show(&name)),
+                ));
+            }
+        }
+    }
+    Ok((out, clear_reverse, inferred))
 }

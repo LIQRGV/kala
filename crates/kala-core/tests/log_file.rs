@@ -126,8 +126,8 @@ fn header_is_magic_then_version_little_endian() {
     assert!(b.len() >= 12);
     assert_eq!(&b[..8], b"KALALOG\0");
     assert_eq!(LOG_MAGIC, *b"KALALOG\0");
-    assert_eq!(LOG_FORMAT_VERSION, 4);
-    assert_eq!(&b[8..12], &4u32.to_le_bytes());
+    assert_eq!(LOG_FORMAT_VERSION, 5);
+    assert_eq!(&b[8..12], &5u32.to_le_bytes());
 }
 
 #[test]

@@ -144,8 +144,10 @@ states") as hints. Kala ships no story rules of its own.
 
 Follow the [story-author guide](GUIDE.md) to write scenes, ask questions and
 correct earlier canon. Open `kala repl w.kala --write` for interactive writes,
-or run `kala transact w.kala scene.edn` for scripts. Schema definitions still
-come from YAML fixtures loaded with `kala load`:
+or run `kala transact w.kala scene.edn` for scripts. New attributes and node types
+are inferred on write by default. Declare, rename, deprecate or migrate them with
+Datalog schema forms; inspect definitions with `kala schema w.kala`. YAML fixtures
+loaded with `kala load` provide the initial schema:
 
 ```yaml
 schema:
@@ -189,6 +191,8 @@ The native Rust API (`kala-core`) can also write directly. See
 - [x] Datalog: joins, rules, recursion, negation, disjunction, history with precision, interval sets, aggregates
 - [x] REPL (`kala repl`)
 - [x] Writes from the CLI and REPL
+- [x] Schema-on-write, schema revisions by canon, copy-forward migrations and `kala schema`
+- [x] `kala create`, replayable full-history dumps, private server backups and JSON snapshots
 - [x] `kala serve`: read-only Bolt 5 Datalog queries through Neo4j drivers
 - [ ] Neo4j Browser compatibility and routing/procedure stubs
 - [ ] Cypher (a subset first), then Gremlin

@@ -422,13 +422,13 @@ impl Session<'_> {
 
     fn schema(&self) -> String {
         let mut out = String::from("node types:\n");
-        for name in self.ctx.world.node_types() {
+        for (name, _, _) in self.ctx.view().node_type_definitions() {
             let _ = writeln!(out, "  {}", escape::line(name));
         }
         out.push_str(
             "attributes (type, kind, cardinality, direction, inverse, reverse, indexed):\n",
         );
-        for a in self.ctx.world.attributes() {
+        for a in self.ctx.view().attributes() {
             let ty = match a.value_type {
                 kala_core::ValueType::Str => "string",
                 kala_core::ValueType::Ref => "ref",

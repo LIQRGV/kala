@@ -263,8 +263,8 @@ fn every_txn_starts_with_a_documented_begin_record() {
     let (_d, path) = build();
     let b = bytes(&path);
     assert_eq!(&b[..8], b"KALALOG\0");
-    assert_eq!(&b[8..12], &4u32.to_le_bytes());
-    assert_eq!(LOG_FORMAT_VERSION, 4);
+    assert_eq!(&b[8..12], &5u32.to_le_bytes());
+    assert_eq!(LOG_FORMAT_VERSION, 5);
     let spans = common::spans(&b);
     assert_eq!(spans.len(), 5, "genesis + 4 txns");
     assert_eq!(
