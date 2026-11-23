@@ -57,7 +57,7 @@ pub(crate) struct StoredIndexes<'w> {
     pub(crate) vfold_latest: &'w LatestIndex,
 }
 
-/// Borrows an owned key bound as a slice bound, for [`OrderedMap::scan`].
+/// Borrows an owned key bound as a slice bound, for [`OrderedKv::scan`].
 fn as_slice(b: &Bound<Vec<u8>>) -> Bound<&[u8]> {
     match b {
         Bound::Included(k) => Bound::Included(k),
@@ -76,8 +76,8 @@ fn as_slice(b: &Bound<Vec<u8>>) -> Bound<&[u8]> {
 /// `history_end(key)` is the length of a key's history prefix. Each round
 /// finds the next distinct history, seeks it, then jumps past all of its
 /// keys, so the cost is one seek per distinct `x` ever stored.
-pub(super) fn for_each_holding<V>(
-    index: &OrderedMap<V>,
+pub(super) fn for_each_holding<M: OrderedKv>(
+    index: &M,
     attr_prefix: &[u8],
     history_end: impl Fn(&[u8]) -> usize,
     work: Work<'_>,
@@ -95,8 +95,8 @@ pub(super) fn for_each_holding<V>(
 /// history prefix of every distinct history under `attr_prefix`, in key
 /// order (`f` may use it as a seek buffer, restoring it before returning).
 /// Charges `work` one key per round (the key that ends the walk included).
-pub(super) fn for_each_history<V>(
-    index: &OrderedMap<V>,
+pub(super) fn for_each_history<M: OrderedKv>(
+    index: &M,
     attr_prefix: &[u8],
     history_end: impl Fn(&[u8]) -> usize,
     work: Work<'_>,
@@ -130,8 +130,8 @@ pub(super) fn tick_after(k: &[u8], prefix_len: usize) -> Tick {
 
 /// Every `(key, op)` of a latest-revision index under `prefix`, in key
 /// order. Charges `work` one per key examined.
-pub(super) fn under<'i>(
-    index: &'i LatestIndex,
+pub(super) fn under<'i, M: OrderedKv<Value = Op>>(
+    index: &'i M,
     prefix: &'i [u8],
     work: Work<'i>,
 ) -> impl Iterator<Item = (&'i [u8], &'i Op)> + 'i {
@@ -144,7 +144,7 @@ pub(super) fn under<'i>(
 /// Makes `mark` the current entry of latest-revision key `at_key`: a fact
 /// is stored (replacing the previous current entry), a `DELETED` marker
 /// empties the key.
-fn set_latest(index: &mut LatestIndex, at_key: &[u8], mark: Mark) {
+fn set_latest(index: &mut impl OrderedKv<Value = Op>, at_key: &[u8], mark: Mark) {
     match mark.op() {
         Some(op) => index.set(at_key, op),
         None => {
@@ -160,7 +160,7 @@ fn set_latest(index: &mut LatestIndex, at_key: &[u8], mark: Mark) {
 /// so there is nothing to skip. Reuses `value_prefix` as the seek key
 /// buffer; it is restored before returning.
 pub(super) fn holds_latest(
-    index: &LatestIndex,
+    index: &impl OrderedKv<Value = Op>,
     value_prefix: &mut Vec<u8>,
     t: Tick,
     work: Work<'_>,
@@ -170,8 +170,8 @@ pub(super) fn holds_latest(
 
 /// The seek of [`holds_latest`]: the key and op of the current entry of the
 /// latest tick `<= t` under `value_prefix`, if any.
-pub(super) fn latest_seek<'i>(
-    index: &'i LatestIndex,
+pub(super) fn latest_seek<'i, M: OrderedKv<Value = Op>>(
+    index: &'i M,
     value_prefix: &mut Vec<u8>,
     t: Tick,
     work: Work<'_>,
@@ -206,8 +206,8 @@ pub(super) fn current_entries<'i>(
 /// the entries of one key are adjacent, newest tx first, so the first
 /// visible one of each run is that key's current entry. Charges `work` one
 /// per entry examined (the one that ends the walk included).
-pub(super) fn current_entries_metered<'i>(
-    index: &'i Index,
+pub(super) fn current_entries_metered<'i, M: OrderedKv<Value = Mark>>(
+    index: &'i M,
     prefix: &'i [u8],
     canon: TxId,
     work: Work<'i>,
@@ -265,7 +265,7 @@ pub(crate) fn decode_vfold_row(k: &[u8]) -> Option<(AttrId, String, Value, Entit
 
 /// Whether the `E`-layout `index` holds any entry (any tx) at `fact`'s key
 /// `E|e|a|v|^tick`.
-pub(super) fn has_key(index: &Index, fact: &FactDef) -> bool {
+pub(super) fn has_key(index: &impl OrderedKv<Value = Mark>, fact: &FactDef) -> bool {
     let mut at_key = key::e_value_prefix(fact.entity, fact.attr, fact.key_value());
     key::push_seek_tick(&mut at_key, fact.tick);
     index
@@ -278,8 +278,8 @@ pub(super) fn has_key(index: &Index, fact: &FactDef) -> bool {
 /// `value_prefix` (`E|e|a|v|`) at exactly tick `t`, if any; `None` if there
 /// is none or it is a `DELETED` marker. Reuses `value_prefix` as the seek
 /// key buffer; it is restored before returning.
-pub(super) fn op_at_tick(
-    layers: &[&Index],
+pub(super) fn op_at_tick<M: OrderedKv<Value = Mark>>(
+    layers: &[&M],
     value_prefix: &mut Vec<u8>,
     t: Tick,
     canon: TxId,
@@ -297,8 +297,8 @@ pub(super) fn op_at_tick(
 /// tick `<= t` under `value_prefix` (`E|e|a|v|`) is an assert, ticks whose
 /// current entry is a `DELETED` marker skipped. Reuses `value_prefix` as
 /// the seek key buffer; it is restored before returning.
-pub(super) fn holds(
-    layers: &[&Index],
+pub(super) fn holds<M: OrderedKv<Value = Mark>>(
+    layers: &[&M],
     value_prefix: &mut Vec<u8>,
     t: Tick,
     canon: TxId,
@@ -326,15 +326,21 @@ pub(super) fn holds(
 /// same tick are not current, so the walk jumps past the tick instead of
 /// falling through to them. At the latest canon with no corrections nothing
 /// is skipped: still one seek.
-fn seek(layers: &[&Index], from: &[u8], prefix: &[u8], canon: TxId, work: Work<'_>) -> Option<Op> {
+fn seek<M: OrderedKv<Value = Mark>>(
+    layers: &[&M],
+    from: &[u8],
+    prefix: &[u8],
+    canon: TxId,
+    work: Work<'_>,
+) -> Option<Op> {
     seek_entry(layers, from, prefix, canon, work).map(|(_, op)| op)
 }
 
 /// [`seek`], also returning the key of the entry found. Charges `work`
 /// one per key examined: the one landed on, every newer-tx or deleted
 /// entry stepped over, and the one past the prefix that ends a miss.
-pub(super) fn seek_entry<'i>(
-    layers: &[&'i Index],
+pub(super) fn seek_entry<'i, M: OrderedKv<Value = Mark>>(
+    layers: &[&'i M],
     from: &[u8],
     prefix: &[u8],
     canon: TxId,

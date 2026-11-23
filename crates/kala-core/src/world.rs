@@ -76,7 +76,7 @@ use crate::schema::{AttrDef, Cardinality, Kind, RefDirection, Schema};
 use crate::schema::{
     AttributeOptions, MigrationOptions, MigrationReport, SchemaChange, SchemaEdit,
 };
-use crate::store::OrderedMap;
+use crate::store::{OrderedKv, OrderedMap};
 use crate::tick::{Precision, Tick};
 use crate::value::{Value, ValueType, fold_for_search};
 use crate::value_table::{ContentHash, ValueTable, fnv1a64};
