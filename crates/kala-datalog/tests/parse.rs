@@ -609,7 +609,7 @@ fn errors_always_carry_a_span_for_syntax_and_unsupported() {
         "[:find ?a :where [?a :x 1]",
         "[:find ?a :where [?a :x 1]] x",
         "[:find ?a :where [?a :x 1 :foo]]",
-        "[:find ?a :where (or [?a :x 1] [?a :y 1])]",
+        "[:find ?a :where (or-join [?a] [?a :x 1] [?a :y 1])]",
         "[:find ?a :at :where [?a :x 1]]",
     ] {
         let e = err(t);
