@@ -119,7 +119,7 @@ impl View<'_> {
             .is_some_and(|&tx| tx <= self.canon)
     }
 
-    /// [`World::resolve`] for a read at this canon: a known attribute, and
+    /// [`Catalog::resolve`] for a read at this canon: a known attribute, and
     /// `entity` defined at the canon (else [`Error::UnknownEntity`]).
     pub(super) fn resolve(
         &self,
@@ -397,10 +397,29 @@ impl View<'_> {
         attr: &str,
         t: Tick,
     ) -> Result<Vec<Change>, Error> {
-        let world = self.world;
         let (attr_id, _) = self.resolve(entity, attr)?;
         // (value encoding, change), sorted by the encoding at the end.
         let mut out: Vec<(Vec<u8>, Change)> = Vec::new();
+        self.stored_details(entity, attr_id, t, &mut out);
+        if self.world.catalog.is_bidirectional(attr_id) {
+            self.mirrored_details(entity, attr_id, t, &mut out);
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.dedup_by(|a, b| a.0 == b.0);
+        Ok(out.into_iter().map(|(_, c)| c).collect())
+    }
+
+    /// [`View::as_of_detail`] for the values stored under `entity` (its `E`
+    /// histories): pushes `(value encoding, change)` for each one holding
+    /// at tick `t`.
+    fn stored_details(
+        &self,
+        entity: EntityId,
+        attr_id: AttrId,
+        t: Tick,
+        out: &mut Vec<(Vec<u8>, Change)>,
+    ) {
+        let world = self.world;
         self.for_each_e_history(entity, attr_id, |p| {
             let Some((k, Op::Assert)) =
                 self.entry_at(&world.indexes.e_index, &world.indexes.e_latest, p, t)
@@ -420,63 +439,65 @@ impl View<'_> {
             };
             out.push((bytes.to_vec(), change));
         });
-        if world.catalog.is_bidirectional(attr_id) {
-            // The pairs stored under a smaller partner, through their R
-            // mirrors; a self pair was found on the E side.
-            let prefix = key::r_attr_prefix(entity, attr_id);
-            let source_end = |_: &[u8]| key::R_SOURCE_PREFIX_LEN;
-            let mut on_history = |p: &mut Vec<u8>| {
-                let Some((k, Op::Assert)) =
-                    self.entry_at(&world.indexes.r_index, &world.indexes.r_latest, p, t)
-                else {
-                    return;
-                };
-                let Some(source) = key::r_source(p).filter(|s| *s != entity) else {
-                    return;
-                };
-                let tick = tick_after(k, p.len());
-                // A latest-revision key has no tx (and the latest path
-                // ignores it); a main R key ends in its entry's.
-                let tx = key::e_key_tx(k).filter(|_| !self.latest);
-                let value = Value::Ref(source);
-                let bytes = value
-                    .encode()
-                    .expect("invariant: a ref value always encodes");
-                let change = Change {
-                    tick,
-                    op: Op::Assert,
-                    value,
-                    precision: self.r_precision(
-                        source,
-                        attr_id,
-                        entity,
-                        tick,
-                        tx.unwrap_or(TxId(0)),
-                    ),
-                };
-                out.push((bytes, change));
+    }
+
+    /// [`View::as_of_detail`] for the partners of `entity` in a
+    /// bidirectional attribute whose pair is stored under the partner:
+    /// pushes `(value encoding, change)` for each one holding at tick `t`.
+    fn mirrored_details(
+        &self,
+        entity: EntityId,
+        attr_id: AttrId,
+        t: Tick,
+        out: &mut Vec<(Vec<u8>, Change)>,
+    ) {
+        let world = self.world;
+        // The pairs stored under a smaller partner, through their R
+        // mirrors; a self pair was found on the E side.
+        let prefix = key::r_attr_prefix(entity, attr_id);
+        let source_end = |_: &[u8]| key::R_SOURCE_PREFIX_LEN;
+        let mut on_history = |p: &mut Vec<u8>| {
+            let Some((k, Op::Assert)) =
+                self.entry_at(&world.indexes.r_index, &world.indexes.r_latest, p, t)
+            else {
+                return;
             };
-            if self.latest {
-                for_each_history(
-                    &world.indexes.r_latest,
-                    &prefix,
-                    source_end,
-                    self.work,
-                    &mut on_history,
-                );
-            } else {
-                for_each_history(
-                    &world.indexes.r_index,
-                    &prefix,
-                    source_end,
-                    self.work,
-                    &mut on_history,
-                );
-            }
+            let Some(source) = key::r_source(p).filter(|s| *s != entity) else {
+                return;
+            };
+            let tick = tick_after(k, p.len());
+            // A latest-revision key has no tx (and the latest path
+            // ignores it); a main R key ends in its entry's.
+            let tx = key::e_key_tx(k).filter(|_| !self.latest);
+            let value = Value::Ref(source);
+            let bytes = value
+                .encode()
+                .expect("invariant: a ref value always encodes");
+            let change = Change {
+                tick,
+                op: Op::Assert,
+                value,
+                precision: self.r_precision(source, attr_id, entity, tick, tx.unwrap_or(TxId(0))),
+            };
+            out.push((bytes, change));
+        };
+        if self.latest {
+            for_each_history(
+                &world.indexes.r_latest,
+                &prefix,
+                source_end,
+                self.work,
+                &mut on_history,
+            );
+        } else {
+            for_each_history(
+                &world.indexes.r_index,
+                &prefix,
+                source_end,
+                self.work,
+                &mut on_history,
+            );
         }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out.dedup_by(|a, b| a.0 == b.0);
-        Ok(out.into_iter().map(|(_, c)| c).collect())
     }
 
     /// The key and op of the current entry of the latest tick `<= t` in
