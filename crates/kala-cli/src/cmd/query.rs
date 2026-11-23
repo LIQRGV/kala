@@ -77,7 +77,7 @@ pub(crate) fn table(world: &World, rs: &ResultSet) -> (Vec<String>, Vec<Vec<JVal
 /// (names, labels) at the query's resolved default tick and canon.
 pub fn run(world: &Path, q: &QueryArgs, json: bool) -> Result<String, CliError> {
     let (ctx, prepared, params) = prepare(world, q)?;
-    let rs = kala_query::run_with_values(&ctx.world, &prepared.plan, &params, &Limits::default())
+    let rs = kala_query::run(&ctx.world, &prepared.plan, &params, &Limits::default())
         .map_err(|e| query_err(e, "query"))?;
     Ok(render_result(&ctx.world, &rs, json))
 }

@@ -269,7 +269,12 @@ fn run_checks(
         let result = if remaining.max_steps == 0 {
             Err(QueryError::StepBudget { limit: 0 })
         } else {
-            kala_query::run_with_usage(&world, &p.plan, &Params::new(), &remaining)
+            kala_query::run_with(
+                &world,
+                &p.plan,
+                &Params::new(),
+                kala_query::RunOptions::new(remaining),
+            )
         };
         let (rs, usage) = match result {
             Ok(result) => result,
