@@ -325,3 +325,13 @@ This release writes **log format 5**. Format-4 and older worlds are refused with
 an older-Kala message and must be recreated from their source fixtures/scripts.
 There is no old-file migration before 1.0. `kala info` reports the format version;
 `kala log` includes schema revisions and world settings in operation order.
+
+Preparation of a query with `:canon ?parameter` happens before parameter values
+are bound, so static schema-dependent typing and access planning use the latest
+schema. Execution rechecks the definition at the bound canon. For an attribute
+whose type or indexing changed while it was still empty, use a literal `:canon N`
+to prepare against that historical definition. Attributes with stored facts
+cannot change these fields in place, so their historical data is unaffected.
+The listed write grammar has `:unindexed` but no `:indexed` option; converting an
+unindexed attribute back to indexed is available through the native
+`MigrationOptions { indexed: Some(true), .. }` API.

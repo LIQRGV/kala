@@ -62,7 +62,8 @@ impl Txn<'_> {
         };
         for entity in ids {
             for change in view.changes(entity, attr) {
-                if mutual
+                if subjects.is_none()
+                    && mutual
                     && let Value::Ref(target) = change.value
                     && entity > target
                 {
@@ -73,23 +74,42 @@ impl Txn<'_> {
         }
         for staged in &self.entries {
             let (fact, mark) = staged.key_and_mark();
-            if fact.attr != attr || subjects.is_some_and(|ids| !ids.contains(&fact.entity)) {
+            if fact.attr != attr {
                 continue;
             }
             let value = Value::decode(&fact.value).expect("invariant: staged fact values encode");
-            let key = (fact.entity, fact.tick, value.clone());
-            if let Some(op) = mark.op() {
-                points.insert(
-                    key,
-                    Change {
-                        tick: fact.tick,
-                        op,
-                        value,
-                        precision: fact.precision,
-                    },
-                );
+            let reverse = if subjects.is_some() && mutual {
+                match &value {
+                    Value::Ref(target) if *target != fact.entity => {
+                        Some((*target, Value::Ref(fact.entity)))
+                    }
+                    _ => None,
+                }
             } else {
-                points.remove(&key);
+                None
+            };
+            // Restricted property reads are oriented around their old edge
+            // subjects, even when a mutual pair is stored under the other end.
+            // The subject list comes from ordered edge-map keys; logarithmic
+            // membership avoids quadratic scans of large ref migrations.
+            for (entity, value) in std::iter::once((fact.entity, value)).chain(reverse) {
+                if subjects.is_some_and(|ids| ids.binary_search(&entity).is_err()) {
+                    continue;
+                }
+                let key = (entity, fact.tick, value.clone());
+                if let Some(op) = mark.op() {
+                    points.insert(
+                        key,
+                        Change {
+                            tick: fact.tick,
+                            op,
+                            value,
+                            precision: fact.precision,
+                        },
+                    );
+                } else {
+                    points.remove(&key);
+                }
             }
         }
         points.into_iter().map(|((e, _, _), c)| (e, c)).collect()

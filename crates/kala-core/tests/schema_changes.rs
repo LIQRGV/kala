@@ -1798,3 +1798,160 @@ fn deprecated_attributes_can_be_relabelled_but_never_written_or_redeclared() {
     let mut tx = world.begin();
     assert!(tx.declare_attribute(attr("age", ValueType::I64)).is_err());
 }
+
+fn migrate_with_mutual_edge_property(staged_property: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("world.kala");
+    let mut world = World::create(
+        &path,
+        Schema::new()
+            .node_type("CHARACTER")
+            .attribute(AttrDef::new(
+                "link",
+                ValueType::Ref,
+                Kind::State,
+                Cardinality::Many,
+            ))
+            .attribute(
+                AttrDef::new("related_to", ValueType::Ref, Kind::State, Cardinality::Many)
+                    .bidirectional(),
+            ),
+    )
+    .unwrap();
+    let a = world.create_entity("CHARACTER", Some("edwin")).unwrap();
+    let b = world.create_entity("CHARACTER", Some("mara")).unwrap();
+    let c = world.create_entity("CHARACTER", Some("greg")).unwrap();
+    world
+        .assert(a, "link", Value::Ref(b), Some(Tick(-300)))
+        .unwrap();
+    let old_edge = world.edge_id(a, "link", b).unwrap();
+    let expected = vec![
+        Change {
+            tick: Tick(-250),
+            op: Op::Assert,
+            value: Value::Ref(c),
+            precision: Precision::Year,
+        },
+        Change {
+            tick: Tick(-200),
+            op: Op::Retract,
+            value: Value::Ref(c),
+            precision: Precision::Day,
+        },
+        Change {
+            tick: Tick(-150),
+            op: Op::Assert,
+            value: Value::Ref(c),
+            precision: Precision::Exact,
+        },
+    ];
+    let mut property = world.begin();
+    property
+        .assert_with_precision(
+            old_edge.into(),
+            "related_to",
+            Value::Ref(c),
+            Some(Tick(-250)),
+            Precision::Year,
+        )
+        .unwrap();
+    property
+        .retract_with_precision(
+            old_edge.into(),
+            "related_to",
+            Value::Ref(c),
+            Some(Tick(-200)),
+            Precision::Day,
+        )
+        .unwrap();
+    property
+        .assert(
+            old_edge.into(),
+            "related_to",
+            Value::Ref(c),
+            Some(Tick(-150)),
+        )
+        .unwrap();
+    let report = if staged_property {
+        let copied = property
+            .migrate_attribute(
+                "link",
+                MigrationOptions {
+                    cardinality: Some(Cardinality::One),
+                    ..MigrationOptions::default()
+                },
+            )
+            .unwrap();
+        property.commit().unwrap();
+        copied
+    } else {
+        property.commit().unwrap();
+        assert_eq!(
+            world.history(old_edge.into(), "related_to").unwrap(),
+            expected
+        );
+        let mut migration = world.begin();
+        let copied = migration
+            .migrate_attribute(
+                "link",
+                MigrationOptions {
+                    cardinality: Some(Cardinality::One),
+                    ..MigrationOptions::default()
+                },
+            )
+            .unwrap();
+        migration.commit().unwrap();
+        copied
+    };
+    assert_eq!(
+        report.edge_properties, 3,
+        "a mutual property stored with the old edge as target must be copied"
+    );
+    let new_edge = world.edge_id(a, "link", b).unwrap();
+    assert_ne!(new_edge, old_edge);
+    assert_eq!(
+        world.history(new_edge.into(), "related_to").unwrap(),
+        expected
+    );
+    assert_eq!(
+        world.history(old_edge.into(), "related_to").unwrap(),
+        expected
+    );
+    assert_eq!(
+        world
+            .as_of(new_edge.into(), "related_to", Tick(-225))
+            .unwrap(),
+        [Value::Ref(c)]
+    );
+    assert!(
+        world
+            .as_of(new_edge.into(), "related_to", Tick(-175))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        world.as_of(new_edge.into(), "related_to", Tick(0)).unwrap(),
+        [Value::Ref(c)]
+    );
+    let reopened = World::open_read_only(&path).unwrap();
+    assert_eq!(world.index_dump(), reopened.index_dump());
+    assert_eq!(
+        reopened.history(new_edge.into(), "related_to").unwrap(),
+        expected
+    );
+    assert!(
+        doctor(&reopened, &DoctorOptions::default())
+            .findings
+            .is_empty()
+    );
+}
+
+#[test]
+fn migration_preserves_committed_bidirectional_ref_edge_property_history() {
+    migrate_with_mutual_edge_property(false);
+}
+
+#[test]
+fn migration_preserves_staged_bidirectional_ref_edge_property_history() {
+    migrate_with_mutual_edge_property(true);
+}
