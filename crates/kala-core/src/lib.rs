@@ -12,6 +12,7 @@ mod key;
 pub mod log;
 pub mod overlap;
 pub mod schema;
+mod store;
 pub mod tick;
 pub mod value;
 mod value_table;

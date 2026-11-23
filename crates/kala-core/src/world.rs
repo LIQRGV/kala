@@ -47,6 +47,7 @@ mod schema_ops;
 use crate::schema::{
     AttributeOptions, MigrationOptions, MigrationReport, SchemaChange, SchemaEdit,
 };
+use crate::store::OrderedMap;
 pub(crate) use schema_ops::type_name as value_type_name;
 use schema_ops::{OrderedEntry, SchemaSnapshot};
 use std::borrow::Cow;
@@ -272,19 +273,19 @@ impl FactDef {
 
 /// An `E`-layout index with its value references resolved, and the stored
 /// keys that couldn't be (see [`World::resolved_e_index`]).
-pub(crate) type ResolvedIndex<'i, V> = (Cow<'i, BTreeMap<Vec<u8>, V>>, Vec<Vec<u8>>);
+pub(crate) type ResolvedIndex<'i, V> = (Cow<'i, OrderedMap<V>>, Vec<Vec<u8>>);
 
 /// An `E`- or `R`-layout index: full key -> what the entry says. Used for
 /// the committed indexes and for a transaction's staged entries, so one seek
 /// routine serves both.
-pub(crate) type Index = BTreeMap<Vec<u8>, Mark>;
+pub(crate) type Index = OrderedMap<Mark>;
 
 /// A latest-revision index (`E_latest` / `R_latest`): an `E`- or `R`-layout
 /// key without its `^tx` (`E|e|a|v|^tick`, `R|t|a|s|^tick`) -> the op of
 /// that key's current entry at the latest canon. A key whose current entry
 /// is a `DELETED` marker is absent, so the first key at or after `^T` in a
 /// history is the answer at `T`: one seek, nothing to skip.
-pub(crate) type LatestIndex = BTreeMap<Vec<u8>, Op>;
+pub(crate) type LatestIndex = OrderedMap<Op>;
 
 /// The tick precisions of an `E`-layout index (main keys with `^tx`, or
 /// latest-revision keys without), by the same key as the entry they belong
@@ -292,7 +293,7 @@ pub(crate) type LatestIndex = BTreeMap<Vec<u8>, Op>;
 /// row, so a world that never writes a vague tick holds none. Precision is
 /// a payload, never part of a key: the indexes themselves are the same
 /// whatever the precisions are.
-pub(crate) type Precisions = BTreeMap<Vec<u8>, Precision>;
+pub(crate) type Precisions = OrderedMap<Precision>;
 
 /// One entry a transaction staged, in write order: the order of its log
 /// entries.
@@ -772,16 +773,16 @@ impl World {
             edges_defined_in: Vec::new(),
             edge_by_triple: HashMap::new(),
             latest_tx: TxId(0),
-            e_index: BTreeMap::new(),
-            r_index: BTreeMap::new(),
-            e_latest: BTreeMap::new(),
-            r_latest: BTreeMap::new(),
-            e_precision: BTreeMap::new(),
-            e_latest_precision: BTreeMap::new(),
-            v_index: BTreeMap::new(),
-            v_latest: BTreeMap::new(),
-            vfold_index: BTreeMap::new(),
-            vfold_latest: BTreeMap::new(),
+            e_index: OrderedMap::new(),
+            r_index: OrderedMap::new(),
+            e_latest: OrderedMap::new(),
+            r_latest: OrderedMap::new(),
+            e_precision: OrderedMap::new(),
+            e_latest_precision: OrderedMap::new(),
+            v_index: OrderedMap::new(),
+            v_latest: OrderedMap::new(),
+            vfold_index: OrderedMap::new(),
+            vfold_latest: OrderedMap::new(),
             values: ValueTable::default(),
             content_hash: fnv1a64,
             tick_counts: BTreeMap::new(),
@@ -1682,13 +1683,7 @@ impl World {
         let vague = mark.op().is_some() && fact.precision != Precision::Exact;
         if vague {
             self.e_precision.insert(k.clone(), fact.precision);
-            match self.e_latest_precision.get_mut(at_key) {
-                Some(p) => *p = fact.precision,
-                None => {
-                    self.e_latest_precision
-                        .insert(at_key.to_vec(), fact.precision);
-                }
-            }
+            self.e_latest_precision.set(at_key, fact.precision);
         } else {
             self.e_latest_precision.remove(at_key);
         }
@@ -1823,7 +1818,7 @@ impl World {
     /// the index when nothing needs resolving.
     pub(crate) fn resolved_e_index<'i, V: Clone>(
         &self,
-        index: &'i BTreeMap<Vec<u8>, V>,
+        index: &'i OrderedMap<V>,
         main: bool,
     ) -> ResolvedIndex<'i, V> {
         let unindexed_strings = self
@@ -1833,27 +1828,27 @@ impl World {
         if self.values.is_empty() && !unindexed_strings {
             return (Cow::Borrowed(index), Vec::new());
         }
-        let mut out = BTreeMap::new();
+        let mut out = OrderedMap::new();
         let mut bad = Vec::new();
-        for (k, v) in index {
+        for (k, v) in index.iter() {
             let split = if main {
                 key::decode_e_key(k).map(|(e, a, part, ..)| (e, a, part))
             } else {
                 key::decode_latest_e_key(k).map(|(e, a, part, _)| (e, a, part))
             };
             let Ok((_, attr, part)) = split else {
-                out.insert(k.clone(), v.clone());
+                out.insert(k.to_vec(), v.clone());
                 continue;
             };
             let is_ref = ValueRef::from_key_bytes(part).is_some();
             if self.attributes.get(attr.0 as usize).is_none() && !is_ref {
                 // An unknown attribute: no layout to check against.
-                out.insert(k.clone(), v.clone());
+                out.insert(k.to_vec(), v.clone());
                 continue;
             }
             let resolved = self.e_part_encoding(attr, part);
             let Some(full) = resolved else {
-                bad.push(k.clone());
+                bad.push(k.to_vec());
                 continue;
             };
             // The part sits right after `E|e|a|`; the suffix follows it.
@@ -1917,24 +1912,33 @@ impl World {
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub fn tamper_index(&mut self, t: Tamper) {
-        fn remove_nth<V>(index: &mut BTreeMap<Vec<u8>, V>, nth: usize) {
-            if let Some(k) = index.keys().nth(nth).cloned() {
+        fn remove_nth<V>(index: &mut OrderedMap<V>, nth: usize) {
+            let key = index.keys().nth(nth).map(<[u8]>::to_vec);
+            if let Some(k) = key {
                 index.remove(&k);
             }
         }
-        let flip_mark = |m: &mut Mark| {
-            *m = match m {
+        fn flip_nth<V: Copy>(index: &mut OrderedMap<V>, nth: usize, flip: fn(V) -> V) {
+            let Some(k) = index.keys().nth(nth).map(<[u8]>::to_vec) else {
+                return;
+            };
+            if let Some(v) = index.get(&k).copied() {
+                index.set(&k, flip(v));
+            }
+        }
+        fn flip_mark(m: Mark) -> Mark {
+            match m {
                 Mark::Assert => Mark::Retract,
                 // A DELETED marker has no op; it becomes a fact.
                 Mark::Retract | Mark::Deleted => Mark::Assert,
             }
-        };
-        let flip_op = |o: &mut Op| {
-            *o = match o {
+        }
+        fn flip_op(o: Op) -> Op {
+            match o {
                 Op::Assert => Op::Retract,
                 Op::Retract => Op::Assert,
             }
-        };
+        }
         match t {
             Tamper::InsertRawKey { index, key } => match index {
                 IndexName::E => {
@@ -1973,54 +1977,14 @@ impl World {
                 IndexName::VFoldLatest => remove_nth(&mut self.vfold_latest, nth),
             },
             Tamper::FlipOp { index, nth } => match index {
-                IndexName::E => self
-                    .e_index
-                    .values_mut()
-                    .nth(nth)
-                    .into_iter()
-                    .for_each(flip_mark),
-                IndexName::R => self
-                    .r_index
-                    .values_mut()
-                    .nth(nth)
-                    .into_iter()
-                    .for_each(flip_mark),
-                IndexName::ELatest => self
-                    .e_latest
-                    .values_mut()
-                    .nth(nth)
-                    .into_iter()
-                    .for_each(flip_op),
-                IndexName::RLatest => self
-                    .r_latest
-                    .values_mut()
-                    .nth(nth)
-                    .into_iter()
-                    .for_each(flip_op),
-                IndexName::V => self
-                    .v_index
-                    .values_mut()
-                    .nth(nth)
-                    .into_iter()
-                    .for_each(flip_mark),
-                IndexName::VLatest => self
-                    .v_latest
-                    .values_mut()
-                    .nth(nth)
-                    .into_iter()
-                    .for_each(flip_op),
-                IndexName::VFold => self
-                    .vfold_index
-                    .values_mut()
-                    .nth(nth)
-                    .into_iter()
-                    .for_each(flip_mark),
-                IndexName::VFoldLatest => self
-                    .vfold_latest
-                    .values_mut()
-                    .nth(nth)
-                    .into_iter()
-                    .for_each(flip_op),
+                IndexName::E => flip_nth(&mut self.e_index, nth, flip_mark),
+                IndexName::R => flip_nth(&mut self.r_index, nth, flip_mark),
+                IndexName::ELatest => flip_nth(&mut self.e_latest, nth, flip_op),
+                IndexName::RLatest => flip_nth(&mut self.r_latest, nth, flip_op),
+                IndexName::V => flip_nth(&mut self.v_index, nth, flip_mark),
+                IndexName::VLatest => flip_nth(&mut self.v_latest, nth, flip_op),
+                IndexName::VFold => flip_nth(&mut self.vfold_index, nth, flip_mark),
+                IndexName::VFoldLatest => flip_nth(&mut self.vfold_latest, nth, flip_op),
             },
         }
     }
@@ -2112,7 +2076,7 @@ impl World {
             base_tick,
             default_tick: None,
             tx,
-            staged: BTreeMap::new(),
+            staged: OrderedMap::new(),
             entries: Vec::new(),
             ids: StagedIds::default(),
             poisoned: false,
@@ -3344,7 +3308,7 @@ fn as_fact(body: &EntryBody) -> Option<FactFields<'_>> {
     }
 }
 
-/// Borrows an owned key bound as a slice bound, for `BTreeMap::range`.
+/// Borrows an owned key bound as a slice bound, for [`OrderedMap::scan`].
 fn as_slice(b: &Bound<Vec<u8>>) -> Bound<&[u8]> {
     match b {
         Bound::Included(k) => Bound::Included(k),
@@ -4420,7 +4384,7 @@ impl View<'_> {
         } else {
             self.work
         };
-        for (k, mark) in &self.world.e_index {
+        for (k, mark) in self.world.e_index.iter() {
             if !work.add(1) {
                 break;
             }
@@ -5540,7 +5504,7 @@ impl View<'_> {
 /// finds the next distinct history, seeks it, then jumps past all of its
 /// keys, so the cost is one seek per distinct `x` ever stored.
 fn for_each_holding<V>(
-    index: &BTreeMap<Vec<u8>, V>,
+    index: &OrderedMap<V>,
     attr_prefix: &[u8],
     history_end: impl Fn(&[u8]) -> usize,
     work: Work<'_>,
@@ -5559,7 +5523,7 @@ fn for_each_holding<V>(
 /// order (`f` may use it as a seek buffer, restoring it before returning).
 /// Charges `work` one key per round (the key that ends the walk included).
 fn for_each_history<V>(
-    index: &BTreeMap<Vec<u8>, V>,
+    index: &OrderedMap<V>,
     attr_prefix: &[u8],
     history_end: impl Fn(&[u8]) -> usize,
     work: Work<'_>,
@@ -5567,10 +5531,7 @@ fn for_each_history<V>(
 ) {
     let mut from = Bound::Included(attr_prefix.to_vec());
     let mut prefix = Vec::new();
-    while let Some((k, _)) = index
-        .range::<[u8], _>((as_slice(&from), Bound::Unbounded))
-        .next()
-    {
+    while let Some((k, _)) = index.scan(as_slice(&from)).next() {
         if !work.add(1) {
             break;
         }
@@ -5602,10 +5563,9 @@ fn under<'i>(
     work: Work<'i>,
 ) -> impl Iterator<Item = (&'i [u8], &'i Op)> + 'i {
     index
-        .range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded))
+        .scan_from(prefix)
         .take_while(move |_| work.add(1))
         .take_while(move |(k, _)| k.starts_with(prefix))
-        .map(|(k, op)| (&k[..], op))
 }
 
 /// Makes `mark` the current entry of latest-revision key `at_key`: a fact
@@ -5613,12 +5573,7 @@ fn under<'i>(
 /// empties the key.
 fn set_latest(index: &mut LatestIndex, at_key: &[u8], mark: Mark) {
     match mark.op() {
-        Some(op) => match index.get_mut(at_key) {
-            Some(current) => *current = op,
-            None => {
-                index.insert(at_key.to_vec(), op);
-            }
-        },
+        Some(op) => index.set(at_key, op),
         None => {
             index.remove(at_key);
         }
@@ -5649,10 +5604,10 @@ fn latest_seek<'i>(
     let len = value_prefix.len();
     key::push_seek_tick(value_prefix, t);
     let found = index
-        .range::<[u8], _>((Bound::Included(&value_prefix[..]), Bound::Unbounded))
+        .scan_from(value_prefix)
         .next()
         .filter(|(k, _)| k.starts_with(&value_prefix[..len]))
-        .map(|(k, op)| (&k[..], *op));
+        .map(|(k, op)| (k, *op));
     value_prefix.truncate(len);
     found
 }
@@ -5681,7 +5636,7 @@ fn current_entries_metered<'i>(
 ) -> impl Iterator<Item = (&'i [u8], Op)> + 'i {
     let mut last_key: Option<&'i [u8]> = None;
     index
-        .range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded))
+        .scan_from(prefix)
         .take_while(move |_| work.add(1))
         .take_while(move |(k, _)| k.starts_with(prefix))
         .filter(move |(k, _)| key::e_key_tx(k).is_some_and(|tx| tx <= canon))
@@ -5691,7 +5646,7 @@ fn current_entries_metered<'i>(
             last_key = Some(at_key);
             first
         })
-        .filter_map(|(k, mark)| Some((&k[..], mark.op()?)))
+        .filter_map(|(k, mark)| Some((k, mark.op()?)))
 }
 
 /// The edge of a stored `ref` pair `(source, attr, target)` of `world`.
@@ -5876,7 +5831,7 @@ fn has_key(index: &Index, fact: &FactDef) -> bool {
     let mut at_key = key::e_value_prefix(fact.entity, fact.attr, fact.key_value());
     key::push_seek_tick(&mut at_key, fact.tick);
     index
-        .range::<[u8], _>((Bound::Included(&at_key[..]), Bound::Unbounded))
+        .scan_from(&at_key)
         .next()
         .is_some_and(|(k, _)| k.starts_with(&at_key))
 }
@@ -5953,7 +5908,7 @@ fn seek_entry<'i>(
             .iter()
             .filter_map(|index| {
                 index
-                    .range::<[u8], _>((lower, Bound::Unbounded))
+                    .scan(lower)
                     .take_while(|_| work.add(1))
                     .take_while(|(k, _)| k.starts_with(prefix))
                     .find(|(k, _)| key::e_key_tx(k).is_some_and(|tx| tx <= canon))
@@ -5961,7 +5916,7 @@ fn seek_entry<'i>(
             .min_by(|(a, _), (b, _)| a.cmp(b));
         let (k, mark) = found?;
         match mark.op() {
-            Some(op) => return Some((&k[..], op)),
+            Some(op) => return Some((k, op)),
             None => past = Some(key::past_tick(k)),
         }
     }
