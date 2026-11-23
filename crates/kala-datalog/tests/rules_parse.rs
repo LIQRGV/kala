@@ -5,8 +5,9 @@
 //! and `ErrorKind::UnknownRule` (the latter two are used in rules_exec.rs).
 //! Valid rule queries must `parse` (today: `Unsupported`, "slice 7").
 
-use kala_core::{World, load_fixture};
+use kala_core::World;
 use kala_datalog::{ErrorKind, MAX_CLAUSES, MAX_PATTERNS, MAX_RULES, parse, prepare};
+use kala_fixture::load_fixture;
 
 const VARROW: &str = include_str!("../../kala-core/tests/fixtures/varrow.yaml");
 

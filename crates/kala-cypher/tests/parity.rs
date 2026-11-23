@@ -1,5 +1,6 @@
 //! Milestone 1: independently parsed languages share the exact IR and rows.
-use kala_core::{Tick, Value, load_fixture};
+use kala_core::{Tick, Value};
+use kala_fixture::load_fixture;
 use kala_query::{Limits, Params, run};
 
 const VARROW: &str = include_str!("../../kala-core/tests/fixtures/varrow.yaml");

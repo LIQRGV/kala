@@ -14,7 +14,7 @@ const FORBIDDEN: &str = "Neo.ClientError.Security.Forbidden";
 
 fn account_server() -> Running {
     let dir = tempfile::tempdir().unwrap();
-    drop(kala_core::load_fixture_to(VARROW, &dir.path().join("varrow.kala")).unwrap());
+    drop(kala_fixture::load_fixture_to(VARROW, &dir.path().join("varrow.kala")).unwrap());
     system::add(dir.path(), "alice@127.0.0.1", Some(PASSWORD)).unwrap();
     system::grant(dir.path(), "alice@127.0.0.1", "read", "varrow").unwrap();
     let config = ServerConfig {
@@ -306,7 +306,7 @@ fn bootstrap_is_marked_private_and_account_changes_keep_history() {
 #[test]
 fn system_cannot_be_read_through_a_user_database_alias() {
     let dir = tempfile::tempdir().unwrap();
-    drop(kala_core::load_fixture_to(VARROW, &dir.path().join("varrow.kala")).unwrap());
+    drop(kala_fixture::load_fixture_to(VARROW, &dir.path().join("varrow.kala")).unwrap());
     system::add(dir.path(), "alice@127.0.0.1", Some(PASSWORD)).unwrap();
     system::grant(dir.path(), "alice@127.0.0.1", "read", "renamed").unwrap();
     std::fs::copy(
@@ -344,7 +344,7 @@ fn system_cannot_be_read_through_a_user_database_alias() {
 fn existing_user_world_cannot_occupy_reserved_system_name() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("system.kala");
-    drop(kala_core::load_fixture_to(VARROW, &path).unwrap());
+    drop(kala_fixture::load_fixture_to(VARROW, &path).unwrap());
     let original = std::fs::read(&path).unwrap();
     assert!(system::ensure(dir.path()).is_err());
     assert_eq!(std::fs::read(path).unwrap(), original);
@@ -470,7 +470,7 @@ fn malformed_auth_does_not_fall_back_to_none() {
 #[test]
 fn backup_only_grant_never_authorizes_bolt_read() {
     let dir = tempfile::tempdir().unwrap();
-    drop(kala_core::load_fixture_to(VARROW, &dir.path().join("varrow.kala")).unwrap());
+    drop(kala_fixture::load_fixture_to(VARROW, &dir.path().join("varrow.kala")).unwrap());
     system::add(dir.path(), "alice@127.0.0.1", Some(PASSWORD)).unwrap();
     system::grant(dir.path(), "alice@127.0.0.1", "backup", "varrow").unwrap();
     let auth = Arc::new(Accounts::open(dir.path()).unwrap());

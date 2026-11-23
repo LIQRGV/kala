@@ -1,5 +1,6 @@
 //! Read-subset behavior, including semantic differences from Datalog.
-use kala_core::{Value, World, load_fixture};
+use kala_core::{Value, World};
+use kala_fixture::load_fixture;
 use kala_query::{Datum, Limits, Params, QueryError, run, run_with_cancel};
 use std::sync::atomic::AtomicBool;
 

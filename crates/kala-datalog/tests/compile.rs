@@ -9,6 +9,7 @@
 use kala_core::*;
 use kala_datalog::ast;
 use kala_datalog::{DatalogError, ErrorKind, ParamKind, Prepared, compile, parse, prepare};
+use kala_fixture::load_fixture;
 use kala_query::{CanonSource, Limits, Params, ResultSet, TickSource, Var, run};
 use std::collections::BTreeSet;
 

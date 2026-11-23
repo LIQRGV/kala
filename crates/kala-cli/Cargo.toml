@@ -12,6 +12,8 @@ workspace = true
 
 [dependencies]
 kala-core = { path = "../kala-core" }
+# `kala load` (internal crate).
+kala-fixture = { path = "../kala-fixture" }
 # `kala query` / `kala explain` (internal crates).
 kala-query = { path = "../kala-query" }
 kala-datalog = { path = "../kala-datalog" }

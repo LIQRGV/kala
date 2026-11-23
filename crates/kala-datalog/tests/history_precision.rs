@@ -1,9 +1,9 @@
 //! Sixth history position exposes the precision of each change point.
 use kala_core::{
     AttrDef, Cardinality, Correction, Kind, Precision, Schema, Tick, Value, ValueType, World,
-    load_fixture,
 };
 use kala_datalog::prepare;
+use kala_fixture::load_fixture;
 use kala_query::{Datum, Limits, Params, run};
 
 const VARROW: &str = include_str!("../../kala-core/tests/fixtures/varrow.yaml");

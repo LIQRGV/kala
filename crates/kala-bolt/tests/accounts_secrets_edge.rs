@@ -14,9 +14,9 @@ const FORBIDDEN: &str = "Neo.ClientError.Security.Forbidden";
 
 fn server_with(extra: &[(&str, &str)]) -> Running {
     let dir = tempfile::tempdir().unwrap();
-    drop(kala_core::load_fixture_to(common::VARROW, &dir.path().join("varrow.kala")).unwrap());
+    drop(kala_fixture::load_fixture_to(common::VARROW, &dir.path().join("varrow.kala")).unwrap());
     for (name, yaml) in extra {
-        drop(kala_core::load_fixture_to(yaml, &dir.path().join(name)).unwrap());
+        drop(kala_fixture::load_fixture_to(yaml, &dir.path().join(name)).unwrap());
     }
     system::add(
         dir.path(),
@@ -144,5 +144,5 @@ schema:
     - { name: password_hash, type: string, inverse: hash_of }
 "#;
     let dir = tempfile::tempdir().unwrap();
-    assert!(kala_core::load_fixture_to(BAD, &dir.path().join("bad.kala")).is_err());
+    assert!(kala_fixture::load_fixture_to(BAD, &dir.path().join("bad.kala")).is_err());
 }

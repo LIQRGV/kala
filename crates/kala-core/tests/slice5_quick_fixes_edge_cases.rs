@@ -5,6 +5,7 @@
 //! `FixtureError`, except the YAML parser's own layout newlines; echoed input
 //! is cut at 64 chars + `...`. A YAML tag on any mapping key is refused.
 use kala_core::*;
+use kala_fixture::{FixtureErrorKind, load_fixture};
 
 const BIDI: [char; 9] = [
     '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}',

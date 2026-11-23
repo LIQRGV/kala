@@ -14,9 +14,10 @@ use std::fs::{self, File};
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
-use kala_core::fixture::MAX_FIXTURE_BYTES;
+use kala_core::World;
 use kala_core::log::EntryBody;
-use kala_core::{FixtureError, FixtureErrorKind, World};
+use kala_fixture::MAX_FIXTURE_BYTES;
+use kala_fixture::{FixtureError, FixtureErrorKind};
 
 use crate::error::CliError;
 use crate::escape;
@@ -207,7 +208,7 @@ fn load_to_temp(
     const ATTEMPTS: u32 = 8;
     for attempt in 0..ATTEMPTS {
         let tmp = temp_path(dir, file_name, attempt);
-        match kala_core::load_fixture_to(yaml, &tmp) {
+        match kala_fixture::load_fixture_to(yaml, &tmp) {
             Ok(w) => return Ok((tmp, w)),
             // `World::create` refused the name: someone else's file, so it
             // isn't removed; try another name.

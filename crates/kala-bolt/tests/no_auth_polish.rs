@@ -29,7 +29,7 @@ fn no_auth_identity_holds_read_star_and_not_admin() {
 
 fn dir_with_real_system_world() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    drop(kala_core::load_fixture_to(VARROW, &dir.path().join("varrow.kala")).unwrap());
+    drop(kala_fixture::load_fixture_to(VARROW, &dir.path().join("varrow.kala")).unwrap());
     assert!(system::ensure(dir.path()).unwrap());
     dir
 }

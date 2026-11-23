@@ -13,7 +13,7 @@ fn loaded_varrow() -> Fx {
     let path = dir.path().join("world.kala");
     let output = kala(["load", VARROW, path.to_str().unwrap()]);
     assert_eq!(code(&output), 0, "{}", stderr(&output));
-    let mem = kala_core::load_fixture(&fs::read_to_string(VARROW).unwrap()).unwrap();
+    let mem = kala_fixture::load_fixture(&fs::read_to_string(VARROW).unwrap()).unwrap();
     Fx { dir, path, mem }
 }
 

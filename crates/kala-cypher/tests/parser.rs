@@ -1,5 +1,6 @@
 //! Grammar and bounded-input regressions through the public front-end.
-use kala_core::{Value, load_fixture};
+use kala_core::Value;
+use kala_fixture::load_fixture;
 use kala_query::{Limits, Params, run};
 use proptest::prelude::*;
 

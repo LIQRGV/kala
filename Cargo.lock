@@ -424,6 +424,7 @@ dependencies = [
  "kala-core",
  "kala-cypher",
  "kala-datalog",
+ "kala-fixture",
  "kala-query",
  "proptest",
  "tempfile",
@@ -439,6 +440,7 @@ dependencies = [
  "kala-core",
  "kala-cypher",
  "kala-datalog",
+ "kala-fixture",
  "kala-query",
  "libc",
  "proptest",
@@ -456,9 +458,8 @@ dependencies = [
  "caseless",
  "crc32fast",
  "kala-core",
+ "kala-fixture",
  "proptest",
- "serde",
- "serde-saphyr",
  "tempfile",
  "unicode-normalization",
 ]
@@ -469,6 +470,7 @@ version = "0.1.0"
 dependencies = [
  "kala-core",
  "kala-datalog",
+ "kala-fixture",
  "kala-query",
  "proptest",
  "tempfile",
@@ -479,8 +481,21 @@ name = "kala-datalog"
 version = "0.1.0"
 dependencies = [
  "kala-core",
+ "kala-fixture",
  "kala-query",
  "proptest",
+ "tempfile",
+]
+
+[[package]]
+name = "kala-fixture"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "kala-core",
+ "proptest",
+ "serde",
+ "serde-saphyr",
  "tempfile",
 ]
 
@@ -489,6 +504,7 @@ name = "kala-query"
 version = "0.1.0"
 dependencies = [
  "kala-core",
+ "kala-fixture",
  "proptest",
  "tempfile",
 ]

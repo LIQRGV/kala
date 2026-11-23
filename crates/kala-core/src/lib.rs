@@ -5,7 +5,6 @@
 pub mod doctor;
 mod echo;
 pub mod error;
-pub mod fixture;
 pub mod id;
 pub mod interval;
 mod key;
@@ -22,9 +21,8 @@ pub mod world;
 #[doc(hidden)]
 pub use doctor::Tamper;
 pub use doctor::{DoctorOptions, Finding, IndexName, Report, Severity, doctor, doctor_log};
-pub use echo::must_escape;
+pub use echo::{Echo, must_escape};
 pub use error::{Error, ErrorEntity, UnconvertibleValue, WorkInterruptReason};
-pub use fixture::{FixtureError, FixtureErrorKind, OpRef, load_fixture, load_fixture_to};
 pub use id::{AttrId, EdgeId, EntityId, IdError, NodeTypeId};
 pub use interval::IntervalSet;
 #[cfg(feature = "test-hooks")]

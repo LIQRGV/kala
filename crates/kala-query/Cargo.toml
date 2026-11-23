@@ -13,5 +13,6 @@ workspace = true
 kala-core = { path = "../kala-core" }
 
 [dev-dependencies]
+kala-fixture = { path = "../kala-fixture" }
 proptest = "1.12.0"
 tempfile = "3.27.0"

@@ -1,5 +1,6 @@
 //! Slice 13 polish, confirm step: edge cases the implementation revealed.
-use kala_core::{Value, World, load_fixture};
+use kala_core::{Value, World};
+use kala_fixture::load_fixture;
 use kala_query::{
     CanonSource, CmpOp, Datum, Expr, Limits, Op, OutputSpec, Params, Plan, QueryParams, RowAction,
     TickSource, Var, run, run_with_values,

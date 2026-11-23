@@ -9,7 +9,7 @@ use kala_query::{
 pub const VARROW: &str = include_str!("../../../kala-core/tests/fixtures/varrow.yaml");
 
 pub fn varrow() -> World {
-    kala_core::load_fixture(VARROW).expect("varrow fixture loads")
+    kala_fixture::load_fixture(VARROW).expect("varrow fixture loads")
 }
 
 pub fn v(n: &str) -> Var {

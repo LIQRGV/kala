@@ -21,7 +21,7 @@ impl Process {
     fn with_options(listen: &str, options: &[&str], test_user: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         drop(
-            kala_core::load_fixture_to(
+            kala_fixture::load_fixture_to(
                 include_str!("../../kala-core/tests/fixtures/varrow.yaml"),
                 &dir.path().join("varrow.kala"),
             )

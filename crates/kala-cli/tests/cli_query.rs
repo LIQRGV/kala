@@ -8,7 +8,8 @@
 mod common;
 
 use common::*;
-use kala_core::{Direction, EntityId, Tick, TxId, World, load_fixture};
+use kala_core::{Direction, EntityId, Tick, TxId, World};
+use kala_fixture::load_fixture;
 use serde_json::{Value as Json, json};
 use std::ffi::OsString;
 use std::path::PathBuf;

@@ -1,5 +1,6 @@
-use kala_core::{Tick, TxId, World, load_fixture};
+use kala_core::{Tick, TxId, World};
 use kala_datalog::{SessionDefaults, parse_rules, prepare_with};
+use kala_fixture::load_fixture;
 use kala_query::{Limits, Params};
 
 fn world() -> World {

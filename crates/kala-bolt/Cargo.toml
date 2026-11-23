@@ -16,5 +16,6 @@ kala-cypher = { path = "../kala-cypher" }
 argon2 = { version = "=0.5.3", default-features = false, features = ["std", "password-hash", "rand"] }
 
 [dev-dependencies]
+kala-fixture = { path = "../kala-fixture" }
 tempfile = "3.27.0"
 proptest = "1.12.0"

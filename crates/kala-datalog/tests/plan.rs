@@ -14,6 +14,7 @@
 //! - the exact header/line formats are those of `Plan::explain` in the contract.
 use kala_core::*;
 use kala_datalog::prepare;
+use kala_fixture::load_fixture;
 use kala_query::{AttrRef, Limits, Op as QOp, Params, Plan, ResultSet, TickSource, run};
 use std::collections::BTreeSet;
 

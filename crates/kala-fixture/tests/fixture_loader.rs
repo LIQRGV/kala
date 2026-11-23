@@ -3,7 +3,7 @@
 //! Test fixture format" and "Core ideas" tick defaulting).
 //!
 //! RED until the implementation lands: this file fails to COMPILE (there is no
-//! `kala_core::fixture` module).
+//! `kala_fixture` crate).
 //!
 //! API expected (module `fixture`, also re-exported at the crate root):
 //!
@@ -23,11 +23,12 @@
 //! into a file has exactly the bytes of the file the loader wrote (so the same entry
 //! IDs, transactions, ticks and precisions). Every parity test builds the native side
 //! FIRST, then calls the loader.
+#[path = "../../kala-core/tests/common/mod.rs"]
 mod common;
 
-use kala_core::fixture::{FixtureError, FixtureErrorKind, OpRef, load_fixture, load_fixture_to};
 use kala_core::log::EntryBody;
 use kala_core::*;
+use kala_fixture::{FixtureError, FixtureErrorKind, OpRef, load_fixture, load_fixture_to};
 use proptest::prelude::*;
 use proptest::test_runner::{RngAlgorithm, RngSeed};
 use std::path::Path;
@@ -235,16 +236,17 @@ fn parity(yaml: &str, native: impl FnOnce(&mut World)) -> Parity {
 
 #[test]
 fn the_fixture_api_is_exported_from_the_module_and_the_crate_root() {
-    let _: fn(&str) -> Result<World, FixtureError> = kala_core::fixture::load_fixture;
-    let _: fn(&str, &Path) -> Result<World, FixtureError> = kala_core::fixture::load_fixture_to;
-    let _: fn(&str) -> Result<World, kala_core::FixtureError> = kala_core::load_fixture;
-    let _: fn(&str, &Path) -> Result<World, kala_core::FixtureError> = kala_core::load_fixture_to;
-    let _ = kala_core::OpRef {
+    let _: fn(&str) -> Result<World, FixtureError> = kala_fixture::load_fixture;
+    let _: fn(&str, &Path) -> Result<World, FixtureError> = kala_fixture::load_fixture_to;
+    let _: fn(&str) -> Result<World, kala_fixture::FixtureError> = kala_fixture::load_fixture;
+    let _: fn(&str, &Path) -> Result<World, kala_fixture::FixtureError> =
+        kala_fixture::load_fixture_to;
+    let _ = kala_fixture::OpRef {
         txn: 0,
         op: 0,
         label: None,
     };
-    let _: kala_core::FixtureErrorKind = kala_core::FixtureErrorKind::Yaml(String::new());
+    let _: kala_fixture::FixtureErrorKind = kala_fixture::FixtureErrorKind::Yaml(String::new());
 }
 
 #[test]

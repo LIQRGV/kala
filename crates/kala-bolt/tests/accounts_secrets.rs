@@ -34,8 +34,8 @@ transactions:
 
 fn server() -> Running {
     let dir = tempfile::tempdir().unwrap();
-    drop(kala_core::load_fixture_to(common::VARROW, &dir.path().join("varrow.kala")).unwrap());
-    drop(kala_core::load_fixture_to(USERS_YAML, &dir.path().join("users.kala")).unwrap());
+    drop(kala_fixture::load_fixture_to(common::VARROW, &dir.path().join("varrow.kala")).unwrap());
+    drop(kala_fixture::load_fixture_to(USERS_YAML, &dir.path().join("users.kala")).unwrap());
     system::add(dir.path(), "carol@127.0.0.1", Some(PASSWORD)).unwrap();
     system::grant(dir.path(), "carol@127.0.0.1", "read", "varrow").unwrap();
     let config = ServerConfig {

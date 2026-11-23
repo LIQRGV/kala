@@ -14,9 +14,12 @@ pub(crate) const MAX_ECHO_CHARS: usize = 64;
 
 /// Shows `self.0` with every [`must_escape`] char escaped (`Cc` as
 /// `char::escape_debug` does: `\u{1b}`, `\n`; the rest as `\u{202e}`), cut to
-/// its first [`MAX_ECHO_CHARS`] chars (counted in the original string) plus `...`.
+/// its first `MAX_ECHO_CHARS` (64) chars (counted in the original string) plus `...`.
 /// Printable text, non-ASCII included, is shown as is.
-pub(crate) struct Echo<'a>(pub(crate) &'a str);
+///
+/// Public so that crates building error messages over kala-core (the fixture
+/// loader) echo input exactly as kala-core's own errors do.
+pub struct Echo<'a>(pub &'a str);
 
 /// [`Echo`] inside double quotes, with `"` and `\` also escaped, so plain
 /// input reads exactly as its `Debug` form would.

@@ -1,5 +1,5 @@
 //! Regressions from the slice-13 security review.
-use kala_core::load_fixture;
+use kala_fixture::load_fixture;
 use kala_query::{Datum, Limits, Params, QueryError, run};
 
 #[test]

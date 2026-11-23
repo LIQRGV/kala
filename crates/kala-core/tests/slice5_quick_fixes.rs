@@ -7,6 +7,7 @@
 //!      (`\u{1b}`, `\n`) and are cut to their first 64 chars plus `...`.
 //!      Printable non-ASCII is kept. Only `Display` is asserted, never payloads.
 use kala_core::*;
+use kala_fixture::{FixtureErrorKind, load_fixture};
 
 // ------------------------------------------------------------------ (a)
 

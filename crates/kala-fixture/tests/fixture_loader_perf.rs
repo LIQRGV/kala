@@ -11,8 +11,8 @@
 //! H2: in the bare `operations:` form, each commit must not rescan the whole
 //! history of the attribute for warnings.
 
-use kala_core::fixture::{load_fixture, load_fixture_to};
 use kala_core::*;
+use kala_fixture::{load_fixture, load_fixture_to};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::time::{Duration, Instant};

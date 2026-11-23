@@ -1,6 +1,7 @@
 //! Polish fixes B, D, E, F, I of slice 13: Cypher front-end semantics.
 use kala_core::ValueType;
-use kala_core::{Value, World, load_fixture};
+use kala_core::{Value, World};
+use kala_fixture::load_fixture;
 use kala_query::{Datum, Limits, ParamKind, Params, run};
 use proptest::prelude::*;
 
