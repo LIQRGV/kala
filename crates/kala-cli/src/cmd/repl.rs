@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kala_core::{Tick, TxId};
-use kala_datalog::{Completeness, MAX_QUERY_BYTES, SessionDefaults};
+use kala_datalog::{Completeness, CompletenessScanner, MAX_QUERY_BYTES, SessionDefaults};
 use kala_query::Limits;
 use rustyline::error::ReadlineError;
 use rustyline::history::MemHistory;
@@ -134,6 +134,7 @@ struct Session<'a> {
     params: BTreeMap<String, String>,
     json: bool,
     buffer: String,
+    scanner: CompletenessScanner,
     pending: Pending,
     cancel: Arc<AtomicBool>,
 }
@@ -151,6 +152,7 @@ impl Session<'_> {
 
     fn discard(&mut self) {
         self.buffer.clear();
+        self.scanner.reset();
         self.pending = Pending::Query;
     }
 
@@ -198,12 +200,14 @@ impl Session<'_> {
         }
         if separator != 0 {
             self.buffer.push('\n');
+            self.scanner.push("\n");
         }
         self.buffer.push_str(line);
-        if kala_datalog::completeness(&self.buffer) == Completeness::Incomplete {
+        if self.scanner.push(line) == Completeness::Incomplete {
             return Ok(Action::Continue);
         }
         let text = std::mem::take(&mut self.buffer);
+        self.scanner.reset();
         let kind = self.pending;
         self.pending = Pending::Query;
         match kind {
@@ -542,6 +546,7 @@ fn drive(
         params: BTreeMap::new(),
         json: false,
         buffer: String::new(),
+        scanner: CompletenessScanner::new(),
         pending: Pending::Query,
         cancel,
     };
