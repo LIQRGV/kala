@@ -8,9 +8,23 @@ use crate::log::EntryId;
 use crate::tick::Tick;
 use crate::value::{ValueError, ValueType};
 
+/// Why a metered read was interrupted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkInterruptReason {
+    /// The key limit was exceeded.
+    Limit,
+    /// The caller requested a stop.
+    Stopped,
+}
+
 /// Why a world operation failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
+    /// A bounded read stopped before producing an answer.
+    WorkInterrupted {
+        /// Whether the key bound or stop flag interrupted the read.
+        reason: WorkInterruptReason,
+    },
     /// The node type name isn't declared in the schema.
     UnknownNodeType(String),
     /// The handle is already used by another entity in this world.
@@ -148,6 +162,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Error::WorkInterrupted { reason } => write!(f, "read interrupted: {reason:?}"),
             Error::UnknownNodeType(name) => write!(f, "unknown node type {}", Quoted(name)),
             Error::DuplicateHandle(h) => write!(f, "handle {} is already in use", Quoted(h)),
             Error::DuplicateName(name) => {

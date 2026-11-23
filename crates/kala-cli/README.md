@@ -111,3 +111,5 @@ memory; summing peaks is deliberately conservative. Exhaustion emits one hint,
 `story checks stopped: budget exhausted at :name`, covering that check and all
 later checks. Hints do not change doctor's exit code. Output renders only the
 first five rows in text or 100 in JSON, while retaining the exact total row count.
+
+Doctor story-check output is capped across hints at 10,000 rendered rows and 16 MiB of row text or JSON; exact row counts remain available with an `output_truncated` hint.

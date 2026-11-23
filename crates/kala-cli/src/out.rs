@@ -264,6 +264,35 @@ pub fn render<T: Serialize + Text>(out: &T, json: bool) -> String {
     if json { to_json(out) } else { out.text() }
 }
 
+/// Count the actual terminal-safe JSON bytes without allocating output.
+/// Stop serialization as soon as the allowance is exceeded.
+pub(crate) fn json_size_within<T: Serialize>(value: &T, limit: usize) -> Option<usize> {
+    struct Counter {
+        bytes: usize,
+        limit: usize,
+    }
+    impl io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > self.limit.saturating_sub(self.bytes) {
+                return Err(io::Error::other("output allowance exceeded"));
+            }
+            self.bytes += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter { bytes: 0, limit };
+    value
+        .serialize(&mut serde_json::Serializer::with_formatter(
+            &mut counter,
+            SafeFormatter,
+        ))
+        .ok()?;
+    Some(counter.bytes)
+}
+
 /// One JSON document and one newline.
 fn to_json<T: Serialize>(v: &T) -> String {
     let mut buf = Vec::new();

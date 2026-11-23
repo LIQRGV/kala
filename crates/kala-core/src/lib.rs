@@ -22,7 +22,7 @@ pub mod world;
 pub use doctor::Tamper;
 pub use doctor::{DoctorOptions, Finding, IndexName, Report, Severity, doctor, doctor_log};
 pub use echo::must_escape;
-pub use error::Error;
+pub use error::{Error, WorkInterruptReason};
 pub use fixture::{FixtureError, FixtureErrorKind, OpRef, load_fixture, load_fixture_to};
 pub use id::{AttrId, EdgeId, EntityId, IdError, NodeTypeId};
 pub use interval::IntervalSet;
@@ -36,5 +36,5 @@ pub use tick::{Precision, Tick};
 pub use value::{MAX_INDEXED_STRING_BYTES, Value, ValueError, ValueType, fold_for_search};
 pub use world::{
     AttrStats, Change, CommitResult, Correction, CutCause, Direction, EntryInfo, IndexDump, Mark,
-    Op, RecoveryReport, TxId, Txn, View, WorkMeter, World, WriteResult,
+    MeteredView, Op, RecoveryReport, TxId, Txn, View, WorkMeter, World, WriteResult,
 };

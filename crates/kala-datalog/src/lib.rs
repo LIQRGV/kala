@@ -159,11 +159,14 @@ pub enum Completeness {
     Complete,
     /// More input is needed (also used for empty input).
     Incomplete,
-    /// Input already contains an irreparable lexical or bracket error.
+    /// Input contains a lexical or bracket error. Extending an unfinished
+    /// bare token (e.g. `1e` to `1e3`) may still make it valid.
     Invalid,
 }
 
 /// Inspect query input using the Datalog lexer without compiling it.
 pub fn completeness(text: &str) -> Completeness {
-    lex::completeness(text)
+    CompletenessScanner::new().push(text)
 }
+
+pub use lex::CompletenessScanner;

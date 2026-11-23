@@ -33,11 +33,24 @@ fn checks_stop_once_when_the_shared_budget_is_exhausted() {
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     let json = parse_one_json(&stdout(&out));
     let hints = json["hints"].as_array().unwrap();
-    assert_eq!(
-        hints.len(),
-        completed + 1,
-        "one hint for all checks not run; usage={usage:?}"
-    );
+    let story: Vec<_> = hints
+        .iter()
+        .filter(|h| h["kind"] == "story_check")
+        .collect();
+    let budget: Vec<_> = hints
+        .iter()
+        .filter(|h| h["kind"] == "budget_exhausted")
+        .collect();
+    let truncated: Vec<_> = hints
+        .iter()
+        .filter(|h| h["kind"] == "output_truncated")
+        .collect();
+    assert_eq!(story.len(), completed, "usage={usage:?}");
+    assert_eq!(budget.len(), 1, "one hint for all checks not run");
+    assert_eq!(truncated.len(), 1, "one hint for the total output cap");
+    assert_eq!(hints.len(), completed + 2);
+    assert_eq!(budget[0]["check"], format!("c{completed:03}"));
+    assert_eq!(truncated[0]["check"], "c100");
     assert!(
         stdout(&out).contains(&format!(
             "story checks stopped: budget exhausted at :c{completed:03}"
@@ -45,9 +58,13 @@ fn checks_stop_once_when_the_shared_budget_is_exhausted() {
         "{}",
         stdout(&out)
     );
-    for hint in &hints[..completed] {
+    for (i, hint) in story.iter().enumerate() {
+        assert_eq!(hint["check"], format!("c{i:03}"));
         assert_eq!(hint["rows_total"], 24usize.pow(3));
-        assert_eq!(hint["rows"].as_array().unwrap().len(), 100);
+        assert_eq!(
+            hint["rows"].as_array().unwrap().len(),
+            if i < 100 { 100 } else { 0 }
+        );
     }
 }
 
