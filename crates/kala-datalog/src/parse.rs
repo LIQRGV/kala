@@ -189,6 +189,19 @@ enum Section {
 }
 
 impl Section {
+    /// The section a `:keyword` header names.
+    fn named(keyword: &str) -> Option<Section> {
+        Some(match keyword {
+            "find" => Section::Find,
+            "in" => Section::In,
+            "at" => Section::At,
+            "canon" => Section::Canon,
+            "where" => Section::Where,
+            "rules" => Section::Rules,
+            _ => return None,
+        })
+    }
+
     fn name(self) -> &'static str {
         match self {
             Section::Find => ":find",
@@ -215,66 +228,6 @@ fn query(form: Form) -> Result<Query, DatalogError> {
             ));
         }
     };
-
-    // Split into sections: (section, header span, body forms).
-    let mut sections: Vec<(Section, Span, Vec<Form>)> = Vec::new();
-    for f in items {
-        if let Form::Atom {
-            tok: Tok::Keyword(k),
-            span,
-        } = &f
-        {
-            let sec = match k.as_str() {
-                "find" => Section::Find,
-                "in" => Section::In,
-                "at" => Section::At,
-                "canon" => Section::Canon,
-                "where" => Section::Where,
-                "rules" => Section::Rules,
-                other => {
-                    return Err(DatalogError::syntax(
-                        *span,
-                        format!(
-                            "unknown section `:{}` (expected :find, :in, :at, :canon, :rules or :where)",
-                            show(other)
-                        ),
-                    ));
-                }
-            };
-            if let Some((prev, _, _)) = sections.last() {
-                if *prev == sec {
-                    return Err(DatalogError::syntax(
-                        *span,
-                        format!("section `{}` appears twice", sec.name()),
-                    ));
-                }
-                if *prev > sec {
-                    return Err(DatalogError::syntax(
-                        *span,
-                        format!(
-                            "section `{}` must come before `{}` (order: :find :in :at :canon :rules :where)",
-                            sec.name(),
-                            prev.name()
-                        ),
-                    ));
-                }
-            } else if sec != Section::Find {
-                return Err(DatalogError::syntax(*span, "a query starts with `:find`"));
-            }
-            sections.push((sec, *span, Vec::new()));
-            continue;
-        }
-        match sections.last_mut() {
-            Some((_, _, body)) => body.push(f),
-            None => {
-                return Err(DatalogError::syntax(
-                    f.span(),
-                    "a query starts with `:find`",
-                ));
-            }
-        }
-    }
-
     let mut q = Query {
         find: Vec::new(),
         inputs: Vec::new(),
@@ -292,7 +245,7 @@ fn query(form: Form) -> Result<Query, DatalogError> {
     let mut saw_where = false;
     // Shared by rule bodies and `:where`: the limits are per query.
     let mut counts = Counts::default();
-    for (sec, head, body) in sections {
+    for (sec, head, body) in sections(items)? {
         if body.is_empty() {
             return Err(DatalogError::syntax(
                 head,
@@ -337,6 +290,74 @@ fn query(form: Form) -> Result<Query, DatalogError> {
     Ok(q)
 }
 
+/// Splits a query's forms into its sections, each (section, header span,
+/// body forms), checking the headers' names and order.
+fn sections(items: Vec<Form>) -> Result<Vec<(Section, Span, Vec<Form>)>, DatalogError> {
+    let mut sections: Vec<(Section, Span, Vec<Form>)> = Vec::new();
+    for f in items {
+        if let Form::Atom {
+            tok: Tok::Keyword(k),
+            span,
+        } = &f
+        {
+            let Some(sec) = Section::named(k) else {
+                return Err(DatalogError::syntax(
+                    *span,
+                    format!(
+                        "unknown section `:{}` (expected :find, :in, :at, :canon, :rules or :where)",
+                        show(k)
+                    ),
+                ));
+            };
+            check_section_order(sections.last().map(|(prev, _, _)| *prev), sec, *span)?;
+            sections.push((sec, *span, Vec::new()));
+            continue;
+        }
+        match sections.last_mut() {
+            Some((_, _, body)) => body.push(f),
+            None => {
+                return Err(DatalogError::syntax(
+                    f.span(),
+                    "a query starts with `:find`",
+                ));
+            }
+        }
+    }
+    Ok(sections)
+}
+
+/// Checks that section `sec` (its header at `span`) may follow `prev`: the
+/// first is `:find`, and each comes once, in the required order.
+fn check_section_order(
+    prev: Option<Section>,
+    sec: Section,
+    span: Span,
+) -> Result<(), DatalogError> {
+    let Some(prev) = prev else {
+        if sec != Section::Find {
+            return Err(DatalogError::syntax(span, "a query starts with `:find`"));
+        }
+        return Ok(());
+    };
+    if prev == sec {
+        return Err(DatalogError::syntax(
+            span,
+            format!("section `{}` appears twice", sec.name()),
+        ));
+    }
+    if prev > sec {
+        return Err(DatalogError::syntax(
+            span,
+            format!(
+                "section `{}` must come before `{}` (order: :find :in :at :canon :rules :where)",
+                sec.name(),
+                prev.name()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The one form of a single-valued section (`:at`, `:canon`).
 fn single(sec: Section, head: Span, body: Vec<Form>) -> Result<Form, DatalogError> {
     let mut it = body.into_iter();
@@ -355,29 +376,29 @@ fn single(sec: Section, head: Span, body: Vec<Form>) -> Result<Form, DatalogErro
 /// One `:find` element: `?name`, or an aggregate `(func ?name)` with
 /// `func` one of `count`, `count-distinct`, `min`, `max`, `sum`.
 fn find_item(f: Form) -> Result<Find, DatalogError> {
-    let (items, span) = match f {
+    match f {
         Form::Atom {
             tok: Tok::Var(name),
             span,
-        } => {
-            return Ok(Find {
-                name,
-                span,
-                agg: None,
-            });
-        }
+        } => Ok(Find {
+            name,
+            span,
+            agg: None,
+        }),
         Form::Seq {
             bracket: Bracket::Round,
             items,
             span,
-        } => (items, span),
-        other => {
-            return Err(DatalogError::syntax(
-                other.span(),
-                "`:find` takes variables (`?name`) and aggregates (`(count ?name)`)",
-            ));
-        }
-    };
+        } => find_aggregate(items, span),
+        other => Err(DatalogError::syntax(
+            other.span(),
+            "`:find` takes variables (`?name`) and aggregates (`(count ?name)`)",
+        )),
+    }
+}
+
+/// An aggregate `:find` element `(func ?name)`.
+fn find_aggregate(items: Vec<Form>, span: Span) -> Result<Find, DatalogError> {
     const SHAPE: &str = "an aggregate is `(count ?x)`, `(count-distinct ?x)`, `(min ?x)`, \
                          `(max ?x)` or `(sum ?x)`";
     let mut it = items.into_iter();
@@ -571,6 +592,19 @@ impl Body {
             && self.durings.is_empty()
             && self.fns.is_empty()
     }
+
+    /// These clauses as one conjunction: a `not`'s body or an `or` branch.
+    fn into_conjunction(self, span: Span) -> Not {
+        Not {
+            clauses: self.clauses,
+            calls: self.calls,
+            nots: self.nots,
+            ors: self.ors,
+            durings: self.durings,
+            fns: self.fns,
+            span,
+        }
+    }
 }
 
 /// The `:rules` section's one form: a vector of definitions
@@ -630,7 +664,36 @@ fn rule(f: Form, counts: &mut Counts) -> Result<Rule, DatalogError> {
         None => return Err(DatalogError::syntax(span, SHAPE)),
     };
     let mut hi = head_items.into_iter();
-    let (name, name_span) = match hi.next() {
+    let (name, name_span) = rule_name(hi.next(), head_span)?;
+    let head = rule_head_vars(hi, head_span)?;
+    let mut b = Body::default();
+    for f in it {
+        clause(f, counts, &mut b)?;
+    }
+    if b.is_empty() {
+        return Err(DatalogError::syntax(
+            span,
+            "a rule definition needs at least one body clause",
+        ));
+    }
+    Ok(Rule {
+        name,
+        name_span,
+        head,
+        clauses: b.clauses,
+        calls: b.calls,
+        nots: b.nots,
+        ors: b.ors,
+        durings: b.durings,
+        fns: b.fns,
+        span,
+    })
+}
+
+/// The name of a rule head `(name ?v ..)`: its first form, a bare symbol
+/// that isn't reserved.
+fn rule_name(first: Option<Form>, head_span: Span) -> Result<(String, Span), DatalogError> {
+    match first {
         Some(Form::Atom {
             tok: Tok::Sym(s),
             span,
@@ -641,23 +704,26 @@ fn rule(f: Form, counts: &mut Counts) -> Result<Rule, DatalogError> {
                     format!("`{}` is reserved and can't name a rule", show(&s)),
                 ));
             }
-            (s, span)
+            Ok((s, span))
         }
-        Some(other) => {
-            return Err(DatalogError::syntax(
-                other.span(),
-                "a rule name is a bare symbol (`ancestor`)",
-            ));
-        }
-        None => {
-            return Err(DatalogError::syntax(
-                head_span,
-                "a rule head is `(name ?v ..)`",
-            ));
-        }
-    };
+        Some(other) => Err(DatalogError::syntax(
+            other.span(),
+            "a rule name is a bare symbol (`ancestor`)",
+        )),
+        None => Err(DatalogError::syntax(
+            head_span,
+            "a rule head is `(name ?v ..)`",
+        )),
+    }
+}
+
+/// The variables of a rule head, after its name: at least one, each once.
+fn rule_head_vars(
+    forms: impl Iterator<Item = Form>,
+    head_span: Span,
+) -> Result<Vec<Sym>, DatalogError> {
     let mut head: Vec<Sym> = Vec::new();
-    for f in hi {
+    for f in forms {
         match f {
             Form::Atom {
                 tok: Tok::Var(v),
@@ -685,28 +751,7 @@ fn rule(f: Form, counts: &mut Counts) -> Result<Rule, DatalogError> {
             "a rule head needs at least one variable",
         ));
     }
-    let mut b = Body::default();
-    for f in it {
-        clause(f, counts, &mut b)?;
-    }
-    if b.is_empty() {
-        return Err(DatalogError::syntax(
-            span,
-            "a rule definition needs at least one body clause",
-        ));
-    }
-    Ok(Rule {
-        name,
-        name_span,
-        head,
-        clauses: b.clauses,
-        calls: b.calls,
-        nots: b.nots,
-        ors: b.ors,
-        durings: b.durings,
-        fns: b.fns,
-        span,
-    })
+    Ok(head)
 }
 
 /// Parses one clause into `body`. Recursion only follows `(not ..)`
@@ -726,39 +771,7 @@ fn clause(f: Form, counts: &mut Counts, body: &mut Body) -> Result<(), DatalogEr
                 _ => None,
             };
             if head == Some("or") {
-                let mut branches = Vec::new();
-                for f in items.into_iter().skip(1) {
-                    let branch = match f {
-                        Form::Seq {
-                            bracket: Bracket::Round,
-                            items,
-                            span,
-                        } if matches!(items.first(), Some(Form::Atom { tok: Tok::Sym(s), .. }) if s == "and") =>
-                        {
-                            counts.clause(span)?;
-                            not(items, span, counts)?
-                        }
-                        f => {
-                            let span = f.span();
-                            let mut b = Body::default();
-                            clause(f, counts, &mut b)?;
-                            Not {
-                                clauses: b.clauses,
-                                calls: b.calls,
-                                nots: b.nots,
-                                ors: b.ors,
-                                durings: b.durings,
-                                fns: b.fns,
-                                span,
-                            }
-                        }
-                    };
-                    branches.push(branch);
-                }
-                if branches.is_empty() {
-                    return Err(DatalogError::syntax(span, "or needs at least one branch"));
-                }
-                body.ors.push(Or { branches, span });
+                body.ors.push(or(items, span, counts)?);
             } else if head == Some("and") {
                 return Err(DatalogError::syntax(
                     span,
@@ -779,6 +792,37 @@ fn clause(f: Form, counts: &mut Counts, body: &mut Body) -> Result<(), DatalogEr
     }
 }
 
+/// A disjunction `(or branch+)`: each branch is one clause, or several
+/// grouped as `(and clause+)`.
+fn or(items: Vec<Form>, span: Span, counts: &mut Counts) -> Result<Or, DatalogError> {
+    let mut branches = Vec::new();
+    // The first item is the `or` symbol.
+    for f in items.into_iter().skip(1) {
+        let branch = match f {
+            Form::Seq {
+                bracket: Bracket::Round,
+                items,
+                span,
+            } if matches!(items.first(), Some(Form::Atom { tok: Tok::Sym(s), .. }) if s == "and") =>
+            {
+                counts.clause(span)?;
+                not(items, span, counts)?
+            }
+            f => {
+                let span = f.span();
+                let mut b = Body::default();
+                clause(f, counts, &mut b)?;
+                b.into_conjunction(span)
+            }
+        };
+        branches.push(branch);
+    }
+    if branches.is_empty() {
+        return Err(DatalogError::syntax(span, "or needs at least one branch"));
+    }
+    Ok(Or { branches, span })
+}
+
 /// A negation `(not clause+)`: at least one clause, of any kind (nested
 /// `not`s included).
 fn not(items: Vec<Form>, span: Span, counts: &mut Counts) -> Result<Not, DatalogError> {
@@ -793,15 +837,7 @@ fn not(items: Vec<Form>, span: Span, counts: &mut Counts) -> Result<Not, Datalog
             "a conjunction needs at least one clause",
         ));
     }
-    Ok(Not {
-        clauses: b.clauses,
-        calls: b.calls,
-        nots: b.nots,
-        ors: b.ors,
-        durings: b.durings,
-        fns: b.fns,
-        span,
-    })
+    Ok(b.into_conjunction(span))
 }
 
 /// `(during [e a v] ?s)`, exactly: a 3-element pattern (not `:kala_handle`) and
@@ -1019,43 +1055,7 @@ fn pattern(items: Vec<Form>, span: Span, history_ok: bool) -> Result<Pattern, Da
     let v = item(v)?;
     let history = match it.next() {
         None => None,
-        Some(t) => {
-            if a.name == "kala_handle" {
-                return Err(DatalogError::syntax(
-                    a.span,
-                    "`:kala_handle` has no history; a history pattern needs a schema attribute",
-                ));
-            }
-            let tick = match item(t)? {
-                t @ (Item::Var(_) | Item::Int(..) | Item::Any(_)) => t,
-                other => {
-                    return Err(DatalogError::syntax(
-                        other.span(),
-                        "the tick position of a history pattern is a variable, an integer or `_`",
-                    ));
-                }
-            };
-            let op = it.next().map(op_item).transpose()?;
-            let precision = it.next().map(item).transpose()?;
-            if let Some(p) = &precision {
-                let valid = match p {
-                    Item::Var(_) | Item::Any(_) => true,
-                    Item::Keyword(k, _) => crate::write::precision_name(k).is_some(),
-                    _ => false,
-                };
-                if !valid {
-                    return Err(DatalogError::syntax(
-                        p.span(),
-                        "precision position needs a variable, wildcard or precision keyword",
-                    ));
-                }
-            }
-            Some(HistoryPos {
-                tick,
-                op,
-                precision,
-            })
-        }
+        Some(t) => Some(history_pos(&a, t, it)?),
     };
     Ok(Pattern {
         e,
@@ -1063,6 +1063,50 @@ fn pattern(items: Vec<Form>, span: Span, history_ok: bool) -> Result<Pattern, Da
         v,
         history,
         span,
+    })
+}
+
+/// The change-point positions of a history pattern over attribute `a`: the
+/// tick `t`, then an optional op and an optional precision from `rest`.
+fn history_pos(
+    a: &Attr,
+    t: Form,
+    mut rest: impl Iterator<Item = Form>,
+) -> Result<HistoryPos, DatalogError> {
+    if a.name == "kala_handle" {
+        return Err(DatalogError::syntax(
+            a.span,
+            "`:kala_handle` has no history; a history pattern needs a schema attribute",
+        ));
+    }
+    let tick = match item(t)? {
+        t @ (Item::Var(_) | Item::Int(..) | Item::Any(_)) => t,
+        other => {
+            return Err(DatalogError::syntax(
+                other.span(),
+                "the tick position of a history pattern is a variable, an integer or `_`",
+            ));
+        }
+    };
+    let op = rest.next().map(op_item).transpose()?;
+    let precision = rest.next().map(item).transpose()?;
+    if let Some(p) = &precision {
+        let valid = match p {
+            Item::Var(_) | Item::Any(_) => true,
+            Item::Keyword(k, _) => crate::write::precision_name(k).is_some(),
+            _ => false,
+        };
+        if !valid {
+            return Err(DatalogError::syntax(
+                p.span(),
+                "precision position needs a variable, wildcard or precision keyword",
+            ));
+        }
+    }
+    Ok(HistoryPos {
+        tick,
+        op,
+        precision,
     })
 }
 
@@ -1110,8 +1154,8 @@ fn predicate(items: Vec<Form>, span: Span) -> Result<Bracketed, DatalogError> {
             "a function clause holds the call and at most one output: `[(f x y) ?out]`",
         ));
     }
-    let mut it = inner.into_iter();
-    let (name, os) = match it.next() {
+    let mut args = inner.into_iter();
+    let (name, name_span) = match args.next() {
         Some(Form::Atom {
             tok: Tok::Sym(s),
             span: os,
@@ -1124,42 +1168,83 @@ fn predicate(items: Vec<Form>, span: Span) -> Result<Bracketed, DatalogError> {
         }
         None => return Err(DatalogError::syntax(list_span, "empty predicate")),
     };
-    let func = match name.as_str() {
-        "intersect" => Some(Func::Intersect),
-        "union" => Some(Func::Union),
-        "difference" => Some(Func::Difference),
-        "not-empty" => Some(Func::NotEmpty),
-        "contains" => Some(Func::Contains),
-        _ => None,
+    let call = Applied {
+        name_span,
+        args,
+        out,
+        list_span,
+        span,
     };
-    if let Some(func) = func {
-        return fn_clause(func, os, it, out, list_span, span);
+    if let Some(func) = func_named(&name) {
+        return fn_clause(func, call);
     }
-    let op = match name.as_str() {
+    let Some(op) = cmp_op_named(&name) else {
+        return Err(DatalogError::syntax(
+            name_span,
+            format!(
+                "unknown predicate or function `{}` (expected = != < <= > >=, intersect, \
+                 union, difference, not-empty or contains)",
+                show(&name)
+            ),
+        ));
+    };
+    comparison(op, call)
+}
+
+/// A `[(name args..) out]` clause after its name: what a comparison and a
+/// function clause are both read from.
+struct Applied {
+    name_span: Span,
+    /// The forms after the name inside the list.
+    args: std::vec::IntoIter<Form>,
+    /// The form after the list, if any.
+    out: Option<Form>,
+    list_span: Span,
+    /// The whole clause.
+    span: Span,
+}
+
+/// The interval-set function named `name`.
+fn func_named(name: &str) -> Option<Func> {
+    Some(match name {
+        "intersect" => Func::Intersect,
+        "union" => Func::Union,
+        "difference" => Func::Difference,
+        "not-empty" => Func::NotEmpty,
+        "contains" => Func::Contains,
+        _ => return None,
+    })
+}
+
+/// The comparison operator written `name`.
+fn cmp_op_named(name: &str) -> Option<CmpOp> {
+    Some(match name {
         "=" => CmpOp::Eq,
         "!=" => CmpOp::Ne,
         "<" => CmpOp::Lt,
         "<=" => CmpOp::Le,
         ">" => CmpOp::Gt,
         ">=" => CmpOp::Ge,
-        other => {
-            return Err(DatalogError::syntax(
-                os,
-                format!(
-                    "unknown predicate or function `{}` (expected = != < <= > >=, intersect, \
-                     union, difference, not-empty or contains)",
-                    show(other)
-                ),
-            ));
-        }
-    };
+        _ => return None,
+    })
+}
+
+/// The rest of a comparison `[(op x y)]`: exactly two operands, no output.
+fn comparison(op: CmpOp, call: Applied) -> Result<Bracketed, DatalogError> {
+    let Applied {
+        mut args,
+        out,
+        list_span,
+        span,
+        ..
+    } = call;
     if let Some(extra) = out {
         return Err(DatalogError::syntax(
             extra.span(),
             "a predicate clause holds only the call: `[(op x y)]`",
         ));
     }
-    let (Some(l), Some(r), None) = (it.next(), it.next(), it.next()) else {
+    let (Some(l), Some(r), None) = (args.next(), args.next(), args.next()) else {
         return Err(DatalogError::syntax(
             list_span,
             "a comparison takes exactly 2 operands",
@@ -1176,14 +1261,14 @@ fn predicate(items: Vec<Form>, span: Span) -> Result<Bracketed, DatalogError> {
 /// The rest of an interval-set function clause: its arguments (2 for
 /// `intersect`, `union`, `difference` and `contains`, 1 for `not-empty`)
 /// and its output (a variable, for the set functions only).
-fn fn_clause(
-    func: Func,
-    name_span: Span,
-    args: impl Iterator<Item = Form>,
-    out: Option<Form>,
-    list_span: Span,
-    span: Span,
-) -> Result<Bracketed, DatalogError> {
+fn fn_clause(func: Func, call: Applied) -> Result<Bracketed, DatalogError> {
+    let Applied {
+        name_span,
+        args,
+        out,
+        list_span,
+        span,
+    } = call;
     let (arity, has_out) = match func {
         Func::Intersect | Func::Union | Func::Difference => (2, true),
         Func::NotEmpty => (1, false),
