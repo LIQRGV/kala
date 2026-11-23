@@ -421,9 +421,9 @@ name = "kala-bolt"
 version = "0.1.0"
 dependencies = [
  "kala-core",
- "kala-cypher",
  "kala-datalog",
  "kala-fixture",
+ "kala-lang",
  "kala-query",
  "kala-system",
  "proptest",
@@ -438,9 +438,9 @@ dependencies = [
  "ctrlc",
  "kala-bolt",
  "kala-core",
- "kala-cypher",
  "kala-datalog",
  "kala-fixture",
+ "kala-lang",
  "kala-query",
  "kala-system",
  "libc",
@@ -498,6 +498,16 @@ dependencies = [
  "serde",
  "serde-saphyr",
  "tempfile",
+]
+
+[[package]]
+name = "kala-lang"
+version = "0.1.0"
+dependencies = [
+ "kala-core",
+ "kala-cypher",
+ "kala-datalog",
+ "kala-query",
 ]
 
 [[package]]

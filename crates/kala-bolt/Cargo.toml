@@ -10,7 +10,8 @@ workspace = true
 kala-core = { path = "../kala-core" }
 kala-query = { path = "../kala-query" }
 kala-datalog = { path = "../kala-datalog" }
-kala-cypher = { path = "../kala-cypher" }
+# The query front-ends behind one interface.
+kala-lang = { path = "../kala-lang" }
 # The `system` database: accounts, privileges and password verification.
 kala-system = { path = "../kala-system" }
 
