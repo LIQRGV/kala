@@ -22,9 +22,8 @@ pub enum ParamKind {
 /// A query compiled and planned, with the kinds of its parameters.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Prepared {
-    /// The plan, ready for [`kala_query::run`].
+    /// The plan, ready for [`crate::run`] or [`crate::run_with_values`].
     pub plan: Plan,
-    /// Every `:in` parameter (name without `?`), in `:in` order, with what
-    /// it must be given.
+    /// Inferred parameter kinds in front-end declaration/discovery order.
     pub params: Vec<(String, ParamKind)>,
 }

@@ -1,7 +1,7 @@
 //! Kala's language-neutral query layer: the shared IR every query language
 //! compiles to, the plan printer, the executor and its limits.
 //!
-//! Front-ends (Datalog first, later Gremlin and Cypher/GQL) emit IR; this
+//! Front-ends (Datalog and Cypher, later Gremlin) emit IR; this
 //! crate never knows which language a plan came from. It reads the world only
 //! through the public kala-core API (`View` reads at a pinned canon), never the
 //! storage layer. Design: docs/slice-6-decisions.md.

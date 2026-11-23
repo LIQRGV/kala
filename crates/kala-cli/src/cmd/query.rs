@@ -1,6 +1,6 @@
 //! `kala query <world> [QUERY] [-f FILE] [--param name=value].. [--json]` and
-//! `kala explain <world> [QUERY] [-f FILE] [--param ..]`: Datalog from the
-//! command line, through `kala_datalog::prepare` and `kala_query::run`.
+//! `kala explain <world> [QUERY] [-f FILE] [--param ..]`: Cypher or Datalog
+//! from the command line, through their front-ends and the shared executor.
 
 use std::fmt::Write as _;
 use std::io::Read as _;

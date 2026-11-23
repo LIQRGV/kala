@@ -1,4 +1,4 @@
-//! Datalog dispatch and bounded result enrichment at the pinned tick and canon.
+//! Language dispatch and bounded result enrichment at the pinned tick and canon.
 use crate::error::{EXECUTION, FORBIDDEN, Failure, MISSING, SYNTAX, TYPE};
 use crate::message::Map;
 use crate::packstream::{self, Value};

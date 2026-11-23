@@ -11,7 +11,7 @@ pub enum Expr<V = Var, C = Value> {
     Value(C),
     /// A missing value.
     Null,
-    /// A scalar query parameter.
+    /// A scalar, NULL or list query parameter.
     Param(String),
     /// An optional property read at the variable's binding tick.
     Property {
