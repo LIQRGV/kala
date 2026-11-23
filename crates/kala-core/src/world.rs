@@ -40,6 +40,14 @@
 //! [`World::assert`], [`World::retract`] and [`World::correct`] are
 //! one-write transactions that commit at once. Every read goes through a [`View`] pinned to a canon tx;
 //! the world's own reads are the view at its latest tx.
+//!
+//! **Layout.** This file holds the public value types, the [`World`] struct
+//! and its facade. The rest of the module is split by concern into private
+//! submodules that share its scope: `ids` (node types, entities, handles,
+//! edges), `index` (the index maps and the seeks reads are built from),
+//! `open` (replaying a log), `txn` (the write path and [`Txn`]), `meter`
+//! (bounded reads), `view` ([`View`]), `schema_ops` and `migration`. The
+//! indexes themselves sit behind the `store` module's ordered-map seam.
 
 mod ids;
 mod index;
