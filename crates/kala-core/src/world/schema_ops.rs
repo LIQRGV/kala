@@ -57,11 +57,11 @@ fn check_new_node_type_name(name: &str) -> Result<(), Error> {
 impl SchemaSnapshot {
     fn capture(world: &World) -> Self {
         Self {
-            attributes: world.attributes.clone(),
-            history: world.attribute_history.clone(),
-            origins: world.node_origins.clone(),
-            settings: world.settings.clone(),
-            node_count: world.node_types.len(),
+            attributes: world.catalog.attributes.clone(),
+            history: world.catalog.attribute_history.clone(),
+            origins: world.catalog.node_origins.clone(),
+            settings: world.catalog.settings.clone(),
+            node_count: world.catalog.node_types.len(),
         }
     }
     /// Whether the schema edits since this snapshot (now applied to `world`)
@@ -76,7 +76,7 @@ impl SchemaSnapshot {
     pub(super) fn changes_overlaps(&self, world: &World) -> bool {
         self.attributes
             .iter()
-            .zip(&world.attributes)
+            .zip(&world.catalog.attributes)
             .any(|(old, new)| {
                 old.name != new.name
                     || old.value_type != new.value_type
@@ -89,27 +89,28 @@ impl SchemaSnapshot {
             })
     }
     pub(super) fn restore(self, world: &mut World) {
-        world.attributes = self.attributes;
-        world.attribute_history = self.history;
-        world.node_origins = self.origins;
-        world.settings = self.settings;
-        world.node_types.truncate(self.node_count);
+        world.catalog.attributes = self.attributes;
+        world.catalog.attribute_history = self.history;
+        world.catalog.node_origins = self.origins;
+        world.catalog.settings = self.settings;
+        world.catalog.node_types.truncate(self.node_count);
         world.rebuild_schema_names();
     }
 }
 
 impl World {
     fn rebuild_schema_names(&mut self) {
-        self.attr_by_name.clear();
-        self.inverse_by_name.clear();
-        for (i, def) in self.attributes.iter().enumerate() {
+        self.catalog.attr_by_name.clear();
+        self.catalog.inverse_by_name.clear();
+        for (i, def) in self.catalog.attributes.iter().enumerate() {
             let id = AttrId(i as u32);
-            self.attr_by_name.insert(def.name.clone(), id);
+            self.catalog.attr_by_name.insert(def.name.clone(), id);
             if let Some(name) = &def.inverse {
-                self.inverse_by_name.insert(name.clone(), id);
+                self.catalog.inverse_by_name.insert(name.clone(), id);
             }
         }
-        self.node_type_by_name = self
+        self.catalog.node_type_by_name = self
+            .catalog
             .node_types
             .iter()
             .enumerate()
@@ -118,12 +119,13 @@ impl World {
     }
     /// The transaction that first defined this attribute.
     pub fn attribute_first_tx(&self, name: &str) -> Option<TxId> {
-        let id = self.attr_by_name.get(name)?;
-        Some(self.attribute_history[id.0 as usize].first()?.0)
+        let id = self.catalog.attr_by_name.get(name)?;
+        Some(self.catalog.attribute_history[id.0 as usize].first()?.0)
     }
     /// Latest value of a generic setting. Schema inference defaults to `infer`.
     pub fn world_setting(&self, key: &str) -> Option<&str> {
-        self.settings
+        self.catalog
+            .settings
             .iter()
             .rev()
             .find(|(_, k, _)| k == key)
@@ -132,10 +134,10 @@ impl World {
     }
     fn validate_attr_edit(&self, id: AttrId, def: &AttrDef, migration: bool) -> Result<(), Error> {
         let index = id.0 as usize;
-        if index > self.attributes.len() {
+        if index > self.catalog.attributes.len() {
             return Err(Error::Schema("attribute ID is not the next ID".into()));
         }
-        let old = self.attributes.get(index);
+        let old = self.catalog.attributes.get(index);
         let same_name = old.is_some_and(|old| old.name == def.name);
         if !same_name && !migration {
             check_new_name(&def.name)?;
@@ -145,10 +147,11 @@ impl World {
         }
         check_direction(def)?;
         if self
+            .catalog
             .attr_by_name
             .get(&def.name)
             .is_some_and(|other| *other != id)
-            || self.inverse_by_name.contains_key(&def.name)
+            || self.catalog.inverse_by_name.contains_key(&def.name)
         {
             return Err(Error::DuplicateName(def.name.clone()));
         }
@@ -159,8 +162,9 @@ impl World {
                 check_new_name(inverse)?;
             }
             if inverse == &def.name
-                || self.attr_by_name.contains_key(inverse)
+                || self.catalog.attr_by_name.contains_key(inverse)
                 || self
+                    .catalog
                     .inverse_by_name
                     .get(inverse)
                     .is_some_and(|other| *other != id)
@@ -202,7 +206,7 @@ impl World {
                     }
                 }
             }
-            if structural_change(old, def) && self.attr_counts.contains_key(&id) {
+            if structural_change(old, def) && self.indexes.attr_counts.contains_key(&id) {
                 return Err(migrate_hint(&old.name));
             }
             if old.inverse.is_some() && old.inverse != def.inverse && !migration {
@@ -245,19 +249,19 @@ impl World {
             SchemaEdit::Attribute { id, def } => {
                 self.validate_attr_edit(*id, def, migration)?;
                 let i = id.0 as usize;
-                if i == self.attributes.len() {
-                    self.attributes.push(def.clone());
-                    self.attribute_history.push(vec![(tx, def.clone())]);
+                if i == self.catalog.attributes.len() {
+                    self.catalog.attributes.push(def.clone());
+                    self.catalog.attribute_history.push(vec![(tx, def.clone())]);
                 } else {
-                    if self.attributes[i] == *def {
+                    if self.catalog.attributes[i] == *def {
                         return Err(Error::Schema("a schema no-op is not a log entry".into()));
                     }
-                    self.attributes[i] = def.clone();
+                    self.catalog.attributes[i] = def.clone();
                     // Names resolve through the latest namespace, including old canons.
-                    for (_, old) in &mut self.attribute_history[i] {
+                    for (_, old) in &mut self.catalog.attribute_history[i] {
                         old.name.clone_from(&def.name);
                     }
-                    self.attribute_history[i].push((tx, def.clone()));
+                    self.catalog.attribute_history[i].push((tx, def.clone()));
                 }
                 self.rebuild_schema_names();
             }
@@ -267,34 +271,34 @@ impl World {
                 // inferred one being confirmed.
                 check_new_node_type_name(name)?;
                 let i = usize::from(id.0);
-                if id.0 > MAX_NODE_TYPE || i > self.node_types.len() {
+                if id.0 > MAX_NODE_TYPE || i > self.catalog.node_types.len() {
                     return Err(Error::Schema(
                         "node type ID out of sequence or range".into(),
                     ));
                 }
-                if i == self.node_types.len() {
+                if i == self.catalog.node_types.len() {
                     if *inferred && self.world_setting("schema") == Some("strict") {
                         return Err(Error::Schema(
                             "cannot infer a node type in strict mode".into(),
                         ));
                     }
-                    if self.node_type_by_name.contains_key(name) {
+                    if self.catalog.node_type_by_name.contains_key(name) {
                         return Err(Error::DuplicateName(name.clone()));
                     }
-                    self.node_types.push(NodeType {
+                    self.catalog.node_types.push(NodeType {
                         name: name.clone(),
                         defined_in: Vec::new(),
                     });
-                    self.node_origins.push(vec![(tx, *inferred)]);
-                    self.node_type_by_name.insert(name.clone(), *id);
+                    self.catalog.node_origins.push(vec![(tx, *inferred)]);
+                    self.catalog.node_type_by_name.insert(name.clone(), *id);
                 } else {
-                    if self.node_types[i].name != *name
+                    if self.catalog.node_types[i].name != *name
                         || *inferred
-                        || !self.node_origins[i].last().is_some_and(|(_, v)| *v)
+                        || !self.catalog.node_origins[i].last().is_some_and(|(_, v)| *v)
                     {
                         return Err(Error::Schema("invalid node type redefinition".into()));
                     }
-                    self.node_origins[i].push((tx, false));
+                    self.catalog.node_origins[i].push((tx, false));
                 }
             }
             SchemaEdit::Setting { key, value } => {
@@ -307,7 +311,7 @@ impl World {
                 if self.world_setting(key) == Some(value) {
                     return Err(Error::Schema("a setting no-op is not a log entry".into()));
                 }
-                self.settings.push((tx, key.clone(), value.clone()));
+                self.catalog.settings.push((tx, key.clone(), value.clone()));
             }
             SchemaEdit::Migration { .. } => {
                 return Err(Error::Schema(
@@ -345,7 +349,7 @@ impl Txn<'_> {
         migration: bool,
     ) -> Result<(), Error> {
         if let SchemaEdit::Attribute { id, def } = &edit
-            && let Some(old) = self.world.attributes.get(id.0 as usize)
+            && let Some(old) = self.world.catalog.attributes.get(id.0 as usize)
             && structural_change(old, def)
             && self.entries.iter().any(|e| e.key_and_mark().0.attr == *id)
         {
@@ -469,7 +473,7 @@ impl Txn<'_> {
     /// Infers a node type unless the world is strict.
     pub fn infer_node_type(&mut self, name: &str) -> Result<(), Error> {
         self.guard(|txn| {
-            if txn.world.node_type_by_name.contains_key(name) {
+            if txn.world.catalog.node_type_by_name.contains_key(name) {
                 return Ok(());
             }
             check_new_node_type_name(name)?;
@@ -510,9 +514,10 @@ impl Txn<'_> {
         self.guard(|txn| {
             let existing = txn
                 .world
+                .catalog
                 .attr_by_name
                 .get(name)
-                .map(|id| &txn.world.attributes[id.0 as usize])
+                .map(|id| &txn.world.catalog.attributes[id.0 as usize])
                 .filter(|old| old.value_type == value_type);
             let mut def = match existing {
                 Some(old) => {
@@ -557,9 +562,9 @@ impl Txn<'_> {
         // The previous definition's cardinality and whether anything but the
         // cardinality changes, for the report.
         let mut cardinality_from = None;
-        let id = match self.world.attr_by_name.get(&def.name) {
+        let id = match self.world.catalog.attr_by_name.get(&def.name) {
             Some(id) => {
-                let old = &self.world.attributes[id.0 as usize];
+                let old = &self.world.catalog.attributes[id.0 as usize];
                 if old.deprecated {
                     return Err(Error::DeprecatedAttribute(old.name.clone()));
                 }
@@ -579,7 +584,7 @@ impl Txn<'_> {
             None => {
                 check_new_name(&def.name)?;
                 AttrId(
-                    u32::try_from(self.world.attributes.len())
+                    u32::try_from(self.world.catalog.attributes.len())
                         .map_err(|_| Error::InvalidName(def.name.clone()))?,
                 )
             }
@@ -619,9 +624,9 @@ impl Txn<'_> {
         self.guard(|txn| txn.node_type_inner(name, false))
     }
     fn node_type_inner(&mut self, name: &str, inferred: bool) -> Result<(), Error> {
-        let id = if let Some(id) = self.world.node_type_by_name.get(name) {
+        let id = if let Some(id) = self.world.catalog.node_type_by_name.get(name) {
             if inferred
-                || !self.world.node_origins[usize::from(id.0)]
+                || !self.world.catalog.node_origins[usize::from(id.0)]
                     .last()
                     .is_some_and(|(_, i)| *i)
             {
@@ -630,10 +635,10 @@ impl Txn<'_> {
             *id
         } else {
             check_new_node_type_name(name)?;
-            if self.world.node_types.len() > usize::from(MAX_NODE_TYPE) {
+            if self.world.catalog.node_types.len() > usize::from(MAX_NODE_TYPE) {
                 return Err(IdError::NodeTypeOutOfRange(MAX_NODE_TYPE + 1).into());
             }
-            NodeTypeId(self.world.node_types.len() as u16)
+            NodeTypeId(self.world.catalog.node_types.len() as u16)
         };
         self.schema_edit(
             SchemaEdit::NodeType {
@@ -656,7 +661,7 @@ impl Txn<'_> {
             if old == new {
                 return Ok(());
             }
-            let mut def = txn.world.attributes[id.0 as usize].clone();
+            let mut def = txn.world.catalog.attributes[id.0 as usize].clone();
             def.name = new.into();
             txn.schema_edit(
                 SchemaEdit::Attribute { id, def },
@@ -670,6 +675,7 @@ impl Txn<'_> {
     }
     pub(super) fn attr_id(&self, name: &str) -> Result<AttrId, Error> {
         self.world
+            .catalog
             .attr_by_name
             .get(name)
             .copied()
@@ -679,7 +685,7 @@ impl Txn<'_> {
     pub fn deprecate_attribute(&mut self, name: &str) -> Result<(), Error> {
         self.guard(|txn| {
             let id = txn.attr_id(name)?;
-            let mut def = txn.world.attributes[id.0 as usize].clone();
+            let mut def = txn.world.catalog.attributes[id.0 as usize].clone();
             if def.deprecated {
                 return Ok(());
             }
@@ -695,7 +701,7 @@ impl Txn<'_> {
     pub fn set_cardinality(&mut self, name: &str, cardinality: Cardinality) -> Result<(), Error> {
         self.guard(|txn| {
             let id = txn.attr_id(name)?;
-            let mut def = txn.world.attributes[id.0 as usize].clone();
+            let mut def = txn.world.catalog.attributes[id.0 as usize].clone();
             let from = def.cardinality;
             if from == cardinality {
                 return Ok(());
@@ -747,9 +753,9 @@ pub fn type_name(ty: ValueType) -> &'static str {
 impl<'w> View<'w> {
     pub(super) fn definition(&self, id: AttrId) -> Option<&'w AttrDef> {
         if self.latest {
-            return self.world.attributes.get(id.0 as usize);
+            return self.world.catalog.attributes.get(id.0 as usize);
         }
-        let history = self.world.attribute_history.get(id.0 as usize)?;
+        let history = self.world.catalog.attribute_history.get(id.0 as usize)?;
         let n = history.partition_point(|(tx, _)| *tx <= self.canon);
         n.checked_sub(1).map(|i| &history[i].1)
     }
@@ -762,12 +768,13 @@ impl<'w> View<'w> {
     }
     /// Definition at this canon, resolved through the latest name table.
     pub fn attribute(&self, name: &str) -> Option<&'w AttrDef> {
-        self.definition(*self.world.attr_by_name.get(name)?)
+        self.definition(*self.world.catalog.attr_by_name.get(name)?)
     }
     /// Resolves a name or returns a canon-specific error if it is too new.
     pub fn require_attribute(&self, name: &str) -> Result<&'w AttrDef, Error> {
         let id = self
             .world
+            .catalog
             .attr_by_name
             .get(name)
             .ok_or_else(|| Error::UnknownAttribute(name.into()))?;
@@ -776,9 +783,9 @@ impl<'w> View<'w> {
     /// Resolves an attribute or inverse through the latest namespace, then
     /// checks its definition at this canon. The bool identifies an inverse.
     pub fn resolve_attribute(&self, name: &str) -> Result<(&'w AttrDef, bool), Error> {
-        let (id, inverse) = if let Some(id) = self.world.attr_by_name.get(name) {
+        let (id, inverse) = if let Some(id) = self.world.catalog.attr_by_name.get(name) {
             (*id, false)
-        } else if let Some(id) = self.world.inverse_by_name.get(name) {
+        } else if let Some(id) = self.world.catalog.inverse_by_name.get(name) {
             (*id, true)
         } else {
             return Err(Error::UnknownAttribute(name.into()));
@@ -795,15 +802,17 @@ impl<'w> View<'w> {
     /// Every attribute defined at this canon, in ID order, with latest names.
     pub fn attributes(&self) -> impl Iterator<Item = &'w AttrDef> + use<'w> {
         let view = *self;
-        (0..self.world.attributes.len()).filter_map(move |i| view.definition(AttrId(i as u32)))
+        (0..self.world.catalog.attributes.len())
+            .filter_map(move |i| view.definition(AttrId(i as u32)))
     }
     /// Node type name, inferred origin, and first definition transaction.
     pub fn node_type_definitions(&self) -> impl Iterator<Item = (&'w str, bool, TxId)> + use<'w> {
         let view = *self;
         self.world
+            .catalog
             .node_types
             .iter()
-            .zip(&self.world.node_origins)
+            .zip(&self.world.catalog.node_origins)
             .filter_map(move |(nt, h)| {
                 let n = h.partition_point(|(tx, _)| *tx <= view.canon);
                 n.checked_sub(1).map(|i| (nt.name.as_str(), h[i].1, h[0].0))
@@ -812,7 +821,7 @@ impl<'w> View<'w> {
     /// Settings at this canon; the default schema mode is `infer`.
     pub fn settings(&self) -> BTreeMap<&'w str, &'w str> {
         let mut out = BTreeMap::from([("schema", "infer")]);
-        for (tx, key, value) in &self.world.settings {
+        for (tx, key, value) in &self.world.catalog.settings {
             if *tx <= self.canon {
                 out.insert(key, value);
             }
@@ -895,24 +904,25 @@ impl<'w> MeteredView<'w> {
 
 impl World {
     pub(crate) fn schema_matches(&self, other: &Self) -> bool {
-        self.attributes == other.attributes
-            && self.attribute_history == other.attribute_history
-            && self.node_origins == other.node_origins
-            && self.settings == other.settings
-            && self.attr_by_name == other.attr_by_name
-            && self.inverse_by_name == other.inverse_by_name
-            && self.node_type_by_name == other.node_type_by_name
-            && self
+        self.catalog.attributes == other.catalog.attributes
+            && self.catalog.attribute_history == other.catalog.attribute_history
+            && self.catalog.node_origins == other.catalog.node_origins
+            && self.catalog.settings == other.catalog.settings
+            && self.catalog.attr_by_name == other.catalog.attr_by_name
+            && self.catalog.inverse_by_name == other.catalog.inverse_by_name
+            && self.catalog.node_type_by_name == other.catalog.node_type_by_name
+            && self.catalog.node_types.iter().map(|n| &n.name).eq(other
+                .catalog
                 .node_types
                 .iter()
-                .map(|n| &n.name)
-                .eq(other.node_types.iter().map(|n| &n.name))
+                .map(|n| &n.name))
     }
     /// Test hook: alter derived metadata without writing the source log.
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub fn tamper_schema(&mut self) {
-        self.settings
+        self.catalog
+            .settings
             .push((self.latest_tx, "schema".into(), "strict".into()));
     }
 }

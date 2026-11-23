@@ -365,58 +365,98 @@ pub(super) fn seek_entry<'i>(
     }
 }
 
-impl World {
-    /// The content hash this world's value references use: doctor rebuilds
-    /// a world with the same one, so the two assign the same references.
-    pub(crate) fn content_hash(&self) -> ContentHash {
-        self.content_hash
+/// Every index over a world's stored facts, with the tables derived
+/// alongside them (the value table, tick counts and planner statistics).
+/// All of it is a copy of the log: written only by [`World::index_entry`],
+/// on commit and replay, and rebuilt from the log on open.
+#[derive(Debug)]
+pub(super) struct Indexes {
+    /// Forward index `E|entity|attr|value|^tick|^tx -> mark` (layout in
+    /// [`crate::key`]): every stored fact and `DELETED` marker. With
+    /// `r_index`, the in-memory copy of the log's entries (milestone 0);
+    /// both are rebuilt from the log on open.
+    pub(super) e_index: Index,
+    /// Reverse index `R|target|attr|source|^tick|^tx -> mark`: one entry
+    /// per stored entry at a `ref` key, written by [`World::index_entry`]
+    /// together with its `E` entry. Read by [`View::neighbors`] for
+    /// [`Direction::In`].
+    pub(super) r_index: Index,
+    /// `E_latest`: every `E` key's current entry at the latest canon, keys
+    /// whose current entry is a `DELETED` marker left out (see
+    /// [`LatestIndex`]). Derived from `e_index`; written only by
+    /// [`World::index_entry`]. Serves every read at the latest canon.
+    /// Crate-visible so doctor can compare it against a rebuild.
+    pub(super) e_latest: LatestIndex,
+    /// `R_latest`: the same for `r_index`.
+    pub(super) r_latest: LatestIndex,
+    /// The precision of every `E` entry that is a fact with a vague tick,
+    /// by its `E` key (see [`Precisions`]): the payload half of an `E` row.
+    /// Written only by [`World::index_entry`], derived and rebuilt with `E`;
+    /// doctor compares it as part of `E`.
+    pub(super) e_precision: Precisions,
+    /// The same for `E_latest`: the precision of each key's current fact at
+    /// the latest canon, if vague. Compared by doctor as part of `E_latest`.
+    pub(super) e_latest_precision: Precisions,
+    /// Value index `V|attr|value|entity|^tick|^tx -> mark`: a copy of every
+    /// `E` entry of an indexed, non-ref attribute (see
+    /// [`World::value_indexed`]), keyed by value so "every entity with
+    /// `attr = v`" is a prefix walk. Written only by [`World::index_entry`]
+    /// next to its `E` entry, so it is derived and rebuilt with `E`.
+    pub(super) v_index: Index,
+    /// `V_latest`: the same for `v_index` as `E_latest` is for `e_index`.
+    /// Serves [`View::lookup`] at the latest canon.
+    pub(super) v_latest: LatestIndex,
+    /// Folded value index `F|attr|fold|original|entity|^tick|^tx -> mark`
+    /// (layout in [`crate::key`]): a copy of every `V` entry of a string
+    /// attribute, keyed by the value's [`fold_for_search`] form, so "every
+    /// entity named edwin, in any case" is a prefix walk. Written only by
+    /// [`World::index_entry`] next to its `V` entry; derived and rebuilt
+    /// with `E`.
+    pub(super) vfold_index: Index,
+    /// `VFold_latest`: the same for `vfold_index` as `E_latest` is for
+    /// `e_index`. Serves [`View::lookup_ci`] at the latest canon.
+    pub(super) vfold_latest: LatestIndex,
+    /// Every unindexed string value an `E` key refers to, by reference and
+    /// by content (see [`crate::value_table`]). Derived like the indexes:
+    /// filled only by [`World::index_entry`] on commit and replay.
+    pub(super) values: ValueTable,
+    /// The content hash of the value references ([`fnv1a64`]; a test hook
+    /// may replace it, see `World::set_content_hash`).
+    pub(super) content_hash: ContentHash,
+    /// How many keys hold a fact (assert or retract) at the latest canon,
+    /// per tick: a key whose current entry is a `DELETED` marker isn't
+    /// counted. The last tick is the world's latest tick. Derived from the
+    /// indexes; maintained by [`World::index_entry`] on commit and replay.
+    pub(super) tick_counts: BTreeMap<Tick, u64>,
+    /// The planner's per-attribute estimates behind [`World::attr_stats`].
+    /// Derived from the log like the indexes (never written to it):
+    /// maintained by [`World::index_entry`] on commit and replay.
+    pub(super) attr_counts: HashMap<AttrId, AttrCounts>,
+}
+
+impl Indexes {
+    /// Empty indexes whose value references use `content_hash`.
+    pub(super) fn new(content_hash: ContentHash) -> Self {
+        Indexes {
+            e_index: OrderedMap::new(),
+            r_index: OrderedMap::new(),
+            e_latest: OrderedMap::new(),
+            r_latest: OrderedMap::new(),
+            e_precision: OrderedMap::new(),
+            e_latest_precision: OrderedMap::new(),
+            v_index: OrderedMap::new(),
+            v_latest: OrderedMap::new(),
+            vfold_index: OrderedMap::new(),
+            vfold_latest: OrderedMap::new(),
+            values: ValueTable::default(),
+            content_hash,
+            tick_counts: BTreeMap::new(),
+            attr_counts: HashMap::new(),
+        }
     }
 
-    /// Sets the content hash of a world being rebuilt, before any fact is
-    /// applied (a world holding just its genesis).
-    pub(crate) fn set_rebuild_hash(&mut self, hash: ContentHash) {
-        debug_assert!(
-            self.values.is_empty(),
-            "invariant: the content hash is set before any value is referenced"
-        );
-        self.content_hash = hash;
-    }
-
-    /// Replaces the content hash of this world's value references with `f`
-    /// and rebuilds its indexes and value table from its kept entries, as a
-    /// replay with that hash would: a test hook, so a forced-collision world
-    /// (`|_| 0`) can be checked to answer exactly like a normal one.
-    /// [`crate::doctor`] rebuilds this world with `f` too. Only this World
-    /// object changes: nothing is logged, and a reopen uses the real hash.
-    /// Not part of the supported API.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn set_content_hash(&mut self, f: fn(&[u8]) -> u64) {
-        let entries: Vec<LogEntry> = self
-            .entries
-            .iter()
-            .map(|e| LogEntry {
-                id: e.id,
-                body: e.body.clone(),
-            })
-            .collect();
-        let rebuilt = World::replay_with_hash(&entries, f)
-            .expect("invariant: a world's kept entries replay cleanly");
-        // The rebuild holds the same schema, IDs and entries; what is kept
-        // from this World is what isn't derived from the log.
-        let log = self.log.take();
-        let recovery = std::mem::take(&mut self.recovery);
-        let unacknowledged = self.recovery_unacknowledged;
-        let read_only = self.read_only;
-        *self = rebuilt;
-        self.log = log;
-        self.recovery = recovery;
-        self.recovery_unacknowledged = unacknowledged;
-        self.read_only = read_only;
-    }
-
-    /// The stored indexes, for doctor to compare against a rebuild.
-    pub(crate) fn indexes(&self) -> StoredIndexes<'_> {
+    /// The stored index maps, borrowed for doctor's comparison.
+    fn stored(&self) -> StoredIndexes<'_> {
         StoredIndexes {
             e: &self.e_index,
             r: &self.r_index,
@@ -431,15 +471,11 @@ impl World {
         }
     }
 
-    /// Stores one entry of transaction `tx` at the key of `fact` in the
-    /// indexes: `mark` (the fact's op, or [`Mark::Deleted`] for a `DELETED`
-    /// marker at that key) under its `E` key and, for a `ref` key, its `R`
-    /// mirror, for an indexed non-ref attribute its `V` mirror (and for a
-    /// string attribute its `VFold` mirror). Commit and
-    /// replay both write the indexes only through here, so the two always
-    /// hold the same entries, and the latest-revision indexes and the
-    /// latest tick follow the keys' current entries.
-    pub(super) fn index_entry(&mut self, fact: &FactDef, mark: Mark, tx: TxId) {
+    /// Stores one entry at the key of `fact` in every index it belongs to
+    /// (see [`World::index_entry`], the only caller). `value_indexed` says
+    /// whether the fact's attribute is mirrored in `V`, which the schema
+    /// decides, not the indexes.
+    fn insert(&mut self, fact: &FactDef, mark: Mark, tx: TxId, value_indexed: bool) {
         // A new unindexed value enters the table with the reference its
         // keys were built with (see `World::value_ref`).
         if let Some(r) = fact.value_ref() {
@@ -488,7 +524,7 @@ impl World {
             set_latest(&mut self.r_latest, key::without_tx(&k), mark);
             self.r_index.insert(k, mark);
         }
-        if self.value_indexed(fact.attr) {
+        if value_indexed {
             let k = key::v_fact_key(fact.attr, &fact.value, fact.entity, fact.tick, tx);
             set_latest(&mut self.v_latest, key::without_tx(&k), mark);
             self.v_index.insert(k, mark);
@@ -507,19 +543,89 @@ impl World {
             }
         }
     }
+}
+
+impl World {
+    /// The content hash this world's value references use: doctor rebuilds
+    /// a world with the same one, so the two assign the same references.
+    pub(crate) fn content_hash(&self) -> ContentHash {
+        self.indexes.content_hash
+    }
+
+    /// Sets the content hash of a world being rebuilt, before any fact is
+    /// applied (a world holding just its genesis).
+    pub(crate) fn set_rebuild_hash(&mut self, hash: ContentHash) {
+        debug_assert!(
+            self.indexes.values.is_empty(),
+            "invariant: the content hash is set before any value is referenced"
+        );
+        self.indexes.content_hash = hash;
+    }
+
+    /// Replaces the content hash of this world's value references with `f`
+    /// and rebuilds its indexes and value table from its kept entries, as a
+    /// replay with that hash would: a test hook, so a forced-collision world
+    /// (`|_| 0`) can be checked to answer exactly like a normal one.
+    /// [`crate::doctor`] rebuilds this world with `f` too. Only this World
+    /// object changes: nothing is logged, and a reopen uses the real hash.
+    /// Not part of the supported API.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn set_content_hash(&mut self, f: fn(&[u8]) -> u64) {
+        let entries: Vec<LogEntry> = self
+            .entries
+            .iter()
+            .map(|e| LogEntry {
+                id: e.id,
+                body: e.body.clone(),
+            })
+            .collect();
+        let rebuilt = World::replay_with_hash(&entries, f)
+            .expect("invariant: a world's kept entries replay cleanly");
+        // The rebuild holds the same schema, IDs and entries; what is kept
+        // from this World is what isn't derived from the log.
+        let log = self.log.take();
+        let recovery = std::mem::take(&mut self.recovery);
+        let unacknowledged = self.recovery_unacknowledged;
+        let read_only = self.read_only;
+        *self = rebuilt;
+        self.log = log;
+        self.recovery = recovery;
+        self.recovery_unacknowledged = unacknowledged;
+        self.read_only = read_only;
+    }
+
+    /// The stored indexes, for doctor to compare against a rebuild.
+    pub(crate) fn indexes(&self) -> StoredIndexes<'_> {
+        self.indexes.stored()
+    }
+
+    /// Stores one entry of transaction `tx` at the key of `fact` in the
+    /// indexes: `mark` (the fact's op, or [`Mark::Deleted`] for a `DELETED`
+    /// marker at that key) under its `E` key and, for a `ref` key, its `R`
+    /// mirror, for an indexed non-ref attribute its `V` mirror (and for a
+    /// string attribute its `VFold` mirror). Commit and
+    /// replay both write the indexes only through here, so the two always
+    /// hold the same entries, and the latest-revision indexes and the
+    /// latest tick follow the keys' current entries.
+    pub(super) fn index_entry(&mut self, fact: &FactDef, mark: Mark, tx: TxId) {
+        let value_indexed = self.value_indexed(fact.attr);
+        self.indexes.insert(fact, mark, tx, value_indexed);
+    }
 
     /// Whether `attr`'s entries are mirrored in `V`: it is declared
     /// indexed and isn't a `ref` attribute (`R` is the value index of a
     /// `ref` attribute).
     fn value_indexed(&self, attr: AttrId) -> bool {
-        let def = &self.attributes[attr.0 as usize];
+        let def = &self.catalog.attributes[attr.0 as usize];
         def.indexed && def.value_type != ValueType::Ref
     }
 
     /// Whether `attr`'s `E` keys carry value references: it is an
     /// unindexed string attribute.
     pub(super) fn keys_by_ref(&self, attr: AttrId) -> bool {
-        self.attributes
+        self.catalog
+            .attributes
             .get(attr.0 as usize)
             .is_some_and(|def| !def.indexed && def.value_type == ValueType::Str)
     }
@@ -533,7 +639,7 @@ impl World {
     /// (doctor reports them).
     fn e_part_encoding<'a>(&'a self, attr: AttrId, part: &'a [u8]) -> Option<&'a [u8]> {
         match (self.keys_by_ref(attr), ValueRef::from_key_bytes(part)) {
-            (true, Some(r)) => self.values.resolve(r),
+            (true, Some(r)) => self.indexes.values.resolve(r),
             (false, None) => Some(part),
             _ => None,
         }
@@ -559,7 +665,7 @@ impl World {
     ) -> Option<(&'a [u8], Value)> {
         let bytes = self.e_part_encoding(attr, part)?;
         let value = Value::decode(bytes).ok()?;
-        let def = self.attributes.get(attr.0 as usize)?;
+        let def = self.catalog.attributes.get(attr.0 as usize)?;
         (value.value_type() == def.value_type).then_some((bytes, value))
     }
 
@@ -575,7 +681,7 @@ impl World {
         if !self.keys_by_ref(attr) {
             return Some(Cow::Borrowed(encoding));
         }
-        let r = self.values.get(encoding)?;
+        let r = self.indexes.values.get(encoding)?;
         Some(Cow::Owned(r.to_key_bytes().to_vec()))
     }
 
@@ -605,10 +711,11 @@ impl World {
         main: bool,
     ) -> ResolvedIndex<'i, V> {
         let unindexed_strings = self
+            .catalog
             .attributes
             .iter()
             .any(|d| !d.indexed && d.value_type == ValueType::Str);
-        if self.values.is_empty() && !unindexed_strings {
+        if self.indexes.values.is_empty() && !unindexed_strings {
             return (Cow::Borrowed(index), Vec::new());
         }
         let mut out = OrderedMap::new();
@@ -624,7 +731,7 @@ impl World {
                 continue;
             };
             let is_ref = ValueRef::from_key_bytes(part).is_some();
-            if self.attributes.get(attr.0 as usize).is_none() && !is_ref {
+            if self.catalog.attributes.get(attr.0 as usize).is_none() && !is_ref {
                 // An unknown attribute: no layout to check against.
                 out.insert(k.to_vec(), v.clone());
                 continue;
@@ -653,6 +760,7 @@ impl World {
     #[doc(hidden)]
     pub fn index_dump(&self) -> IndexDump {
         let e = self
+            .indexes
             .e_index
             .iter()
             .filter_map(|(k, mark)| {
@@ -661,6 +769,7 @@ impl World {
             })
             .collect();
         let r = self
+            .indexes
             .r_index
             .iter()
             .filter_map(|(k, mark)| {
@@ -669,6 +778,7 @@ impl World {
             })
             .collect();
         let v = self
+            .indexes
             .v_index
             .iter()
             .filter_map(|(k, mark)| {
@@ -677,6 +787,7 @@ impl World {
             })
             .collect();
         let v_fold = self
+            .indexes
             .vfold_index
             .iter()
             .filter_map(|(k, mark)| {
@@ -725,49 +836,49 @@ impl World {
         match t {
             Tamper::InsertRawKey { index, key } => match index {
                 IndexName::E => {
-                    self.e_index.insert(key, Mark::Assert);
+                    self.indexes.e_index.insert(key, Mark::Assert);
                 }
                 IndexName::R => {
-                    self.r_index.insert(key, Mark::Assert);
+                    self.indexes.r_index.insert(key, Mark::Assert);
                 }
                 IndexName::ELatest => {
-                    self.e_latest.insert(key, Op::Assert);
+                    self.indexes.e_latest.insert(key, Op::Assert);
                 }
                 IndexName::RLatest => {
-                    self.r_latest.insert(key, Op::Assert);
+                    self.indexes.r_latest.insert(key, Op::Assert);
                 }
                 IndexName::V => {
-                    self.v_index.insert(key, Mark::Assert);
+                    self.indexes.v_index.insert(key, Mark::Assert);
                 }
                 IndexName::VLatest => {
-                    self.v_latest.insert(key, Op::Assert);
+                    self.indexes.v_latest.insert(key, Op::Assert);
                 }
                 IndexName::VFold => {
-                    self.vfold_index.insert(key, Mark::Assert);
+                    self.indexes.vfold_index.insert(key, Mark::Assert);
                 }
                 IndexName::VFoldLatest => {
-                    self.vfold_latest.insert(key, Op::Assert);
+                    self.indexes.vfold_latest.insert(key, Op::Assert);
                 }
             },
             Tamper::RemoveRow { index, nth } => match index {
-                IndexName::E => remove_nth(&mut self.e_index, nth),
-                IndexName::R => remove_nth(&mut self.r_index, nth),
-                IndexName::ELatest => remove_nth(&mut self.e_latest, nth),
-                IndexName::RLatest => remove_nth(&mut self.r_latest, nth),
-                IndexName::V => remove_nth(&mut self.v_index, nth),
-                IndexName::VLatest => remove_nth(&mut self.v_latest, nth),
-                IndexName::VFold => remove_nth(&mut self.vfold_index, nth),
-                IndexName::VFoldLatest => remove_nth(&mut self.vfold_latest, nth),
+                IndexName::E => remove_nth(&mut self.indexes.e_index, nth),
+                IndexName::R => remove_nth(&mut self.indexes.r_index, nth),
+                IndexName::ELatest => remove_nth(&mut self.indexes.e_latest, nth),
+                IndexName::RLatest => remove_nth(&mut self.indexes.r_latest, nth),
+                IndexName::V => remove_nth(&mut self.indexes.v_index, nth),
+                IndexName::VLatest => remove_nth(&mut self.indexes.v_latest, nth),
+                IndexName::VFold => remove_nth(&mut self.indexes.vfold_index, nth),
+                IndexName::VFoldLatest => remove_nth(&mut self.indexes.vfold_latest, nth),
             },
             Tamper::FlipOp { index, nth } => match index {
-                IndexName::E => flip_nth(&mut self.e_index, nth, flip_mark),
-                IndexName::R => flip_nth(&mut self.r_index, nth, flip_mark),
-                IndexName::ELatest => flip_nth(&mut self.e_latest, nth, flip_op),
-                IndexName::RLatest => flip_nth(&mut self.r_latest, nth, flip_op),
-                IndexName::V => flip_nth(&mut self.v_index, nth, flip_mark),
-                IndexName::VLatest => flip_nth(&mut self.v_latest, nth, flip_op),
-                IndexName::VFold => flip_nth(&mut self.vfold_index, nth, flip_mark),
-                IndexName::VFoldLatest => flip_nth(&mut self.vfold_latest, nth, flip_op),
+                IndexName::E => flip_nth(&mut self.indexes.e_index, nth, flip_mark),
+                IndexName::R => flip_nth(&mut self.indexes.r_index, nth, flip_mark),
+                IndexName::ELatest => flip_nth(&mut self.indexes.e_latest, nth, flip_op),
+                IndexName::RLatest => flip_nth(&mut self.indexes.r_latest, nth, flip_op),
+                IndexName::V => flip_nth(&mut self.indexes.v_index, nth, flip_mark),
+                IndexName::VLatest => flip_nth(&mut self.indexes.v_latest, nth, flip_op),
+                IndexName::VFold => flip_nth(&mut self.indexes.vfold_index, nth, flip_mark),
+                IndexName::VFoldLatest => flip_nth(&mut self.indexes.vfold_latest, nth, flip_op),
             },
         }
     }

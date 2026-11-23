@@ -132,7 +132,7 @@ impl Txn<'_> {
     ) -> Result<MigrationReport, Error> {
         self.guard(|txn| {
             let source = txn.attr_id(name)?;
-            let old = txn.world.attributes[source.0 as usize].clone();
+            let old = txn.world.catalog.attributes[source.0 as usize].clone();
             if old.deprecated {
                 return Err(Error::DeprecatedAttribute(name.into()));
             }
@@ -295,8 +295,8 @@ impl Txn<'_> {
                 } else {
                     format!("{name}@old{suffix}")
                 };
-                if !txn.world.attr_by_name.contains_key(&candidate)
-                    && !txn.world.inverse_by_name.contains_key(&candidate)
+                if !txn.world.catalog.attr_by_name.contains_key(&candidate)
+                    && !txn.world.catalog.inverse_by_name.contains_key(&candidate)
                 {
                     break candidate;
                 }
@@ -327,7 +327,7 @@ impl Txn<'_> {
                 true,
             )?;
             let target = AttrId(
-                u32::try_from(txn.world.attributes.len())
+                u32::try_from(txn.world.catalog.attributes.len())
                     .map_err(|_| Error::Schema("too many attributes".into()))?,
             );
             txn.schema_edit(
@@ -379,6 +379,7 @@ impl Txn<'_> {
                 Vec::new()
             } else {
                 txn.world
+                    .catalog
                     .attributes
                     .iter()
                     .enumerate()
@@ -463,6 +464,7 @@ impl World {
         skip: bool,
     ) -> Result<std::collections::VecDeque<EntryBody>, Error> {
         let old = self
+            .catalog
             .attributes
             .get(source.0 as usize)
             .ok_or_else(|| Error::Schema("unknown migration source".into()))?;

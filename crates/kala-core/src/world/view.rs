@@ -66,14 +66,15 @@ impl<'w> View<'w> {
     ) -> Result<impl Iterator<Item = EntityId> + use<'w>, Error> {
         let world = self.world;
         let type_id = *world
+            .catalog
             .node_type_by_name
             .get(node_type)
             .ok_or_else(|| Error::UnknownNodeType(node_type.to_owned()))?;
         let canon = self.canon;
-        if world.node_origins[usize::from(type_id.0)][0].0 > canon {
+        if world.catalog.node_origins[usize::from(type_id.0)][0].0 > canon {
             return Err(Error::UnknownNodeType(node_type.into()));
         }
-        let defined_in = &world.node_types[usize::from(type_id.0)].defined_in;
+        let defined_in = &world.catalog.node_types[usize::from(type_id.0)].defined_in;
         // Entities are defined in tx order, so those visible at the canon
         // are a prefix of the type's sequences.
         let visible = defined_in.partition_point(|&tx| tx <= canon) as u64;
@@ -109,6 +110,7 @@ impl View<'_> {
             .and_then(|i| usize::try_from(i).ok())
             .and_then(|i| {
                 self.world
+                    .catalog
                     .node_types
                     .get(usize::from(id.node_type().0))?
                     .defined_in
@@ -137,7 +139,7 @@ impl View<'_> {
         id.seq()
             .checked_sub(1)
             .and_then(|i| usize::try_from(i).ok())
-            .and_then(|i| self.world.edges_defined_in.get(i))
+            .and_then(|i| self.world.catalog.edges_defined_in.get(i))
             .is_some_and(|&tx| tx <= self.canon)
     }
 
@@ -178,12 +180,12 @@ impl View<'_> {
         let mut done: Option<&[u8]> = None;
         // Unbounded meters retain the old bulk-count fast path.
         let work = if self.work.0.is_some_and(|m| m.limit.is_none()) {
-            self.work.add(self.world.e_index.len() as u64);
+            self.work.add(self.world.indexes.e_index.len() as u64);
             Work::NONE
         } else {
             self.work
         };
-        for (k, mark) in self.world.e_index.iter() {
+        for (k, mark) in self.world.indexes.e_index.iter() {
             if !work.add(1) {
                 break;
             }
@@ -250,10 +252,10 @@ impl View<'_> {
     /// key buffer; it is restored before returning.
     fn holds_e(&self, value_prefix: &mut Vec<u8>, t: Tick) -> bool {
         if self.latest {
-            holds_latest(&self.world.e_latest, value_prefix, t, self.work)
+            holds_latest(&self.world.indexes.e_latest, value_prefix, t, self.work)
         } else {
             holds(
-                &[&self.world.e_index],
+                &[&self.world.indexes.e_index],
                 value_prefix,
                 t,
                 self.canon,
@@ -338,7 +340,7 @@ impl View<'_> {
         self.resolve_attribute(attr)?;
         let world = self.world;
         let mut out = Vec::new();
-        if let Some(&attr_id) = world.attr_by_name.get(attr) {
+        if let Some(&attr_id) = world.catalog.attr_by_name.get(attr) {
             self.require_definition(attr_id)?;
             // IDs ascend and each entity's values come sorted, so `out` is
             // sorted and duplicate-free as built.
@@ -353,6 +355,7 @@ impl View<'_> {
             return Ok(out);
         }
         let &attr_id = world
+            .catalog
             .inverse_by_name
             .get(attr)
             .ok_or_else(|| Error::UnknownAttribute(attr.to_owned()))?;
@@ -396,7 +399,9 @@ impl View<'_> {
         // (value encoding, change), sorted by the encoding at the end.
         let mut out: Vec<(Vec<u8>, Change)> = Vec::new();
         self.for_each_e_history(entity, attr_id, |p| {
-            let Some((k, Op::Assert)) = self.entry_at(&world.e_index, &world.e_latest, p, t) else {
+            let Some((k, Op::Assert)) =
+                self.entry_at(&world.indexes.e_index, &world.indexes.e_latest, p, t)
+            else {
                 return;
             };
             // An unresolvable or mistyped key (only by tampering) is skipped.
@@ -418,7 +423,8 @@ impl View<'_> {
             let prefix = key::r_attr_prefix(entity, attr_id);
             let source_end = |_: &[u8]| key::R_SOURCE_PREFIX_LEN;
             let mut on_history = |p: &mut Vec<u8>| {
-                let Some((k, Op::Assert)) = self.entry_at(&world.r_index, &world.r_latest, p, t)
+                let Some((k, Op::Assert)) =
+                    self.entry_at(&world.indexes.r_index, &world.indexes.r_latest, p, t)
                 else {
                     return;
                 };
@@ -449,7 +455,7 @@ impl View<'_> {
             };
             if self.latest {
                 for_each_history(
-                    &world.r_latest,
+                    &world.indexes.r_latest,
                     &prefix,
                     source_end,
                     self.work,
@@ -457,7 +463,7 @@ impl View<'_> {
                 );
             } else {
                 for_each_history(
-                    &world.r_index,
+                    &world.indexes.r_index,
                     &prefix,
                     source_end,
                     self.work,
@@ -521,6 +527,7 @@ impl View<'_> {
     pub fn lookup(&self, attr: &str, v: &Value, t: Tick) -> Result<Vec<EntityId>, Error> {
         let world = self.world;
         let attr_id = *world
+            .catalog
             .attr_by_name
             .get(attr)
             .ok_or_else(|| Error::UnknownAttribute(attr.to_owned()))?;
@@ -552,8 +559,8 @@ impl View<'_> {
                 // the history of one entity, in entity order.
                 let entity_end = |k: &[u8]| (prefix.len() + key::V_ENTITY_LEN).min(k.len());
                 self.for_each_value_holder(
-                    &world.v_index,
-                    &world.v_latest,
+                    &world.indexes.v_index,
+                    &world.indexes.v_latest,
                     &prefix,
                     entity_end,
                     t,
@@ -585,6 +592,7 @@ impl View<'_> {
     pub fn lookup_ci(&self, attr: &str, text: &str, t: Tick) -> Result<Vec<EntityId>, Error> {
         let world = self.world;
         let attr_id = *world
+            .catalog
             .attr_by_name
             .get(attr)
             .ok_or_else(|| Error::UnknownAttribute(attr.to_owned()))?;
@@ -609,8 +617,8 @@ impl View<'_> {
         let history_end = |k: &[u8]| key::vfold_history_end(fold_prefix_len, k);
         let mut out = Vec::new();
         self.for_each_value_holder(
-            &world.vfold_index,
-            &world.vfold_latest,
+            &world.indexes.vfold_index,
+            &world.indexes.vfold_latest,
             &prefix,
             history_end,
             t,
@@ -684,11 +692,11 @@ impl View<'_> {
             let world = self.world;
             let work = self.work;
             if self.latest {
-                let index = &world.r_latest;
+                let index = &world.indexes.r_latest;
                 let holds_at = |p: &mut Vec<u8>| holds_latest(index, p, t, work);
                 for_each_holding(index, &prefix, source_end, work, holds_at, f);
             } else {
-                let index = &world.r_index;
+                let index = &world.indexes.r_index;
                 let holds_at = |p: &mut Vec<u8>| holds(&[index], p, t, self.canon, work);
                 for_each_holding(index, &prefix, source_end, work, holds_at, f);
             }
@@ -729,7 +737,7 @@ impl View<'_> {
                         .0
                         .len()
             };
-            for_each_history(&world.e_latest, &prefix, value_end, self.work, f);
+            for_each_history(&world.indexes.e_latest, &prefix, value_end, self.work, f);
         } else {
             let value_end = |k: &[u8]| {
                 key::E_ATTR_PREFIX_LEN
@@ -737,7 +745,7 @@ impl View<'_> {
                         .expect("invariant: E index keys are built only by key::e_fact_key")
                         .len()
             };
-            for_each_history(&world.e_index, &prefix, value_end, self.work, f);
+            for_each_history(&world.indexes.e_index, &prefix, value_end, self.work, f);
         }
     }
 
@@ -747,7 +755,7 @@ impl View<'_> {
     fn e_current<'v>(&'v self, attr_prefix: &'v [u8]) -> Vec<(Tick, &'v [u8], Op, Precision)> {
         let world = self.world;
         if self.latest {
-            under(&world.e_latest, attr_prefix, self.work)
+            under(&world.indexes.e_latest, attr_prefix, self.work)
                 .map(|(k, op)| {
                     let (value, tick) = key::latest_e_value_and_tick(k)
                         .expect("invariant: E_latest keys are E keys without their ^tx");
@@ -755,7 +763,7 @@ impl View<'_> {
                 })
                 .collect()
         } else {
-            current_entries_metered(&world.e_index, attr_prefix, self.canon, self.work)
+            current_entries_metered(&world.indexes.e_index, attr_prefix, self.canon, self.work)
                 .map(|(k, op)| {
                     let (value, tick) = key::e_value_and_tick(k)
                         .expect("invariant: E index keys are built only by key::e_fact_key");
@@ -770,9 +778,9 @@ impl View<'_> {
     /// otherwise): [`Precision::Exact`] unless a vague one is recorded.
     fn precision_at(&self, k: &[u8]) -> Precision {
         let precisions = if self.latest {
-            &self.world.e_latest_precision
+            &self.world.indexes.e_latest_precision
         } else {
-            &self.world.e_precision
+            &self.world.indexes.e_precision
         };
         precisions.get(k).copied().unwrap_or_default()
     }
@@ -789,7 +797,7 @@ impl View<'_> {
         tx: TxId,
     ) -> Precision {
         let world = self.world;
-        if world.e_precision.is_empty() {
+        if world.indexes.e_precision.is_empty() {
             return Precision::Exact;
         }
         let value = Value::Ref(target)
@@ -810,7 +818,7 @@ impl View<'_> {
         let world = self.world;
         let attr_prefix = key::r_attr_prefix(target, attr);
         if self.latest {
-            under(&world.r_latest, &attr_prefix, self.work)
+            under(&world.indexes.r_latest, &attr_prefix, self.work)
                 .map(|(k, op)| {
                     let (source, tick) = key::latest_r_source_and_tick(k)
                         .expect("invariant: R_latest keys are R keys without their ^tx");
@@ -820,7 +828,7 @@ impl View<'_> {
                 })
                 .collect()
         } else {
-            current_entries_metered(&world.r_index, &attr_prefix, self.canon, self.work)
+            current_entries_metered(&world.indexes.r_index, &attr_prefix, self.canon, self.work)
                 .map(|(k, op)| {
                     let (_, _, source, tick, tx) =
                         key::decode_r_key(k).expect("invariant: R index keys are fixed-width");
@@ -938,10 +946,11 @@ impl View<'_> {
     pub fn history_scan(&self, attr: &str) -> Result<Vec<(EntityId, Change)>, Error> {
         self.resolve_attribute(attr)?;
         let world = self.world;
-        let (attr_id, inverse) = match world.attr_by_name.get(attr) {
+        let (attr_id, inverse) = match world.catalog.attr_by_name.get(attr) {
             Some(&id) => (id, false),
             None => (
                 *world
+                    .catalog
                     .inverse_by_name
                     .get(attr)
                     .ok_or_else(|| Error::UnknownAttribute(attr.to_owned()))?,
@@ -1086,6 +1095,7 @@ impl View<'_> {
     pub fn overlaps(&self, attr: &str) -> Result<Vec<Overlap>, Error> {
         let world = self.world;
         let attr_id = *world
+            .catalog
             .attr_by_name
             .get(attr)
             .ok_or_else(|| Error::UnknownAttribute(attr.to_owned()))?;
@@ -1148,7 +1158,7 @@ impl View<'_> {
         if changes.is_empty() {
             return Vec::new();
         }
-        let name = &self.world.attributes[attr.0 as usize].name;
+        let name = &self.world.catalog.attributes[attr.0 as usize].name;
         let per_value = value_intervals(&changes);
         let rows = match touched {
             None => find_overlaps(&per_value),
@@ -1212,7 +1222,7 @@ impl View<'_> {
             }
         }
         let mut out = Vec::new();
-        for (i, _) in world.attributes.iter().enumerate() {
+        for (i, _) in world.catalog.attributes.iter().enumerate() {
             let attr = AttrId(i as u32);
             let Some(def) = self.definition(attr) else {
                 continue;
@@ -1226,7 +1236,7 @@ impl View<'_> {
                     .get(&(o.entity, attr, o.side))
                     .copied()
                     .unwrap_or(self.canon);
-                let history = &world.attribute_history[attr.0 as usize];
+                let history = &world.catalog.attribute_history[attr.0 as usize];
                 let schema_tx = history
                     .iter()
                     .rev()
@@ -1272,6 +1282,7 @@ impl View<'_> {
                 let i = usize::try_from(edge.seq().checked_sub(1)?).ok()?;
                 let &(source, attr, target) = self
                     .world
+                    .catalog
                     .edges
                     .get(i)
                     .expect("invariant: a kept entry's edge subject is defined");
@@ -1283,7 +1294,9 @@ impl View<'_> {
                     return None;
                 }
                 let tag = history_tx.get(&triple).map_or(tx, |t| tx.max(*t));
-                let name = self.world.attributes[fact.attr.0 as usize].name.clone();
+                let name = self.world.catalog.attributes[fact.attr.0 as usize]
+                    .name
+                    .clone();
                 Some((tag, entry, edge, name, fact.tick))
             })
             .collect();

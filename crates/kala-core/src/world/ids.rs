@@ -102,14 +102,19 @@ impl World {
     /// then sequence (the type is the ID's high bits), then edges (tagged
     /// with the ID's top bit).
     pub(super) fn defined_ids(&self) -> impl Iterator<Item = EntityId> + '_ {
-        let entities = self.node_types.iter().enumerate().flat_map(|(t, nt)| {
-            // In range: at most MAX_NODE_TYPE + 1 types are declared.
-            let t = NodeTypeId(t as u16);
-            (1..=nt.last_seq()).map(move |seq| {
-                EntityId::new(t, seq).expect("invariant: assigned entity sequences fit an ID")
-            })
-        });
-        let edges = (1..=self.edges.len() as u64).map(|seq| {
+        let entities = self
+            .catalog
+            .node_types
+            .iter()
+            .enumerate()
+            .flat_map(|(t, nt)| {
+                // In range: at most MAX_NODE_TYPE + 1 types are declared.
+                let t = NodeTypeId(t as u16);
+                (1..=nt.last_seq()).map(move |seq| {
+                    EntityId::new(t, seq).expect("invariant: assigned entity sequences fit an ID")
+                })
+            });
+        let edges = (1..=self.catalog.edges.len() as u64).map(|seq| {
             EntityId::from(EdgeId::new(seq).expect("invariant: assigned edge sequences fit an ID"))
         });
         entities.chain(edges)
@@ -143,12 +148,12 @@ impl World {
     /// staged edges.
     pub(super) fn last_edge_seq(&self, staged: &StagedIds) -> u64 {
         // A Vec's length always fits a u64.
-        (self.edges.len() + staged.edges.len()) as u64
+        (self.catalog.edges.len() + staged.edges.len()) as u64
     }
 
     /// Whether `attr` is a bidirectional `ref` attribute.
     pub(super) fn is_bidirectional(&self, attr: AttrId) -> bool {
-        self.attributes[attr.0 as usize].direction == Some(RefDirection::Bidirectional)
+        self.catalog.attributes[attr.0 as usize].direction == Some(RefDirection::Bidirectional)
     }
 
     /// The order a `ref` pair `(source, target)` of `attr` is stored and
@@ -180,7 +185,8 @@ impl World {
     ) -> Option<EdgeId> {
         let (source, target) = self.stored_pair(attr, source, target);
         let triple = (source, attr, target);
-        self.edge_by_triple
+        self.catalog
+            .edge_by_triple
             .get(&triple)
             .or_else(|| staged.edge_by_triple.get(&triple))
             .copied()
@@ -213,12 +219,12 @@ impl World {
     pub(super) fn apply_edge(&mut self, def: EdgeDef, tx: TxId) {
         debug_assert_eq!(
             def.id.seq(),
-            self.edges.len() as u64 + 1,
+            self.catalog.edges.len() as u64 + 1,
             "invariant: edges are applied in sequence order"
         );
-        self.edge_by_triple.insert(def.triple(), def.id);
-        self.edges.push(def.triple());
-        self.edges_defined_in.push(tx);
+        self.catalog.edge_by_triple.insert(def.triple(), def.id);
+        self.catalog.edges.push(def.triple());
+        self.catalog.edges_defined_in.push(tx);
     }
 
     /// The edge interned for `(source, attr, target)`, if any: the ID the
@@ -227,7 +233,7 @@ impl World {
     /// are only read by `neighbors`), a non-ref attribute or an undefined
     /// entity; never an error.
     pub fn edge_id(&self, source: EntityId, attr: &str, target: EntityId) -> Option<EdgeId> {
-        let attr = *self.attr_by_name.get(attr)?;
+        let attr = *self.catalog.attr_by_name.get(attr)?;
         self.edge_of(&StagedIds::default(), source, attr, target)
     }
 
@@ -235,10 +241,10 @@ impl World {
     /// `None` if `id` isn't defined in this world.
     pub fn edge(&self, id: EdgeId) -> Option<(EntityId, String, EntityId)> {
         let i = usize::try_from(id.seq().checked_sub(1)?).ok()?;
-        let (source, attr, target) = *self.edges.get(i)?;
+        let (source, attr, target) = *self.catalog.edges.get(i)?;
         Some((
             source,
-            self.attributes[attr.0 as usize].name.clone(),
+            self.catalog.attributes[attr.0 as usize].name.clone(),
             target,
         ))
     }
@@ -246,7 +252,7 @@ impl World {
     /// The last sequence number assigned to node type `t`, counting staged
     /// entities; `None` if the type isn't declared.
     fn last_seq(&self, staged: &StagedIds, t: NodeTypeId) -> Option<u64> {
-        let committed = self.node_types.get(usize::from(t.0))?.last_seq();
+        let committed = self.catalog.node_types.get(usize::from(t.0))?.last_seq();
         Some(staged.last_seq.get(&t).copied().unwrap_or(committed))
     }
 
@@ -277,6 +283,7 @@ impl World {
         handle: Option<&str>,
     ) -> Result<EntityDef, Error> {
         let type_id = *self
+            .catalog
             .node_type_by_name
             .get(node_type)
             .ok_or_else(|| Error::UnknownNodeType(node_type.to_owned()))?;
@@ -284,7 +291,7 @@ impl World {
             if h.is_empty() {
                 return Err(Error::InvalidHandle(h.to_owned()));
             }
-            if self.entity_by_handle.contains_key(h) || staged.handles.contains(h) {
+            if self.catalog.entity_by_handle.contains_key(h) || staged.handles.contains(h) {
                 return Err(Error::DuplicateHandle(h.to_owned()));
             }
         }
@@ -303,7 +310,7 @@ impl World {
     /// Applies a definition produced by [`World::prepare_entity`], as part
     /// of the commit (or replay) of transaction `tx`. Infallible.
     pub(super) fn apply_entity(&mut self, def: EntityDef, tx: TxId) {
-        let nt = &mut self.node_types[usize::from(def.id.node_type().0)];
+        let nt = &mut self.catalog.node_types[usize::from(def.id.node_type().0)];
         debug_assert_eq!(
             def.id.seq(),
             nt.last_seq() + 1,
@@ -311,21 +318,21 @@ impl World {
         );
         nt.defined_in.push(tx);
         if let Some(h) = def.handle {
-            self.handle_by_entity.insert(def.id, h.clone());
-            self.entity_by_handle.insert(h, def.id);
+            self.catalog.handle_by_entity.insert(def.id, h.clone());
+            self.catalog.entity_by_handle.insert(h, def.id);
         }
     }
 
     /// The entity with this handle, if any. Handles are matched exactly.
     pub fn entity_by_handle(&self, handle: &str) -> Option<EntityId> {
-        self.entity_by_handle.get(handle).copied()
+        self.catalog.entity_by_handle.get(handle).copied()
     }
 
     /// The handle of entity `id`, if it was created with one: the inverse
     /// of [`World::entity_by_handle`]. `None` for an entity without a
     /// handle, an edge or an ID that isn't defined in this world.
     pub fn handle_of(&self, id: EntityId) -> Option<&str> {
-        self.handle_by_entity.get(&id).map(String::as_str)
+        self.catalog.handle_by_entity.get(&id).map(String::as_str)
     }
 
     /// Parses an ID in the form [`World::format_id`] writes: `TYPE#seq` for
@@ -358,7 +365,7 @@ impl World {
         if prefix == "edge" {
             return EdgeId::new(seq).ok().map(EntityId::from);
         }
-        let t = *self.node_type_by_name.get(prefix)?;
+        let t = *self.catalog.node_type_by_name.get(prefix)?;
         EntityId::new(t, seq).ok()
     }
 
@@ -374,7 +381,7 @@ impl World {
             return format!("edge#{}", id.raw() & !(1 << 63));
         }
         let t = id.node_type();
-        match self.node_types.get(usize::from(t.0)) {
+        match self.catalog.node_types.get(usize::from(t.0)) {
             Some(nt) => format!("{}#{}", nt.name, id.seq()),
             None => format!("#{}#{}", t.0, id.seq()),
         }
