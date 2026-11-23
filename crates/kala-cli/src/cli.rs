@@ -67,6 +67,25 @@ fn parse_param(s: &str) -> Result<(String, String), String> {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Serve read-only Datalog queries over Bolt 5 on loopback.
+    Serve {
+        /// Directory containing <database>.kala world files.
+        dir: PathBuf,
+        /// Loopback IP:port, [::1]:port, or localhost:port.
+        #[arg(long, default_value = "127.0.0.1:7687")]
+        listen: String,
+        /// Authentication policy (only none is available yet).
+        #[arg(long, default_value = "none", value_parser = ["none"])]
+        auth: String,
+        #[arg(long)]
+        default_db: Option<String>,
+        /// Maximum simultaneous client connections.
+        #[arg(long, default_value_t = 64)]
+        max_connections: usize,
+        /// Seconds allowed to receive a complete message.
+        #[arg(long, default_value_t = 600)]
+        idle_timeout: u64,
+    },
     /// Build a world file from a YAML fixture.
     Load {
         /// The YAML fixture to load.

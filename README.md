@@ -8,7 +8,8 @@ before last week's retcon?
 The name means "time" in Sanskrit, Javanese and Indonesian.
 
 > **Status: early.** The storage engine, terminal writes, the REPL and Datalog work.
-> Bolt (Neo4j driver compatibility), Cypher and Gremlin are not built yet. The
+> Read-only Bolt 5 access supports Datalog through Neo4j drivers. Cypher and
+> Gremlin are not built yet. The
 > on-disk format may still change without migration.
 
 ## Ideas
@@ -63,6 +64,38 @@ kala log w.kala                                     # the author timeline, with 
 
 Ticks are written `@T` (or `--at T`). Every read takes `--canon tx#N` to see an
 older canon and `--json` for scripts.
+
+### Serve through a Neo4j driver
+
+Serve a directory of worlds; `worlds/varrow.kala` becomes database `varrow`:
+
+```sh
+mkdir -p worlds
+kala load crates/kala-core/tests/fixtures/varrow.yaml worlds/varrow.kala
+kala serve worlds --listen 127.0.0.1:7687
+```
+
+Install the Python driver (`python3 -m pip install neo4j==5.28.8`), then:
+
+```python
+from neo4j import GraphDatabase
+uri = "bolt://127.0.0.1:7687"
+query = "// kala:datalog\n[:find ?a :at -210 :where [:edwin :ally_of ?a]]"
+with GraphDatabase.driver(uri, auth=None) as driver:
+    driver.verify_connectivity()
+    with driver.session(database="varrow", fetch_size=5) as session:
+        for record in session.run(query):
+            ally = record["a"]
+            print(ally.element_id, ally.labels, ally["name"])
+# CHARACTER#… frozenset({'CHARACTER', ...}) Greg / Tomas
+```
+
+The server is read-only and accepts no-auth connections only on loopback.
+Changes committed by `kala transact` become visible on the next query.
+Ctrl-C stops the server. Cypher comes next; explicit transactions, routing,
+Neo4j Browser and writes over Bolt are not supported yet. See the
+[Bolt support and limits](crates/kala-bolt/README.md) and the opt-in
+[driver E2E tests](e2e/README.md).
 
 ### Datalog
 
@@ -140,6 +173,7 @@ The native Rust API (`kala-core`) can also write directly. See
 | `kala-core` | The log, indexes (`E`, `R`, `V`), `assert`/`retract`/`correct`, `AsOf`/`History`/`Neighbors`, overlap warnings, doctor, the YAML fixture loader |
 | `kala-query` | A language-neutral query IR and executor, with row, step and memory budgets |
 | `kala-datalog` | The Datalog parser, compiler and planner |
+| `kala-bolt` | Read-only Bolt 5 server, authentication boundary and driver value mapping |
 | `kala-cli` | The `kala` command-line tool |
 
 ## Roadmap
@@ -149,6 +183,7 @@ The native Rust API (`kala-core`) can also write directly. See
 - [x] Datalog: joins, rules, recursion, negation, disjunction, history with precision, interval sets, aggregates
 - [x] REPL (`kala repl`)
 - [x] Writes from the CLI and REPL
-- [ ] `kala serve`: the Bolt protocol, so Neo4j drivers and Neo4j Browser can connect
+- [x] `kala serve`: read-only Bolt 5 Datalog queries through Neo4j drivers
+- [ ] Neo4j Browser compatibility and routing/procedure stubs
 - [ ] Cypher (a subset first), then Gremlin
 - [ ] On-disk indexes with checkpoints, authentication

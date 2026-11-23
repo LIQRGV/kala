@@ -16,6 +16,7 @@ mod read;
 pub mod repl;
 mod repl_editor;
 mod repl_history;
+pub mod serve;
 pub mod transact;
 
 use crate::cli::Command;
@@ -40,6 +41,20 @@ impl From<String> for Done {
 /// Runs a parsed command.
 pub fn dispatch(cmd: &Command) -> Result<Done, CliError> {
     let text = match cmd {
+        Command::Serve {
+            dir,
+            listen,
+            auth: _,
+            default_db,
+            max_connections,
+            idle_timeout,
+        } => serve::run(
+            dir,
+            listen,
+            default_db.clone(),
+            *max_connections,
+            *idle_timeout,
+        ),
         Command::Load {
             fixture,
             world,

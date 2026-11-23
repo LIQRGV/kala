@@ -1,0 +1,13 @@
+[package]
+name = "kala-bolt"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kala-core = { path = "../kala-core" }
+kala-query = { path = "../kala-query" }
+kala-datalog = { path = "../kala-datalog" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+proptest = "1.12.0"

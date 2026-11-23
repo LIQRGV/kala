@@ -12,6 +12,7 @@ kala-core = { path = "../kala-core" }
 # `kala query` / `kala explain` (internal crates).
 kala-query = { path = "../kala-query" }
 kala-datalog = { path = "../kala-datalog" }
+kala-bolt = { path = "../kala-bolt" }
 # Argument parsing; no `color` (no ANSI in output), no argfiles, no env args
 # (security-consultant approved, slice 5).
 clap = { version = "4.6.9", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
