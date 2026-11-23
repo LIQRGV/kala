@@ -288,6 +288,10 @@ old name is immediately free. Names containing `@` are reserved for migration;
 is reserved for names introduced after genesis. Both prefixes are case-sensitive.
 `edge` (ID prefix) is reserved only for node types. Attributes and inverse names
 may use `handle` or `edge`; the built-in query pseudo-attribute is `:kala_handle`.
+Upgrading queries: the built-in used to be `:handle`. In a world without a
+`handle` attribute an old `[?e :handle …]` query fails with a hint; in a world
+that declares its own `handle` attribute it reads that attribute's values
+instead, so rewrite old queries to `:kala_handle`.
 Attribute and inverse names share a namespace. Node type renaming and inverse renaming
 are not supported.
 

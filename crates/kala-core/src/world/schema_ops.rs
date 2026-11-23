@@ -23,7 +23,7 @@ pub(super) fn check_name(name: &str) -> Result<(), Error> {
     if name.is_empty() || name.contains('@') {
         return Err(Error::InvalidName(name.to_owned()));
     }
-    if name.starts_with(crate::RESERVED_ATTRIBUTE_PREFIX) {
+    if name.starts_with(crate::BUILTIN_NAME_PREFIX) {
         return Err(Error::ReservedName(name.to_owned()));
     }
     Ok(())

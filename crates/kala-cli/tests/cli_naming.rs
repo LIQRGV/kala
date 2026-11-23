@@ -225,3 +225,29 @@ fn edge_is_an_inverse_but_never_a_node_type() {
         assert_eq!(fs::read(&path).unwrap(), before);
     }
 }
+
+// PR #8 review: the rename hint must not claim `:handle` is gone when the
+// world has its own `handle` attribute (read at a canon before it existed).
+#[test]
+fn handle_hint_only_when_the_world_has_no_handle_attribute() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("world.kala");
+    success(&kala(["create", path.to_str().unwrap()]));
+    write(&path, "[:create :CHARACTER :ann]", false);
+    let query = |q: &str| kala(["query", path.to_str().unwrap(), q]);
+    let before = query("[:find ?e :where [?e :handle \"x\"]]");
+    assert!(
+        stderr(&before).contains(":kala_handle"),
+        "{}",
+        stderr(&before)
+    );
+    write(&path, "[:assert :ann :handle \"x\" :at 0]", false);
+    let old = query("[:find ?e :canon 1 :where [?e :handle \"x\"]]");
+    assert_ne!(code(&old), 0);
+    assert!(
+        !stderr(&old).contains("now :kala_handle"),
+        "the world has a user handle attribute: {}",
+        stderr(&old)
+    );
+    assert!(stdout(&query("[:find ?e :where [?e :handle \"x\"]]")).contains("ann"));
+}

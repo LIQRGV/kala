@@ -32,8 +32,8 @@ pub use log::LogFault;
 pub use log::{EntryId, MAX_ENTRY_BYTES};
 pub use overlap::{Interval, Overlap, Side, Warnings, find_overlaps, value_intervals};
 pub use schema::{
-    AttrDef, AttributeOptions, Cardinality, Kind, MigrationOptions, MigrationReport,
-    RESERVED_ATTRIBUTE_PREFIX, RESERVED_NAME_PREFIX, RefDirection, Schema, SchemaChange,
+    AttrDef, AttributeOptions, BUILTIN_NAME_PREFIX, Cardinality, Kind, MigrationOptions,
+    MigrationReport, RESERVED_NAME_PREFIX, RefDirection, Schema, SchemaChange,
 };
 pub use tick::{Precision, Tick};
 pub use value::{MAX_INDEXED_STRING_BYTES, Value, ValueError, ValueType, fold_for_search};
