@@ -963,3 +963,90 @@ fn cypher_cli_json_list_and_null_parameters() {
         ]})
     );
 }
+
+const HEIGHTS: &str = r#"
+schema:
+  node_types: [CHARACTER]
+  attributes:
+    - { name: name, type: string }
+    - { name: height, type: f64 }
+entities:
+  CHARACTER: [alice]
+transactions:
+  - tick: 0
+    ops:
+      - assert: [alice, name, "Alice"]
+      - assert: [alice, height, 2.0]
+"#;
+
+fn heights() -> Fx {
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = dir.path().join("h.yaml");
+    std::fs::write(&yaml, HEIGHTS).unwrap();
+    let path = dir.path().join("w.kala");
+    let o = kala([
+        OsString::from("load"),
+        yaml.clone().into(),
+        path.clone().into(),
+    ]);
+    assert_eq!(code(&o), 0, "kala load: {}", stderr(&o));
+    Fx {
+        dir: dir.path().to_path_buf(),
+        _dir: dir,
+        path,
+        twin: load_fixture(HEIGHTS).unwrap(),
+    }
+}
+
+#[test]
+fn cypher_cli_f64_param_accepts_integer_text() {
+    let f = heights();
+    for text in ["2", "2.0", "+2", "2e0"] {
+        let j = f.json(&[
+            "--lang",
+            "cypher",
+            "MATCH (a) WHERE a.height = $p RETURN a.name",
+            "--param",
+            &format!("p={text}"),
+        ]);
+        assert_eq!(j["rows"].as_array().unwrap().len(), 1, "p={text}: {j}");
+        assert_eq!(j["rows"][0][0]["value"], "Alice", "p={text}");
+    }
+}
+
+fn scalar_echo(f: &Fx, text: &str) -> Json {
+    let j = f.json(&[
+        "--lang",
+        "cypher",
+        "MATCH (a {kala_handle: 'alice'}) RETURN $p",
+        "--param",
+        &format!("p={text}"),
+    ]);
+    assert_eq!(j["rows"].as_array().unwrap().len(), 1, "p={text}: {j}");
+    j["rows"][0][0].clone()
+}
+
+#[test]
+fn cypher_cli_scalar_param_non_numeric_words_stay_strings() {
+    let f = heights();
+    for text in ["nan", "inf", "Infinity", "-inf", "NaN", "+infinity"] {
+        assert_eq!(
+            scalar_echo(&f, text),
+            json!({"type":"string","value":text}),
+            "p={text}"
+        );
+    }
+}
+
+#[test]
+fn cypher_cli_scalar_param_numeric_looking_text_is_a_float() {
+    let f = heights();
+    for (text, want) in [("1.5", 1.5), ("-2e3", -2000.0), (".5", 0.5), ("2.", 2.0)] {
+        assert_eq!(
+            scalar_echo(&f, text),
+            json!({"type":"f64","value":want}),
+            "p={text}"
+        );
+    }
+    assert_eq!(scalar_echo(&f, "7"), json!({"type":"i64","value":7}));
+}

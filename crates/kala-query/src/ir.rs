@@ -887,8 +887,8 @@ impl Plan {
         if !self.params.is_empty() {
             out.push_str("  in");
             for p in &self.params {
-                out.push_str(" $");
-                out.push_str(p);
+                out.push(' ');
+                out.push_str(&param_text(p));
             }
         }
         out.push_str("  at ");
@@ -902,10 +902,7 @@ impl Plan {
             CanonSource::Const(n) => {
                 let _ = write!(out, "{n}");
             }
-            CanonSource::Param(p) => {
-                out.push('$');
-                out.push_str(p);
-            }
+            CanonSource::Param(p) => out.push_str(&param_text(p)),
         }
         out.push('\n');
         if out.len() > MAX_EXPLAIN_BYTES {
@@ -917,8 +914,190 @@ impl Plan {
     }
 }
 
+/// `?name`. A generated variable (a front-end's hidden one, named with a
+/// leading NUL) prints as `?#` plus the rest of its name, and any control
+/// character is escaped as `{:?}` would, so explain text never holds one.
 fn var_text(v: &Var) -> String {
-    format!("?{}", v.0)
+    let mut out = String::from("?");
+    let name = match v.0.strip_prefix('\0') {
+        Some(rest) => {
+            out.push('#');
+            rest
+        }
+        None => v.0.as_str(),
+    };
+    push_name(&mut out, name);
+    out
+}
+
+/// `$name`, control characters escaped as in [`var_text`].
+fn param_text(p: &str) -> String {
+    let mut out = String::from("$");
+    push_name(&mut out, p);
+    out
+}
+
+/// Appends `name` with its control characters escaped (`\n`, `\u{1}`).
+fn push_name(out: &mut String, name: &str) {
+    for c in name.chars() {
+        if c.is_control() {
+            out.extend(c.escape_debug());
+        } else {
+            out.push(c);
+        }
+    }
+}
+
+/// A [`RowAction`](crate::RowAction) line without its newline:
+/// `nodes ?c :CHARACTER @latest`, `edge [?c :present ?p] as ?r out @-240`,
+/// `bind ?#1 = ?c.name@latest`, `select (… OR …)`.
+fn row_text(action: &crate::RowAction, world: &World, out: &mut String) {
+    use crate::RowAction;
+    out.push_str("Row ");
+    match action {
+        RowAction::Nodes { var, labels, tick } => {
+            out.push_str("nodes ");
+            out.push_str(&var_text(var));
+            if !labels.is_empty() {
+                out.push(' ');
+            }
+            for label in labels {
+                out.push(':');
+                push_name(out, label);
+            }
+            out.push_str(" @");
+            out.push_str(&tick_text(tick));
+        }
+        RowAction::Edge {
+            source,
+            target,
+            edge,
+            attr,
+            direction,
+            tick,
+        } => {
+            out.push_str("edge [");
+            out.push_str(&var_text(source));
+            out.push_str(" :");
+            push_name(out, attr);
+            out.push(' ');
+            out.push_str(&var_text(target));
+            out.push_str("] as ");
+            out.push_str(&var_text(edge));
+            out.push_str(match direction {
+                crate::Orientation::Out => " out @",
+                crate::Orientation::In => " in @",
+                crate::Orientation::Either => " either @",
+            });
+            out.push_str(&tick_text(tick));
+        }
+        RowAction::Bind { var, expr } => {
+            out.push_str("bind ");
+            out.push_str(&var_text(var));
+            out.push_str(" = ");
+            expr_text(expr, world, 0, out);
+        }
+        RowAction::Select(expr) => {
+            out.push_str("select ");
+            expr_text(expr, world, 0, out);
+        }
+    }
+}
+
+/// An [`OutputSpec`](crate::OutputSpec) line without its newline:
+/// `Output ?n ?r  distinct  order ?#1 desc, ?x asc  skip 1  limit $l`.
+fn output_text(spec: &crate::OutputSpec, world: &World, out: &mut String) {
+    out.push_str("Output");
+    for v in &spec.vars {
+        out.push(' ');
+        out.push_str(&var_text(v));
+    }
+    if spec.distinct {
+        out.push_str("  distinct");
+    }
+    for (i, (v, desc)) in spec.order.iter().enumerate() {
+        out.push_str(if i == 0 { "  order " } else { ", " });
+        out.push_str(&var_text(v));
+        out.push_str(if *desc { " desc" } else { " asc" });
+    }
+    if let Some(t) = &spec.skip {
+        out.push_str("  skip ");
+        out.push_str(&term_text(t, world));
+    }
+    if let Some(t) = &spec.limit {
+        out.push_str("  limit ");
+        out.push_str(&term_text(t, world));
+    }
+}
+
+/// Deeper expression levels than this print as `...`. Above the
+/// executor's own nesting limit, so every runnable expression prints whole,
+/// while an expression from any front-end can't overflow the stack here.
+const MAX_EXPLAIN_EXPR_DEPTH: usize = 64;
+
+/// Appends `e`: boolean connectives in parentheses (`(a OR b)`), a
+/// comparison, `IS NULL` or `NOT` operand in parentheses when it is itself
+/// one of those, so the text reads back unambiguously. Recursion is capped
+/// at [`MAX_EXPLAIN_EXPR_DEPTH`]; it also stops once the line alone is past
+/// [`MAX_EXPLAIN_BYTES`] (it is truncated when pushed anyway).
+fn expr_text(e: &crate::Expr, world: &World, depth: usize, out: &mut String) {
+    use crate::Expr;
+    if depth >= MAX_EXPLAIN_EXPR_DEPTH || out.len() > MAX_EXPLAIN_BYTES {
+        out.push_str("...");
+        return;
+    }
+    let operand = |e: &Expr, out: &mut String| {
+        if matches!(e, Expr::Compare(..) | Expr::IsNull(_) | Expr::Not(_)) {
+            out.push('(');
+            expr_text(e, world, depth + 1, out);
+            out.push(')');
+        } else {
+            expr_text(e, world, depth + 1, out);
+        }
+    };
+    match e {
+        Expr::Var(v) => out.push_str(&var_text(v)),
+        Expr::Value(v) => out.push_str(&value_text(v, world)),
+        Expr::Null => out.push_str("null"),
+        Expr::Param(p) => out.push_str(&param_text(p)),
+        Expr::Property { entity, key, tick } => {
+            out.push_str(&var_text(entity));
+            out.push('.');
+            push_name(out, key);
+            out.push('@');
+            out.push_str(&tick_text(tick));
+        }
+        Expr::Compare(op, a, b) => {
+            operand(a, out);
+            out.push(' ');
+            // Row expressions are three-valued, Cypher-style: `<>` for `!=`.
+            out.push_str(match op {
+                CmpOp::Ne => "<>",
+                op => op.symbol(),
+            });
+            out.push(' ');
+            operand(b, out);
+        }
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+            out.push('(');
+            expr_text(a, world, depth + 1, out);
+            out.push_str(match e {
+                Expr::And(..) => " AND ",
+                Expr::Or(..) => " OR ",
+                _ => " XOR ",
+            });
+            expr_text(b, world, depth + 1, out);
+            out.push(')');
+        }
+        Expr::Not(x) => {
+            out.push_str("NOT ");
+            operand(x, out);
+        }
+        Expr::IsNull(x) => {
+            operand(x, out);
+            out.push_str(" IS NULL");
+        }
+    }
 }
 
 /// A tick source without the `@` prefix (`latest`, `-210`, `$t`, `?t`).
@@ -926,7 +1105,7 @@ fn tick_text(t: &TickSource) -> String {
     match t {
         TickSource::Default => "latest".to_string(),
         TickSource::Const(Tick(n)) => n.to_string(),
-        TickSource::Param(p) => format!("${p}"),
+        TickSource::Param(p) => param_text(p),
         TickSource::Var(v) => var_text(v),
     }
 }
@@ -946,7 +1125,7 @@ fn value_text(v: &Value, world: &World) -> String {
 fn term_text(t: &Term, world: &World) -> String {
     match t {
         Term::Var(v) => var_text(v),
-        Term::Param(p) => format!("${p}"),
+        Term::Param(p) => param_text(p),
         Term::Const(v) => value_text(v, world),
         Term::Op(o) => op_text(*o).to_string(),
         Term::Precision(p) => format!(":{}", precision_text(*p)),
@@ -1012,11 +1191,13 @@ fn explain_op(root: &Op, world: &World, indent: usize, out: &mut String) {
         };
         match op {
             Op::Row { input, action } => {
-                let _ = writeln!(out, "Row {action:?}");
+                row_text(action, world, out);
+                out.push('\n');
                 todo.push((Item::Op(input), child));
             }
             Op::Output { input, spec } => {
-                let _ = writeln!(out, "Output {spec:?}");
+                output_text(spec, world, out);
+                out.push('\n');
                 todo.push((Item::Op(input), child));
             }
             Op::Unit => out.push_str("Unit\n"),

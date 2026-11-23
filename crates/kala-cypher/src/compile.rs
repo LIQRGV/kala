@@ -241,29 +241,33 @@ impl Compiler<'_> {
                     .map(|n| self.bind_name(&n.name, &tick, false))
                     .collect::<Result<Vec<_>, _>>()?;
                 // Handle lookup is selective, timeless and identical to Datalog's access.
+                // Keyed by node position, not variable: a variable repeated in the path
+                // keeps every other occurrence's property filters.
                 let mut handles = BTreeSet::new();
-                for (n, v) in path.nodes.iter().zip(&vars) {
+                for (position, (n, v)) in path.nodes.iter().zip(&vars).enumerate() {
                     for (i, (key, value)) in n.props.iter().enumerate() {
-                        if key == "kala_handle" && matches!(value, Expr::Value(Value::Str(_))) {
-                            let value = match value {
-                                Expr::Value(v) => Term::Const(v.clone()),
-                                Expr::Param(p) => {
-                                    self.param(p, ParamKind::Value(ValueType::Str))?;
-                                    Term::Param(p.clone())
-                                }
-                                _ => unreachable!(),
-                            };
-                            self.root = Op::Expand {
-                                input: Box::new(self.root),
-                                entity: Term::Var(v.clone()),
-                                attr: AttrRef::Handle,
-                                value,
-                                tick: TickSource::Default,
-                                access: Access::Handle,
-                            };
-                            bound.insert(v.clone());
-                            handles.insert((v.clone(), i));
+                        if key != "kala_handle" {
+                            continue;
                         }
+                        let value = match value {
+                            Expr::Value(v @ Value::Str(_)) => Term::Const(v.clone()),
+                            Expr::Param(p) => {
+                                self.param(p, ParamKind::Value(ValueType::Str))?;
+                                Term::Param(p.clone())
+                            }
+                            // Other values stay ordinary (never-equal) property filters.
+                            _ => continue,
+                        };
+                        self.root = Op::Expand {
+                            input: Box::new(self.root),
+                            entity: Term::Var(v.clone()),
+                            attr: AttrRef::Handle,
+                            value,
+                            tick: TickSource::Default,
+                            access: Access::Handle,
+                        };
+                        bound.insert(v.clone());
+                        handles.insert((position, i));
                     }
                 }
                 for (i, edge) in path.edges.iter().enumerate() {
@@ -319,7 +323,7 @@ impl Compiler<'_> {
                     }
                     bound.extend([source.clone(), target.clone()]);
                 }
-                for (node, var) in path.nodes.iter().zip(&vars) {
+                for (position, (node, var)) in path.nodes.iter().zip(&vars).enumerate() {
                     if !bound.contains(var) || !node.labels.is_empty() {
                         self.row(RowAction::Nodes {
                             var: var.clone(),
@@ -332,7 +336,7 @@ impl Compiler<'_> {
                         .props
                         .iter()
                         .enumerate()
-                        .filter(|(i, _)| !handles.contains(&(var.clone(), *i)))
+                        .filter(|(i, _)| !handles.contains(&(position, *i)))
                         .map(|(_, p)| p.clone())
                         .collect();
                     self.property_map(var, &tick, &props)?;

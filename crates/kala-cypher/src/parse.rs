@@ -102,6 +102,20 @@ impl Parser<'_> {
             while self.sym(",") {
                 paths.push(self.path()?);
             }
+            // Cypher binds one relationship per variable within a clause; a later
+            // clause may reuse it to mean the same edge.
+            let mut edge_names = std::collections::BTreeSet::new();
+            for name in paths
+                .iter()
+                .flat_map(|p| &p.edges)
+                .filter_map(|e| e.name.as_ref())
+            {
+                if !edge_names.insert(name) {
+                    return Err(self.err(format!(
+                        "relationship variable `{name}` is used for more than one relationship in one MATCH"
+                    )));
+                }
+            }
             let tick = if self.kw("AT") {
                 self.need_kw("TICK")?;
                 Some(self.integer(false)?)
@@ -152,6 +166,14 @@ impl Parser<'_> {
                     _ => self.text[start..end].into(),
                 }
             };
+            if items.iter().any(|i: &Item| i.name == name) {
+                return Err(CypherError::new(
+                    self.text,
+                    start,
+                    ErrorKind::Syntax,
+                    "Multiple result columns with the same name are not supported",
+                ));
+            }
             items.push(Item { expr, name });
             if !self.sym(",") {
                 break;
@@ -355,6 +377,7 @@ impl Parser<'_> {
         };
         Ok(e)
     }
+    /// Boolean connectives (`OR` < `XOR` < `AND` < `NOT`) by precedence climbing.
     fn expression(&mut self, min: u8, depth: usize) -> Result<Expr<String>, CypherError> {
         if depth >= MAX_DEPTH {
             return Err(self.err("expression nesting depth limit exceeded"));
@@ -362,57 +385,85 @@ impl Parser<'_> {
         self.element()?;
         let mut left = if self.kw("NOT") {
             Expr::Not(Box::new(self.expression(4, depth + 1)?))
-        } else if self.sym("(") {
-            let e = self.expression(0, depth + 1)?;
-            self.need(")")?;
-            e
         } else {
-            self.item()?
+            self.comparison(depth)?
         };
         loop {
-            let (precedence, op) = match &self.token().kind {
-                Kind::Ident(s, false) if s.eq_ignore_ascii_case("OR") => (1, "OR"),
-                Kind::Ident(s, false) if s.eq_ignore_ascii_case("XOR") => (2, "XOR"),
-                Kind::Ident(s, false) if s.eq_ignore_ascii_case("AND") => (3, "AND"),
-                Kind::Ident(s, false) if s.eq_ignore_ascii_case("IS") => (5, "IS"),
-                Kind::Symbol(s @ ("=" | "<>" | "<" | "<=" | ">" | ">=")) => (5, *s),
+            let precedence = match &self.token().kind {
+                Kind::Ident(s, false) if s.eq_ignore_ascii_case("OR") => 1,
+                Kind::Ident(s, false) if s.eq_ignore_ascii_case("XOR") => 2,
+                Kind::Ident(s, false) if s.eq_ignore_ascii_case("AND") => 3,
                 _ => break,
             };
             if precedence < min {
                 break;
             }
             self.bump();
-            if op == "IS" {
-                let not = self.kw("NOT");
-                self.need_kw("NULL")?;
-                left = Expr::IsNull(Box::new(left));
-                if not {
-                    left = Expr::Not(Box::new(left));
-                }
-            } else {
-                let right = Box::new(self.expression(precedence + 1, depth + 1)?);
-                let a = Box::new(left);
-                left = match op {
-                    "AND" => Expr::And(a, right),
-                    "OR" => Expr::Or(a, right),
-                    "XOR" => Expr::Xor(a, right),
-                    _ => Expr::Compare(
-                        match op {
-                            "=" => CmpOp::Eq,
-                            "<>" => CmpOp::Ne,
-                            "<" => CmpOp::Lt,
-                            "<=" => CmpOp::Le,
-                            ">" => CmpOp::Gt,
-                            _ => CmpOp::Ge,
-                        },
-                        a,
-                        right,
-                    ),
-                };
-            }
+            let right = Box::new(self.expression(precedence + 1, depth + 1)?);
+            let a = Box::new(left);
+            left = match precedence {
+                1 => Expr::Or(a, right),
+                2 => Expr::Xor(a, right),
+                _ => Expr::And(a, right),
+            };
             self.check_depth(&left)?;
         }
         Ok(left)
+    }
+    fn comparison_op(&self) -> Option<CmpOp> {
+        match &self.token().kind {
+            Kind::Symbol("=") => Some(CmpOp::Eq),
+            Kind::Symbol("<>") => Some(CmpOp::Ne),
+            Kind::Symbol("<") => Some(CmpOp::Lt),
+            Kind::Symbol("<=") => Some(CmpOp::Le),
+            Kind::Symbol(">") => Some(CmpOp::Gt),
+            Kind::Symbol(">=") => Some(CmpOp::Ge),
+            _ => None,
+        }
+    }
+    /// A comparison chain: `a < b <= c` means `a < b AND b <= c` (openCypher).
+    /// Each middle operand is copied once, so the tree stays linear in the input,
+    /// and the chain is read iteratively; the element and depth limits bound it.
+    fn comparison(&mut self, depth: usize) -> Result<Expr<String>, CypherError> {
+        let first = self.postfix(depth)?;
+        let Some(op) = self.comparison_op() else {
+            return Ok(first);
+        };
+        self.bump();
+        let mut right = self.postfix(depth)?;
+        let mut chain = Expr::Compare(op, Box::new(first), Box::new(right.clone()));
+        while let Some(op) = self.comparison_op() {
+            self.bump();
+            self.element()?;
+            let next = self.postfix(depth)?;
+            let compare = Expr::Compare(op, Box::new(right), Box::new(next.clone()));
+            chain = Expr::And(Box::new(chain), Box::new(compare));
+            self.check_depth(&chain)?;
+            right = next;
+        }
+        self.check_depth(&chain)?;
+        Ok(chain)
+    }
+    /// An operand with its `IS [NOT] NULL` suffixes, which bind tighter than comparisons.
+    fn postfix(&mut self, depth: usize) -> Result<Expr<String>, CypherError> {
+        let mut e = if self.sym("(") {
+            let e = self.expression(0, depth + 1)?;
+            self.need(")")?;
+            e
+        } else {
+            self.item()?
+        };
+        while self.kw("IS") {
+            self.element()?;
+            let not = self.kw("NOT");
+            self.need_kw("NULL")?;
+            e = Expr::IsNull(Box::new(e));
+            if not {
+                e = Expr::Not(Box::new(e));
+            }
+            self.check_depth(&e)?;
+        }
+        Ok(e)
     }
     fn check_depth(&self, expr: &Expr<String>) -> Result<(), CypherError> {
         let mut stack = vec![(expr, 1)];

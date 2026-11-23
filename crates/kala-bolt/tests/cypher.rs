@@ -154,3 +154,79 @@ fn cypher_list_and_null_parameters_preserve_values_and_list_equality() {
     );
     assert_eq!(c.pull(-1).0, vec![vec![aliases]]);
 }
+
+fn float_world() -> Running {
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = r#"
+schema:
+  node_types: [CHARACTER]
+  attributes:
+    - { name: name, type: string }
+    - { name: height, type: f64 }
+entities:
+  CHARACTER: [alice, bob, cy, di]
+transactions:
+  - tick: 0
+    ops:
+      - assert: [alice, name, Alice]
+      - assert: [alice, height, 2.0]
+      - assert: [bob, name, Bob]
+      - assert: [bob, height, 9007199254740992.0]
+      - assert: [cy, name, Cy]
+      - assert: [cy, height, -9007199254740992.0]
+      - assert: [di, name, Di]
+      - assert: [di, height, 9007199254740994.0]
+"#;
+    drop(kala_core::load_fixture_to(yaml, &dir.path().join("typed.kala")).unwrap());
+    Running::in_dir(
+        dir,
+        kala_bolt::ServerConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            ..kala_bolt::ServerConfig::default()
+        },
+    )
+}
+
+const HEIGHT_Q: &str = "MATCH (a) WHERE a.height = $p RETURN a.name";
+
+#[test]
+fn cypher_f64_attribute_accepts_integer_parameter() {
+    let server = float_world();
+    let mut c = Client::ready(&server);
+    c.run(HEIGHT_Q, map(&[("p", Value::Integer(2))]), map(&[]));
+    assert_eq!(c.pull(-1).0, vec![vec![string("Alice")]]);
+}
+
+#[test]
+fn cypher_f64_integer_parameter_accepts_exactly_plus_minus_2_pow_53() {
+    let server = float_world();
+    let mut c = Client::ready(&server);
+    c.run(HEIGHT_Q, map(&[("p", Value::Integer(1 << 53))]), map(&[]));
+    assert_eq!(c.pull(-1).0, vec![vec![string("Bob")]]);
+    c.run(
+        HEIGHT_Q,
+        map(&[("p", Value::Integer(-(1 << 53)))]),
+        map(&[]),
+    );
+    assert_eq!(c.pull(-1).0, vec![vec![string("Cy")]]);
+}
+
+#[test]
+fn cypher_f64_integer_parameter_beyond_2_pow_53_is_a_type_error() {
+    let server = float_world();
+    let mut c = Client::ready(&server);
+    for n in [
+        (1i64 << 53) + 1,
+        (1i64 << 53) + 2,
+        -(1i64 << 53) - 1,
+        i64::MAX,
+        i64::MIN,
+    ] {
+        c.send(
+            0x10,
+            vec![string(HEIGHT_Q), map(&[("p", Value::Integer(n))]), map(&[])],
+        );
+        c.failure("Neo.ClientError.Statement.TypeError");
+        c.reset();
+    }
+}

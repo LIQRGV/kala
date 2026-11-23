@@ -190,7 +190,7 @@ fn parse_param(ctx: &Ctx, name: &str, kind: &ParamKind, s: &str) -> Result<Value
             Value::I64(n)
         } else if let Ok(b) = s.parse::<bool>() {
             Value::Bool(b)
-        } else if let Ok(f) = s.parse::<f64>() {
+        } else if let Some(f) = numeric_float(s) {
             Value::f64(f).map_err(|_| CliError::User("invalid float parameter".into()))?
         } else {
             Value::Str(s.to_owned())
@@ -217,6 +217,47 @@ fn parse_param(ctx: &Ctx, name: &str, kind: &ParamKind, s: &str) -> Result<Value
                 ))
             }),
     }
+}
+
+/// `s` as a float, only when it looks numeric:
+/// `^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$`. Rust's `f64` parser also
+/// takes `nan`, `inf` and `infinity`; those words stay strings here, since a
+/// scalar parameter is guessed from its text.
+fn numeric_float(s: &str) -> Option<f64> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let digits = |i: &mut usize| {
+        let start = *i;
+        while *i < b.len() && b[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        *i - start
+    };
+    if matches!(b.first(), Some(b'+' | b'-')) {
+        i += 1;
+    }
+    let int_digits = digits(&mut i);
+    let mut frac_digits = 0;
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        frac_digits = digits(&mut i);
+    }
+    if int_digits == 0 && frac_digits == 0 {
+        return None;
+    }
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(b.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        if digits(&mut i) == 0 {
+            return None;
+        }
+    }
+    if i != b.len() {
+        return None;
+    }
+    s.parse::<f64>().ok()
 }
 
 /// A query (or checks) file's text: a regular file only (a directory, FIFO

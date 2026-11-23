@@ -145,6 +145,10 @@ fn parameters(
     }
     Ok(params)
 }
+/// The largest magnitude an `i64` can have and still convert to `f64`
+/// exactly (2^53).
+const F64_EXACT_INT_MAX: u64 = 1 << 53;
+
 fn parameter_value(
     world: &World,
     kind: &ParamKind,
@@ -188,6 +192,15 @@ fn parameter_value(
         ),
         (ParamKind::Value(ValueType::F64), Value::Float(n)) => {
             CoreValue::f64(*n).map_err(|_| bad())?
+        }
+        // Drivers send integral numbers as Integer. Accept one for a float
+        // parameter only when the conversion is exact (|n| <= 2^53), so a
+        // parameter never silently becomes a different number.
+        (ParamKind::Value(ValueType::F64), Value::Integer(n))
+            if n.unsigned_abs() <= F64_EXACT_INT_MAX =>
+        {
+            #[allow(clippy::cast_precision_loss)] // exact: |n| <= 2^53
+            CoreValue::f64(*n as f64).map_err(|_| bad())?
         }
         (ParamKind::Value(ValueType::Bool), Value::Bool(v)) => CoreValue::Bool(*v),
         (ParamKind::Value(ValueType::Str), Value::String(v)) => CoreValue::Str(v.clone()),

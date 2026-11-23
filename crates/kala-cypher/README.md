@@ -19,8 +19,12 @@ One or more MATCH clauses support comma-separated paths, anonymous nodes,
 multiple node labels, property maps, chains, typed relationships in either or
 both directions, relationship variables and relationship property maps.
 WHERE supports `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `XOR`, `NOT`,
-parentheses, `IS NULL` and `IS NOT NULL`. RETURN items are variables, properties,
-literals or parameters, with optional aliases and DISTINCT. ORDER BY supports
+parentheses, `IS NULL` and `IS NOT NULL`. As in openCypher, `IS [NOT] NULL`
+binds tighter than comparisons (`a = b IS NULL` is `a = (b IS NULL)`), and a
+comparison chain `a < b <= c` means `a < b AND b <= c`. RETURN items are
+variables, properties, literals or parameters, with optional aliases and
+DISTINCT; two columns with the same name (`RETURN a, a`) are a syntax error.
+ORDER BY supports
 several keys and ASC/DESC; SKIP/LIMIT accept non-negative integers or parameters.
 With DISTINCT, sort keys must be returned expressions or aliases.
 
@@ -46,8 +50,12 @@ types, excluding edges. Relationship types name ref attributes, including
 inverse names. Bidirectional attributes match both ways regardless of the arrow;
 an undirected match does not duplicate a direction. A self-edge matches once.
 One MATCH cannot use the same edge twice; separate MATCH clauses may reuse it.
+Likewise a relationship variable names one relationship per MATCH (using `r`
+twice in one clause is a syntax error); a later MATCH reusing `r` constrains it
+to the same edge.
 
-`kala_handle` is the permanent, read-only world handle; `handle` is ordinary
+`kala_handle` is the permanent, read-only world handle, looked up through the
+handle index for a string literal or a `$parameter`; `handle` is ordinary
 data. Unknown labels/types match nothing; unknown properties yield NULL,
 including names not yet defined at the requested canon. Name resolution uses
 the latest name table, as elsewhere in Kala.
@@ -58,9 +66,17 @@ the latest name table, as elsewhere in Kala.
 | --- | --- | --- |
 | Missing property | NULL | No binding; no row |
 | Comparison with NULL | NULL | No NULL datum |
+| Ordering incomparable types (`'a' < 5`, `n < 1`) | NULL | Type error |
 | Boolean predicates | Three-valued; WHERE retains only true | Boolean; negation uses `not` |
 | NULL in output | One NULL cell; row retained | Not produced |
 | Duplicates | Bag unless RETURN DISTINCT | Set |
+
+`<`, `<=`, `>` and `>=` compare only mutually comparable values: two numbers
+(integers and floats compare numerically), two strings, two booleans, or two
+lists of such values (element-wise, then by length). Any other pair, including
+a node or relationship on either side, gives NULL, so `WHERE n.name < 5` and
+`WHERE NOT (n.name < 5)` both drop the row. `=` and `<>` across different
+types are false and true, as in Neo4j.
 
 ORDER BY is stable, with NULL last ascending and first descending. Supported
 mixed types sort as nodes, relationships, lists, strings, booleans, numbers,
@@ -90,6 +106,11 @@ Parameters accept scalars, NULL and lists. Property lists are sorted sets;
 supplied parameter lists retain their input order for equality. Comparisons
 with NULL inside lists use three-valued equality. The embedded `QueryParams`
 API supports these values; the existing scalar `Params` alias remains valid.
+Numeric parameters: over Bolt, a parameter compared with an `f64` attribute
+accepts a PackStream Integer when it converts exactly (|n| <= 2^53); a larger
+Integer is a type error. On the CLI, an untyped `--param` is an integer when
+it parses as one, and a float only when it looks numeric (`1.5`, `.5`, `2e3`),
+so `nan`, `inf` and `Infinity` stay strings.
 
 The CLI uses `kala query WORLD --lang cypher QUERY` and
 `kala explain WORLD --lang cypher QUERY`; its default remains Datalog.

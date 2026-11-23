@@ -69,6 +69,39 @@ pub(in crate::exec) fn order(
         _ => cmp_real(a, b, work),
     }
 }
+/// The ordering `<`, `<=`, `>` and `>=` use: `None` (NULL) unless both sides
+/// are mutually comparable, i.e. both numbers (integers and floats compare
+/// numerically), both strings, both booleans, or both lists of such values,
+/// compared element-wise (a NULL or incomparable element pair is NULL). Nodes
+/// and relationships aren't comparable. [`order`] (the cross-type ranking)
+/// stays for `ORDER BY`.
+fn compare(a: &Val, b: &Val, work: &mut crate::exec::val::CmpWork) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Val::List(_, xs), Val::List(_, ys)) => {
+            for (x, y) in xs.iter().zip(ys.iter()) {
+                // Lists hold scalars; a nested list is not compared.
+                let o = compare_scalar(x, y, work)?;
+                if !o.is_eq() {
+                    return Some(o);
+                }
+            }
+            Some(xs.len().cmp(&ys.len()))
+        }
+        _ => compare_scalar(a, b, work),
+    }
+}
+fn compare_scalar(
+    a: &Val,
+    b: &Val,
+    work: &mut crate::exec::val::CmpWork,
+) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Val::I64(_) | Val::F64(_), Val::I64(_) | Val::F64(_))
+        | (Val::Str(..), Val::Str(..))
+        | (Val::Bool(_), Val::Bool(_)) => Some(order(a, b, work)),
+        _ => None,
+    }
+}
 fn int_float(i: i64, f: f64) -> std::cmp::Ordering {
     use std::cmp::Ordering::*;
     if f >= 9223372036854775808.0 {
@@ -141,49 +174,143 @@ impl Exec<'_, '_> {
                     attr,
                     direction,
                     tick: t,
-                } => {
-                    let schema = self.world.at_canon(self.view.canon());
-                    let Ok((def, _)) = schema.resolve_attribute(attr) else {
-                        continue;
-                    };
-                    if def.value_type != ValueType::Ref {
-                        continue;
-                    }
-                    // The shared scan already implements inverse names and bidirectional attributes.
-                    let (pairs, fresh) = self.scan_once(attr, tick(t))?;
-                    for (a, b) in pairs.iter() {
-                        self.budget.step(1)?;
-                        let Val::Ref(b) = b else { continue };
-                        let Some(id) = self.view.edge_id(*a, attr, *b) else {
-                            continue;
-                        };
-                        let (a, b) = if *direction == Orientation::In {
-                            (*b, *a)
-                        } else {
-                            (*a, *b)
-                        };
-                        let reverse = *direction == Orientation::Either
-                            && def.direction == Some(kala_core::RefDirection::Directed);
-                        for (a, b) in std::iter::once((a, b))
-                            .chain(reverse.then_some((b, a)).filter(|(x, y)| x != y))
-                        {
-                            let mut r = row.clone();
-                            if put(&mut r, *source, Val::Ref(a))
-                                && put(&mut r, *target, Val::Ref(b))
-                                && put(&mut r, *edge, Val::Ref(id.into()))
-                            {
-                                self.budget.emit(&mut out, r)?;
-                            }
-                        }
-                    }
-                    if fresh {
-                        self.budget
-                            .release_bytes(pairs.len().saturating_mul(PAIR_BYTES));
-                    }
-                }
+                } => self.edge_row(
+                    row,
+                    (*source, *target, *edge),
+                    attr,
+                    *direction,
+                    tick(t),
+                    &mut out,
+                )?,
             }
         }
         Ok(out)
+    }
+    /// Emits `row` extended with each relationship of `attr` holding at `t`
+    /// that fits its bound ends. `x`/`y` are the pattern's ends in `attr`'s
+    /// named orientation (`Out`: x is the source, `In`: x is the target;
+    /// `Either`: both, for a directed attribute). With an end bound this is
+    /// one `neighbors` seek (which reads inverse names and both sides of a
+    /// bidirectional pair, and returns the stored edge's ID); with neither
+    /// bound, the query's cached scan of `attr` at `t`, read once per tick.
+    fn edge_row(
+        &mut self,
+        row: Row,
+        (x, y, edge): (usize, usize, usize),
+        attr: &str,
+        direction: Orientation,
+        t: Tick,
+        out: &mut BTreeSet<Row>,
+    ) -> Result<(), QueryError> {
+        let schema = self.world.at_canon(self.view.canon());
+        let Ok((def, inverse)) = schema.resolve_attribute(attr) else {
+            return Ok(());
+        };
+        if def.value_type != ValueType::Ref {
+            return Ok(());
+        }
+        let end = |v: &Option<Val>| match v {
+            None => Ok(None),
+            Some(Val::Ref(e)) => Ok(Some(*e)),
+            // A non-entity end (NULL, a scalar) matches no relationship.
+            Some(_) => Err(()),
+        };
+        let (Ok(bx), Ok(by)) = (end(&row[x]), end(&row[y])) else {
+            return Ok(());
+        };
+        // Seek from the bound end; from `y` the read runs the other way.
+        let (from, slot, dir) = match (bx, by) {
+            (Some(e), _) => (e, y, direction),
+            (None, Some(e)) => (
+                e,
+                x,
+                match direction {
+                    Orientation::Out => Orientation::In,
+                    Orientation::In => Orientation::Out,
+                    Orientation::Either => Orientation::Either,
+                },
+            ),
+            (None, None) => {
+                return self.edge_scan(row, (x, y, edge), attr, inverse, def, direction, t, out);
+            }
+        };
+        // `Both` on a directed attribute reads `Out` and `In`; a self loop is
+        // one (partner, edge) pair after kala-core's dedup, so one row. A
+        // bidirectional attribute reads both sides whatever the direction.
+        let dir = match dir {
+            Orientation::Out => Direction::Out,
+            Orientation::In => Direction::In,
+            Orientation::Either => Direction::Both,
+        };
+        self.budget.step(1)?;
+        let found = self.read_view().neighbors(from, attr, dir, t);
+        self.charge_index_work()?;
+        let found = absent_as_empty(found)?.unwrap_or_default();
+        self.budget.step(found.len() as u64)?;
+        for (other, id) in found {
+            let mut r = row.clone();
+            if put(&mut r, slot, Val::Ref(other)) && put(&mut r, edge, Val::Ref(id.into())) {
+                self.budget.emit(out, r)?;
+            }
+        }
+        Ok(())
+    }
+    /// [`Exec::edge_row`] with neither end bound: every pair of the cached
+    /// scan, one step each. The edge ID is looked up under the base
+    /// attribute in stored order: `(c child_of p)` is the edge `(p parent_of
+    /// c)`, and kala-core finds a bidirectional pair in either order.
+    #[allow(clippy::too_many_arguments)]
+    fn edge_scan(
+        &mut self,
+        row: Row,
+        (x, y, edge): (usize, usize, usize),
+        attr: &str,
+        inverse: bool,
+        def: &kala_core::AttrDef,
+        direction: Orientation,
+        t: Tick,
+        out: &mut BTreeSet<Row>,
+    ) -> Result<(), QueryError> {
+        // `View::edge_id` resolves names in the latest name table, so the
+        // base is named there too (the canon's definition may predate a rename).
+        let base = if inverse {
+            let latest = self.world.at_canon(self.world.latest_tx());
+            match latest.resolve_attribute(attr) {
+                Ok((d, true)) => Some(d.name.clone()),
+                _ => return Ok(()),
+            }
+        } else {
+            None
+        };
+        let reverse = direction == Orientation::Either
+            && def.direction == Some(kala_core::RefDirection::Directed);
+        let pairs = self.scan(attr, t)?;
+        for (a, b) in pairs.iter() {
+            self.budget.step(1)?;
+            let Val::Ref(b) = b else { continue };
+            let id = match &base {
+                Some(base) => self.view.edge_id(*b, base, *a),
+                None => self.view.edge_id(*a, attr, *b),
+            };
+            let Some(id) = id else { continue };
+            let (a, b) = if direction == Orientation::In {
+                (*b, *a)
+            } else {
+                (*a, *b)
+            };
+            for (a, b) in
+                std::iter::once((a, b)).chain(reverse.then_some((b, a)).filter(|(p, q)| p != q))
+            {
+                let mut r = row.clone();
+                if put(&mut r, x, Val::Ref(a))
+                    && put(&mut r, y, Val::Ref(b))
+                    && put(&mut r, edge, Val::Ref(id.into()))
+                {
+                    self.budget.emit(out, r)?;
+                }
+            }
+        }
+        Ok(())
     }
     fn node_labels(
         &mut self,
@@ -399,16 +526,15 @@ impl Exec<'_, '_> {
                             equal.map(|v| if *op == CmpOp::Ne { !v } else { v }),
                         ));
                     }
-                    let o = order(&a, &b, &mut self.budget.cmp);
+                    let o = compare(&a, &b, &mut self.budget.cmp);
                     self.budget.charge_cmp()?;
-                    Val::Bool(match op {
-                        CmpOp::Eq => o.is_eq(),
-                        CmpOp::Ne => !o.is_eq(),
+                    bool_value(o.map(|o| match op {
                         CmpOp::Lt => o.is_lt(),
                         CmpOp::Le => o.is_le(),
                         CmpOp::Gt => o.is_gt(),
                         CmpOp::Ge => o.is_ge(),
-                    })
+                        CmpOp::Eq | CmpOp::Ne => unreachable!("equality returned above"),
+                    }))
                 }
             }
         })
