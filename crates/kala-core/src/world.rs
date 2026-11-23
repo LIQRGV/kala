@@ -717,7 +717,7 @@ impl World {
             if i > usize::from(MAX_NODE_TYPE) {
                 return Err(IdError::NodeTypeOutOfRange(MAX_NODE_TYPE + 1).into());
             }
-            schema_ops::check_name(name)?;
+            schema_ops::check_node_type_name(name)?;
             let id = NodeTypeId(i as u16); // i <= MAX_NODE_TYPE, checked above
             if node_type_by_name.insert(name.clone(), id).is_some() {
                 return Err(Error::DuplicateName(name.clone()));
@@ -1494,11 +1494,6 @@ impl World {
                         &"bidirectional DELETED marker with entity > value",
                     ));
                 }
-                if def.deprecated {
-                    return Err(ReplayFault::Refused(Error::DeprecatedAttribute(
-                        def.name.clone(),
-                    )));
-                }
                 let chain = self.replay_chain(*of).map_err(|why| bad_correction(&why))?;
                 let current = chain.current.ok_or_else(|| {
                     bad_correction(&format!("the chain of entry#{} is already deleted", of.0))
@@ -1553,7 +1548,15 @@ impl World {
                 // length, RetractEvent); not judged by the hold-based no-op
                 // rules, which don't apply to corrections.
                 let mut fact = self
-                    .prepare_fact(&StagedIds::default(), *entity, &def.name, value, *tick, *op)
+                    .prepare_fact_as(
+                        &StagedIds::default(),
+                        *entity,
+                        &def.name,
+                        value,
+                        *tick,
+                        *op,
+                        DeprecatedWrites::Correction,
+                    )
                     .map_err(ReplayFault::from_write)?;
                 fact.precision = *precision;
                 // A live correction interns the edge of a revised assert's
@@ -1567,11 +1570,6 @@ impl World {
                     return Err(corrupt(
                         &"revised ref assert with no edge defined before it",
                     ));
-                }
-                if def.deprecated {
-                    return Err(ReplayFault::Refused(Error::DeprecatedAttribute(
-                        def.name.clone(),
-                    )));
                 }
                 let chain = self.replay_chain(*of).map_err(|why| bad_correction(&why))?;
                 if prev_deleted == Some((*of, *rev)) {
@@ -2351,9 +2349,9 @@ impl World {
         self.prepare_fact_as(staged, entity, attr, v, tick, op, DeprecatedWrites::Refuse)
     }
 
-    /// [`World::prepare_fact`] with an explicit deprecation rule. Only a
-    /// migration's own copy (and replay of exactly the copy sequence it
-    /// regenerates) passes [`DeprecatedWrites::MigrationCopy`].
+    /// [`World::prepare_fact`] with an explicit deprecation rule. Corrections
+    /// may revise deprecated history; only a migration's own verified copy
+    /// may append plain facts to deprecated attributes.
     #[allow(clippy::too_many_arguments)]
     fn prepare_fact_as(
         &self,
@@ -3105,14 +3103,15 @@ struct TouchedSide {
     values: Vec<Vec<u8>>,
 }
 
-/// Whether a prepared fact may target a deprecated attribute. Every user
-/// write refuses; only the internal copy of a migration (live, and replay of
-/// the exact copy sequence regenerated from the migration marker) may write
-/// the history of a deprecated edge property onto the new edges. Private to
-/// the world module, so no public API or flag can select it.
+/// Whether a prepared fact may target a deprecated attribute. New asserts
+/// and retracts refuse; corrections may revise existing history. Only the
+/// internal, verified copy of a migration may append plain facts for a
+/// deprecated edge property onto new edges. Private to the world module,
+/// so no public write flag can bypass deprecation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeprecatedWrites {
     Refuse,
+    Correction,
     MigrationCopy,
 }
 
@@ -3362,9 +3361,12 @@ pub struct CommitResult {
     /// no-op and no entity was created), nothing is appended and this is
     /// the unchanged latest tx.
     pub tx: TxId,
-    /// Fact/correction entries plus reported schema actions (no-ops excluded).
-    /// A migration reports its rename, deprecation, declaration and copy action.
+    /// Fact, `DELETED` and revised entries, including migration copies.
+    /// Entity creation, edge interning and schema actions do not count.
     pub changed: usize,
+    /// Reported schema actions, excluding no-ops. A migration reports its
+    /// rename, deprecation, declaration and copy action.
+    pub declared: usize,
     /// IDs of the fact, `DELETED` and `Revised` entries the transaction appended, in
     /// log order (`DEFINE`s and the `Commit` are not listed): one per stored
     /// entry. Empty if nothing was appended.
@@ -3593,9 +3595,6 @@ impl Txn<'_> {
                 value: current_value,
             } = txn.world.correction_target(entry)?;
             let attr = txn.world.attributes[current.attr.0 as usize].name.clone();
-            if txn.world.attributes[current.attr.0 as usize].deprecated {
-                return Err(Error::DeprecatedAttribute(attr));
-            }
             // Judged against the committed chain: if this transaction already
             // corrected it, that state is stale, so refuse before anything
             // else (a "no-op" against stale state could be a real change).
@@ -3634,13 +3633,14 @@ impl Txn<'_> {
             // replaced, validated like a write. The subject is the current
             // fact's (stored) entity; a bidirectional pair is renormalised,
             // which may swap it with the value.
-            let mut new = txn.world.prepare_fact(
+            let mut new = txn.world.prepare_fact_as(
                 &txn.ids,
                 current.entity,
                 &attr,
                 value.as_ref().unwrap_or(&current_value),
                 tick.unwrap_or(current.tick),
                 op.unwrap_or(current.op),
+                DeprecatedWrites::Correction,
             )?;
             // Kept unless given, also when the key moves.
             new.precision = precision.unwrap_or(current.precision);
@@ -3779,6 +3779,7 @@ impl Txn<'_> {
             return Ok(CommitResult {
                 tx: self.world.latest_tx,
                 changed: 0,
+                declared: 0,
                 entries: Vec::new(),
                 edges: Vec::new(),
                 warnings: Warnings::default(),
@@ -3915,7 +3916,8 @@ impl Txn<'_> {
         };
         Ok(CommitResult {
             tx: self.tx,
-            changed: self.entries.len() + self.schema_changes.len(),
+            changed: self.entries.len(),
+            declared: self.schema_changes.len(),
             entries,
             edges,
             warnings,

@@ -316,12 +316,9 @@ fn properties(
         };
         props.insert(attr.name.clone(), value);
     }
-    // A user attribute named `handle` wins; the world handle stays in the
-    // node's `element_id`/labels identity and Datalog's `:handle`.
-    if let Some(handle) = view.world().handle_of(id)
-        && !props.contains_key("handle")
-    {
-        props.insert("handle".into(), budget.string(handle.into())?);
+    // The reserved prefix keeps the permanent handle separate from user facts.
+    if let Some(handle) = view.world().handle_of(id) {
+        props.insert("kala_handle".into(), budget.string(handle.into())?);
     }
     Ok(props)
 }

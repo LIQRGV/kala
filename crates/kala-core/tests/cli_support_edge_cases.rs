@@ -214,26 +214,11 @@ fn parse_id_round_trips_type_name_containing_hash() {
     assert_eq!(w.parse_id("B#1"), None);
 }
 
-/// FINDING (for the PM, not asserted as a bug): a node type named `edge`
-/// collides with the `edge#N` form. This documents current behaviour.
+/// Node types cannot shadow the reserved `edge#N` identifier form.
 #[test]
-fn parse_id_node_type_named_edge_is_shadowed_by_the_edge_form() {
+fn parse_id_node_type_named_edge_is_refused() {
     let s = Schema::new().node_type("edge").node_type("CHARACTER");
-    let mut w = match World::in_memory(s) {
-        Ok(w) => w,
-        Err(e) => {
-            println!("schema refuses a node type named `edge`: {e}");
-            return;
-        }
-    };
-    let id = w.create_entity("edge", None).unwrap();
-    assert!(!id.is_edge());
-    assert_eq!(w.format_id(id), "edge#1");
-    // Documented current behaviour: parse_id reads `edge#1` as the EDGE,
-    // so the entity's own formatted ID does not round-trip.
-    let parsed = w.parse_id("edge#1").unwrap();
-    assert!(parsed.is_edge());
-    assert_ne!(parsed, id);
+    assert!(matches!(World::in_memory(s), Err(Error::InvalidName(name)) if name == "edge"));
 }
 
 // ---------- handle_of ----------

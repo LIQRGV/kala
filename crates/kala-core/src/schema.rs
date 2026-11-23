@@ -267,6 +267,11 @@ pub struct MigrationOptions {
 /// rename) may introduce one, and replay refuses a log where one does.
 pub const RESERVED_NAME_PREFIX: &str = "_KALA_";
 
+/// Prefix for Kala's built-in query attributes and properties. Node types,
+/// attributes and inverse names may never use it, including at genesis.
+/// Like all schema names, this prefix is case-sensitive.
+pub const RESERVED_ATTRIBUTE_PREFIX: &str = "kala_";
+
 /// Counts of history copied by a migration.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MigrationReport {

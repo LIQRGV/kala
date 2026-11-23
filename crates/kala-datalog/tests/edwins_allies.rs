@@ -52,9 +52,9 @@ fn native(v: &View<'_>, e: EntityId, t: i64) -> Rows {
         .collect()
 }
 
-const HEADLINE: &str = r#"[:find ?a :in $ ?who :where [?e :handle ?who] [?e :ally_of ?a]]"#;
+const HEADLINE: &str = r#"[:find ?a :in $ ?who :where [?e :kala_handle ?who] [?e :ally_of ?a]]"#;
 const PARAM_ALL: &str = r#"[:find ?a :in $ ?who ?t ?c :at ?t :canon ?c
-    :where [?e :handle ?who] [?e :ally_of ?a]]"#;
+    :where [?e :kala_handle ?who] [?e :ally_of ?a]]"#;
 
 fn who() -> (&'static str, Value) {
     ("who", Value::Str("edwin".into()))
@@ -99,7 +99,7 @@ fn headline_with_param_tick_equals_native_at_every_change_point_latest_canon() {
     for t in ticks(w) {
         let got = dl(
             w,
-            r#"[:find ?a :in $ ?who ?t :at ?t :where [?e :handle ?who] [?e :ally_of ?a]]"#,
+            r#"[:find ?a :in $ ?who ?t :at ?t :where [?e :kala_handle ?who] [?e :ally_of ?a]]"#,
             &[who(), ("t", Value::I64(t))],
         );
         assert_eq!(got, native(&v, edwin(w), t), "tick {t}");
@@ -112,7 +112,7 @@ fn headline_with_constant_at_equals_native() {
     let v = w.at_canon(w.latest_tx());
     for t in ticks(w) {
         let text =
-            format!("[:find ?a :in $ ?who :at {t} :where [?e :handle ?who] [?e :ally_of ?a]]");
+            format!("[:find ?a :in $ ?who :at {t} :where [?e :kala_handle ?who] [?e :ally_of ?a]]");
         assert_eq!(dl(w, &text, &[who()]), native(&v, edwin(w), t), "tick {t}");
         let constant = format!("[:find ?a :at {t} :where [:edwin :ally_of ?a]]");
         assert_eq!(dl(w, &constant, &[]), native(&v, edwin(w), t), "tick {t}");
@@ -135,7 +135,7 @@ fn headline_at_the_canon_before_the_retcon_equals_native_at_that_canon() {
     let old = w.at_canon(TxId(BEFORE_RETCON));
     for t in ticks(w) {
         let text = format!(
-            "[:find ?a :in $ ?who :at {t} :canon {BEFORE_RETCON} :where [?e :handle ?who] [?e :ally_of ?a]]"
+            "[:find ?a :in $ ?who :at {t} :canon {BEFORE_RETCON} :where [?e :kala_handle ?who] [?e :ally_of ?a]]"
         );
         assert_eq!(
             dl(w, &text, &[who()]),
@@ -267,7 +267,7 @@ fn names_only_find_matches_native_names() {
         .collect();
     let got = dl(
         w,
-        "[:find ?n :in $ ?who :at -210 :where [?e :handle ?who] [?e :ally_of ?a] [?a :name ?n]]",
+        "[:find ?n :in $ ?who :at -210 :where [?e :kala_handle ?who] [?e :ally_of ?a] [?a :name ?n]]",
         &[who()],
     );
     assert_eq!(got, want);
@@ -291,7 +291,7 @@ fn sweep_every_tick_in_a_range_datalog_equals_native() {
     let w = world();
     let p = prepare(
         w,
-        "[:find ?a :in $ ?who ?t ?c :at ?t :canon ?c :where [?e :handle ?who] [?e :ally_of ?a]]",
+        "[:find ?a :in $ ?who ?t ?c :at ?t :canon ?c :where [?e :kala_handle ?who] [?e :ally_of ?a]]",
     )
     .expect("prepare");
     for canon in [BEFORE_RETCON, 12] {
@@ -334,7 +334,7 @@ proptest! {
         let v = w.at_canon(TxId(canon));
         let got = dl(
             w,
-            "[:find ?a :in $ ?who ?t ?c :at ?t :canon ?c :where [?e :handle ?who] [?e :ally_of ?a]]",
+            "[:find ?a :in $ ?who ?t ?c :at ?t :canon ?c :where [?e :kala_handle ?who] [?e :ally_of ?a]]",
             &[("who", Value::Str(handle.into())), ("t", Value::I64(t)), ("c", Value::I64(canon as i64))],
         );
         prop_assert_eq!(got, native(&v, e, t));

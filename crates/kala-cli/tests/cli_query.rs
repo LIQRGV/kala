@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 const RETCON: u64 = 12;
 const BEFORE_RETCON: u64 = 11;
-const ALLIES: &str = "[:find ?a :in $ ?who :where [?e :handle ?who] [?e :ally_of ?a]]";
+const ALLIES: &str = "[:find ?a :in $ ?who :where [?e :kala_handle ?who] [?e :ally_of ?a]]";
 
 struct Fx {
     _dir: tempfile::TempDir,
@@ -240,7 +240,7 @@ fn query_entity_param_by_id_equals_by_handle() {
     let fx = varrow();
     let id = fx.twin.format_id(fx.id("edwin"));
     let by_handle = fx.q(&[ALLIES, "--param", "who=edwin"]);
-    // `:handle` binds ?who as a string, so for an entity-typed param use ?e directly.
+    // `:kala_handle` binds ?who as a string, so for an entity-typed param use ?e directly.
     let by_id = fx.q(&[
         "[:find ?a :in $ ?e :where [?e :ally_of ?a]]",
         "--param",
@@ -263,7 +263,8 @@ fn query_entity_param_by_id_equals_by_handle() {
 fn query_at_two_ticks_matches_native_and_header_reports_tick() {
     let fx = varrow();
     for t in [-210i64, -200] {
-        let q = format!("[:find ?a :in $ ?who :at {t} :where [?e :handle ?who] [?e :ally_of ?a]]");
+        let q =
+            format!("[:find ?a :in $ ?who :at {t} :where [?e :kala_handle ?who] [?e :ally_of ?a]]");
         let want = fx.allies("edwin", t, RETCON);
         let o = fx.q(&[&q, "--param", "who=edwin"]);
         assert_eq!(code(&o), 0, "t={t}: {}", stderr(&o));
@@ -315,8 +316,8 @@ fn query_older_canon_literal_and_param() {
     let fx = varrow();
     let tick = fx.twin.at_canon(TxId(BEFORE_RETCON)).latest_tick().0;
     let want = fx.allies("edwin", tick, BEFORE_RETCON);
-    let lit = "[:find ?a :in $ ?who :canon 11 :where [?e :handle ?who] [?e :ally_of ?a]]";
-    let par = "[:find ?a :in $ ?who ?c :canon ?c :where [?e :handle ?who] [?e :ally_of ?a]]";
+    let lit = "[:find ?a :in $ ?who :canon 11 :where [?e :kala_handle ?who] [?e :ally_of ?a]]";
+    let par = "[:find ?a :in $ ?who ?c :canon ?c :where [?e :kala_handle ?who] [?e :ally_of ?a]]";
     let a = fx.q(&[lit, "--param", "who=edwin"]);
     assert_eq!(code(&a), 0, "{}", stderr(&a));
     let (h, _, rows) = text_parts(&stdout(&a));

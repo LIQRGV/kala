@@ -172,7 +172,8 @@ class DriverTests(unittest.TestCase):
                 self.assertIsInstance(node, Node)
                 self.assertIn("CHARACTER", node.labels)
                 self.assertTrue(node.element_id.startswith("CHARACTER#"))
-                self.assertIn("handle", node)
+                self.assertIn("kala_handle", node)
+                self.assertNotIn("handle", node)
                 self.assertNotIn("located_in", node)
             summary = result.consume()
             self.assertEqual(summary.database, "varrow")
@@ -181,17 +182,18 @@ class DriverTests(unittest.TestCase):
 
     def test_node_properties_follow_story_tick_and_canon(self):
         with self.driver.session(database="varrow") as session:
-            query = PREFIX + '[:find ?e :at -210 :where [?e :handle "edwin"]]'
+            query = PREFIX + '[:find ?e :at -210 :where [?e :kala_handle "edwin"]]'
             earlier = session.run(query).single()[0]
             self.assertIn("Knight", earlier.labels)
             self.assertNotIn("King", earlier.labels)
             self.assertEqual(earlier["name"], "Edwin")
+            self.assertEqual(earlier["kala_handle"], "edwin")
             self.assertEqual(earlier["alias"], ["Ed", "Eddie", "the Lost Knight"])
-            query = PREFIX + '[:find ?e :at -180 :where [?e :handle "edwin"]]'
+            query = PREFIX + '[:find ?e :at -180 :where [?e :kala_handle "edwin"]]'
             later = session.run(query).single()[0]
             self.assertIn("King", later.labels)
             self.assertEqual(later["name"], "the Grey King")
-            query = PREFIX + '[:find ?e :at -210 :canon 5 :where [?e :handle "edwin"]]'
+            query = PREFIX + '[:find ?e :at -210 :canon 5 :where [?e :kala_handle "edwin"]]'
             old_canon = session.run(query).single()[0]
             self.assertEqual(old_canon["alias"], ["Ed", "Eddy", "the Lost Knight"])
 
@@ -206,13 +208,13 @@ class DriverTests(unittest.TestCase):
             self.assertEqual(len(list(session.run(ALLIES))), 2)
 
     def test_parameters_and_ignored_extra(self):
-        query = PREFIX + "[:find ?a :in $ ?who ?t :at ?t :where [?e :handle ?who] [?e :ally_of ?a]]"
+        query = PREFIX + "[:find ?a :in $ ?who ?t :at ?t :where [?e :kala_handle ?who] [?e :ally_of ?a]]"
         with self.driver.session(database="varrow") as session:
             nodes = [r["a"] for r in session.run(query, who="edwin", t=-210, unused=None)]
             self.assertEqual([n["name"] for n in nodes], ["Greg", "Tomas"])
 
     def test_parameter_errors_and_session_reuse(self):
-        query = PREFIX + "[:find ?a :in $ ?who ?t :at ?t :where [?e :handle ?who] [?e :ally_of ?a]]"
+        query = PREFIX + "[:find ?a :in $ ?who ?t :at ?t :where [?e :kala_handle ?who] [?e :ally_of ?a]]"
         with self.driver.session(database="varrow") as session:
             for params, code in [({"who": "edwin"}, "ParameterMissing"),
                                  ({"who": "edwin", "t": "-210"}, "TypeError"),

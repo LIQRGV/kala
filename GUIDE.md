@@ -33,7 +33,7 @@ kala repl varrow.kala --write
 ```
 
 The three ops commit together at tx#13: Nerys is created, and two facts land at
-800. JSON reports `changed: 2`, the new entity and edge IDs, and each fact's
+800. JSON reports `changed: 2` and `declared: 0`, the new entity and edge IDs, and each fact's
 `entries`. Save these entry IDs when you want to correct an edit later. Creating
 an entity adds no fact entries, so its op reports `changed: 0` and its entity ID.
 
@@ -335,7 +335,9 @@ kala asof varrow.kala edwin years@old --at 0
 
 Both migration reports say `1 change points copied`. The preview leaves the file
 unchanged. `years` now holds the string `"42"`; deprecated `years@old` still holds
-the integer `42`. Its original correction trail remains readable. The schema at
+the integer `42`. Its original correction trail remains readable and can still be
+corrected with `[:correct]`; those corrections do not alter the migrated `years`.
+New assertions and retractions on `years@old` are refused. The schema at
 tx#12 lists neither attribute, because neither existed then. To read a canon
 before migration but after the original write, use `years@old`; the replacement
 `years` is not defined at that canon.
@@ -371,3 +373,14 @@ it does not contain the full history. To back up a server's accounts too, use
 Its `system.dump.edn` contains password hashes: keep the private permissions and
 protect it like the original server directory. Restore each file with
 `kala transact --create`, including `system.kala`, into a new server directory.
+
+Write counts separate facts from schema actions: inferring an attribute while
+asserting one fact reports `1 changed, 1 declared`. A pure schema declaration
+reports `0 changed, 1 declared`; fact-only writes retain `N changed`. JSON
+always includes both `changed` and `declared`, per transaction and per op.
+
+To find an entity by its permanent handle text, use
+`[:find ?e :where [?e :kala_handle "edwin"]]`. A user attribute named `handle`
+is separate and has ordinary fact history. Schema names beginning with `kala_`
+are reserved, as are new `_KALA_` names. `edge` is reserved only for node types,
+so attributes and inverse names may use `edge`.

@@ -6,7 +6,7 @@
 //!   `(at ..)` it is `Syntax`). `e` and `v` may be constants, params, bound or
 //!   free variables, or `_`; free ones are bound, one row per (entity, value)
 //!   that EVER held (non-empty sets only). `a` is an attribute or inverse name;
-//!   `:handle` is `Syntax`. An already-bound `?ie` is an equality constraint.
+//!   `:kala_handle` is `Syntax`. An already-bound `?ie` is an equality constraint.
 //!   The form is exactly `(during <3-element pattern> ?var)`, else `Syntax`.
 //!   Compiles to `Op::During`.
 //! - Functions `[(intersect ?a ?b) ?c]`, `[(union ?a ?b) ?c]`,
@@ -616,8 +616,8 @@ fn malformed_during_is_a_syntax_error() {
         "(during [:edwin :located_in :varrow] 5)",
         "(during [:edwin :located_in :varrow] :x)",
         "(during)",
-        "(during [:edwin :handle :varrow] ?s)",
-        "(during [?e :handle \"edwin\"] ?s)",
+        "(during [:edwin :kala_handle :varrow] ?s)",
+        "(during [?e :kala_handle \"edwin\"] ?s)",
     ] {
         let text = format!("[:find ?e :where {bad}]");
         assert_eq!(kind(&f.w, &text), ErrorKind::Syntax, "{bad}");

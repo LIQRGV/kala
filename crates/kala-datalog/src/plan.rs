@@ -7,7 +7,7 @@
 //! bound (a constant, a param or a bound variable) reads its relation
 //! through a hash index on those positions; a pattern with a bound `ref`
 //! value reads `R`; else a bound value of an indexed attribute reads `V`; a
-//! `:handle` pattern with either side bound reads the handle table; a rule
+//! `:kala_handle` pattern with either side bound reads the handle table; a rule
 //! call with nothing bound joins its whole (already computed) relation;
 //! else (nothing bound) a full scan, the attribute with the fewest stored
 //! pairs first. A history pattern ranks as an `E` read with its entity
@@ -31,7 +31,7 @@ use crate::error::{DatalogError, ErrorKind, Span, show};
 
 /// What the planner needs to know about a pattern's attribute.
 pub(crate) enum PatAttr {
-    /// The `:handle` pseudo-attribute.
+    /// The `:kala_handle` pseudo-attribute.
     Handle,
     /// A schema attribute (or inverse name).
     Named {
@@ -323,7 +323,9 @@ fn plan_from(
                         }
                     }
                     (Some(_), AttrRef::Handle) => {
-                        unreachable!("invariant: the parser refuses `:handle` history patterns")
+                        unreachable!(
+                            "invariant: the parser refuses `:kala_handle` history patterns"
+                        )
                     }
                     (None, _) => Op::Expand {
                         input: Box::new(op),
@@ -479,7 +481,7 @@ fn stuck(p: &Pat, bound: &BTreeSet<String>) -> DatalogError {
     DatalogError::new(
         ErrorKind::Unsupported,
         Some(p.span),
-        "`:handle` needs the entity or the handle bound",
+        "`:kala_handle` needs the entity or the handle bound",
     )
 }
 

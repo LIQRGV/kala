@@ -20,7 +20,18 @@ pub(super) enum OrderedEntry {
 }
 
 pub(super) fn check_name(name: &str) -> Result<(), Error> {
-    if name.is_empty() || name.contains('@') || name == "handle" || name == "edge" {
+    if name.is_empty() || name.contains('@') {
+        return Err(Error::InvalidName(name.to_owned()));
+    }
+    if name.starts_with(crate::RESERVED_ATTRIBUTE_PREFIX) {
+        return Err(Error::ReservedName(name.to_owned()));
+    }
+    Ok(())
+}
+
+pub(super) fn check_node_type_name(name: &str) -> Result<(), Error> {
+    check_name(name)?;
+    if name == "edge" {
         return Err(Error::InvalidName(name.to_owned()));
     }
     Ok(())
@@ -36,6 +47,11 @@ pub(super) fn check_new_name(name: &str) -> Result<(), Error> {
         return Err(Error::ReservedName(name.to_owned()));
     }
     Ok(())
+}
+
+fn check_new_node_type_name(name: &str) -> Result<(), Error> {
+    check_node_type_name(name)?;
+    check_new_name(name)
 }
 
 impl SchemaSnapshot {
@@ -249,7 +265,7 @@ impl World {
                 // Genesis node types are declared, so they never reach the
                 // redefinition branch: every edit here is a new name or an
                 // inferred one being confirmed.
-                check_new_name(name)?;
+                check_new_node_type_name(name)?;
                 let i = usize::from(id.0);
                 if id.0 > MAX_NODE_TYPE || i > self.node_types.len() {
                     return Err(Error::Schema(
@@ -360,6 +376,11 @@ impl Txn<'_> {
         self.infer_attribute(name, value)?;
         Ok(true)
     }
+    /// Schema actions staged so far, in operation order, excluding no-ops.
+    /// Includes declarations inferred by writes and each migration action.
+    pub fn schema_changes(&self) -> &[SchemaChange] {
+        &self.schema_changes
+    }
     /// The current staged definition, including earlier operations in this transaction.
     pub fn attribute(&self, name: &str) -> Option<&AttrDef> {
         self.world.attribute(name)
@@ -451,7 +472,7 @@ impl Txn<'_> {
             if txn.world.node_type_by_name.contains_key(name) {
                 return Ok(());
             }
-            check_new_name(name)?;
+            check_new_node_type_name(name)?;
             if txn.world.world_setting("schema") == Some("strict") {
                 return Err(Error::Schema(format!(
                     "node type {:?} is not in the schema; declare it first: [:node-type :{}]",
@@ -608,7 +629,7 @@ impl Txn<'_> {
             }
             *id
         } else {
-            check_new_name(name)?;
+            check_new_node_type_name(name)?;
             if self.world.node_types.len() > usize::from(MAX_NODE_TYPE) {
                 return Err(IdError::NodeTypeOutOfRange(MAX_NODE_TYPE + 1).into());
             }

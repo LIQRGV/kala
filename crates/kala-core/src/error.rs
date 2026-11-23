@@ -64,10 +64,9 @@ pub enum Error {
     InvalidHandle(String),
     /// A node type or attribute name in the schema isn't valid (e.g. empty).
     InvalidName(String),
-    /// A schema edit after the genesis names a node type or attribute with
-    /// the [`RESERVED_NAME_PREFIX`](crate::RESERVED_NAME_PREFIX) prefix,
-    /// which belongs to Kala's own worlds (e.g. the `system` world). Holds
-    /// the name.
+    /// A schema name uses [`RESERVED_ATTRIBUTE_PREFIX`](crate::RESERVED_ATTRIBUTE_PREFIX),
+    /// or a post-genesis edit introduces [`RESERVED_NAME_PREFIX`](crate::RESERVED_NAME_PREFIX).
+    /// Both prefixes belong to Kala. Holds the name.
     ReservedName(String),
     /// A migration found change points whose value doesn't convert to the
     /// new type (or collides with another value of the same entity) and
@@ -291,9 +290,10 @@ impl fmt::Display for Error {
             }
             Error::ReservedName(name) => write!(
                 f,
-                "schema name {} is reserved: names starting with {} belong to Kala",
+                "schema name {} is reserved: names starting with {} or {} belong to Kala",
                 Quoted(name),
-                crate::RESERVED_NAME_PREFIX
+                crate::RESERVED_NAME_PREFIX,
+                crate::RESERVED_ATTRIBUTE_PREFIX
             ),
             Error::InvalidDirection(a) => {
                 write!(

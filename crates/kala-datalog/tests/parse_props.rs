@@ -37,7 +37,7 @@ const TOKENS: &[&str] = &[
     ":canon",
     ":where",
     ":rules",
-    ":handle",
+    ":kala_handle",
     ":x",
     "?a",
     "?b",
@@ -127,7 +127,7 @@ proptest! {
 
     #[test]
     fn never_panics_on_truncated_valid_query(cut in 0usize..200) {
-        let full = "[:find ?name :in $ ?who :at -210 :canon 41 :where [?e :handle ?who] \
+        let full = "[:find ?name :in $ ?who :at -210 :canon 41 :where [?e :kala_handle ?who] \
                     (at -200 [?a :located_in ?p]) [(!= ?a ?e)] [?a :name \"é\\u0041\"]]";
         let mut c = cut.min(full.len());
         while !full.is_char_boundary(c) { c -= 1; }
@@ -175,8 +175,14 @@ fn tick_strat() -> impl Strategy<Value = (String, String)> {
 }
 
 fn attr() -> impl Strategy<Value = String> {
-    prop::sample::select(vec!["ally_of", "located_in", "name", "child_of", "handle"])
-        .prop_map(|s| s.to_string())
+    prop::sample::select(vec![
+        "ally_of",
+        "located_in",
+        "name",
+        "child_of",
+        "kala_handle",
+    ])
+    .prop_map(|s| s.to_string())
 }
 
 fn pattern_strat() -> impl Strategy<Value = (String, String)> {

@@ -1,4 +1,4 @@
-//! Slice 7, item 00 (e): `[?p :handle :varrow]` (a handle keyword where the
+//! Slice 7, item 00 (e): `[?p :kala_handle :varrow]` (a handle keyword where the
 //! handle *string* belongs) is a TypeMismatch whose message tells the author
 //! what to write instead, using the handle from the query.
 
@@ -15,7 +15,7 @@ fn world() -> World {
 fn handle_keyword_in_value_position_hints_both_spellings() {
     let w = world();
     for h in ["varrow", "greg", "edwin"] {
-        let q = format!("[:find ?p :where [?p :handle :{h}]]");
+        let q = format!("[:find ?p :where [?p :kala_handle :{h}]]");
         let e = prepare(&w, &q).expect_err("must be rejected");
         assert_eq!(e.kind, ErrorKind::TypeMismatch, "{e}");
         assert!(
@@ -24,7 +24,7 @@ fn handle_keyword_in_value_position_hints_both_spellings() {
             e.message
         );
         assert!(
-            e.message.contains(&format!("[?p :handle \"{h}\"]")),
+            e.message.contains(&format!("[?p :kala_handle \"{h}\"]")),
             "hint for the string form with the actual handle missing: {}",
             e.message
         );
@@ -34,7 +34,7 @@ fn handle_keyword_in_value_position_hints_both_spellings() {
 #[test]
 fn the_string_form_still_works() {
     let w = world();
-    let p = prepare(&w, r#"[:find ?p :where [?p :handle "varrow"]]"#).expect("compiles");
+    let p = prepare(&w, r#"[:find ?p :where [?p :kala_handle "varrow"]]"#).expect("compiles");
     let rs = kala_query::run(&w, &p.plan, &Default::default(), &Default::default()).unwrap();
     assert_eq!(rs.rows.len(), 1);
 }
@@ -45,5 +45,5 @@ fn other_type_mismatches_do_not_get_the_handle_hint() {
     let e = prepare(&w, r#"[:find ?p :where [?p :located_in "varrow"]]"#)
         .expect_err("string where a ref belongs");
     assert_eq!(e.kind, ErrorKind::TypeMismatch);
-    assert!(!e.message.contains("[?p :handle"), "{}", e.message);
+    assert!(!e.message.contains("[?p :kala_handle"), "{}", e.message);
 }

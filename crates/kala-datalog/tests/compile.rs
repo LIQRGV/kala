@@ -5,7 +5,7 @@
 //!
 //! Pinned readings of the contract (see the report's open decisions):
 //! - `Prepared.params` / `Plan.params` names are written without `?`/`$`, in `:in` order, `$` excluded.
-//! - the value position of `:handle` is a string, so a param there is `Value(Str)`.
+//! - the value position of `:kala_handle` is a string, so a param there is `Value(Str)`.
 use kala_core::*;
 use kala_datalog::ast;
 use kala_datalog::{DatalogError, ErrorKind, ParamKind, Prepared, compile, parse, prepare};
@@ -199,7 +199,7 @@ fn no_at_no_canon_means_default_and_latest() {
 #[test]
 fn compile_of_parse_equals_prepare() {
     let w = varrow();
-    let t = "[:find ?n :in $ ?who :at -210 :where [?e :handle ?who] [?e :ally_of ?a] [?a :name ?n] [(!= ?a ?e)]]";
+    let t = "[:find ?n :in $ ?who :at -210 :where [?e :kala_handle ?who] [?e :ally_of ?a] [?a :name ?n] [(!= ?a ?e)]]";
     let q: ast::Query = parse(t).unwrap();
     assert_eq!(compile(w, &q).unwrap(), prepare(w, t).unwrap().plan);
 }
@@ -450,7 +450,7 @@ fn param_kind_value_of_the_attribute_type() {
 #[test]
 fn handle_value_param_is_a_string() {
     let w = varrow();
-    let t = "[:find ?n :in $ ?who :where [?e :handle ?who] [?e :name ?n]]";
+    let t = "[:find ?n :in $ ?who :where [?e :kala_handle ?who] [?e :name ?n]]";
     assert_eq!(
         prep(w, t).params,
         vec![("who".to_string(), ParamKind::Value(ValueType::Str))]
@@ -705,17 +705,17 @@ fn at_variable_bound_later_in_text_does_not_panic() {
     );
 }
 
-// ---------------------------------------------------------------- :handle, inverse, bidirectional
+// ---------------------------------------------------------------- :kala_handle, inverse, bidirectional
 
 #[test]
 fn handle_entity_to_string() {
     let w = small();
     assert_eq!(
-        rows(w, "[:find ?h :where [:ann :handle ?h]]", &[]),
+        rows(w, "[:find ?h :where [:ann :kala_handle ?h]]", &[]),
         col([s("ann")])
     );
     assert_eq!(
-        rows(w, "[:find ?h :where [PLACE#2 :handle ?h]]", &[]),
+        rows(w, "[:find ?h :where [PLACE#2 :kala_handle ?h]]", &[]),
         col([s("mill")])
     );
 }
@@ -724,12 +724,12 @@ fn handle_entity_to_string() {
 fn handle_string_to_entity() {
     let w = small();
     assert_eq!(
-        rows(w, "[:find ?e :where [?e :handle \"bob\"]]", &[]),
+        rows(w, "[:find ?e :where [?e :kala_handle \"bob\"]]", &[]),
         refs(w, &["bob"])
     );
-    assert!(rows(w, "[:find ?e :where [?e :handle \"nobody\"]]", &[]).is_empty());
+    assert!(rows(w, "[:find ?e :where [?e :kala_handle \"nobody\"]]", &[]).is_empty());
     assert!(
-        rows(w, "[:find ?e :where [?e :handle \"BOB\"]]", &[]).is_empty(),
+        rows(w, "[:find ?e :where [?e :kala_handle \"BOB\"]]", &[]).is_empty(),
         "handles are exact"
     );
 }
@@ -737,11 +737,11 @@ fn handle_string_to_entity() {
 #[test]
 fn handle_joins_with_other_patterns_and_ignores_the_tick() {
     let w = small();
-    let t = "[:find ?h :where [?e :age 30] [?e :handle ?h]]";
+    let t = "[:find ?h :where [?e :age 30] [?e :kala_handle ?h]]";
     assert_eq!(rows(w, t, &[]), col([s("ann"), s("cy")]));
-    let t = "[:find ?h :where [?e :handle ?h] [?e :age 30]]";
+    let t = "[:find ?h :where [?e :kala_handle ?h] [?e :age 30]]";
     assert_eq!(rows(w, t, &[]), col([s("ann"), s("cy")]));
-    let t = "[:find ?n :at -1000 :where [?e :handle \"ann\"] (at 0 [?e :name ?n])]";
+    let t = "[:find ?n :at -1000 :where [?e :kala_handle \"ann\"] (at 0 [?e :name ?n])]";
     assert_eq!(rows(w, t, &[]), col([s("Ann")]));
 }
 
@@ -749,10 +749,10 @@ fn handle_joins_with_other_patterns_and_ignores_the_tick() {
 fn handle_with_both_sides_unbound_does_not_panic() {
     // OPEN DECISION: all (entity, handle) pairs, or a compile/run error? Contract: "Handle: either side bound".
     let w = small();
-    let out = prepare(w, "[:find ?e ?h :where [?e :handle ?h]]")
+    let out = prepare(w, "[:find ?e ?h :where [?e :kala_handle ?h]]")
         .map(|p| run(w, &p.plan, &Params::new(), &Limits::default()));
     eprintln!(
-        "OPEN DECISION [?e :handle ?h] unbound -> {:?}",
+        "OPEN DECISION [?e :kala_handle ?h] unbound -> {:?}",
         out.map(|r| r.map(|rs| rs.rows.len()).map_err(|e| e.to_string()))
     );
 }
@@ -1049,7 +1049,7 @@ fn projection_drops_unfound_variables_and_dedups() {
 
 // ---------------------------------------------------------------- varrow headline
 
-const HEADLINE: &str = "[:find ?name :in $ ?who :at -210 :where [?e :handle ?who] [?e :ally_of ?a] \
+const HEADLINE: &str = "[:find ?name :in $ ?who :at -210 :where [?e :kala_handle ?who] [?e :ally_of ?a] \
                         (at -200 [?a :located_in ?p]) [?a :name ?name] [(!= ?a ?e)]]";
 
 fn native_headline(w: &World, who: &str, tick: i64, at: i64) -> BTreeSet<Vec<Value>> {
@@ -1083,7 +1083,7 @@ fn headline_query_on_varrow() {
 #[test]
 fn headline_with_tick_and_who_as_params_sweeps_ticks() {
     let w = varrow();
-    let t = "[:find ?name :in $ ?who ?t :at ?t :where [?e :handle ?who] [?e :ally_of ?a] \
+    let t = "[:find ?name :in $ ?who ?t :at ?t :where [?e :kala_handle ?who] [?e :ally_of ?a] \
              (at -200 [?a :located_in ?p]) [?a :name ?name] [(!= ?a ?e)]]";
     let mut nonempty = 0;
     for tick in (-450..=700).step_by(10) {
@@ -1310,13 +1310,13 @@ fn wrong_typed_constants() {
     );
     cerr(
         w,
-        "[:find ?e :where [?e :handle 5]]",
+        "[:find ?e :where [?e :kala_handle 5]]",
         ErrorKind::TypeMismatch,
         Some("5"),
     );
     cerr(
         w,
-        "[:find ?e :where [?e :handle :ann]]",
+        "[:find ?e :where [?e :kala_handle :ann]]",
         ErrorKind::TypeMismatch,
         Some(":ann"),
     );

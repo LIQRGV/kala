@@ -128,6 +128,114 @@ fn schema_edits_corrections_migrations_and_inferred_declarations_replay_in_order
 }
 
 #[test]
+fn user_handle_edge_attributes_and_edge_properties_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("world.kala");
+    load(&path);
+    transact(
+        &path,
+        "[[:assert :edwin :handle \"author-handle\" :at -1] [:assert :edwin :edge :mara :at 0] [:assert [:edwin :edge :mara] :handle \"edge-handle\" :at 0] [:assert [:edwin :edge :mara] :edge :greg :at 0]]",
+    );
+    let dump = roundtrip(&path, dir.path());
+    assert!(dump.contains(":handle"));
+    assert!(dump.contains(":edge"));
+    assert!(dump.contains("[:create :CHARACTER :edwin]"));
+}
+
+#[test]
+fn deprecated_correction_variants_and_migrated_history_roundtrip() {
+    use kala_core::{Op, Precision, Tick, Value, World};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("world.kala");
+    load(&path);
+    transact(
+        &path,
+        "[[:assert :wren :alias \"deleted\" :at 0] [:assert :wren :alias \"moved\" :at 0] [:assert :wren :alias \"changed\" :at 0] [:assert :wren :alias \"ended\" :at 0] [:assert :wren :alias \"vague\" :at 0] [:assert :wren :age 42 :at 0]]",
+    );
+    let world = World::open_read_only(&path).unwrap();
+    let wren = world.entity_by_handle("wren").unwrap();
+    let entry = |name, expected: &Value| {
+        world
+            .entries()
+            .find_map(|e| match &e.body {
+                kala_core::log::EntryBody::Fact {
+                    entity,
+                    attr,
+                    value,
+                    ..
+                } if *entity == wren
+                    && world.attr_name(*attr) == Some(name)
+                    && value == expected =>
+                {
+                    Some(e.id.0)
+                }
+                _ => None,
+            })
+            .unwrap()
+    };
+    let entries = ["deleted", "moved", "changed", "ended", "vague"]
+        .map(|value| entry("alias", &Value::Str(value.into())));
+    let age = entry("age", &Value::I64(42));
+    drop(world);
+    transact(&path, "[:deprecate :alias]");
+    for (id, correction) in entries.into_iter().zip([
+        ":delete",
+        ":replace :at -10",
+        ":replace :value \"replacement\"",
+        ":replace :op :retract",
+        ":replace :precision :year",
+    ]) {
+        transact(&path, &format!("[:correct {id} {correction}]"));
+    }
+    for source in [
+        "[:assert :wren :alias \"new\"]",
+        "[:retract :wren :alias \"vague\" :at 1]",
+    ] {
+        let before = fs::read(&path).unwrap();
+        let input = path.with_extension("writes.edn");
+        fs::write(&input, source).unwrap();
+        let output = kala(["transact", path.to_str().unwrap(), input.to_str().unwrap()]);
+        assert_eq!(code(&output), 1, "{}", stderr(&output));
+        assert!(stderr(&output).contains("deprecated"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+    transact(&path, "[:migrate :age :string]");
+    transact(&path, &format!("[:correct {age} :replace :value 99]"));
+    let world = World::open_read_only(&path).unwrap();
+    let values = world.as_of(wren, "alias", Tick(0)).unwrap();
+    assert!(!values.contains(&Value::Str("deleted".into())));
+    assert!(!values.contains(&Value::Str("changed".into())));
+    assert!(!values.contains(&Value::Str("ended".into())));
+    assert!(values.contains(&Value::Str("replacement".into())));
+    let history = world.history(wren, "alias").unwrap();
+    assert!(
+        history
+            .iter()
+            .any(|c| c.value == Value::Str("moved".into()) && c.tick == Tick(-10))
+    );
+    assert!(
+        history
+            .iter()
+            .any(|c| c.value == Value::Str("ended".into()) && c.op == Op::Retract)
+    );
+    assert!(
+        history
+            .iter()
+            .any(|c| c.value == Value::Str("vague".into()) && c.precision == Precision::Year)
+    );
+    assert_eq!(
+        world.as_of(wren, "age@old", Tick(0)).unwrap(),
+        [Value::I64(99)]
+    );
+    assert_eq!(
+        world.as_of(wren, "age", Tick(0)).unwrap(),
+        [Value::Str("42".into())]
+    );
+    drop(world);
+    roundtrip(&path, dir.path());
+}
+
+#[test]
 fn large_native_transaction_and_utf8_numeric_extremes_roundtrip_exactly() {
     use kala_core::{AttrDef, Cardinality, Kind, Schema, Tick, Value, ValueType, World};
     let dir = tempfile::tempdir().unwrap();

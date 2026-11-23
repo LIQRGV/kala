@@ -104,6 +104,26 @@ fn comparison_less_than_on_password_hash_is_forbidden() {
 }
 
 #[test]
+fn kala_handle_anchor_does_not_bypass_password_hash_refusal() {
+    let server = server();
+    let mut root = Client::ready(&server);
+    // Confirm the renamed pseudo-attribute is usable for account entities.
+    let visible = rows(
+        &mut root,
+        "system",
+        &sys("[:find ?h :where [?e :user \"root\"] [?e :kala_handle ?h]]"),
+    );
+    assert_eq!(visible.len(), 1);
+    for query in [
+        "[:find ?p :where [?e :kala_handle \"missing-account\"] [?e :password_hash ?p]]",
+        "[:find ?h :where [?e :user \"root\"] [?e :kala_handle ?h] (not [?e :password_hash ?p])]",
+        "[:find ?h :rules [[(leak ?e) [?e :password_hash ?p]]] :where [?e :user \"root\"] [?e :kala_handle ?h]]",
+    ] {
+        assert_forbidden(&mut root, "system", &sys(query), map(&[]));
+    }
+}
+
+#[test]
 fn comparison_greater_than_and_ge_le_on_password_hash_are_forbidden() {
     let server = server();
     let mut root = Client::ready(&server);

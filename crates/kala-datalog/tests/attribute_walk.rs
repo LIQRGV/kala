@@ -107,9 +107,12 @@ fn plan_names_history_and_during_attributes() {
 
 #[test]
 fn plan_leaves_the_handle_pseudo_attribute_out() {
-    let q = r#"[:find ?p :where [?p :handle "varrow"]]"#;
+    let q = r#"[:find ?p :where [?p :kala_handle "varrow"]]"#;
     assert!(plan_attrs(q).is_empty(), "{:?}", plan_attrs(q));
-    assert!(ast_attrs(q).contains("handle"), "AST still names :handle");
+    assert!(
+        ast_attrs(q).contains("kala_handle"),
+        "AST still names :kala_handle"
+    );
 }
 
 #[test]

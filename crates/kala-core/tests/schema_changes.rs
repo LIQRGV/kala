@@ -273,7 +273,7 @@ fn rename_without_reuse_removes_old_name_at_every_canon() {
 #[test]
 fn reserved_names_and_shared_inverse_namespace_are_enforced() {
     let mut world = World::in_memory(schema()).unwrap();
-    for name in ["handle", "age@old", "@hidden", ""] {
+    for name in ["kala_handle", "age@old", "@hidden", ""] {
         let mut tx = world.begin();
         assert!(
             tx.declare_attribute(attr(name, ValueType::I64)).is_err(),
@@ -302,7 +302,7 @@ fn reserved_names_and_shared_inverse_namespace_are_enforced() {
 }
 
 #[test]
-fn deprecation_refuses_assert_retract_and_every_correction_but_keeps_reads() {
+fn deprecation_refuses_new_facts_but_keeps_reads_and_corrections() {
     let mut world = World::in_memory(schema()).unwrap();
     let edwin = world.create_entity("CHARACTER", None).unwrap();
     let written = world
@@ -331,8 +331,7 @@ fn deprecation_refuses_assert_retract_and_every_correction_but_keeps_reads() {
             .retract(edwin, "name", Value::Str("Edwin".into()), Some(Tick(0)))
             .is_err()
     );
-    assert!(world.correct(entry, Correction::Delete).is_err());
-    assert!(
+    assert_eq!(
         world
             .correct(
                 entry,
@@ -343,7 +342,9 @@ fn deprecation_refuses_assert_retract_and_every_correction_but_keeps_reads() {
                     precision: None
                 }
             )
-            .is_err()
+            .unwrap()
+            .changed,
+        0
     );
     let mut tx = world.begin();
     tx.deprecate_attribute("name").unwrap();
@@ -355,6 +356,8 @@ fn deprecation_refuses_assert_retract_and_every_correction_but_keeps_reads() {
     tx.rename_attribute("name", "old_name").unwrap();
     tx.commit().unwrap();
     assert!(world.attribute("old_name").unwrap().deprecated);
+    world.correct(entry, Correction::Delete).unwrap();
+    assert!(world.as_of(edwin, "old_name", Tick(0)).unwrap().is_empty());
 }
 
 #[test]
@@ -1744,7 +1747,7 @@ fn mutual_self_edge_migration_creates_one_directed_copy_with_properties() {
 }
 
 #[test]
-fn deprecated_attributes_can_be_relabelled_but_never_written_or_redeclared() {
+fn deprecated_attributes_can_be_relabelled_and_corrected_but_not_asserted_or_redeclared() {
     let mut world = World::in_memory(Schema::new().node_type("CHARACTER").attribute(AttrDef::new(
         "age",
         ValueType::I64,
@@ -1794,7 +1797,8 @@ fn deprecated_attributes_can_be_relabelled_but_never_written_or_redeclared() {
             .retract(e, "age", Value::I64(42), Some(Tick(0)))
             .is_err()
     );
-    assert!(world.correct(base, Correction::Delete).is_err());
+    world.correct(base, Correction::Delete).unwrap();
+    assert_eq!(world.as_of(e, "age", Tick(0)).unwrap(), [Value::I64(50)]);
     let mut tx = world.begin();
     assert!(tx.declare_attribute(attr("age", ValueType::I64)).is_err());
 }

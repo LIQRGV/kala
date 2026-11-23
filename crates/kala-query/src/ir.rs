@@ -74,7 +74,7 @@ pub enum CanonSource {
 pub enum AttrRef {
     /// A schema attribute by name (inverse names allowed).
     Named(String),
-    /// The built-in `:handle` pseudo-attribute (entity <-> handle string).
+    /// The built-in `:kala_handle` pseudo-attribute (entity <-> handle string).
     Handle,
 }
 
@@ -805,7 +805,7 @@ pub struct Plan {
 impl Plan {
     /// The name of every schema attribute the plan reads (`Expand`,
     /// `History`, `During`, in every subplan and every `Fixpoint` rule),
-    /// possibly repeated. The `:handle` pseudo-attribute is not a schema
+    /// possibly repeated. The `:kala_handle` pseudo-attribute is not a schema
     /// attribute and is left out.
     ///
     /// For callers that refuse plans by attribute. Every attribute
@@ -1023,8 +1023,11 @@ fn explain_op(root: &Op, world: &World, indent: usize, out: &mut String) {
                     }
                     // The handle table has no history, so its tick is not shown.
                     AttrRef::Handle => {
-                        let _ =
-                            writeln!(out, "Expand [{e} :handle {v}] via {}", access_text(*access));
+                        let _ = writeln!(
+                            out,
+                            "Expand [{e} :kala_handle {v}] via {}",
+                            access_text(*access)
+                        );
                     }
                 }
                 todo.push((Item::Op(input), child));

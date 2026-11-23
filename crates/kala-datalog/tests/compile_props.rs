@@ -14,7 +14,7 @@ fn varrow() -> &'static World {
 }
 
 const SEEDS: &[&str] = &[
-    "[:find ?name :in $ ?who :at -210 :canon 41 :where [?e :handle ?who] [?e :ally_of ?a] (at -200 [?a :located_in ?p]) [?a :name ?name] [(!= ?a ?e)]]",
+    "[:find ?name :in $ ?who :at -210 :canon 41 :where [?e :kala_handle ?who] [?e :ally_of ?a] (at -200 [?a :located_in ?p]) [?a :name ?name] [(!= ?a ?e)]]",
     "[:find ?a ?t :where [?a :located_in :varrow] [?a :name \"Edwin\"] (at ?t [?a :alive true])]",
     "[:find ?c :where [?c :child_of ?p] [?p :ruled_by _] [(< ?c ?p)]]",
     "[:find ?e :in ?t :where [?e :name ?n] [?e :disguised 1.5] (at ?t [?e :present CHARACTER#1])]",
@@ -36,7 +36,7 @@ const TOKENS: &[&str] = &[
     "?zz",
     "_",
     ":edwin",
-    ":handle",
+    ":kala_handle",
     ":name",
     ":ally_of",
     ":nope",

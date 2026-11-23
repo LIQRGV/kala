@@ -752,7 +752,7 @@ impl<'w> Compiler<'w> {
                         }
                         _ => {
                             let want = if ty == ValueType::Ref {
-                                "an entity (`:handle`, `TYPE#n` or `edge#n`)".to_string()
+                                "an entity (`:edwin`, `TYPE#n` or `edge#n`)".to_string()
                             } else {
                                 format!("a {}", type_name(ty))
                             };
@@ -831,14 +831,14 @@ impl<'w> Compiler<'w> {
                 "a history pattern can't be inside `(at ..)`: history patterns read every tick",
             ));
         }
-        if p.history.is_some() && p.a.name == "handle" {
+        if p.history.is_some() && p.a.name == "kala_handle" {
             return Err(DatalogError::new(
                 ErrorKind::Syntax,
                 Some(p.a.span),
-                "`:handle` has no history; a history pattern needs a schema attribute",
+                "`:kala_handle` has no history; a history pattern needs a schema attribute",
             ));
         }
-        let (attr, info, value_type) = if p.a.name == "handle" {
+        let (attr, info, value_type) = if p.a.name == "kala_handle" {
             (AttrRef::Handle, PatAttr::Handle, ValueType::Str)
         } else {
             let (value_type, indexed) = self.resolve_attr(&p.a.name).map_err(|e| {
@@ -846,6 +846,9 @@ impl<'w> Compiler<'w> {
                     ErrorKind::UnknownAttribute,
                     Some(p.a.span),
                     match e {
+                        kala_core::Error::UnknownAttribute(_) if p.a.name == "handle" => {
+                            "attribute `:handle` is not defined; the built-in handle attribute is now :kala_handle".into()
+                        }
                         kala_core::Error::UnknownAttribute(_) => {
                             format!("unknown attribute `:{}`", show(&p.a.name))
                         }
@@ -988,9 +991,9 @@ impl<'w> Compiler<'w> {
                     (ValueType::F64, Value::I64(n)) => Term::Const(int_as_f64(n, other.span())?),
                     _ => {
                         let want = if entity_pos {
-                            "an entity (`:handle`, `TYPE#n` or `edge#n`)".to_string()
+                            "an entity (`:edwin`, `TYPE#n` or `edge#n`)".to_string()
                         } else if ty == ValueType::Ref {
-                            "a ref (`:handle`, `TYPE#n` or `edge#n`)".to_string()
+                            "a ref (`:edwin`, `TYPE#n` or `edge#n`)".to_string()
                         } else {
                             format!("a {}", type_name(ty))
                         };
@@ -1252,7 +1255,7 @@ impl<'w> Compiler<'w> {
     /// every tick, at the query's canon), with `?s` an interval set.
     fn during(&mut self, d: &During, scope: &mut Scope) -> Result<Pat, DatalogError> {
         // The parser refuses both; an AST built by hand may not.
-        if d.pattern.history.is_some() || d.pattern.a.name == "handle" {
+        if d.pattern.history.is_some() || d.pattern.a.name == "kala_handle" {
             return Err(DatalogError::new(
                 ErrorKind::Syntax,
                 Some(d.pattern.span),
@@ -1359,7 +1362,7 @@ impl<'w> Compiler<'w> {
     }
 }
 
-/// `[?p :handle :varrow]`: a handle keyword where `:handle` needs the
+/// `[?p :kala_handle :varrow]`: a handle keyword where `:kala_handle` needs the
 /// handle's text. The keyword already is the entity, so say both ways to
 /// write what was probably meant (the handle and variable echoed safely).
 fn handle_keyword(entity: &Item, handle: &str, span: Span) -> DatalogError {
@@ -1371,10 +1374,10 @@ fn handle_keyword(entity: &Item, handle: &str, span: Span) -> DatalogError {
     mismatch(
         span,
         format!(
-            "the value position of `:handle` needs a string, not the entity `:{h}`; \
+            "the value position of `:kala_handle` needs a string, not the entity `:{h}`; \
              a handle keyword already is its entity, so use it directly \
              (as in `[?c :located_in :varrow]`), or match the handle's text: \
-             `[{e} :handle \"{h}\"]`"
+             `[{e} :kala_handle \"{h}\"]`"
         ),
     )
 }

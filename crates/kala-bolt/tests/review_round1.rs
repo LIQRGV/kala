@@ -83,7 +83,7 @@ fn error_lines_count_the_prefix_line() {
 fn bytes_parameter_is_a_type_error_and_the_connection_survives() {
     let server = Running::start();
     let mut c = Client::ready(&server);
-    let q = "// kala:datalog\n[:find ?a :in $ ?who :where [?e :handle ?who] [?e :ally_of ?a]]";
+    let q = "// kala:datalog\n[:find ?a :in $ ?who :where [?e :kala_handle ?who] [?e :ally_of ?a]]";
     let mut msg = vec![0xb3, 0x10, 0xd0, q.len() as u8];
     msg.extend_from_slice(q.as_bytes());
     // {"who": Bytes[0x78]} and an empty extra map.
@@ -133,10 +133,9 @@ fn same_length_different_content_reloads() {
     assert_eq!(c.query(q), [vec![string("bbbb")]]);
 }
 
-// `handle` is reserved for entity identity in the query and Bolt adapters.
-// Rejecting the declaration prevents a property from shadowing that identity.
+// User attributes have their own `handle`; identity uses `kala_handle`.
 #[test]
-fn reserved_handle_attribute_is_refused_before_creating_the_world_file() {
+fn user_handle_attribute_is_accepted_at_genesis() {
     let dir = tempfile::tempdir().unwrap();
     let schema = Schema::new().node_type("THING").attribute(AttrDef::new(
         "handle",
@@ -144,16 +143,20 @@ fn reserved_handle_attribute_is_refused_before_creating_the_world_file() {
         Kind::State,
         Cardinality::One,
     ));
-    assert!(matches!(
-        World::in_memory(schema.clone()),
-        Err(kala_core::Error::InvalidName(name)) if name == "handle"
-    ));
+    assert!(
+        World::in_memory(schema.clone())
+            .unwrap()
+            .attribute("handle")
+            .is_some()
+    );
     let path = dir.path().join("w.kala");
-    assert!(matches!(
-        World::create(&path, schema),
-        Err(kala_core::Error::InvalidName(name)) if name == "handle"
-    ));
-    assert!(!path.exists(), "a refused schema must not create a log");
+    drop(World::create(&path, schema).unwrap());
+    assert!(
+        World::open_read_only(&path)
+            .unwrap()
+            .attribute("handle")
+            .is_some()
+    );
 }
 
 // Review round 2: a sub-second idle timeout sends no recv-timeout hint (0

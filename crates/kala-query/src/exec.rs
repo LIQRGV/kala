@@ -1645,7 +1645,7 @@ impl Compiler<'_> {
                     AttrRef::Handle => {
                         if *access != Access::Handle {
                             return Err(QueryError::Plan(format!(
-                                ":handle can only be read via handle, not {access:?}"
+                                ":kala_handle can only be read via handle, not {access:?}"
                             )));
                         }
                         (None, ValueType::Str)
@@ -1653,7 +1653,7 @@ impl Compiler<'_> {
                     AttrRef::Named(name) => {
                         if *access == Access::Handle {
                             return Err(QueryError::Plan(format!(
-                                "handle access is only for :handle, not :{name}"
+                                "handle access is only for :kala_handle, not :{name}"
                             )));
                         }
                         let a = resolve_attr(world, self.canon, name)?;
@@ -2093,7 +2093,7 @@ fn check_access(access: Access, attr: &Attr, e: &Pos, v: &Pos) -> Result<(), Que
             format!("V access needs an indexed attribute; :{name} is unindexed"),
         )),
         Access::Handle => Err(QueryError::Plan(format!(
-            "handle access is only for :handle, not :{name}"
+            "handle access is only for :kala_handle, not :{name}"
         ))),
         _ => Ok(()),
     }
@@ -3577,7 +3577,9 @@ impl Exec<'_, '_> {
                     .cloned()
                     .collect()
             }
-            Access::Handle => unreachable!("invariant: compile routes :handle to Step::Handle"),
+            Access::Handle => {
+                unreachable!("invariant: compile routes :kala_handle to Step::Handle")
+            }
         };
         self.budget.step(pairs.len() as u64)?;
         Ok(pairs)

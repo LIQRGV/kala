@@ -931,7 +931,7 @@ fn handle_access_mismatches_are_plan_errors() {
         ),
     );
     assert!(matches!(exec_latest(&w, &p), Err(QueryError::Plan(_))));
-    // :handle read through an index access
+    // :kala_handle read through an index access
     for access in [Access::E, Access::R, Access::V, Access::Scan] {
         let p = one_col("h", handle_expand(tr(edwin), tv("h"), access));
         assert!(
