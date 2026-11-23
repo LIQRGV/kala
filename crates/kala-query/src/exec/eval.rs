@@ -255,12 +255,7 @@ impl Exec<'_, '_> {
                     for &id in rels {
                         self.clear_rel(id);
                     }
-                    frames.push(Frame {
-                        loop_pc: 0,
-                        round: 0,
-                        variant: 0,
-                        delta_occ: None,
-                    });
+                    frames.push(Frame::new());
                 }
                 Step::RuleEnd { rel, cols } => {
                     let rows = pop(&mut stack);
@@ -270,19 +265,8 @@ impl Exec<'_, '_> {
                     let f = frames
                         .last_mut()
                         .expect("invariant: a RuleEnd runs inside its Fixpoint");
-                    if f.round > 0 {
-                        // A variant is done: the next one, or the round's end.
-                        let Step::FixLoop { variants, .. } = &prog[f.loop_pc] else {
-                            unreachable!("invariant: loop_pc is its Fixpoint's FixLoop")
-                        };
-                        pc = match self.next_variant(variants, f.variant + 1) {
-                            Some(i) => {
-                                f.variant = i;
-                                f.delta_occ = Some(variants[i].occ);
-                                variants[i].start
-                            }
-                            None => f.loop_pc,
-                        };
+                    if let Some(next) = self.after_rule(prog, f) {
+                        pc = next;
                     }
                 }
                 Step::FixLoop { rels, variants } => {
@@ -290,22 +274,9 @@ impl Exec<'_, '_> {
                         .last_mut()
                         .expect("invariant: a FixLoop runs inside its Fixpoint");
                     f.loop_pc = pc - 1;
-                    for &id in rels {
-                        self.merge_new(id, !variants.is_empty())?;
-                    }
-                    f.round += 1;
-                    // Only variants reading a non-empty delta can derive
-                    // anything new; with none, the relations are complete.
-                    match self.next_variant(variants, 0) {
-                        Some(i) => {
-                            f.variant = i;
-                            f.delta_occ = Some(variants[i].occ);
-                            pc = variants[i].start;
-                        }
+                    match self.next_round(f, rels, variants)? {
+                        Some(start) => pc = start,
                         None => {
-                            for &id in rels {
-                                self.clear_delta(id);
-                            }
                             frames.pop();
                         }
                     }
@@ -313,18 +284,10 @@ impl Exec<'_, '_> {
                 Step::Rel { rel, args, occ } => {
                     let read = match occ {
                         None => Read::All,
-                        Some(o) => {
-                            let f = frames
-                                .last()
-                                .expect("invariant: a recursive Rel runs inside its Fixpoint");
-                            if f.round == 0 {
-                                Read::Nothing
-                            } else if f.delta_occ == Some(*o) {
-                                Read::Delta
-                            } else {
-                                Read::All
-                            }
-                        }
+                        Some(o) => frames
+                            .last()
+                            .expect("invariant: a recursive Rel runs inside its Fixpoint")
+                            .read_of(*o),
                     };
                     let rows = pop(&mut stack);
                     let n = rows.len();
