@@ -8,6 +8,7 @@ use proptest::prelude::*;
 fn every_operation_and_option_order() {
     for text in [
         "[:create :CHARACTER :kael]",
+        "[:create :CHARACTER]",
         "[:assert :greg :located_in :ashford :at 601]",
         "[:retract CHARACTER#1 :located_in PLACE#2 :at -300]",
         "[:assert :greg :name \"Greg the Bold\" :at 610 :precision :year]",
@@ -97,7 +98,7 @@ fn tick_and_entry_extremes() {
 fn malformed_operations_have_spans() {
     for text in [
         "[:destroy :greg]",
-        "[:create :CHARACTER]",
+        "[:create]",
         "[:assert :greg :name]",
         "[:assert :greg :name \"Greg\" :precision :week]",
         "[:assert :greg :name \"Greg\" :at 0 :at 1]",
@@ -175,5 +176,29 @@ proptest! {
         let _ = parse_write(&text);
         let _ = parse_writes(&text);
         let _ = form_kind(&text);
+    }
+}
+
+#[test]
+fn eight_digit_unicode_escapes_accept_scalars_and_reject_invalid_codepoints() {
+    let parsed = parse_write(r#"[:assert :ann :bio "\U000e0001\U000e007f\U0010FFFF"]"#).unwrap();
+    match &parsed.ops[0] {
+        WriteOp::Fact {
+            value: WriteValue::Scalar(kala_datalog::ast::Item::Str(value, _)),
+            ..
+        } => assert_eq!(value, "\u{e0001}\u{e007f}\u{10ffff}"),
+        other => panic!("unexpected value: {other:?}"),
+    }
+    for source in [
+        r#"[:assert :ann :bio "\U00110000"]"#,
+        r#"[:assert :ann :bio "\U0000D800"]"#,
+        r#"[:assert :ann :bio "\UFFFFFFFF"]"#,
+        r#"[:assert :ann :bio "\U000e00g1"]"#,
+        r#"[:assert :ann :bio "\U000e001"]"#,
+    ] {
+        assert!(
+            parse_write(source).is_err(),
+            "accepted invalid Unicode escape: {source}"
+        );
     }
 }

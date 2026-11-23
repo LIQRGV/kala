@@ -192,6 +192,7 @@ The native Rust API (`kala-core`) can also write directly. See
 - [x] REPL (`kala repl`)
 - [x] Writes from the CLI and REPL
 - [x] Schema-on-write, schema revisions by canon, copy-forward migrations and `kala schema`
+- [x] `kala create`, replayable full-history dumps, private server backups and JSON snapshots
 - [x] `kala serve`: read-only Bolt 5 Datalog queries through Neo4j drivers
 - [ ] Neo4j Browser compatibility and routing/procedure stubs
 - [ ] Cypher (a subset first), then Gremlin

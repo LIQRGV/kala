@@ -466,3 +466,29 @@ fn malformed_auth_does_not_fall_back_to_none() {
         assert_closed(&mut client.stream);
     }
 }
+
+#[test]
+fn backup_only_grant_never_authorizes_bolt_read() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(kala_core::load_fixture_to(VARROW, &dir.path().join("varrow.kala")).unwrap());
+    system::add(dir.path(), "alice@127.0.0.1", Some(PASSWORD)).unwrap();
+    system::grant(dir.path(), "alice@127.0.0.1", "backup", "varrow").unwrap();
+    let auth = Arc::new(Accounts::open(dir.path()).unwrap());
+    let server = Server::bind_with_auth(
+        dir.path(),
+        ServerConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            ..ServerConfig::default()
+        },
+        auth,
+    )
+    .unwrap();
+    let server = Running::from_server(dir, server);
+    let mut alice = login(&server, "alice", PASSWORD);
+    alice.success();
+    alice.send(
+        0x10,
+        vec![string(ALLIES), map(&[]), map(&[("db", string("varrow"))])],
+    );
+    alice.failure(FORBIDDEN);
+}

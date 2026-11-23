@@ -405,6 +405,46 @@ impl Txn<'_> {
             txn.declare_attr_inner(def)
         })
     }
+    /// Reproduce an inferred declaration from a script without a dummy fact.
+    /// Only the defaults that live inference can produce are accepted, and
+    /// strict mode and reserved-name checks remain in force.
+    pub fn infer_attribute_with(
+        &mut self,
+        name: &str,
+        ty: ValueType,
+        options: &AttributeOptions,
+    ) -> Result<(), Error> {
+        self.guard(|txn| {
+            let cardinality = if ty == ValueType::Ref {
+                Cardinality::Many
+            } else {
+                Cardinality::One
+            };
+            if options.kind.is_some_and(|v| v != Kind::State)
+                || options.cardinality.is_some_and(|v| v != cardinality)
+                || options
+                    .direction
+                    .is_some_and(|v| ty != ValueType::Ref || v != RefDirection::Directed)
+                || options.indexed == Some(false)
+                || options.inverse.is_some()
+                || options.reverse_cardinality.is_some()
+                || txn.world.attribute(name).is_some()
+            {
+                return Err(Error::Schema(
+                    "an inferred declaration must be new and use inference defaults".into(),
+                ));
+            }
+            let sample = match ty {
+                ValueType::Bool => Value::Bool(false),
+                ValueType::I64 => Value::I64(0),
+                ValueType::F64 => Value::F64(0.0),
+                ValueType::Str => Value::Str(String::new()),
+                ValueType::Ref => Value::Ref(EntityId::new(NodeTypeId(0), 1)?),
+            };
+            txn.infer_attribute(name, &sample)
+        })
+    }
+
     /// Infers a node type unless the world is strict.
     pub fn infer_node_type(&mut self, name: &str) -> Result<(), Error> {
         self.guard(|txn| {
@@ -479,7 +519,14 @@ impl Txn<'_> {
             if let Some(inverse) = &options.inverse {
                 def.inverse = Some(inverse.clone());
             }
-            if let Some(reverse) = options.reverse_cardinality {
+            if options.clear_reverse_cardinality {
+                if options.reverse_cardinality.is_some() {
+                    return Err(Error::Schema(
+                        "conflicting reverse cardinality options".into(),
+                    ));
+                }
+                def.reverse_cardinality = None;
+            } else if let Some(reverse) = options.reverse_cardinality {
                 def.reverse_cardinality = Some(reverse);
             }
             txn.declare_attr_inner(def)

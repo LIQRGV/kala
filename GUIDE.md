@@ -344,3 +344,30 @@ For explicit declarations use `[:attribute :age :i64]` or
 `[:node-type :FACTION]`. `[:world-setting :schema :strict]` requires declarations
 before writes; `[:world-setting :schema :infer]` restores inference. Schema forms
 also work in `kala repl --write` and inside an atomic vector of operations.
+
+## Backing up and moving a world
+
+Keep a replayable copy of the whole history before moving a world or upgrading
+Kala. The dump includes the schema, original transaction boundaries, and retcons:
+
+```sh
+kala dump world.kala -o world.dump.edn
+kala transact --create moved.kala world.dump.edn
+kala doctor moved.kala
+```
+
+`moved.kala` must not exist. A successful replay preserves the original log bytes
+in the same format; a failed replay leaves no destination. Dumps are read-only
+and can run while a writer has the world open. A partial tail is omitted with a
+warning. For one scene's state in another tool, export a JSON snapshot instead:
+
+```sh
+kala export world.kala --at -208 -o snapshot.json
+```
+
+The snapshot contains entities, active edges and their typed values at that tick;
+it does not contain the full history. To back up a server's accounts too, use
+`kala dump --all worlds -o private-backup`. That directory must be new or empty.
+Its `system.dump.edn` contains password hashes: keep the private permissions and
+protect it like the original server directory. Restore each file with
+`kala transact --create`, including `system.kala`, into a new server directory.

@@ -136,6 +136,9 @@ fn subject(
     refs: &HashMap<String, EntityId>,
 ) -> Result<EntityId, CliError> {
     match v {
+        WriteValue::Scalar(Item::Id(s, _)) => {
+            tx.parse_id(s).ok_or_else(|| user("invalid entity ID"))
+        }
         WriteValue::Scalar(i) => reference(i, refs),
         WriteValue::Edge {
             source,
@@ -169,6 +172,19 @@ fn value(
 /// the transaction, so even newly allocated handles are rolled back.
 pub fn execute(w: &mut World, form: &WriteTxn, default: Option<Tick>) -> Result<Report, CliError> {
     refuse_system(w)?;
+    execute_restore(w, form, default)
+}
+
+/// The create-mode caller owns a private, unplaced file; system restores are
+/// allowed only here, and every op still uses the ordinary native transaction.
+pub(super) fn execute_restore(
+    w: &mut World,
+    form: &WriteTxn,
+    default: Option<Tick>,
+) -> Result<Report, CliError> {
+    if form.genesis {
+        return Err(user(":genesis must be first; use kala transact --create"));
+    }
     let default = form.at.or(default);
     let fallback = default.unwrap_or_else(|| w.latest_tick());
     let mut refs = HashMap::new();
@@ -212,14 +228,24 @@ pub fn execute(w: &mut World, form: &WriteTxn, default: Option<Tick>) -> Result<
                     name,
                     value_type,
                     options,
+                    inferred,
                     ..
                 } => {
-                    tx.declare_attribute_with(name, *value_type, options)
-                        .map_err(core_err)?;
+                    if *inferred {
+                        tx.infer_attribute_with(name, *value_type, options)
+                            .map_err(core_err)?;
+                    } else {
+                        tx.declare_attribute_with(name, *value_type, options)
+                            .map_err(core_err)?;
+                    }
                     Ok((0, fallback, None, None))
                 }
-                WriteOp::NodeType { name, .. } => {
-                    tx.declare_node_type(name).map_err(core_err)?;
+                WriteOp::NodeType { name, inferred, .. } => {
+                    if *inferred {
+                        tx.infer_node_type(name).map_err(core_err)?;
+                    } else {
+                        tx.declare_node_type(name).map_err(core_err)?;
+                    }
                     Ok((0, fallback, None, None))
                 }
                 WriteOp::Rename { old, new, .. } => {
@@ -256,9 +282,11 @@ pub fn execute(w: &mut World, form: &WriteTxn, default: Option<Tick>) -> Result<
                 } => {
                     tx.infer_node_type(node_type).map_err(core_err)?;
                     let id = tx
-                        .create_entity(node_type, Some(handle))
+                        .create_entity(node_type, handle.as_deref())
                         .map_err(core_err)?;
-                    refs.insert(format!(":{handle}"), id);
+                    if let Some(handle) = handle {
+                        refs.insert(format!(":{handle}"), id);
+                    }
                     // Numeric IDs may also refer to entities created earlier in this transaction.
                     refs.insert(format!("{node_type}#{}", id.seq()), id);
                     Ok((0, fallback, None, Some(id)))

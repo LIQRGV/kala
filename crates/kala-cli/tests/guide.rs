@@ -279,3 +279,39 @@ fn guide_changing_schema_infers_renames_previews_and_migrates() {
             .is_empty()
     );
 }
+
+#[test]
+fn guide_backing_up_and_moving_a_world_replays_identical_bytes() {
+    let prose = guide();
+    for command in [
+        "kala dump world.kala -o world.dump.edn",
+        "kala transact --create moved.kala world.dump.edn",
+        "kala export world.kala --at -208 -o snapshot.json",
+    ] {
+        assert!(
+            prose.contains(command),
+            "guide is missing tested command: {command}"
+        );
+    }
+    let f = fixture_through_cli();
+    let dump = f.dir.path().join("world.dump.edn");
+    let moved = f.dir.path().join("moved.kala");
+    let snapshot = f.dir.path().join("snapshot.json");
+    let o = f.run("dump", &["-o", dump.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = kala([
+        "transact",
+        "--create",
+        moved.to_str().unwrap(),
+        dump.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(fs::read(&f.path).unwrap(), fs::read(moved).unwrap());
+    let o = f.run(
+        "export",
+        &["--at", "-208", "-o", snapshot.to_str().unwrap()],
+    );
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let j: Json = serde_json::from_slice(&fs::read(snapshot).unwrap()).unwrap();
+    assert_eq!(j["tick"], -208);
+}

@@ -2,8 +2,11 @@
 //! [`CliError`](crate::error::CliError); `main` prints and picks the exit code.
 
 pub mod asof;
+pub mod create;
 pub mod doctor;
+pub mod dump;
 pub mod edge;
+pub mod export;
 pub mod find;
 pub mod history;
 pub mod info;
@@ -19,6 +22,7 @@ mod repl_history;
 pub mod schema;
 pub mod serve;
 pub mod transact;
+mod transfer;
 pub mod user;
 
 use crate::cli::Command;
@@ -43,6 +47,19 @@ impl From<String> for Done {
 /// Runs a parsed command.
 pub fn dispatch(cmd: &Command) -> Result<Done, CliError> {
     let text = match cmd {
+        Command::Dump {
+            world,
+            output,
+            all,
+            force,
+        } => dump::run(world, output.as_deref(), *all, *force),
+        Command::Create { world, schema } => create::run(world, schema.as_deref()),
+        Command::Export {
+            world,
+            at,
+            canon,
+            output,
+        } => export::run(world, *at, *canon, output.as_deref()),
         Command::Schema { world, canon, json } => schema::run(world, *canon, *json),
         Command::Serve {
             dir,
@@ -126,12 +143,16 @@ pub fn dispatch(cmd: &Command) -> Result<Done, CliError> {
         Command::Query { world, query, json } => query::run(world, query, *json),
         Command::Explain { world, query } => query::explain(world, query),
         Command::Transact {
+            create,
             world,
             input,
             dry_run,
             json,
             acknowledge_recovery,
         } => {
+            if *create {
+                return create::replay(world, input, *json).map(Done::from);
+            }
             return transact::run(world, input, *dry_run, *json, *acknowledge_recovery);
         }
         Command::Repl {

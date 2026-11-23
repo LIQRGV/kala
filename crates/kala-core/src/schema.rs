@@ -140,6 +140,7 @@ impl AttrDef {
 pub struct Schema {
     node_types: Vec<String>,
     attributes: Vec<AttrDef>,
+    settings: Vec<(String, String)>,
 }
 
 impl Schema {
@@ -158,6 +159,17 @@ impl Schema {
     pub fn attribute(mut self, def: AttrDef) -> Schema {
         self.attributes.push(def);
         self
+    }
+
+    /// Sets a world setting in the genesis, after the schema declarations.
+    /// Settings use the same validation as a live transaction.
+    pub fn setting(mut self, key: &str, value: &str) -> Schema {
+        self.settings.push((key.to_owned(), value.to_owned()));
+        self
+    }
+
+    pub(crate) fn settings(&self) -> &[(String, String)] {
+        &self.settings
     }
 
     /// Declared node type names, in declaration (= ID) order.
@@ -223,6 +235,9 @@ pub struct AttributeOptions {
     pub inverse: Option<String>,
     /// Reverse cardinality label (directed `ref` only).
     pub reverse_cardinality: Option<Cardinality>,
+    /// Explicitly remove a reverse cardinality label (`:reverse :none`).
+    /// Cannot be combined with `reverse_cardinality`.
+    pub clear_reverse_cardinality: bool,
 }
 
 /// Options omitted from a migration keep the old definition's value.

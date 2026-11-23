@@ -25,20 +25,8 @@ pub(super) fn cardinality(c: Cardinality) -> &'static str {
 pub fn run(path: &Path, canon: Option<Canon>, as_json: bool) -> Result<String, CliError> {
     let ctx = Ctx::open(path, canon)?;
     let view = ctx.view();
-    let nodes: Vec<_> = view
-        .node_type_definitions()
-        .map(|(name, inferred, first)| json!({"name":name,"inferred":inferred,"first_tx":first.0}))
-        .collect();
-    let attrs:Vec<_>=view.attributes().map(|d|json!({
-        "name":d.name,"type":type_name(d.value_type),"kind":if d.kind==Kind::State {"state"} else {"event"},
-        "cardinality":cardinality(d.cardinality),"direction":d.direction.map(|v|if v==RefDirection::Directed {"directed"} else {"bidirectional"}),
-        "inverse":d.inverse,"reverse_cardinality":d.reverse_cardinality.map(cardinality),"indexed":d.indexed,"deprecated":d.deprecated,
-        "inferred":d.inferred,"first_tx":ctx.world.attribute_first_tx(&d.name).map(|tx|tx.0)
-    })).collect();
     if as_json {
-        return Ok(out::to_json(
-            &json!({"command":"schema","canon":ctx.canon.0,"node_types":nodes,"attributes":attrs,"settings":view.settings()}),
-        ));
+        return Ok(out::to_json(&document(&ctx.world, ctx.canon)));
     }
     let mut text = format!("schema at canon tx#{}\nnode types:\n", ctx.canon.0);
     for (name, inferred, first) in view.node_type_definitions() {
@@ -222,4 +210,20 @@ pub(super) fn change_text(change: &SchemaChange) -> String {
             text
         }
     }
+}
+
+/// One pinned world's schema, shared with snapshot export.
+pub(super) fn document(world: &kala_core::World, canon: kala_core::TxId) -> Value {
+    let view = world.at_canon(canon);
+    let nodes: Vec<_> = view
+        .node_type_definitions()
+        .map(|(name, inferred, first)| json!({"name":name,"inferred":inferred,"first_tx":first.0}))
+        .collect();
+    let attrs:Vec<_>=view.attributes().map(|d|json!({
+        "name":d.name,"type":type_name(d.value_type),"kind":if d.kind==Kind::State {"state"} else {"event"},
+        "cardinality":cardinality(d.cardinality),"direction":d.direction.map(|v|if v==RefDirection::Directed {"directed"} else {"bidirectional"}),
+        "inverse":d.inverse,"reverse_cardinality":d.reverse_cardinality.map(cardinality),"indexed":d.indexed,"deprecated":d.deprecated,
+        "inferred":d.inferred,"first_tx":world.attribute_first_tx(&d.name).map(|tx|tx.0)
+    })).collect();
+    json!({"command":"schema","canon":canon.0,"node_types":nodes,"attributes":attrs,"settings":view.settings()})
 }

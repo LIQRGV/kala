@@ -1,0 +1,142 @@
+//! Private staging and no-clobber publication shared by create/dump/export.
+use crate::{error::CliError, escape};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+
+pub(super) fn io(e: std::io::Error) -> CliError {
+    CliError::io(e.kind(), e.to_string())
+}
+pub(super) fn absent(path: &Path) -> Result<(), CliError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(CliError::Usage(format!(
+            "{} already exists",
+            escape::path(path)
+        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io(e)),
+    }
+}
+pub(super) fn parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+/// A private staging directory on the destination filesystem. Its cleanup
+/// covers parsing, validation, log-write and publication errors alike.
+pub(super) struct Staging {
+    dir: PathBuf,
+    pub path: PathBuf,
+}
+impl Staging {
+    pub fn new(target: &Path) -> Result<Self, CliError> {
+        let name = target
+            .file_name()
+            .ok_or_else(|| CliError::Usage("expected a file path".into()))?;
+        if !target
+            .as_os_str()
+            .as_encoded_bytes()
+            .ends_with(name.as_encoded_bytes())
+        {
+            return Err(CliError::Usage("expected a file path".into()));
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        for n in 0..32 {
+            let dir =
+                parent(target).join(format!(".kala-transfer-{}-{nonce}-{n}", std::process::id()));
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&dir) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path: dir.join("payload"),
+                        dir,
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(io(e)),
+            }
+        }
+        Err(CliError::Store(
+            "cannot allocate a private staging directory".into(),
+        ))
+    }
+    pub fn place(&self, target: &Path, force: bool) -> Result<(), CliError> {
+        if force {
+            fs::rename(&self.path, target).map_err(io)?;
+        } else {
+            fs::hard_link(&self.path, target).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    CliError::Usage("destination already exists".into())
+                } else {
+                    io(e)
+                }
+            })?;
+            fs::remove_file(&self.path).map_err(io)?;
+        }
+        File::open(parent(target))
+            .and_then(|d| d.sync_all())
+            .map_err(io)
+    }
+}
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+pub(super) fn private_file(path: &Path) -> Result<File, CliError> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(path).map_err(io)
+}
+pub(super) fn output(path: Option<&Path>, text: &str, force: bool) -> Result<String, CliError> {
+    let Some(path) = path else {
+        return Ok(text.to_owned());
+    };
+    if !force {
+        absent(path)?;
+    }
+    let stage = Staging::new(path)?;
+    let mut file = private_file(&stage.path)?;
+    file.write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(io)?;
+    stage.place(path, force)?;
+    Ok(String::new())
+}
+/// Local restore inputs have no size cap, but must be finite regular files
+/// (or explicit stdin). Read only the opened file's observed length.
+pub(super) fn input(path: &Path) -> Result<String, CliError> {
+    let mut text = String::new();
+    if path == Path::new("-") {
+        std::io::stdin().read_to_string(&mut text).map_err(io)?;
+    } else {
+        let mut opts = OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NONBLOCK);
+        }
+        let file = opts.open(path).map_err(io)?;
+        let meta = file.metadata().map_err(io)?;
+        if !meta.is_file() {
+            return Err(CliError::User("input must be a regular file".into()));
+        }
+        file.take(meta.len())
+            .read_to_string(&mut text)
+            .map_err(io)?;
+    }
+    Ok(text)
+}

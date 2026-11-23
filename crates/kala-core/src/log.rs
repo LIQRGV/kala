@@ -40,6 +40,9 @@
 //! Schema edit 0: attribute id u32 | definition
 //! Schema edit 1: node type id u16 | name str | inferred u8
 //! Schema edit 2: setting key str | setting value str
+//! Genesis may also contain Schema edit 2 world settings, validated exactly
+//! like live settings and effective at tx#0. Existing genesis encodings are unchanged.
+//!
 //! Schema edit 3: migration source attr id u32 | definition | skip_unconvertible u8
 //! `definition` is precisely the kind-2 fields after its id, including name,
 //! inferred and deprecated. Edit 0 declares the next attribute ID or revises an
@@ -64,7 +67,7 @@
 //! operation order: schema revisions, entity definitions, edge definitions and
 //! facts may interleave; an ID is always defined before use. A newly interned
 //! edge precedes its fact. A moved correction's Deleted/Revised pair is adjacent.
-//! The Commit is last. Genesis contains only kinds 1 and 2, then Commit.
+//! The Commit is last. Genesis contains kinds 1 and 2 and optional kind 9/edit 2 settings, then Commit.
 //! An edge `(source, attr, target)` is defined (with the next edge
 //! sequence, counted across the whole log) in the transaction that first
 //! stores an assert (a `Fact` or a `Revised`) of that `ref` triple, or a
@@ -1625,10 +1628,15 @@ impl LogWriter {
         buf.extend_from_slice(&LOG_MAGIC);
         buf.extend_from_slice(&LOG_FORMAT_VERSION.to_le_bytes());
         buf.extend_from_slice(&genesis.bytes);
-        let mut file = OpenOptions::new()
-            .append(true)
-            .create_new(true)
-            .open(path)?;
+        let mut options = OpenOptions::new();
+        options.append(true).create_new(true);
+        // Restored account databases must never have a wider-permission window.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(path)?;
         lock(&file)?;
         file.write_all(&buf)?;
         file.sync_data()?;

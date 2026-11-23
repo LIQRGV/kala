@@ -439,6 +439,7 @@ dependencies = [
  "kala-datalog",
  "kala-query",
  "libc",
+ "proptest",
  "rpassword",
  "rustyline",
  "serde",

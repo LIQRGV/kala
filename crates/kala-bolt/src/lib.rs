@@ -12,3 +12,6 @@ mod server;
 mod session;
 pub mod system;
 pub use server::{Server, ServerConfig};
+
+/// Shared database filename validation for server discovery and local backups.
+pub use registry::valid_name as valid_database_name;

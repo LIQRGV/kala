@@ -57,7 +57,7 @@ impl fmt::Display for SystemError {
                 "invalid host selector; use an IP, CIDR, trailing IPv4 wildcard, localhost, or %"
             }
             Self::InvalidGrant => {
-                "invalid grant; use read, write, or admin and a database name or *"
+                "invalid grant; use read, write, backup, or admin and a database name or *"
             }
             Self::EmptyPassword => "empty passwords are refused",
             Self::TrustRequiresLoopback => "trust requires localhost, 127.0.0.1, or ::1",
@@ -364,6 +364,12 @@ pub(crate) fn read_accounts(world: &World) -> Result<Vec<Account>, SystemError> 
     });
     Ok(accounts)
 }
+/// Validate a restored accounts database, including all active accounts and
+/// grants, without returning any password hashes to the caller.
+pub fn validate_restore(world: &World) -> Result<(), SystemError> {
+    read_accounts(world).map(|_| ())
+}
+
 /// List accounts, excluding all current and historical hashes.
 pub fn list(directory: impl AsRef<Path>) -> Result<Vec<AccountSummary>, SystemError> {
     ensure(directory.as_ref())?;
@@ -423,7 +429,7 @@ pub enum Change<'a> {
     Grant {
         /// `user@host`.
         account: &'a str,
-        /// `read`, `write` or `admin`.
+        /// `read`, `write`, `backup` or `admin`.
         privilege: &'a str,
         /// A database name or `*`.
         db: &'a str,
@@ -433,7 +439,7 @@ pub enum Change<'a> {
     Revoke {
         /// `user@host`.
         account: &'a str,
-        /// `read`, `write` or `admin`.
+        /// `read`, `write`, `backup` or `admin`.
         privilege: &'a str,
         /// A database name or `*`.
         db: &'a str,
@@ -708,7 +714,7 @@ fn set_inner(
     })
 }
 fn validate_grant(privilege: &str, db: &str) -> Result<(), SystemError> {
-    if !matches!(privilege, "read" | "write" | "admin")
+    if !matches!(privilege, "read" | "write" | "backup" | "admin")
         || db.len() > 250
         || (db != "*"
             && (db.is_empty()

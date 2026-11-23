@@ -185,10 +185,10 @@ impl<'a> Lexer<'a> {
                         'n' => out.push('\n'),
                         't' => out.push('\t'),
                         'r' => out.push('\r'),
-                        'u' => {
+                        'u' | 'U' => {
                             let mut code = 0u32;
                             let mut end = after;
-                            for _ in 0..4 {
+                            for _ in 0..if e == 'u' { 4 } else { 8 } {
                                 let Some((k, h)) = chars.next() else {
                                     self.unfinished_string = true;
                                     return Err(unterminated());
@@ -197,7 +197,7 @@ impl<'a> Lexer<'a> {
                                 let Some(d) = h.to_digit(16) else {
                                     return Err(DatalogError::syntax(
                                         Span::new(i, end),
-                                        "`\\u` needs exactly 4 hex digits (`\\uXXXX`)",
+                                        "Unicode escape needs 4 (\\u) or 8 (\\U) hex digits",
                                     ));
                                 };
                                 code = code * 16 + d;
@@ -207,7 +207,9 @@ impl<'a> Lexer<'a> {
                                 None => {
                                     return Err(DatalogError::syntax(
                                         Span::new(i, end),
-                                        format!("`\\u{code:04X}` is a surrogate, not a character"),
+                                        format!(
+                                            "Unicode value {code:08X} is not a scalar character"
+                                        ),
                                     ));
                                 }
                             }
@@ -517,6 +519,7 @@ impl CompletenessScanner {
                 self.mode = match c {
                     '"' | '\\' | 'n' | 't' | 'r' => ScanMode::String,
                     'u' => ScanMode::Unicode { code: 0, left: 4 },
+                    'U' => ScanMode::Unicode { code: 0, left: 8 },
                     _ => {
                         self.invalid = true;
                         ScanMode::Trivia

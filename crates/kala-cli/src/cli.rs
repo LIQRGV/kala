@@ -67,6 +67,32 @@ fn parse_param(s: &str) -> Result<(String, String), String> {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Write a replayable world script.
+    Dump {
+        world: PathBuf,
+        #[arg(short = 'o')]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Create an empty world, optionally declaring its genesis schema.
+    Create {
+        world: PathBuf,
+        #[arg(long)]
+        schema: Option<PathBuf>,
+    },
+    /// Export a JSON snapshot at a tick and canon.
+    Export {
+        world: PathBuf,
+        #[arg(long, allow_negative_numbers = true)]
+        at: Option<i64>,
+        #[arg(long, value_parser = parse_canon)]
+        canon: Option<Canon>,
+        #[arg(short = 'o')]
+        output: Option<PathBuf>,
+    },
     /// Show schema definitions and settings at a canon.
     Schema {
         world: PathBuf,
@@ -256,6 +282,9 @@ pub enum Command {
     },
     /// Commit Datalog write transactions from a file or stdin (-).
     Transact {
+        /// Replay a dump into a new world, preserving its genesis.
+        #[arg(long, conflicts_with_all = ["dry_run", "acknowledge_recovery"])]
+        create: bool,
         world: PathBuf,
         input: PathBuf,
         /// Preview the forms in order (each sees the ones before it)
@@ -340,7 +369,7 @@ pub enum UserCommand {
         #[command(flatten)]
         write: UserWrite,
     },
-    /// Grant read, write or admin on a database (or *).
+    /// Grant read, write, backup or admin on a database (or *).
     Grant {
         dir: PathBuf,
         account: String,

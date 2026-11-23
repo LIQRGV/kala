@@ -61,6 +61,15 @@ pub struct Identity {
     pub grants: Vec<String>,
 }
 impl Identity {
+    /// Whether this identity has the stored backup privilege. Local file
+    /// backups use filesystem permissions; a future server dump will call this.
+    pub fn permits_backup(&self, db: &str) -> bool {
+        self.grants.iter().any(|grant| {
+            grant.split_once(':').is_some_and(|(privilege, target)| {
+                (target == "*" || target == db) && matches!(privilege, "admin" | "backup")
+            })
+        })
+    }
     /// Whether this identity may read the named database.
     pub fn permits_read(&self, db: &str) -> bool {
         self.grants.iter().any(|grant| {
