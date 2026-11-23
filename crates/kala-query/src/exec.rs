@@ -47,20 +47,20 @@
 //!
 //! [`Func`]: crate::ir::Func
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::atomic::AtomicBool;
 
-use kala_core::{Error as CoreError, Tick, TxId, Value, View, WorkMeter, World};
+use kala_core::{Error as CoreError, MeteredView, Tick, TxId, Value, View, WorkMeter, World};
 
 use crate::ParameterInput;
 use crate::datum::Datum;
 use crate::ir::{CanonSource, Plan, TickSource, Var};
 
-use budget::{Budget, Memo, check_cancel};
-use compile::{compile, plan_depth};
-use eval::{Exec, Relation};
-use program::Slots;
-use val::{CmpWork, Interner, Val, cmp_real_rows, result_row_bytes, row_bytes, tuple_bytes};
+use budget::{Budget, check_cancel};
+use compile::{CompileEnv, compile, plan_depth};
+use eval::Exec;
+use program::{Program, Slots};
+use val::{Interner, Val, cmp_real_rows, result_row_bytes, row_bytes, tuple_bytes};
 
 mod agg;
 mod budget;
@@ -134,17 +134,6 @@ pub struct ResultSet {
     pub canon: TxId,
 }
 
-/// Runs a plan with a caller-owned cancellation flag.
-pub fn run_with_cancel(
-    world: &World,
-    plan: &Plan,
-    params: &Params,
-    limits: &Limits,
-    cancel: &AtomicBool,
-) -> Result<ResultSet, QueryError> {
-    run_tracked(world, plan, params, limits, cancel).map(|(rows, _)| rows)
-}
-
 /// Measured resource usage of a successful run. A batch can deduct these
 /// values from its remaining budget without changing [`Limits`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -155,58 +144,69 @@ pub struct Usage {
     pub peak_bytes: usize,
 }
 
-/// Runs a plan and reports the resources it consumed. Batches conservatively
-/// sum each run's peak memory, even though runs execute sequentially.
-pub fn run_with_usage(
-    world: &World,
-    plan: &Plan,
-    params: &Params,
-    limits: &Limits,
-) -> Result<(ResultSet, Usage), QueryError> {
-    run_tracked(world, plan, params, limits, &AtomicBool::new(false))
+/// How one [`run_with`] is bounded: its resource limits and, optionally, a
+/// caller-owned cancellation flag. The default is [`Limits::default`] and no
+/// cancellation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RunOptions<'a> {
+    /// The run's resource limits.
+    pub limits: Limits,
+    /// Set to `true` (from any thread) to stop the run with
+    /// [`QueryError::Cancelled`]; `None` runs to the end.
+    pub cancel: Option<&'a AtomicBool>,
+}
+
+impl<'a> RunOptions<'a> {
+    /// `limits`, with no cancellation.
+    pub fn new(limits: Limits) -> RunOptions<'a> {
+        RunOptions {
+            limits,
+            cancel: None,
+        }
+    }
+
+    /// The same options, stopping once `cancel` is set.
+    pub fn with_cancel(self, cancel: &'a AtomicBool) -> RunOptions<'a> {
+        RunOptions {
+            cancel: Some(cancel),
+            ..self
+        }
+    }
 }
 
 /// Resolves `plan.canon` against `world` (a canon past the latest is the
-/// latest) and runs the plan there with [`execute`].
-pub fn run(
+/// latest), runs the plan there and reports the resources it consumed.
+/// `params` is a scalar [`Params`] map or nullable/list
+/// [`QueryParams`](crate::QueryParams). Batches conservatively sum each
+/// run's peak memory, even though runs execute sequentially.
+pub fn run_with(
     world: &World,
     plan: &Plan,
-    params: &Params,
-    limits: &Limits,
-) -> Result<ResultSet, QueryError> {
-    run_with_cancel(world, plan, params, limits, &AtomicBool::new(false))
+    params: &dyn ParameterInput,
+    options: RunOptions<'_>,
+) -> Result<(ResultSet, Usage), QueryError> {
+    let never = AtomicBool::new(false);
+    let request = Request {
+        world,
+        plan,
+        params,
+        limits: &options.limits,
+        cancel: options.cancel.unwrap_or(&never),
+    };
+    check_cancel(request.cancel)?;
+    let canon = request.canon()?;
+    request.execute_on(&world.at_canon(canon))
 }
 
-fn run_tracked(
+/// [`run_with`] under `limits` alone (no cancellation), returning only the
+/// answer.
+pub fn run(
     world: &World,
     plan: &Plan,
     params: &dyn ParameterInput,
     limits: &Limits,
-    cancel: &AtomicBool,
-) -> Result<(ResultSet, Usage), QueryError> {
-    check_cancel(cancel)?;
-    let latest = world.latest_tx();
-    let canon = match &plan.canon {
-        CanonSource::Latest => latest,
-        CanonSource::Const(n) => TxId(*n),
-        CanonSource::Param(name) => match params.scalar(name)? {
-            Value::I64(n) if *n >= 0 => TxId(n.unsigned_abs()),
-            _ => {
-                return Err(QueryError::ParamType {
-                    name: name.clone(),
-                    expected: "non-negative i64".into(),
-                });
-            }
-        },
-    };
-    execute_on(
-        world,
-        &world.at_canon(canon.min(latest)),
-        plan,
-        params,
-        limits,
-        cancel,
-    )
+) -> Result<ResultSet, QueryError> {
+    run_with(world, plan, params, RunOptions::new(*limits)).map(|(rows, _)| rows)
 }
 
 /// Runs `plan` on `view`. `plan.canon` is ignored: the view is already
@@ -215,177 +215,200 @@ fn run_tracked(
 pub fn execute(
     view: &View,
     plan: &Plan,
-    params: &Params,
+    params: &dyn ParameterInput,
     limits: &Limits,
 ) -> Result<ResultSet, QueryError> {
-    execute_on(
-        view.world(),
-        view,
+    let request = Request {
+        world: view.world(),
         plan,
         params,
         limits,
-        &AtomicBool::new(false),
-    )
-    .map(|(rows, _)| rows)
+        cancel: &AtomicBool::new(false),
+    };
+    request.execute_on(view).map(|(rows, _)| rows)
 }
 
-fn execute_on(
-    world: &World,
-    view: &View,
-    plan: &Plan,
-    params: &dyn ParameterInput,
-    limits: &Limits,
-    cancel: &AtomicBool,
-) -> Result<(ResultSet, Usage), QueryError> {
-    let meter = WorkMeter::bounded(limits.max_steps, Some(cancel));
-    execute_inner(world, view, plan, params, limits, cancel, &meter).map_err(|error| match error {
-        QueryError::Core(CoreError::WorkInterrupted { reason }) => match reason {
-            kala_core::WorkInterruptReason::Limit => QueryError::StepBudget {
-                limit: limits.max_steps,
+/// One execution's inputs: what every phase of a run reads.
+struct Request<'a> {
+    world: &'a World,
+    plan: &'a Plan,
+    params: &'a dyn ParameterInput,
+    limits: &'a Limits,
+    cancel: &'a AtomicBool,
+}
+
+impl Request<'_> {
+    /// The canon the plan reads: `plan.canon` resolved, never past the
+    /// world's latest.
+    fn canon(&self) -> Result<TxId, QueryError> {
+        let latest = self.world.latest_tx();
+        let canon = match &self.plan.canon {
+            CanonSource::Latest => latest,
+            CanonSource::Const(n) => TxId(*n),
+            CanonSource::Param(name) => match self.params.scalar(name)? {
+                Value::I64(n) if *n >= 0 => TxId(n.unsigned_abs()),
+                _ => {
+                    return Err(QueryError::ParamType {
+                        name: name.clone(),
+                        expected: "non-negative i64".into(),
+                    });
+                }
             },
-            kala_core::WorkInterruptReason::Stopped => QueryError::Cancelled,
-        },
-        other => other,
-    })
-}
+        };
+        Ok(canon.min(latest))
+    }
 
-fn execute_inner(
-    world: &World,
-    view: &View,
-    plan: &Plan,
-    params: &dyn ParameterInput,
-    limits: &Limits,
-    cancel: &AtomicBool,
-    meter: &WorkMeter,
-) -> Result<(ResultSet, Usage), QueryError> {
-    check_cancel(cancel)?;
-    let depth = plan_depth(&plan.root);
-    if depth > MAX_PLAN_DEPTH {
-        return Err(QueryError::Plan(format!(
-            "plan too deep: {depth} nested operators, at most {MAX_PLAN_DEPTH}"
-        )));
+    /// Runs the plan on `view` under a meter bounded by the step budget,
+    /// reporting an interrupted kala-core read as the budget or the
+    /// cancellation that stopped it.
+    fn execute_on(&self, view: &View) -> Result<(ResultSet, Usage), QueryError> {
+        let meter = WorkMeter::bounded(self.limits.max_steps, Some(self.cancel));
+        self.execute_inner(view, &meter)
+            .map_err(|error| match error {
+                QueryError::Core(CoreError::WorkInterrupted { reason }) => match reason {
+                    kala_core::WorkInterruptReason::Limit => QueryError::StepBudget {
+                        limit: self.limits.max_steps,
+                    },
+                    kala_core::WorkInterruptReason::Stopped => QueryError::Cancelled,
+                },
+                other => other,
+            })
     }
-    for name in &plan.params {
-        if !params.contains_key(name) {
-            return Err(QueryError::MissingParam(name.clone()));
-        }
+
+    fn execute_inner(
+        &self,
+        view: &View,
+        meter: &WorkMeter,
+    ) -> Result<(ResultSet, Usage), QueryError> {
+        let plan = self.plan;
+        check_cancel(self.cancel)?;
+        self.check_plan()?;
+        // Every read below goes through the metered view, so its index work is
+        // charged to the step budget (after each kala-core call).
+        let view = &view.metered(meter);
+        let default_tick = self.default_tick(view)?;
+        let mut slots = Slots::default();
+        // Plan constants are interned first, uncharged; the rest of the query's
+        // strings and interval sets join the same table.
+        let mut interner = Interner::default();
+        let (root, output) = match &plan.root {
+            crate::Op::Output { input, spec } => (input.as_ref(), Some(spec)),
+            root => (root, None),
+        };
+        let mut budget = Budget::new(self.cancel, *self.limits);
+        let env = CompileEnv {
+            world: self.world,
+            canon: view.canon(),
+            params: self.params,
+            default_tick,
+        };
+        let prog = compile(root, env, &mut slots, &mut interner, &mut budget)?;
+        let find = self.find_slots(output, &slots, &prog)?;
+        let width = slots.len();
+        budget.row_bytes = row_bytes(width);
+        let mut ex = Exec::new(self.world, view, meter, width, budget, interner, &prog.rels);
+        // The default tick's read (a walk of the E index at an older canon).
+        ex.charge_index_work()?;
+        let rows = ex.eval(&prog.steps)?;
+        let rows = match output {
+            Some(spec) => output_rows(&rows, &find, spec, &slots, self.params, &mut ex.budget)?,
+            None => set_rows(&rows, &find, &mut ex.budget)?,
+        };
+        check_cancel(self.cancel)?;
+        Ok((
+            ResultSet {
+                columns: plan.find.clone(),
+                rows,
+                tick: default_tick,
+                canon: view.canon(),
+            },
+            Usage {
+                steps: ex.budget.steps,
+                peak_bytes: ex.budget.peak_bytes,
+            },
+        ))
     }
-    // Every read below goes through the metered view, so its index work is
-    // charged to the step budget (after each kala-core call).
-    let view = &view.metered(meter);
-    let default_tick = match &plan.default_tick {
-        TickSource::Default => view.latest_tick()?,
-        TickSource::Const(t) => *t,
-        TickSource::Param(name) => tick_param(params, name)?,
-        TickSource::Var(v) => {
+
+    /// The checks that need no read: the plan's depth, then that every
+    /// declared parameter was supplied.
+    fn check_plan(&self) -> Result<(), QueryError> {
+        let depth = plan_depth(&self.plan.root);
+        if depth > MAX_PLAN_DEPTH {
             return Err(QueryError::Plan(format!(
-                "the default tick can't be a variable (?{})",
-                v.0
+                "plan too deep: {depth} nested operators, at most {MAX_PLAN_DEPTH}"
             )));
         }
-    };
-    let mut slots = Slots::default();
-    // Plan constants are interned first, uncharged; the rest of the query's
-    // strings and interval sets join the same table.
-    let mut interner = Interner::default();
-    let (root, output) = match &plan.root {
-        crate::Op::Output { input, spec } => (input.as_ref(), Some(spec)),
-        root => (root, None),
-    };
-    let mut budget = Budget {
-        cancel,
-        peak_bytes: 0,
-        steps: 0,
-        bytes: 0,
-        row_bytes: 0,
-        cmp: CmpWork::default(),
-        memo: Memo::default(),
-        limits: *limits,
-    };
-    let prog = compile(
-        root,
-        world,
-        view.canon(),
-        params,
-        default_tick,
-        &mut slots,
-        &mut interner,
-        &mut budget,
-    )?;
-    let mut find = Vec::with_capacity(plan.find.len());
-    for v in output.map_or(&plan.find, |spec| &spec.vars) {
-        match slots.get(v) {
-            Some(s) if prog.bound.contains(&s) => find.push(s),
-            _ => {
-                return Err(QueryError::Plan(format!(
-                    "find variable ?{} is not bound by the plan (its root is {})",
-                    v.0,
-                    plan.root.name()
-                )));
+        for name in &self.plan.params {
+            if !self.params.contains_key(name) {
+                return Err(QueryError::MissingParam(name.clone()));
             }
         }
+        Ok(())
     }
-    let width = slots.len();
-    budget.row_bytes = row_bytes(width);
-    let mut ex = Exec {
-        world,
-        view,
-        meter,
-        width,
-        budget,
-        interner,
-        scans: HashMap::new(),
-        history_scans: HashMap::new(),
-        during_scans: HashMap::new(),
-        checked_types: HashSet::new(),
-        node_types: None,
-        rels: prog
-            .rels
-            .iter()
-            .map(|cols| Relation {
-                tuples: BTreeSet::new(),
-                delta: BTreeSet::new(),
-                new: BTreeSet::new(),
-                tuple_bytes: tuple_bytes(cols.len()),
-            })
-            .collect(),
-    };
-    // The default tick's read (a walk of the E index at an older canon).
-    ex.charge_index_work()?;
-    let rows = ex.eval(&prog.steps)?;
-    let rows = if let Some(spec) = output {
-        output_rows(&rows, &find, spec, &slots, params, &mut ex.budget)?
-    } else {
-        let mut out = BTreeSet::new();
-        for row in &rows {
-            let r: Vec<Val> = find
-                .iter()
-                .map(|&s| row[s].clone().expect("checked find binding"))
-                .collect();
-            out.insert(r);
+
+    /// What [`TickSource::Default`] reads at: the plan's default tick,
+    /// resolved once.
+    fn default_tick(&self, view: &MeteredView) -> Result<Tick, QueryError> {
+        match &self.plan.default_tick {
+            TickSource::Default => Ok(view.latest_tick()?),
+            TickSource::Const(t) => Ok(*t),
+            TickSource::Param(name) => tick_param(self.params, name),
+            TickSource::Var(v) => Err(QueryError::Plan(format!(
+                "the default tick can't be a variable (?{})",
+                v.0
+            ))),
         }
-        let result_bytes = out.iter().map(|r| result_row_bytes(r)).sum();
-        ex.budget.charge_bytes(result_bytes)?;
-        let out: Vec<Vec<Val>> = out.into_iter().collect();
-        let order = sort_real(&out, &mut ex.budget)?;
-        order
-            .into_iter()
-            .map(|i| out[i].iter().map(Val::to_datum).collect())
-            .collect()
-    };
-    check_cancel(cancel)?;
-    Ok((
-        ResultSet {
-            columns: plan.find.clone(),
-            rows,
-            tick: default_tick,
-            canon: view.canon(),
-        },
-        Usage {
-            steps: ex.budget.steps,
-            peak_bytes: ex.budget.peak_bytes,
-        },
-    ))
+    }
+
+    /// The slots of the result columns (an `Output` root's, else the plan's
+    /// `find`), each of which the compiled root must bind.
+    fn find_slots(
+        &self,
+        output: Option<&crate::OutputSpec>,
+        slots: &Slots,
+        prog: &Program,
+    ) -> Result<Vec<usize>, QueryError> {
+        let plan = self.plan;
+        let mut find = Vec::with_capacity(plan.find.len());
+        for v in output.map_or(&plan.find, |spec| &spec.vars) {
+            match slots.get(v) {
+                Some(s) if prog.bound.contains(&s) => find.push(s),
+                _ => {
+                    return Err(QueryError::Plan(format!(
+                        "find variable ?{} is not bound by the plan (its root is {})",
+                        v.0,
+                        plan.root.name()
+                    )));
+                }
+            }
+        }
+        Ok(find)
+    }
+}
+
+/// A set plan's answer: the `find` slots of `rows`, deduplicated and sorted
+/// in value order, the result charged at its real size.
+fn set_rows(
+    rows: &BTreeSet<val::Row>,
+    find: &[usize],
+    budget: &mut Budget,
+) -> Result<Vec<Vec<Datum>>, QueryError> {
+    let mut out = BTreeSet::new();
+    for row in rows {
+        let r: Vec<Val> = find
+            .iter()
+            .map(|&s| row[s].clone().expect("checked find binding"))
+            .collect();
+        out.insert(r);
+    }
+    let result_bytes = out.iter().map(|r| result_row_bytes(r)).sum();
+    budget.charge_bytes(result_bytes)?;
+    let out: Vec<Vec<Val>> = out.into_iter().collect();
+    let order = sort_real(&out, budget)?;
+    Ok(order
+        .into_iter()
+        .map(|i| out[i].iter().map(Val::to_datum).collect())
+        .collect())
 }
 
 /// The order of `rows` (their indices) ascending by [`cmp_real_rows`]: a
@@ -585,24 +608,4 @@ fn sort_by(
     }
     budget.release_bytes(n.saturating_mul(std::mem::size_of::<usize>()));
     Ok(a)
-}
-
-/// Run with nullable/list parameters, leaving the original scalar API unchanged.
-pub fn run_with_values(
-    world: &World,
-    plan: &Plan,
-    params: &crate::QueryParams,
-    limits: &Limits,
-) -> Result<ResultSet, QueryError> {
-    run_with_values_and_cancel(world, plan, params, limits, &AtomicBool::new(false))
-}
-/// Run nullable/list parameters with caller-owned cancellation.
-pub fn run_with_values_and_cancel(
-    world: &World,
-    plan: &Plan,
-    params: &crate::QueryParams,
-    limits: &Limits,
-    cancel: &AtomicBool,
-) -> Result<ResultSet, QueryError> {
-    run_tracked(world, plan, params, limits, cancel).map(|(rows, _)| rows)
 }

@@ -125,25 +125,31 @@ pub(super) fn plan_depth(root: &Op) -> usize {
     deepest
 }
 
+/// What a plan is compiled against: the world and canon its names resolve
+/// in, the query's parameters and its resolved default tick.
+#[derive(Clone, Copy)]
+pub(super) struct CompileEnv<'c> {
+    pub(super) world: &'c World,
+    pub(super) canon: TxId,
+    pub(super) params: &'c dyn ParameterInput,
+    pub(super) default_tick: Tick,
+}
+
 /// Compiles `root` into a flat program. Errors come in the order a
 /// recursive walk (inputs first, left to right) would find them.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn compile(
     root: &Op,
-    world: &World,
-    canon: TxId,
-    params: &dyn ParameterInput,
-    default_tick: Tick,
+    env: CompileEnv<'_>,
     slots: &mut Slots,
     interner: &mut Interner,
     budget: &mut super::budget::Budget,
 ) -> Result<Program, QueryError> {
     let walk = post_order(root);
     let mut c = Compiler {
-        world,
-        canon,
-        params,
-        default_tick,
+        world: env.world,
+        canon: env.canon,
+        params: env.params,
+        default_tick: env.default_tick,
         slots,
         interner,
         budget,

@@ -33,7 +33,22 @@ pub(super) struct Budget<'a> {
     pub(super) limits: Limits,
 }
 
-impl Budget<'_> {
+impl<'a> Budget<'a> {
+    /// A fresh budget: nothing charged yet, and the row size unknown until
+    /// the plan is compiled.
+    pub(super) fn new(cancel: &'a AtomicBool, limits: Limits) -> Budget<'a> {
+        Budget {
+            cancel,
+            peak_bytes: 0,
+            steps: 0,
+            bytes: 0,
+            row_bytes: 0,
+            cmp: CmpWork::default(),
+            memo: Memo::default(),
+            limits,
+        }
+    }
+
     /// Charges `n` more bytes held. If that exceeds the budget, the memo
     /// (a cache) is dropped first; only then is it an error.
     pub(super) fn charge_bytes(&mut self, n: usize) -> Result<(), QueryError> {

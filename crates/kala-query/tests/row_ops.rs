@@ -1,8 +1,8 @@
 //! The neutral row IR independently of any language compiler.
 use kala_core::{Value, load_fixture};
 use kala_query::{
-    CanonSource, Datum, Expr, Limits, Op, OutputSpec, Params, Plan, QueryError, RowAction, Term,
-    TickSource, Var, run, run_with_cancel, run_with_usage,
+    CanonSource, Datum, Expr, Limits, Op, OutputSpec, Params, Plan, QueryError, RowAction,
+    RunOptions, Term, TickSource, Var, run, run_with,
 };
 use std::sync::atomic::AtomicBool;
 fn var(name: &str) -> Var {
@@ -169,9 +169,20 @@ fn sorting_charges_extra_work_and_memory_and_checks_cancellation() {
         None,
         Some(Term::Const(Value::I64(1))),
     );
-    let (_, plain_usage) = run_with_usage(&w, &plain, &Params::new(), &Limits::default()).unwrap();
-    let (result, ordered_usage) =
-        run_with_usage(&w, &ordered, &Params::new(), &Limits::default()).unwrap();
+    let (_, plain_usage) = run_with(
+        &w,
+        &plain,
+        &Params::new(),
+        RunOptions::new(Limits::default()),
+    )
+    .unwrap();
+    let (result, ordered_usage) = run_with(
+        &w,
+        &ordered,
+        &Params::new(),
+        RunOptions::new(Limits::default()),
+    )
+    .unwrap();
     assert_eq!(result.rows.len(), 1);
     assert!(
         ordered_usage.steps > plain_usage.steps,
@@ -214,13 +225,13 @@ fn sorting_charges_extra_work_and_memory_and_checks_cancellation() {
         Err(QueryError::RowLimit { .. })
     ));
     assert!(matches!(
-        run_with_cancel(
+        run_with(
             &w,
             &ordered,
             &Params::new(),
-            &Limits::default(),
-            &AtomicBool::new(true)
-        ),
+            RunOptions::new(Limits::default()).with_cancel(&AtomicBool::new(true))
+        )
+        .map(|(rs, _)| rs),
         Err(QueryError::Cancelled)
     ));
 }
@@ -258,9 +269,14 @@ fn distinct_output_accounts_for_hash_keys_while_projected_rows_are_live() {
     let bag = plan(&values, false, vec![], None, None);
     let distinct = plan(&values, true, vec![], None, None);
     let (bag_rows, bag_usage) =
-        run_with_usage(&w, &bag, &Params::new(), &Limits::default()).unwrap();
-    let (distinct_rows, distinct_usage) =
-        run_with_usage(&w, &distinct, &Params::new(), &Limits::default()).unwrap();
+        run_with(&w, &bag, &Params::new(), RunOptions::new(Limits::default())).unwrap();
+    let (distinct_rows, distinct_usage) = run_with(
+        &w,
+        &distinct,
+        &Params::new(),
+        RunOptions::new(Limits::default()),
+    )
+    .unwrap();
     assert_eq!(distinct_rows.rows, bag_rows.rows);
     assert!(
         distinct_usage.peak_bytes > bag_usage.peak_bytes,

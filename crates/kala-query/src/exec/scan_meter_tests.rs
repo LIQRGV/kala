@@ -4,6 +4,27 @@ use kala_core::{AttrDef, Cardinality, Kind, Schema, ValueType, WorkInterruptReas
 use proptest::prelude::*;
 use std::sync::atomic::Ordering as AtomicOrdering;
 
+/// [`Request::execute_inner`] with the request spelled out, so a test can
+/// run a plan under a meter of its own.
+fn execute_inner(
+    world: &World,
+    view: &View,
+    plan: &Plan,
+    params: &Params,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    meter: &WorkMeter,
+) -> Result<(ResultSet, Usage), QueryError> {
+    let request = Request {
+        world,
+        plan,
+        params,
+        limits,
+        cancel,
+    };
+    request.execute_inner(view, meter)
+}
+
 fn world(values: &[i64]) -> World {
     let mut world = World::in_memory(Schema::new().node_type("N").attribute(AttrDef::new(
         "score",

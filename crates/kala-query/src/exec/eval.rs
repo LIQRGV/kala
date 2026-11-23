@@ -14,7 +14,7 @@ use super::budget::Budget;
 use super::program::{Attr, Pos, Step, TickPos, pop};
 use super::val::{
     CMP_BYTES_PER_STEP, Interner, PAIR_BYTES, Pairs, Points, Row, STRING_OVERHEAD_BYTES, Sets, Val,
-    compare, index_entry_bytes,
+    compare, index_entry_bytes, tuple_bytes,
 };
 pub(super) use fixpoint::Relation;
 use fixpoint::{Frame, Read};
@@ -53,6 +53,43 @@ pub(super) struct Exec<'a, 'w> {
     pub(super) node_types: Option<HashSet<String>>,
     /// Every relation of the plan, by id (empty outside its `Fixpoint`).
     pub(super) rels: Vec<Relation>,
+}
+
+impl<'a, 'w> Exec<'a, 'w> {
+    /// The state of a query about to run: no scans cached, and one empty
+    /// relation per entry of `rels` (each relation's columns, by id).
+    pub(super) fn new(
+        world: &'a World,
+        view: &'a MeteredView<'w>,
+        meter: &'a WorkMeter<'a>,
+        width: usize,
+        budget: Budget<'a>,
+        interner: Interner,
+        rels: &[Vec<usize>],
+    ) -> Exec<'a, 'w> {
+        Exec {
+            world,
+            view,
+            meter,
+            width,
+            budget,
+            interner,
+            scans: HashMap::new(),
+            history_scans: HashMap::new(),
+            during_scans: HashMap::new(),
+            checked_types: HashSet::new(),
+            node_types: None,
+            rels: rels
+                .iter()
+                .map(|cols| Relation {
+                    tuples: BTreeSet::new(),
+                    delta: BTreeSet::new(),
+                    new: BTreeSet::new(),
+                    tuple_bytes: tuple_bytes(cols.len()),
+                })
+                .collect(),
+        }
+    }
 }
 
 impl Exec<'_, '_> {
