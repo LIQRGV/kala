@@ -441,6 +441,7 @@ impl World {
                     .map(|nt| nt.name.clone())
                     .ok_or_else(|| corrupt(&format!("entity {id:?} has an unknown node type")))?;
                 let def = self
+                    .catalog
                     .prepare_entity(&StagedIds::default(), &name, handle.as_deref())
                     .map_err(ReplayFault::Refused)?;
                 if def.id != *id {
@@ -451,7 +452,7 @@ impl World {
                 }
                 // Both replay paths key the transaction at `next_tx`.
                 let tx = self.next_tx();
-                self.apply_entity(def, tx);
+                self.catalog.apply_entity(def, tx);
                 Ok(())
             }
             EntryBody::DefineEdge {
@@ -475,7 +476,7 @@ impl World {
                     )));
                 }
                 for end in [source, target] {
-                    if !self.is_defined_staged(&StagedIds::default(), *end) {
+                    if !self.catalog.is_defined_staged(&StagedIds::default(), *end) {
                         return Err(ReplayFault::DanglingId(*end));
                     }
                 }
@@ -487,14 +488,14 @@ impl World {
                 if let Some(existing) = self.catalog.edge_by_triple.get(&triple) {
                     return Err(corrupt(&format!("triple already interned as {existing:?}")));
                 }
-                if id.seq() != self.last_edge_seq(&StagedIds::default()) + 1 {
+                if id.seq() != self.catalog.last_edge_seq(&StagedIds::default()) + 1 {
                     return Err(corrupt(&format!("{id:?} out of sequence")));
                 }
                 if !copied {
                     txn.unasserted_edges.insert(triple, *id);
                 }
                 let tx = self.next_tx();
-                self.apply_edge(
+                self.catalog.apply_edge(
                     EdgeDef {
                         id: *id,
                         source: *source,
@@ -552,6 +553,7 @@ impl World {
                 // defined by an earlier entry.
                 if let Value::Ref(target) = value
                     && self
+                        .catalog
                         .edge_of(&StagedIds::default(), fact.entity, fact.attr, *target)
                         .is_none()
                 {
@@ -692,6 +694,7 @@ impl World {
                 // the triple's only entry (no edge).
                 if let (Some(target), Op::Assert) = (fact.target, fact.op)
                     && self
+                        .catalog
                         .edge_of(&StagedIds::default(), fact.entity, fact.attr, target)
                         .is_none()
                 {

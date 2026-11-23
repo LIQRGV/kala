@@ -63,11 +63,11 @@ impl Txn<'_> {
         subjects: Option<&[EntityId]>,
     ) -> Vec<(EntityId, Change)> {
         let mut points = BTreeMap::new();
-        let mutual = self.world.is_bidirectional(attr);
+        let mutual = self.world.catalog.is_bidirectional(attr);
         let view = self.world.at_canon(self.world.latest_tx());
         let ids: Box<dyn Iterator<Item = EntityId> + '_> = match subjects {
             Some(ids) => Box::new(ids.iter().copied()),
-            None => Box::new(self.world.defined_ids()),
+            None => Box::new(self.world.catalog.defined_ids()),
         };
         for entity in ids {
             for change in view.changes(entity, attr) {
@@ -355,7 +355,7 @@ impl Txn<'_> {
                     copies.push((other, Value::Ref(entity)));
                 }
                 let old_edge = if let Value::Ref(other) = c.value {
-                    txn.world.edge_of(&txn.ids, entity, source, other)
+                    txn.world.catalog.edge_of(&txn.ids, entity, source, other)
                 } else {
                     None
                 };
@@ -431,12 +431,14 @@ impl Txn<'_> {
         let edge = if let Some(target) = fact.target {
             if let Some(edge) =
                 self.world
+                    .catalog
                     .prepare_edge(&self.ids, fact.entity, fact.attr, target)?
             {
                 self.order.push(OrderedEntry::Edge(self.ids.edges.len()));
                 self.ids.push_edge(edge);
             }
             self.world
+                .catalog
                 .edge_of(&self.ids, fact.entity, fact.attr, target)
         } else {
             None

@@ -461,6 +461,38 @@ impl Indexes {
         }
     }
 
+    /// The world's latest tick: the highest tick any key holds a fact at
+    /// (latest canon), or `Tick(0)` if there is none (see
+    /// [`World::latest_tick`]).
+    pub(super) fn latest_tick(&self) -> Tick {
+        self.tick_counts
+            .last_key_value()
+            .map_or(Tick(0), |(tick, _)| *tick)
+    }
+
+    /// The planner's estimates for attribute `attr` (see
+    /// [`World::attr_stats`]).
+    pub(super) fn attr_stats(&self, attr: AttrId) -> AttrStats {
+        self.attr_counts
+            .get(&attr)
+            .map_or_else(AttrStats::default, AttrCounts::stats)
+    }
+
+    /// Whether any fact entry was ever stored for attribute `attr`.
+    pub(super) fn has_facts(&self, attr: AttrId) -> bool {
+        self.attr_counts.contains_key(&attr)
+    }
+
+    /// Sets the content hash of indexes being rebuilt, before any fact is
+    /// applied.
+    fn set_rebuild_hash(&mut self, hash: ContentHash) {
+        debug_assert!(
+            self.values.is_empty(),
+            "invariant: the content hash is set before any value is referenced"
+        );
+        self.content_hash = hash;
+    }
+
     /// The stored index maps, borrowed for doctor's comparison.
     fn stored(&self) -> StoredIndexes<'_> {
         StoredIndexes {
@@ -561,11 +593,7 @@ impl World {
     /// Sets the content hash of a world being rebuilt, before any fact is
     /// applied (a world holding just its genesis).
     pub(crate) fn set_rebuild_hash(&mut self, hash: ContentHash) {
-        debug_assert!(
-            self.indexes.values.is_empty(),
-            "invariant: the content hash is set before any value is referenced"
-        );
-        self.indexes.content_hash = hash;
+        self.indexes.set_rebuild_hash(hash);
     }
 
     /// Replaces the content hash of this world's value references with `f`
@@ -606,25 +634,8 @@ impl World {
     /// hold the same entries, and the latest-revision indexes and the
     /// latest tick follow the keys' current entries.
     pub(super) fn index_entry(&mut self, fact: &FactDef, mark: Mark, tx: TxId) {
-        let value_indexed = self.value_indexed(fact.attr);
+        let value_indexed = self.catalog.value_indexed(fact.attr);
         self.indexes.insert(fact, mark, tx, value_indexed);
-    }
-
-    /// Whether `attr`'s entries are mirrored in `V`: it is declared
-    /// indexed and isn't a `ref` attribute (`R` is the value index of a
-    /// `ref` attribute).
-    fn value_indexed(&self, attr: AttrId) -> bool {
-        let def = &self.catalog.attributes[attr.0 as usize];
-        def.indexed && def.value_type != ValueType::Ref
-    }
-
-    /// Whether `attr`'s `E` keys carry value references: it is an
-    /// unindexed string attribute.
-    pub(super) fn keys_by_ref(&self, attr: AttrId) -> bool {
-        self.catalog
-            .attributes
-            .get(attr.0 as usize)
-            .is_some_and(|def| !def.indexed && def.value_type == ValueType::Str)
     }
 
     /// The full value encoding an `E`-key value part of attribute `attr`
@@ -635,7 +646,10 @@ impl World {
     /// table lacks: only reachable by tampering, so readers skip such keys
     /// (doctor reports them).
     fn e_part_encoding<'a>(&'a self, attr: AttrId, part: &'a [u8]) -> Option<&'a [u8]> {
-        match (self.keys_by_ref(attr), ValueRef::from_key_bytes(part)) {
+        match (
+            self.catalog.keys_by_ref(attr),
+            ValueRef::from_key_bytes(part),
+        ) {
             (true, Some(r)) => self.indexes.values.resolve(r),
             (false, None) => Some(part),
             _ => None,
@@ -675,7 +689,7 @@ impl World {
         attr: AttrId,
         encoding: &'a [u8],
     ) -> Option<Cow<'a, [u8]>> {
-        if !self.keys_by_ref(attr) {
+        if !self.catalog.keys_by_ref(attr) {
             return Some(Cow::Borrowed(encoding));
         }
         let r = self.indexes.values.get(encoding)?;

@@ -156,7 +156,10 @@ impl Txn<'_> {
         handle: Option<&str>,
     ) -> Result<EntityId, Error> {
         self.guard(|txn| {
-            let def = txn.world.prepare_entity(&txn.ids, node_type, handle)?;
+            let def = txn
+                .world
+                .catalog
+                .prepare_entity(&txn.ids, node_type, handle)?;
             let id = def.id;
             txn.order.push(OrderedEntry::Entity(txn.ids.defs.len()));
             txn.ids.push(def);
@@ -242,7 +245,7 @@ impl Txn<'_> {
     /// transaction.
     pub fn edge_id(&self, source: EntityId, attr: &str, target: EntityId) -> Option<EdgeId> {
         let attr = *self.world.catalog.attr_by_name.get(attr)?;
-        self.world.edge_of(&self.ids, source, attr, target)
+        self.world.catalog.edge_of(&self.ids, source, attr, target)
     }
 
     /// Resolves the tick, validates, judges against committed + staged
@@ -432,6 +435,7 @@ impl Txn<'_> {
         if let (Some(target), Op::Assert) = (fact.target, fact.op)
             && let Some(edge) =
                 self.world
+                    .catalog
                     .prepare_edge(&self.ids, fact.entity, fact.attr, target)?
         {
             self.order.push(OrderedEntry::Edge(self.ids.edges.len()));
@@ -510,7 +514,7 @@ impl Txn<'_> {
         // new declarations, node types, deprecations and settings keep the
         // touched-sides diff, which costs what the transaction wrote.
         let schema_changed = self.schema_before.as_ref().is_some_and(|before| {
-            before.changes_overlaps(self.world)
+            before.changes_overlaps(&self.world.catalog)
                 || self
                     .order
                     .iter()
@@ -521,12 +525,13 @@ impl Txn<'_> {
         // schema is the one `after` reads.
         let touched = if warn && !schema_changed {
             self.world
+                .catalog
                 .touched_side_values(self.entries.iter().map(|e| e.key_and_mark().0))
         } else {
             Vec::new()
         };
         if let Some(before) = self.schema_before.take() {
-            before.restore(self.world);
+            before.restore(&mut self.world.catalog);
         }
         let old_names = if schema_changed {
             self.world.catalog.attr_by_name.clone()
@@ -556,7 +561,7 @@ impl Txn<'_> {
                 }
                 OrderedEntry::Entity(i) => {
                     let d = &self.ids.defs[*i];
-                    self.world.apply_entity(
+                    self.world.catalog.apply_entity(
                         EntityDef {
                             id: d.id,
                             handle: d.handle.clone(),
@@ -566,7 +571,7 @@ impl Txn<'_> {
                 }
                 OrderedEntry::Edge(i) => {
                     let d = &self.ids.edges[*i];
-                    self.world.apply_edge(
+                    self.world.catalog.apply_edge(
                         EdgeDef {
                             id: d.id,
                             source: d.source,
@@ -846,7 +851,7 @@ impl World {
         op: Op,
         deprecated: DeprecatedWrites,
     ) -> Result<FactDef, Error> {
-        let (attr_id, def) = self.resolve(staged, entity, attr)?;
+        let (attr_id, def) = self.catalog.resolve(staged, entity, attr)?;
         if def.deprecated && deprecated == DeprecatedWrites::Refuse {
             return Err(Error::DeprecatedAttribute(attr.to_owned()));
         }
@@ -857,7 +862,7 @@ impl World {
         }
         let mut value = v.encode()?;
         if let Value::Ref(target) = v
-            && !self.is_defined_staged(staged, *target)
+            && !self.catalog.is_defined_staged(staged, *target)
         {
             return Err(Error::UnknownEntity(*target));
         }
@@ -869,7 +874,7 @@ impl World {
         }
         let (entity, target) = match v {
             Value::Ref(target) => {
-                let (source, target) = self.stored_pair(attr_id, entity, *target);
+                let (source, target) = self.catalog.stored_pair(attr_id, entity, *target);
                 if source != entity {
                     // Swapped: the value is now the caller's entity.
                     value = Value::Ref(target).encode()?;
@@ -964,9 +969,11 @@ impl World {
             vref,
         })
     }
+}
 
-    /// Applies an edge definition (its `DefineEdge` entry) as part of a
-    /// commit or a replay. Infallible.
+/// The overlap checks a commit touches: which `(entity, attr, side)` checks
+/// a set of written keys can change. Decided by the schema alone.
+impl Catalog {
     /// The `(entity, attr, side)` overlap checks the stored entries at the
     /// keys `facts` can change (write warnings): the fact's entity
     /// (Forward), for a `ref` fact its target (Reverse), and for a
@@ -989,7 +996,7 @@ impl World {
         touched
     }
 
-    /// [`World::touched_sides`], each side with the values the entries
+    /// [`Catalog::touched_sides`], each side with the values the entries
     /// change on it (their encodings, ascending and deduplicated): on the
     /// entity's Forward side the fact's value, on the target's Reverse (and
     /// bidirectional Forward) side `Ref(entity)`. Only those values'
@@ -1044,13 +1051,15 @@ impl World {
             Side::Forward => 0u8,
             Side::Reverse => 1,
         };
-        let name = |a: AttrId| self.catalog.attributes[a.0 as usize].name.as_str();
+        let name = |a: AttrId| self.attributes[a.0 as usize].name.as_str();
         items.sort_by(|x, y| {
             let (x, y) = (side(x), side(y));
             (x.0.raw(), name(x.1), rank(x.2)).cmp(&(y.0.raw(), name(y.1), rank(y.2)))
         });
     }
+}
 
+impl World {
     /// The overlaps at the latest canon of each touched side in `sides`
     /// that involve one of its touched values, one list per entry (see
     /// [`View::overlaps_of_touching`]).

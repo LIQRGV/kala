@@ -443,71 +443,8 @@ impl World {
     /// transaction, and returns it with that transaction encoded (what
     /// [`World::create`] writes after the file header).
     fn with_genesis(schema: Schema) -> Result<(World, EncodedTxn), Error> {
-        let names = schema.node_types();
-        let mut node_types = Vec::with_capacity(names.len());
-        let mut node_type_by_name = HashMap::with_capacity(names.len());
-        for (i, name) in names.iter().enumerate() {
-            // IDs are assigned in declaration order, so the first one that
-            // doesn't fit is exactly MAX_NODE_TYPE + 1.
-            if i > usize::from(MAX_NODE_TYPE) {
-                return Err(IdError::NodeTypeOutOfRange(MAX_NODE_TYPE + 1).into());
-            }
-            schema_ops::check_node_type_name(name)?;
-            let id = NodeTypeId(i as u16); // i <= MAX_NODE_TYPE, checked above
-            if node_type_by_name.insert(name.clone(), id).is_some() {
-                return Err(Error::DuplicateName(name.clone()));
-            }
-            node_types.push(NodeType {
-                name: name.clone(),
-                defined_in: Vec::new(),
-            });
-        }
-        let defs = schema.attributes();
-        let mut attr_by_name = HashMap::with_capacity(defs.len());
-        let mut inverse_by_name = HashMap::new();
-        for (i, def) in defs.iter().enumerate() {
-            schema_ops::check_name(&def.name)?;
-            if def.inferred || def.deprecated {
-                return Err(Error::Schema(
-                    "genesis attributes must be declared and writable".into(),
-                ));
-            }
-            // More than u32::MAX attributes can't be keyed; report it as a
-            // bad schema rather than wrapping into another attribute's ID.
-            let id = AttrId(u32::try_from(i).map_err(|_| Error::InvalidName(def.name.clone()))?);
-            if attr_by_name.insert(def.name.clone(), id).is_some()
-                || inverse_by_name.contains_key(&def.name)
-            {
-                return Err(Error::DuplicateName(def.name.clone()));
-            }
-            check_direction(def)?;
-            if let Some(inverse) = &def.inverse {
-                schema_ops::check_name(inverse)?;
-                // Inverse names share the attribute namespace (in both
-                // directions), so a name always means one thing.
-                if attr_by_name.contains_key(inverse)
-                    || inverse_by_name.insert(inverse.clone(), id).is_some()
-                {
-                    return Err(Error::DuplicateName(inverse.clone()));
-                }
-            }
-        }
         let mut world = World {
-            catalog: Catalog {
-                node_types,
-                node_type_by_name,
-                entity_by_handle: HashMap::new(),
-                handle_by_entity: HashMap::new(),
-                attributes: defs.to_vec(),
-                attribute_history: defs.iter().map(|d| vec![(TxId(0), d.clone())]).collect(),
-                node_origins: names.iter().map(|_| vec![(TxId(0), false)]).collect(),
-                settings: Vec::new(),
-                attr_by_name,
-                inverse_by_name,
-                edges: Vec::new(),
-                edges_defined_in: Vec::new(),
-                edge_by_triple: HashMap::new(),
-            },
+            catalog: Catalog::from_schema(&schema)?,
             indexes: Indexes::new(fnv1a64),
             journal: Journal::in_memory(),
             gate: WriteGate::open(),
@@ -523,38 +460,46 @@ impl World {
         for edit in &settings {
             world.apply_schema_edit(edit, TxId(0), false)?;
         }
+        let genesis = world.encode_genesis(&settings)?;
+        world
+            .journal
+            .record(genesis.entries.iter().cloned(), TxId(0));
+        Ok((world, genesis))
+    }
+
+    /// Encodes the genesis transaction tx#0 of this new world: a `DEFINE`
+    /// per node type and per attribute, in ID order, then the world
+    /// `settings`, numbered from entry 1.
+    fn encode_genesis(&self, settings: &[SchemaEdit]) -> Result<EncodedTxn, Error> {
         let node_types =
-            world
-                .catalog
+            self.catalog
                 .node_types
                 .iter()
                 .enumerate()
                 .map(|(i, nt)| NewEntry::NodeType {
-                    // In range: refused above if more than MAX_NODE_TYPE + 1 types.
+                    // In range: refused by `Catalog::from_schema` if more
+                    // than MAX_NODE_TYPE + 1 types.
                     id: NodeTypeId(i as u16),
                     name: &nt.name,
                 });
-        let attrs = world
+        let attrs = self
             .catalog
             .attributes
             .iter()
             .enumerate()
             .map(|(i, def)| NewEntry::Attr {
-                // In range: refused above if more than u32::MAX + 1 attributes.
+                // In range: refused by `Catalog::from_schema` if more than
+                // u32::MAX + 1 attributes.
                 id: AttrId(i as u32),
                 def,
             });
-        let genesis = log::encode_txn(
+        log::encode_txn(
             EntryId(1),
             TxId(0),
             node_types
                 .chain(attrs)
                 .chain(settings.iter().map(NewEntry::Schema)),
-        )?;
-        world
-            .journal
-            .record(genesis.entries.iter().cloned(), TxId(0));
-        Ok((world, genesis))
+        )
     }
 
     /// The committed entry with ID `id`: its tx and what it says, for every
@@ -659,10 +604,7 @@ impl World {
     /// no-op or a failed write leaves it as it is; deleting the fact(s) at
     /// the highest tick lowers it to the next highest.
     pub fn latest_tick(&self) -> Tick {
-        self.indexes
-            .tick_counts
-            .last_key_value()
-            .map_or(Tick(0), |(tick, _)| *tick)
+        self.indexes.latest_tick()
     }
 
     /// Asserts that `entity.attr` has value `v` from `tick` on.
@@ -795,25 +737,6 @@ impl World {
         self.journal.next_tx()
     }
 
-    /// Looks up a known attribute and checks the entity is defined: the
-    /// validation shared by writes and reads. Reads pass no staged entities.
-    fn resolve(
-        &self,
-        staged: &StagedIds,
-        entity: EntityId,
-        attr: &str,
-    ) -> Result<(AttrId, &AttrDef), Error> {
-        let attr_id = *self
-            .catalog
-            .attr_by_name
-            .get(attr)
-            .ok_or_else(|| Error::UnknownAttribute(attr.to_owned()))?;
-        if !self.is_defined_staged(staged, entity) {
-            return Err(Error::UnknownEntity(entity));
-        }
-        Ok((attr_id, &self.catalog.attributes[attr_id.0 as usize]))
-    }
-
     /// A read-only view of the world as of canon `tx`: only transactions
     /// `<= tx` are visible, so later commits (story changes, prequels, new
     /// values) don't change its answers. A `tx` past the latest is the
@@ -919,17 +842,8 @@ impl World {
     /// Cost: one hash lookup. Fails with [`Error::UnknownAttribute`] for a
     /// name that is neither an attribute nor an inverse name.
     pub fn attr_stats(&self, attr: &str) -> Result<AttrStats, Error> {
-        let attr_id = self
-            .catalog
-            .attr_by_name
-            .get(attr)
-            .or_else(|| self.catalog.inverse_by_name.get(attr))
-            .ok_or_else(|| Error::UnknownAttribute(attr.to_owned()))?;
-        Ok(self
-            .indexes
-            .attr_counts
-            .get(attr_id)
-            .map_or_else(AttrStats::default, AttrCounts::stats))
+        let attr_id = self.catalog.attr_or_inverse_id(attr)?;
+        Ok(self.indexes.attr_stats(attr_id))
     }
 
     /// The change points of `entity.attr` (latest canon).
@@ -975,22 +889,6 @@ impl World {
             .neighbors(entity, attr, dir, t)
     }
 
-    /// Resolves a name `neighbors` accepts: an attribute, read in `dir`, or
-    /// an inverse name, read as its base attribute with `dir` flipped.
-    fn resolve_neighbor_attr(
-        &self,
-        attr: &str,
-        dir: Direction,
-    ) -> Result<(AttrId, Direction), Error> {
-        if let Some(id) = self.catalog.attr_by_name.get(attr) {
-            return Ok((*id, dir));
-        }
-        match self.catalog.inverse_by_name.get(attr) {
-            Some(id) => Ok((*id, dir.flipped())),
-            None => Err(Error::UnknownAttribute(attr.to_owned())),
-        }
-    }
-
     /// Every declared attribute, in ID (= declaration) order. Inverse names
     /// aren't attributes and aren't listed (they are on their attribute's
     /// [`AttrDef::inverse`]).
@@ -1001,15 +899,13 @@ impl World {
     /// The declaration of attribute `name`, matched exactly. `None` for an
     /// unknown name and for an inverse name (see [`World::attributes`]).
     pub fn attribute(&self, name: &str) -> Option<&AttrDef> {
-        let id = self.catalog.attr_by_name.get(name)?;
-        self.catalog.attributes.get(id.0 as usize)
+        self.catalog.attribute(name)
     }
 
     /// The name of attribute `id` (as stored in a log entry), or `None` if
     /// the schema declares no attribute with that ID.
     pub fn attr_name(&self, id: AttrId) -> Option<&str> {
-        let i = usize::try_from(id.0).ok()?;
-        self.catalog.attributes.get(i).map(|a| a.name.as_str())
+        self.catalog.attr_name(id)
     }
 
     /// Every declared node type name, in ID (= declaration) order.
