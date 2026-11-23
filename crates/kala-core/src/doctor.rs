@@ -525,14 +525,9 @@ fn compare_indexes(world: &World, rebuilt: &World, found: &mut Vec<TaggedFinding
     // `World::resolved_e_index`), so a wrong reference or table entry is a
     // mismatch and the references themselves never are. A stored key whose
     // reference can't be resolved is undecodable.
-    let (stored_e, fresh_e) = resolved_pair(IndexName::E, worlds, (stored.e, fresh.e), true, found);
-    let (stored_e_latest, fresh_e_latest) = resolved_pair(
-        IndexName::ELatest,
-        worlds,
-        (stored.e_latest, fresh.e_latest),
-        false,
-        found,
-    );
+    let e_rows = resolved_pair(IndexName::E, worlds, (stored.e, fresh.e), true, found);
+    let e_latest = (stored.e_latest, fresh.e_latest);
+    let e_latest = resolved_pair(IndexName::ELatest, worlds, e_latest, false, found);
     // The tick precisions are the payload half of `E` and `E_latest` rows
     // (kept beside them, sparse), so a wrong, missing or extra precision is
     // a mismatch of that index. Keys are resolved as for the rows; a
@@ -540,88 +535,69 @@ fn compare_indexes(world: &World, rebuilt: &World, found: &mut Vec<TaggedFinding
     // `IndexDecode`, and its precision is left out (so the rebuilt one is
     // reported missing).
     let mut ignored = Vec::new();
-    let (stored_p, fresh_p) = resolved_pair(
-        IndexName::E,
-        worlds,
-        (stored.e_precision, fresh.e_precision),
-        true,
-        &mut ignored,
-    );
-    let (stored_lp, fresh_lp) = resolved_pair(
-        IndexName::ELatest,
-        worlds,
-        (stored.e_latest_precision, fresh.e_latest_precision),
-        false,
-        &mut ignored,
-    );
+    let e_p = (stored.e_precision, fresh.e_precision);
+    let e_p = resolved_pair(IndexName::E, worlds, e_p, true, &mut ignored);
+    let e_latest_p = (stored.e_latest_precision, fresh.e_latest_precision);
+    let e_latest_p = resolved_pair(IndexName::ELatest, worlds, e_latest_p, false, &mut ignored);
 
-    compare_main(IndexName::E, &stored_e, &fresh_e, describe_e, found);
-    compare_main(IndexName::E, &stored_p, &fresh_p, describe_e, found);
-    compare_main(IndexName::R, stored.r, fresh.r, describe_r, found);
-    compare_main(IndexName::V, stored.v, fresh.v, describe_v, found);
-    compare_main(
-        IndexName::VFold,
-        stored.vfold,
-        fresh.vfold,
-        describe_vfold,
-        found,
-    );
+    let e = as_refs(&e_rows);
+    let r = (stored.r, fresh.r);
+    let v = (stored.v, fresh.v);
+    let vfold = (stored.vfold, fresh.vfold);
+    compare_main(IndexName::E, e, describe_e, found);
+    compare_main(IndexName::E, as_refs(&e_p), describe_e, found);
+    compare_main(IndexName::R, r, describe_r, found);
+    compare_main(IndexName::V, v, describe_v, found);
+    compare_main(IndexName::VFold, vfold, describe_vfold, found);
 
-    let e_main = (&*stored_e, &*fresh_e);
     compare_latest(
         IndexName::ELatest,
-        &stored_e_latest,
-        &fresh_e_latest,
+        as_refs(&e_latest),
         describe_e_latest,
-        e_main,
+        e,
         found,
     );
     compare_latest(
         IndexName::ELatest,
-        &stored_lp,
-        &fresh_lp,
+        as_refs(&e_latest_p),
         describe_e_latest,
-        e_main,
+        e,
         found,
     );
-    compare_latest(
-        IndexName::RLatest,
-        stored.r_latest,
-        fresh.r_latest,
-        describe_r_latest,
-        (stored.r, fresh.r),
-        found,
-    );
-    compare_latest(
-        IndexName::VLatest,
-        stored.v_latest,
-        fresh.v_latest,
-        describe_v_latest,
-        (stored.v, fresh.v),
-        found,
-    );
+    let r_latest = (stored.r_latest, fresh.r_latest);
+    compare_latest(IndexName::RLatest, r_latest, describe_r_latest, r, found);
+    let v_latest = (stored.v_latest, fresh.v_latest);
+    compare_latest(IndexName::VLatest, v_latest, describe_v_latest, v, found);
+    let vfold_latest = (stored.vfold_latest, fresh.vfold_latest);
     compare_latest(
         IndexName::VFoldLatest,
-        stored.vfold_latest,
-        fresh.vfold_latest,
+        vfold_latest,
         describe_vfold_latest,
-        (stored.vfold, fresh.vfold),
+        vfold,
         found,
     );
 }
 
+/// One index of the stored world and the same index of the rebuilt one:
+/// `(stored, rebuilt)`.
+type Pair<'i, V> = (&'i OrderedMap<V>, &'i OrderedMap<V>);
+
 /// An index with its values resolved (see [`resolved`]).
 type Resolved<'i, V> = std::borrow::Cow<'i, OrderedMap<V>>;
 
-/// One `E`-layout index of the stored world and of the rebuilt one, each
-/// [`resolved`] through its own world: `(stored, rebuilt)`, as the
-/// `worlds` and `keys` pairs are. Only the stored index's unresolvable keys
-/// are reported (to `found`): the rebuilt one's keys are built by the key
-/// encoders.
+/// A resolved pair, borrowed as a [`Pair`].
+fn as_refs<'a, V: Clone>(pair: &'a (Resolved<'_, V>, Resolved<'_, V>)) -> Pair<'a, V> {
+    (&pair.0, &pair.1)
+}
+
+/// One `E`-layout index pair, each side [`resolved`] through its own world
+/// (`worlds` is `(stored, rebuilt)` too). Only the stored index's
+/// unresolvable keys are reported (to `found`): the rebuilt one's keys are
+/// built by the key encoders.
 fn resolved_pair<'i, V: Clone>(
     index: IndexName,
     (world, rebuilt): (&World, &World),
-    (stored, fresh): (&'i OrderedMap<V>, &'i OrderedMap<V>),
+    (stored, fresh): Pair<'i, V>,
     main: bool,
     found: &mut Vec<TaggedFinding>,
 ) -> (Resolved<'i, V>, Resolved<'i, V>) {
@@ -634,8 +610,7 @@ fn resolved_pair<'i, V: Clone>(
 /// `^tx`, which tags its findings for `since`.
 fn compare_main<V: PartialEq + Debug>(
     index: IndexName,
-    stored: &OrderedMap<V>,
-    rebuilt: &OrderedMap<V>,
+    (stored, rebuilt): Pair<'_, V>,
     describe: fn(&[u8]) -> Option<String>,
     found: &mut Vec<TaggedFinding>,
 ) {
@@ -653,8 +628,7 @@ fn compare_main<V: PartialEq + Debug>(
 /// across indexes.
 fn compare_latest<V: PartialEq + Debug>(
     index: IndexName,
-    stored: &OrderedMap<V>,
-    rebuilt: &OrderedMap<V>,
+    (stored, rebuilt): Pair<'_, V>,
     describe: fn(&[u8]) -> Option<String>,
     (stored_main, fresh_main): (&Index, &Index),
     found: &mut Vec<TaggedFinding>,
