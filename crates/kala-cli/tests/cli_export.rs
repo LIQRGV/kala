@@ -135,7 +135,14 @@ fn export_is_deterministic_read_only_and_can_write_a_file() {
 #[test]
 fn export_refuses_accounts_even_when_the_system_file_is_renamed() {
     let dir = tempfile::tempdir().unwrap();
-    kala_bolt::system::add(dir.path(), "alice@localhost", None).unwrap();
+    let added = kala([
+        "user",
+        "add",
+        dir.path().to_str().unwrap(),
+        "alice@localhost",
+        "--trust",
+    ]);
+    assert_eq!(code(&added), 0, "{}", stderr(&added));
     let renamed = dir.path().join("ordinary.kala");
     fs::rename(dir.path().join("system.kala"), &renamed).unwrap();
     let o = kala(["export", renamed.to_str().unwrap()]);

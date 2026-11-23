@@ -272,7 +272,23 @@ fn all_dump_and_system_restore_keep_private_modes_accounts_and_secrets() {
     let source = dir.path().join("server");
     fs::create_dir(&source).unwrap();
     load(&source.join("varrow.kala"));
-    kala_bolt::system::add(&source, "alice@127.0.0.1", Some(PASSWORD)).unwrap();
+    // Keep the account bootstrap lock inside its own process: another test's
+    // concurrently spawned child must not inherit this process's native lock.
+    let mut add = std::process::Command::new(env!("CARGO_BIN_EXE_kala"))
+        .args(["user", "add"])
+        .arg(&source)
+        .args(["alice@127.0.0.1", "--password-stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        writeln!(add.stdin.take().unwrap(), "{PASSWORD}").unwrap();
+    }
+    let added = add.wait_with_output().unwrap();
+    success(&added);
     let grant = kala([
         "user",
         "grant",
@@ -343,7 +359,7 @@ fn all_dump_and_system_restore_keep_private_modes_accounts_and_secrets() {
     let listed = kala(["user", "list", restore.to_str().unwrap()]);
     success(&listed);
     assert_eq!(list.stdout, listed.stdout);
-    for output in [&grant, &list, &single, &dumped, &restored, &listed] {
+    for output in [&added, &grant, &list, &single, &dumped, &restored, &listed] {
         for bytes in [&output.stdout, &output.stderr] {
             let text = String::from_utf8_lossy(bytes);
             assert!(!text.contains(PASSWORD), "plaintext password leaked");
@@ -575,7 +591,13 @@ fn all_dump_tightens_an_existing_empty_directory_before_writing() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("server");
     fs::create_dir(&source).unwrap();
-    kala_bolt::system::add(&source, "alice@localhost", None).unwrap();
+    success(&kala([
+        "user",
+        "add",
+        source.to_str().unwrap(),
+        "alice@localhost",
+        "--trust",
+    ]));
     let out = dir.path().join("backup");
     fs::create_dir(&out).unwrap();
     fs::set_permissions(&out, fs::Permissions::from_mode(0o777)).unwrap();
@@ -670,4 +692,110 @@ fn native_removal_of_reverse_cardinality_roundtrips() {
     tx.commit().unwrap();
     drop(world);
     roundtrip(&path, dir.path());
+}
+
+#[test]
+fn bidirectional_reference_corrections_track_the_chains_current_subject() {
+    use kala_core::{
+        AttrDef, Cardinality, Correction, Kind, Precision, Schema, Tick, Value, ValueType, World,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("world.kala");
+    let mut world = World::create(
+        &path,
+        Schema::new().node_type("CHARACTER").attribute(
+            AttrDef::new("ally_of", ValueType::Ref, Kind::State, Cardinality::Many).bidirectional(),
+        ),
+    )
+    .unwrap();
+    let low = world.create_entity("CHARACTER", Some("low")).unwrap();
+    let middle = world.create_entity("CHARACTER", Some("middle")).unwrap();
+    let high = world.create_entity("CHARACTER", Some("high")).unwrap();
+    let base = world
+        .assert(middle, "ally_of", Value::Ref(high), Some(Tick(-100)))
+        .unwrap()
+        .entries[0];
+    // The first correction normalizes (middle, low) into (low, middle).
+    world
+        .correct(
+            base,
+            Correction::Replace {
+                value: Some(Value::Ref(low)),
+                tick: None,
+                op: None,
+                precision: None,
+            },
+        )
+        .unwrap();
+    assert!(
+        world
+            .as_of_value(low, "ally_of", &Value::Ref(middle), Tick(-100))
+            .unwrap()
+    );
+    // The next correction starts from the revised subject low, not the base's
+    // subject middle. Keeping only the original subject loses this distinction.
+    world
+        .correct(
+            base,
+            Correction::Replace {
+                value: Some(Value::Ref(high)),
+                tick: None,
+                op: None,
+                precision: None,
+            },
+        )
+        .unwrap();
+    world
+        .correct(
+            base,
+            Correction::Replace {
+                value: None,
+                tick: None,
+                op: None,
+                precision: Some(Precision::Year),
+            },
+        )
+        .unwrap();
+    assert!(
+        world
+            .as_of_value(low, "ally_of", &Value::Ref(high), Tick(-100))
+            .unwrap()
+    );
+    assert!(
+        !world
+            .as_of_value(middle, "ally_of", &Value::Ref(high), Tick(-100))
+            .unwrap()
+    );
+    drop(world);
+    roundtrip(&path, dir.path());
+}
+
+#[cfg(unix)]
+#[test]
+fn all_dump_refuses_output_symlink_with_trailing_separator_or_dot() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("server");
+    fs::create_dir(&source).unwrap();
+    load(&source.join("world.kala"));
+    let mut violations = Vec::new();
+    for (index, suffix) in ["/", "/."].into_iter().enumerate() {
+        let output_dir = dir.path().join(format!("output{index}"));
+        fs::create_dir(&output_dir).unwrap();
+        let alias = dir.path().join(format!("alias{index}"));
+        symlink(&output_dir, &alias).unwrap();
+        let spelling = format!("{}{suffix}", alias.display());
+        let output = kala(["dump", "--all", source.to_str().unwrap(), "-o", &spelling]);
+        let files = fs::read_dir(&output_dir).unwrap().count();
+        if code(&output) == 0 || files != 0 {
+            violations.push(format!(
+                "{suffix:?}: exit {}, created {files} files",
+                code(&output)
+            ));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "symlink destinations were followed: {violations:?}"
+    );
 }

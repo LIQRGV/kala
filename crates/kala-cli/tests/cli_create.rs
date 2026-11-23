@@ -273,3 +273,29 @@ fn malformed_system_restore_errors_never_echo_input_or_fake_hashes() {
         assert!(!stderr(&output).contains(SENTINEL));
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn create_replay_json_accepts_non_utf8_destination_paths() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("dump.edn");
+    fs::write(&input, "[:genesis]").unwrap();
+    let target = dir
+        .path()
+        .join(OsString::from_vec(b"world-\xff.kala".to_vec()));
+    let output = kala([
+        std::ffi::OsStr::new("transact"),
+        std::ffi::OsStr::new("--create"),
+        target.as_os_str(),
+        input.as_os_str(),
+        std::ffi::OsStr::new("--json"),
+    ]);
+    success(&output);
+    let json: Json = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["transactions"], 0);
+    let world = World::open_read_only(&target).unwrap();
+    assert_eq!(world.latest_tx().0, 0);
+    assert_eq!(json["entries"], world.entries().count());
+}

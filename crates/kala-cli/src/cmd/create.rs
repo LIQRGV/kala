@@ -135,7 +135,7 @@ pub fn replay(path: &Path, source: &Path, as_json: bool) -> Result<String, CliEr
     }
     if as_json {
         Ok(out::to_json(
-            &json!({"command":"transact","create":true,"transactions":transactions,"entries":entries,"world":path}),
+            &json!({"command":"transact","create":true,"transactions":transactions,"entries":entries,"world":path.to_string_lossy()}),
         ))
     } else {
         Ok(format!(

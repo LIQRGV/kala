@@ -184,6 +184,7 @@ fn script(world: &World) -> Result<String, CliError> {
         entries.len()
     );
     let mut attrs = BTreeMap::new();
+    let mut subjects = BTreeMap::new();
     let mut current_tx = 0;
     for (i, entry) in entries.iter().enumerate() {
         if entry.tx.0 != current_tx {
@@ -243,23 +244,35 @@ fn script(world: &World) -> Result<String, CliError> {
                 }
                 EntryBody::Revised {
                     of,
+                    entity,
                     value: v,
                     tick,
                     op,
                     precision,
                     ..
-                } => Some(format!(
-                    "[:correct {} :replace :value {} :at {} :op :{} :precision :{}]",
-                    of.0,
-                    value(world, v),
-                    tick.0,
-                    if *op == Op::Assert {
-                        "assert"
+                } => {
+                    // A bidirectional correction can normalize the pair by
+                    // swapping its subject and value. Correct takes the old
+                    // subject implicitly, so undo that normalization when
+                    // choosing the replacement reference for the script.
+                    let replacement = if subjects.get(of).is_some_and(|old| old != entity) {
+                        Value::Ref(*entity)
                     } else {
-                        "retract"
-                    },
-                    out::precision_str(*precision)
-                )),
+                        v.clone()
+                    };
+                    Some(format!(
+                        "[:correct {} :replace :value {} :at {} :op :{} :precision :{}]",
+                        of.0,
+                        value(world, &replacement),
+                        tick.0,
+                        if *op == Op::Assert {
+                            "assert"
+                        } else {
+                            "retract"
+                        },
+                        out::precision_str(*precision)
+                    ))
+                }
                 EntryBody::Commit { .. } => {
                     s.push_str("]\n");
                     None
@@ -273,6 +286,12 @@ fn script(world: &World) -> Result<String, CliError> {
         // Migration copies are omitted as forms but their new names take
         // effect immediately, even before the end of this transaction.
         match &entry.body {
+            EntryBody::Fact { entity, .. } => {
+                subjects.insert(entry.id, *entity);
+            }
+            EntryBody::Revised { of, entity, .. } => {
+                subjects.insert(*of, *entity);
+            }
             EntryBody::DefineAttr { id, def }
             | EntryBody::Schema(SchemaEdit::Attribute { id, def }) => {
                 attrs.insert(*id, def.clone());
@@ -345,6 +364,11 @@ pub fn run(path: &Path, output: Option<&Path>, all: bool, force: bool) -> Result
     Ok(result)
 }
 fn dump_all(directory: &Path, output: &Path) -> Result<String, CliError> {
+    // A terminal slash or `/.` would make a symlink an intermediate
+    // component, bypassing O_NOFOLLOW. Components removes those spellings
+    // without following symlinks or changing the meaning of `..`.
+    let normalized: std::path::PathBuf = output.components().collect();
+    let output = normalized.as_path();
     let mut worlds = BTreeMap::new();
     for entry in fs::read_dir(directory).map_err(transfer::io)? {
         let entry = entry.map_err(transfer::io)?;

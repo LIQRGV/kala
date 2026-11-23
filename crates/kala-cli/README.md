@@ -431,6 +431,9 @@ Each becomes `<name>.dump.edn`, including `system.dump.edn`. OUTDIR is private
 (mode 0700 on Unix), and files are created mode 0600 before writing. Output
 symlinks and nonempty directories are refused. Each completed world gets one
 summary line; a failure can leave earlier completed dump files in OUTDIR.
+On Linux, writes are anchored to the opened OUTDIR descriptor. On other platforms,
+keep its parent directory trusted: a concurrent pathname replacement is not
+prevented there (new files still use private permissions).
 Each world is a committed snapshot at its own open time, not a cross-world
 transactional snapshot.
 
