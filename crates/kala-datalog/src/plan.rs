@@ -65,6 +65,7 @@ pub(crate) struct Pat {
 pub(crate) struct Hist {
     pub tick: Term,
     pub op: OpTerm,
+    pub precision: Term,
 }
 
 /// A resolved rule call: its relation's name and one term per column.
@@ -99,6 +100,7 @@ pub(crate) struct Body {
     pub filts: Vec<Filt>,
     pub apps: Vec<App>,
     pub nots: Vec<Neg>,
+    pub ors: Vec<Disjunction>,
 }
 
 /// A resolved `(not ..)`.
@@ -112,7 +114,7 @@ pub(crate) struct Neg {
 
 fn is_bound(t: &Term, bound: &BTreeSet<String>) -> bool {
     match t {
-        Term::Const(_) | Term::Op(_) | Term::Param(_) => true,
+        Term::Const(_) | Term::Op(_) | Term::Precision(_) | Term::Param(_) => true,
         Term::Var(v) => bound.contains(&v.0),
         Term::Any => false,
     }
@@ -178,6 +180,7 @@ fn call_rank(c: &Call, bound: &BTreeSet<String>) -> u8 {
 enum Pick {
     Pat(usize, Access),
     Call(usize),
+    Or(usize),
 }
 
 /// Plans `body` into an operator tree over `Unit`, starting with `bound`
@@ -187,8 +190,17 @@ enum Pick {
 pub(crate) fn plan(
     world: &World,
     body: Body,
+    bound: BTreeSet<String>,
+    find: Option<&[Var]>,
+) -> Result<Op, DatalogError> {
+    plan_from(world, body, bound, find, Op::Unit)
+}
+fn plan_from(
+    world: &World,
+    body: Body,
     mut bound: BTreeSet<String>,
     find: Option<&[Var]>,
+    input: Op,
 ) -> Result<Op, DatalogError> {
     let Body {
         pats,
@@ -196,6 +208,7 @@ pub(crate) fn plan(
         filts,
         apps,
         nots,
+        ors,
     } = body;
     // Scan sizes, looked up once per pattern.
     let mut pairs = Vec::with_capacity(pats.len());
@@ -220,12 +233,14 @@ pub(crate) fn plan(
     let mut placed_filts = vec![false; filts.len()];
     let mut apps: Vec<Option<App>> = apps.into_iter().map(Some).collect();
     let mut nots: Vec<Option<Neg>> = nots.into_iter().map(Some).collect();
-    let mut op = place_filters(Op::Unit, &filts, &mut placed_filts, &mut apps, &mut bound);
+    let mut ors: Vec<_> = ors.into_iter().map(Some).collect();
+    let mut n_ors = ors.len();
+    let mut op = place_filters(input, &filts, &mut placed_filts, &mut apps, &mut bound);
     op = place_nots(world, op, &mut nots, &bound)?;
     let mut left: Vec<usize> = (0..pats.len()).collect();
     let mut calls_left: Vec<Option<Call>> = calls.into_iter().map(Some).collect();
     let mut n_calls = calls_left.len();
-    while !left.is_empty() || n_calls > 0 {
+    while !left.is_empty() || n_calls > 0 || n_ors > 0 {
         // (rank, scan size, what) of the best candidate.
         let mut best: Option<(u8, usize, Pick)> = None;
         for (pos, &i) in left.iter().enumerate() {
@@ -244,8 +259,24 @@ pub(crate) fn plan(
                 best = Some((rank, 0, Pick::Call(i)));
             }
         }
+        for (i, o) in ors.iter().enumerate() {
+            if o.as_ref()
+                .is_some_and(|o| o.uses.iter().all(|v| bound.contains(v)))
+                && best.is_none_or(|(r, _, _)| r > 4)
+            {
+                best = Some((4, 0, Pick::Or(i)));
+            }
+        }
         let Some((_, _, pick)) = best else {
-            return Err(stuck(&pats[left[0]], &bound));
+            if let Some(&i) = left.first() {
+                return Err(stuck(&pats[i], &bound));
+            }
+            let span = ors.iter().flatten().next().map(|o| o.span);
+            return Err(DatalogError::new(
+                ErrorKind::UnboundVariable,
+                span,
+                "or input variables are not bound",
+            ));
         };
         op = match pick {
             Pick::Pat(pos, acc) => {
@@ -278,6 +309,9 @@ pub(crate) fn plan(
                         if let OpTerm::Var(v) = &h.op {
                             bound.insert(v.0.clone());
                         }
+                        if let Term::Var(v) = &h.precision {
+                            bound.insert(v.0.clone());
+                        }
                         Op::History {
                             input: Box::new(op),
                             entity: p.entity.clone(),
@@ -285,6 +319,7 @@ pub(crate) fn plan(
                             value: p.value.clone(),
                             tick: h.tick.clone(),
                             op: h.op.clone(),
+                            precision: h.precision.clone(),
                         }
                     }
                     (Some(_), AttrRef::Handle) => {
@@ -299,6 +334,16 @@ pub(crate) fn plan(
                         access: acc,
                     },
                 }
+            }
+            Pick::Or(i) => {
+                let o = ors[i].take().expect("invariant: chosen an unplaced or");
+                n_ors -= 1;
+                let mut inputs = Vec::new();
+                for b in o.branches {
+                    inputs.push(plan_from(world, b, bound.clone(), None, op.clone())?);
+                }
+                bound.extend(o.binds);
+                Op::Union { inputs }
             }
             Pick::Call(i) => {
                 let c = calls_left[i]
@@ -436,4 +481,12 @@ fn stuck(p: &Pat, bound: &BTreeSet<String>) -> DatalogError {
         Some(p.span),
         "`:handle` needs the entity or the handle bound",
     )
+}
+
+/// Branches resolved with their shared input and output bindings.
+pub(crate) struct Disjunction {
+    pub branches: Vec<Body>,
+    pub binds: Vec<String>,
+    pub uses: Vec<String>,
+    pub span: Span,
 }

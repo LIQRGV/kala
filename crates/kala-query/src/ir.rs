@@ -37,6 +37,8 @@ pub enum Term {
     /// A constant op (`:assert` / `:retract`), compared with an op a
     /// history read bound. Never a stored value.
     Op(kala_core::Op),
+    /// A history precision constant, never a stored value.
+    Precision(kala_core::Precision),
     /// `_`: matches anything, binds nothing.
     Any,
 }
@@ -312,6 +314,8 @@ pub enum Op {
         tick: Term,
         /// The change point's op.
         op: OpTerm,
+        /// The precision position (Any, Var, or Precision).
+        precision: Term,
     },
     /// For each input row and each matching `(entity, value)`, bind `out` to
     /// the interval set where `(entity, attr, value)` holds.
@@ -519,6 +523,7 @@ impl Op {
                 value,
                 tick,
                 op,
+                precision,
                 ..
             } => Op::History {
                 input: input(),
@@ -527,6 +532,7 @@ impl Op {
                 value: value.clone(),
                 tick: tick.clone(),
                 op: op.clone(),
+                precision: precision.clone(),
             },
             Op::During {
                 entity,
@@ -648,6 +654,7 @@ impl Op {
                     value: v1,
                     tick: t1,
                     op: o1,
+                    precision: p1,
                     ..
                 },
                 Op::History {
@@ -656,9 +663,10 @@ impl Op {
                     value: v2,
                     tick: t2,
                     op: o2,
+                    precision: p2,
                     ..
                 },
-            ) => e1 == e2 && a1 == a2 && v1 == v2 && t1 == t2 && o1 == o2,
+            ) => e1 == e2 && a1 == a2 && v1 == v2 && t1 == t2 && o1 == o2 && p1 == p2,
             (
                 Op::During {
                     entity: e1,
@@ -873,6 +881,7 @@ fn term_text(t: &Term, world: &World) -> String {
         Term::Param(p) => format!("${p}"),
         Term::Const(v) => value_text(v, world),
         Term::Op(o) => op_text(*o).to_string(),
+        Term::Precision(p) => format!(":{}", precision_text(*p)),
         Term::Any => "_".to_string(),
     }
 }
@@ -1013,7 +1022,13 @@ fn explain_op(root: &Op, world: &World, indent: usize, out: &mut String) {
                 value,
                 tick,
                 op,
+                precision,
             } => {
+                let prec = if matches!(precision, Term::Any) {
+                    String::new()
+                } else {
+                    format!(" {}", term_text(precision, world))
+                };
                 let op = match op {
                     OpTerm::Any => "_".to_owned(),
                     OpTerm::Var(v) => var_text(v),
@@ -1021,7 +1036,7 @@ fn explain_op(root: &Op, world: &World, indent: usize, out: &mut String) {
                 };
                 let _ = writeln!(
                     out,
-                    "History [{} :{attr} {} {} {op}]",
+                    "History [{} :{attr} {} {} {op}{prec}]",
                     term_text(entity, world),
                     term_text(value, world),
                     term_text(tick, world)
@@ -1178,5 +1193,17 @@ fn detach_children(op: &mut Op, todo: &mut Vec<Op>) {
                 todo.append(&mut rel.rules);
             }
         }
+    }
+}
+
+/// Stable language-neutral name of a tick precision.
+pub fn precision_text(p: kala_core::Precision) -> &'static str {
+    match p {
+        kala_core::Precision::Exact => "exact",
+        kala_core::Precision::Day => "day",
+        kala_core::Precision::Month => "month",
+        kala_core::Precision::Year => "year",
+        kala_core::Precision::Decade => "decade",
+        kala_core::Precision::Century => "century",
     }
 }

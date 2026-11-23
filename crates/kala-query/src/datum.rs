@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 
-use kala_core::{IntervalSet, Op, Value};
+use kala_core::{IntervalSet, Op, Precision, Value};
 
 /// One cell of a [`ResultSet`](crate::ResultSet) row: a stored [`Value`],
 /// a change point's [`Op`] (bound by a history read) or an [`IntervalSet`]
@@ -19,6 +19,8 @@ pub enum Datum {
     Value(Value),
     /// A change point's op.
     Op(Op),
+    /// The precision attached to a change point.
+    Precision(Precision),
     /// An interval set.
     Intervals(IntervalSet),
 }
@@ -28,7 +30,7 @@ impl Datum {
     pub fn as_value(&self) -> Option<&Value> {
         match self {
             Datum::Value(v) => Some(v),
-            Datum::Op(_) | Datum::Intervals(_) => None,
+            Datum::Op(_) | Datum::Precision(_) | Datum::Intervals(_) => None,
         }
     }
 
@@ -38,6 +40,7 @@ impl Datum {
             Datum::Value(_) => 0,
             Datum::Op(_) => 1,
             Datum::Intervals(_) => 2,
+            Datum::Precision(_) => 3,
         }
     }
 }
@@ -54,6 +57,7 @@ impl Ord for Datum {
     fn cmp(&self, other: &Datum) -> Ordering {
         match (self, other) {
             (Datum::Value(a), Datum::Value(b)) => a.cmp(b),
+            (Datum::Precision(a), Datum::Precision(b)) => (*a as u8).cmp(&(*b as u8)),
             (Datum::Op(a), Datum::Op(b)) => op_rank(*a).cmp(&op_rank(*b)),
             (Datum::Intervals(a), Datum::Intervals(b)) => a.cmp(b),
             _ => self.rank().cmp(&other.rank()),
@@ -74,6 +78,7 @@ impl Hash for Datum {
         match self {
             Datum::Value(v) => v.hash(state),
             Datum::Op(op) => op_rank(*op).hash(state),
+            Datum::Precision(p) => (*p as u8).hash(state),
             Datum::Intervals(s) => s.hash(state),
         }
     }

@@ -219,8 +219,26 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Ask Datalog questions in a read-only snapshot session.
+    /// Commit Datalog write transactions from a file or stdin (-).
+    Transact {
+        world: PathBuf,
+        input: PathBuf,
+        /// Preview the forms in order (each sees the ones before it)
+        /// without changing the log.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+        /// Accept cutting a damaged last transaction (see `kala info`) to a
+        /// quarantine file before writing.
+        #[arg(long)]
+        acknowledge_recovery: bool,
+    },
+    /// Ask Datalog questions, optionally holding the world open for writing.
     Repl {
+        /// Enable writes and hold the world's exclusive writer lock.
+        #[arg(long, conflicts_with = "canon")]
+        write: bool,
         /// The world file.
         world: PathBuf,
         /// Initial default story tick.
@@ -232,6 +250,10 @@ pub enum Command {
         /// Opt in to private, bounded query history at this path.
         #[arg(long, value_name = "FILE")]
         history: Option<PathBuf>,
+        /// With --write: accept cutting a damaged last transaction (see
+        /// `kala info`) to a quarantine file.
+        #[arg(long, requires = "write")]
+        acknowledge_recovery: bool,
     },
     /// Print a Datalog query's plan without running it.
     Explain {

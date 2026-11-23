@@ -31,6 +31,8 @@ pub struct Query {
     /// the same reason). `clauses`, `calls`, `nots`, `durings` and `fns`
     /// are never all empty.
     pub nots: Vec<Not>,
+    /// Disjunctions, each with matching branch variables.
+    pub ors: Vec<Or>,
     /// The `:where` interval-set reads `(during ..)`, in query order.
     pub durings: Vec<During>,
     /// The `:where` interval-set function clauses, in query order.
@@ -57,6 +59,8 @@ pub struct Rule {
     /// The body's negations, in text order. `clauses`, `calls`, `nots`,
     /// `durings` and `fns` are never all empty.
     pub nots: Vec<Not>,
+    /// Disjunctions, each with matching branch variables.
+    pub ors: Vec<Or>,
     /// The body's `(during ..)` reads, in text order.
     pub durings: Vec<During>,
     /// The body's interval-set function clauses, in text order.
@@ -78,6 +82,8 @@ pub struct Not {
     /// Nested negations, in text order. `clauses`, `calls`, `nots`,
     /// `durings` and `fns` are never all empty.
     pub nots: Vec<Not>,
+    /// Disjunctions, each with matching branch variables.
+    pub ors: Vec<Or>,
     /// `(during ..)` reads, in text order.
     pub durings: Vec<During>,
     /// Interval-set function clauses, in text order.
@@ -231,6 +237,8 @@ pub struct HistoryPos {
     pub tick: Item,
     /// The change point's op; `None` for the 4-element form (any op).
     pub op: Option<OpItem>,
+    /// Optional sixth history position: variable, wildcard or precision keyword.
+    pub precision: Option<Item>,
 }
 
 /// The op position of a history pattern.
@@ -303,5 +311,65 @@ pub struct Pred {
     /// Right operand.
     pub right: Item,
     /// The whole outer vector, `[` to `]`.
+    pub span: Span,
+}
+
+/// One transaction authored as EDN, with an optional default tick.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WriteTxn {
+    pub at: Option<kala_core::Tick>,
+    pub ops: Vec<WriteOp>,
+    pub span: Span,
+}
+
+/// A literal value or an edge triple used as a reference.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WriteValue {
+    Scalar(Item),
+    Edge {
+        source: Item,
+        attr: Attr,
+        target: Item,
+    },
+}
+
+/// One write; validation of store rules is left to kala-core's transaction.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WriteOp {
+    Create {
+        node_type: String,
+        handle: String,
+        span: Span,
+    },
+    Fact {
+        op: kala_core::Op,
+        subject: WriteValue,
+        attr: Attr,
+        value: WriteValue,
+        at: Option<kala_core::Tick>,
+        precision: kala_core::Precision,
+        span: Span,
+    },
+    Correct {
+        entry: kala_core::EntryId,
+        replacement: Option<Replacement>,
+        span: Span,
+    },
+}
+
+/// Fields replaced by a correction; omitted fields retain their current values.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Replacement {
+    pub value: Option<WriteValue>,
+    pub at: Option<kala_core::Tick>,
+    pub op: Option<kala_core::Op>,
+    pub precision: Option<kala_core::Precision>,
+}
+
+/// A disjunction `(or clause (and clause ...))`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Or {
+    /// Each branch is a conjunction; its container is not a negation.
+    pub branches: Vec<Not>,
     pub span: Span,
 }

@@ -76,16 +76,16 @@ pub fn prepare_with(
     // session rule only fails the queries that use it.
     let mut reach: HashSet<String> = HashSet::new();
     let mut todo: Vec<String> = Vec::new();
-    calls_of(&query.calls, &query.nots, &mut todo);
+    calls_of(&query.calls, &query.nots, &query.ors, &mut todo);
     for r in &query.rules {
-        calls_of(&r.calls, &r.nots, &mut todo);
+        calls_of(&r.calls, &r.nots, &r.ors, &mut todo);
     }
     while let Some(name) = todo.pop() {
         if names.contains(name.as_str()) || !reach.insert(name.clone()) {
             continue;
         }
         for r in defaults.rules.iter().filter(|r| r.name() == name) {
-            calls_of(&r.rule.calls, &r.rule.nots, &mut todo);
+            calls_of(&r.rule.calls, &r.rule.nots, &r.rule.ors, &mut todo);
         }
     }
     let extra: Vec<&SessionRule> = defaults
@@ -167,6 +167,9 @@ fn shift_pattern(p: &mut ast::Pattern, offset: usize) {
     shift_item(&mut p.v, offset);
     if let Some(h) = &mut p.history {
         shift_item(&mut h.tick, offset);
+        if let Some(p) = &mut h.precision {
+            shift_item(p, offset);
+        }
         if let Some(op) = &mut h.op {
             match op {
                 ast::OpItem::Var(s) => shift_span(&mut s.span, offset),
@@ -188,6 +191,7 @@ fn shift_rule(r: &mut ast::Rule, offset: usize) {
         &mut r.clauses,
         &mut r.calls,
         &mut r.nots,
+        &mut r.ors,
         &mut r.durings,
         &mut r.fns,
         offset,
@@ -198,6 +202,7 @@ fn shift_body(
     clauses: &mut [ast::Clause],
     calls: &mut [ast::Call],
     nots: &mut [ast::Not],
+    ors: &mut [ast::Or],
     durings: &mut [ast::During],
     fns: &mut [ast::FnClause],
     offset: usize,
@@ -248,12 +253,28 @@ fn shift_body(
             shift_span(&mut s.span, offset);
         }
     }
+    for o in ors {
+        shift_span(&mut o.span, offset);
+        for b in &mut o.branches {
+            shift_span(&mut b.span, offset);
+            shift_body(
+                &mut b.clauses,
+                &mut b.calls,
+                &mut b.nots,
+                &mut b.ors,
+                &mut b.durings,
+                &mut b.fns,
+                offset,
+            );
+        }
+    }
     for n in nots {
         shift_span(&mut n.span, offset);
         shift_body(
             &mut n.clauses,
             &mut n.calls,
             &mut n.nots,
+            &mut n.ors,
             &mut n.durings,
             &mut n.fns,
             offset,
@@ -262,14 +283,14 @@ fn shift_body(
 }
 
 fn check_limits(q: &ast::Query) -> Result<(), DatalogError> {
-    let mut bodies = vec![(&q.clauses, &q.calls, &q.nots, &q.durings, &q.fns)];
+    let mut bodies = vec![(&q.clauses, &q.calls, &q.nots, &q.ors, &q.durings, &q.fns)];
     for r in &q.rules {
-        bodies.push((&r.clauses, &r.calls, &r.nots, &r.durings, &r.fns));
+        bodies.push((&r.clauses, &r.calls, &r.nots, &r.ors, &r.durings, &r.fns));
     }
     let mut clauses = 0;
     let mut patterns = 0;
-    while let Some((cs, calls, nots, durings, fns)) = bodies.pop() {
-        clauses += cs.len() + calls.len() + nots.len() + 2 * durings.len() + fns.len();
+    while let Some((cs, calls, nots, ors, durings, fns)) = bodies.pop() {
+        clauses += cs.len() + calls.len() + nots.len() + ors.len() + 2 * durings.len() + fns.len();
         patterns += durings.len();
         for c in cs {
             match c {
@@ -293,8 +314,14 @@ fn check_limits(q: &ast::Query) -> Result<(), DatalogError> {
                 format!("more than {MAX_PATTERNS} patterns in one query"),
             ));
         }
+        for o in ors {
+            for b in &o.branches {
+                clauses += 1;
+                bodies.push((&b.clauses, &b.calls, &b.nots, &b.ors, &b.durings, &b.fns));
+            }
+        }
         for n in nots {
-            bodies.push((&n.clauses, &n.calls, &n.nots, &n.durings, &n.fns));
+            bodies.push((&n.clauses, &n.calls, &n.nots, &n.ors, &n.durings, &n.fns));
         }
     }
     Ok(())
@@ -302,9 +329,14 @@ fn check_limits(q: &ast::Query) -> Result<(), DatalogError> {
 
 /// Pushes the names of the rules called by `calls` and, recursively, by the
 /// negations `nots`.
-fn calls_of(calls: &[ast::Call], nots: &[ast::Not], out: &mut Vec<String>) {
+fn calls_of(calls: &[ast::Call], nots: &[ast::Not], ors: &[ast::Or], out: &mut Vec<String>) {
     out.extend(calls.iter().map(|c| c.name.clone()));
+    for o in ors {
+        for b in &o.branches {
+            calls_of(&b.calls, &b.nots, &b.ors, out);
+        }
+    }
     for n in nots {
-        calls_of(&n.calls, &n.nots, out);
+        calls_of(&n.calls, &n.nots, &n.ors, out);
     }
 }

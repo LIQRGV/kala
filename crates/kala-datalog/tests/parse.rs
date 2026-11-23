@@ -502,7 +502,7 @@ fn predicate_errors() {
 
 #[test]
 fn wrong_arity_patterns() {
-    // 4 and 5 elements are history patterns now (item 5).
+    // 4, 5 and 6 elements are history patterns, with optional op and precision.
     ok(&q("[?e :a ?v ?t]"));
     ok(&q("[?e :a ?v ?t ?x]"));
     // an integer in op position has no meaning
@@ -510,8 +510,9 @@ fn wrong_arity_patterns() {
     err_kind(&q("[?e :a]"), ErrorKind::Syntax);
     err_kind(&q("[?e]"), ErrorKind::Syntax);
     err_kind(&q("[]"), ErrorKind::Syntax);
-    // 6+ elements: no meaning at all
-    err_kind(&q("[?e :a ?v ?t ?x ?y]"), ErrorKind::Syntax);
+    // Six elements expose precision; seven still have no meaning.
+    ok(&q("[?e :a ?v ?t ?x ?y]"));
+    err_kind(&q("[?e :a ?v ?t ?x ?y ?z]"), ErrorKind::Syntax);
 }
 
 #[test]
@@ -520,10 +521,13 @@ fn four_element_pattern_inside_at_is_a_syntax_error() {
 }
 
 #[test]
-fn rules_and_not_unsupported() {
-    for c in ["(not-join [?e] [?e :x 1])", "(or [?e :x 1] [?e :y 1])"] {
+fn join_forms_stay_unsupported() {
+    for c in [
+        "(not-join [?e] [?e :x 1])",
+        "(or-join [?e] [?e :x 1] [?e :y 1])",
+    ] {
         let e = err_kind(&q(c), ErrorKind::Unsupported);
-        assert!(e.message.contains("slice 7"), "{c}: {}", e.message);
+        assert!(e.message.contains("not supported"), "{c}: {}", e.message);
     }
     // A plain `(name arg..)` is a rule call now: it parses (the compiler reports
     // UnknownRule when no `:rules` definition names it).
@@ -605,7 +609,7 @@ fn errors_always_carry_a_span_for_syntax_and_unsupported() {
         "[:find ?a :where [?a :x 1]",
         "[:find ?a :where [?a :x 1]] x",
         "[:find ?a :where [?a :x 1 :foo]]",
-        "[:find ?a :where (or [?a :x 1] [?a :y 1])]",
+        "[:find ?a :where (or-join [?a] [?a :x 1] [?a :y 1])]",
         "[:find ?a :at :where [?a :x 1]]",
     ] {
         let e = err(t);

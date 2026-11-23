@@ -82,12 +82,12 @@ impl Text for Info {
             r.bytes_cut
         );
         if cause == "damaged" {
-            // The CLI writes nothing, so it can't acknowledge for the author.
             s.push_str(
-                "hint: those bytes look committed but fail their checksum. Once the world \
-                 is opened for writing, writes are refused until the recovery is \
-                 acknowledged: review the quarantine file, then acknowledge the recovery \
-                 in your writing tool (World::acknowledge_recovery).\n",
+                "hint: those bytes look committed but fail their checksum, so they may be a \
+                 write that was acknowledged. `kala transact` and `kala repl --write` refuse \
+                 to open this world until you rerun them with --acknowledge-recovery, which \
+                 cuts these bytes to a quarantine file (from the Rust API: \
+                 World::acknowledge_recovery).\n",
             );
         }
         s

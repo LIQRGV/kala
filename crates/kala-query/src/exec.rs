@@ -87,6 +87,8 @@ use kala_core::{
     Op as FactOp, Tick, TxId, Value, ValueType, View, WorkMeter, World,
 };
 
+use kala_core::Precision;
+
 use crate::datum::{Datum, op_rank};
 use crate::ir::{
     Access, AggFn, AttrRef, CanonSource, CmpOp, Func, Op, OpTerm, Plan, Term, TickSource, Var,
@@ -576,6 +578,7 @@ enum ValKind {
     Value(ValueType),
     Op,
     Intervals,
+    Precision,
 }
 
 impl ValKind {
@@ -584,6 +587,7 @@ impl ValKind {
         match self {
             ValKind::Value(t) => type_name(t),
             ValKind::Op => "op",
+            ValKind::Precision => "precision",
             ValKind::Intervals => "interval set",
         }
     }
@@ -613,6 +617,7 @@ enum Val {
     Ref(EntityId),
     /// A change point's op (bound by a history read).
     Op(FactOp),
+    Precision(Precision),
     /// An interval set (built by `During` or `Apply`).
     Intervals(Id, Rc<IntervalSet>),
 }
@@ -626,7 +631,7 @@ impl Val {
             Val::F64(x) => Value::F64(*x),
             Val::Str(_, s) => Value::Str(s.to_string()),
             Val::Ref(e) => Value::Ref(*e),
-            Val::Op(_) | Val::Intervals(..) => return None,
+            Val::Op(_) | Val::Precision(_) | Val::Intervals(..) => return None,
         })
     }
 
@@ -634,6 +639,7 @@ impl Val {
     fn to_datum(&self) -> Datum {
         match self {
             Val::Op(op) => Datum::Op(*op),
+            Val::Precision(p) => Datum::Precision(*p),
             Val::Intervals(_, s) => Datum::Intervals(IntervalSet::clone(s)),
             v => Datum::Value(v.to_value().expect("invariant: every other Val is a value")),
         }
@@ -647,6 +653,7 @@ impl Val {
             Val::Str(..) => ValKind::Value(ValueType::Str),
             Val::Ref(_) => ValKind::Value(ValueType::Ref),
             Val::Op(_) => ValKind::Op,
+            Val::Precision(_) => ValKind::Precision,
             Val::Intervals(..) => ValKind::Intervals,
         }
     }
@@ -663,6 +670,7 @@ impl Ord for Val {
             (Val::F64(a), Val::F64(b)) => Value::F64(*a).cmp(&Value::F64(*b)),
             (Val::Str(a, _), Val::Str(b, _)) => a.cmp(b),
             (Val::Ref(a), Val::Ref(b)) => a.cmp(b),
+            (Val::Precision(a), Val::Precision(b)) => (*a as u8).cmp(&(*b as u8)),
             (Val::Op(a), Val::Op(b)) => op_rank(*a).cmp(&op_rank(*b)),
             (Val::Intervals(a, _), Val::Intervals(b, _)) => a.cmp(b),
             _ => self.kind().cmp(&other.kind()),
@@ -694,6 +702,7 @@ impl Hash for Val {
             Val::I64(n) => (ValueType::I64, n).hash(state),
             Val::Ref(e) => (ValueType::Ref, e.raw()).hash(state),
             Val::Op(op) => (ValKind::Op, op_rank(*op)).hash(state),
+            Val::Precision(p) => (ValKind::Precision, *p as u8).hash(state),
             Val::Intervals(id, _) => (ValKind::Intervals, id).hash(state),
         }
     }
@@ -850,10 +859,10 @@ type Pairs = Vec<(EntityId, Val)>;
 
 /// Change points `(entity, value, tick, op)` read from an index, sorted by
 /// entity (then as [`View::history`] orders one entity's).
-type Points = Vec<(EntityId, Val, Tick, FactOp)>;
+type Points = Vec<(EntityId, Val, Tick, FactOp, Precision)>;
 
 /// Charged per change point of a held history scan.
-const POINT_BYTES: usize = size_of::<(EntityId, Val, Tick, FactOp)>();
+const POINT_BYTES: usize = size_of::<(EntityId, Val, Tick, FactOp, Precision)>();
 
 /// The interval sets of an attribute's history scan, one per `(entity,
 /// value)` that ever held, sorted by entity (then value).
@@ -1007,6 +1016,7 @@ enum Step {
         value: Pos,
         tick: Pos,
         op: Pos,
+        precision: Pos,
     },
     /// The interval set where `(entity, attr, value)` holds, over every
     /// tick, bound to `out` (a constraint if bound); free entity and value
@@ -1771,6 +1781,7 @@ impl Compiler<'_> {
                         Term::Any => Pos::Any,
                         Term::Const(c) => Pos::Const(interner.constant(c)?),
                         Term::Op(o) => Pos::Const(Val::Op(*o)),
+                        Term::Precision(p) => Pos::Const(Val::Precision(*p)),
                         Term::Param(p) => Pos::Const(interner.constant(param(params, p)?)?),
                     });
                 }
@@ -1795,6 +1806,7 @@ impl Compiler<'_> {
                 value,
                 tick,
                 op,
+                precision,
                 ..
             } => {
                 let mut bound = pop(stack);
@@ -1807,7 +1819,18 @@ impl Compiler<'_> {
                     OpTerm::Const(o) => Pos::Const(Val::Op(*o)),
                     OpTerm::Var(var) => var_pos(var, slots, &bound),
                 };
+                let prec = match precision {
+                    Term::Any => Pos::Any,
+                    Term::Var(v) => var_pos(v, slots, &bound),
+                    Term::Precision(p) => Pos::Const(Val::Precision(*p)),
+                    _ => {
+                        return Err(QueryError::TypeMismatch(
+                            "History precision needs a precision, variable or wildcard".into(),
+                        ));
+                    }
+                };
                 for (p, k) in [
+                    (&prec, ValKind::Precision),
                     (&e, ValKind::Value(ValueType::Ref)),
                     (&v, ValKind::Value(attr.value_type)),
                     (&t, ValKind::Value(ValueType::I64)),
@@ -1824,6 +1847,7 @@ impl Compiler<'_> {
                     value: v,
                     tick: t,
                     op: o,
+                    precision: prec,
                 };
                 (step, bound)
             }
@@ -2121,7 +2145,7 @@ fn entity_pos(
                 type_name(c.value_type())
             )));
         }
-        Term::Op(_) => {
+        Term::Op(_) | Term::Precision(_) => {
             return Err(QueryError::TypeMismatch(format!(
                 "{what} position needs an entity, got an op"
             )));
@@ -2158,7 +2182,7 @@ fn value_pos(
                 type_name(c.value_type())
             )));
         }
-        Term::Op(_) => {
+        Term::Op(_) | Term::Precision(_) => {
             return Err(QueryError::TypeMismatch(format!(
                 "value position needs {}, got an op",
                 type_name(ty)
@@ -2193,7 +2217,7 @@ fn tick_term_pos(
                 type_name(c.value_type())
             )));
         }
-        Term::Op(_) => {
+        Term::Op(_) | Term::Precision(_) => {
             return Err(QueryError::TypeMismatch(
                 "History tick position needs i64, got an op".into(),
             ));
@@ -2213,6 +2237,7 @@ fn operand_pos(
     match t {
         Term::Const(c) => Ok(Pos::Const(interner.constant(c)?)),
         Term::Op(o) => Ok(Pos::Const(Val::Op(*o))),
+        Term::Precision(p) => Ok(Pos::Const(Val::Precision(*p))),
         Term::Param(name) => Ok(Pos::Const(interner.constant(param(params, name)?)?)),
         Term::Var(v) => match slots.get(v) {
             Some(s) if bound.contains(&s) => Ok(Pos::Bound(s)),
@@ -2267,7 +2292,7 @@ fn term_name(t: &Term) -> String {
     match t {
         Term::Var(v) => format!("?{}", v.0),
         Term::Param(p) => format!("${p}"),
-        Term::Const(_) | Term::Op(_) => "a constant".into(),
+        Term::Const(_) | Term::Op(_) | Term::Precision(_) => "a constant".into(),
         Term::Any => "_".into(),
     }
 }
@@ -3337,9 +3362,10 @@ impl Exec<'_, '_> {
                 value,
                 tick,
                 op,
+                precision,
             } => {
                 for row in rows {
-                    self.history_row(&row, entity, attr, value, tick, op, &mut out)?;
+                    self.history_row(&row, entity, attr, value, tick, op, precision, &mut out)?;
                 }
             }
             Step::During {
@@ -3584,6 +3610,7 @@ impl Exec<'_, '_> {
         value: &Pos,
         tick: &Pos,
         op: &Pos,
+        precision: &Pos,
         out: &mut BTreeSet<Row>,
     ) -> Result<(), QueryError> {
         let e = match resolve(entity, row) {
@@ -3634,12 +3661,13 @@ impl Exec<'_, '_> {
             }
         };
         self.budget.step(range.len() as u64)?;
-        for (x, v, t, o) in &points[range] {
+        for (x, v, t, o, p) in &points[range] {
             let binds = [
                 (entity, Val::Ref(*x)),
                 (value, v.clone()),
                 (tick, Val::I64(t.0)),
                 (op, Val::Op(*o)),
+                (precision, Val::Precision(*p)),
             ];
             if let Some(r) = bind_all(row, binds) {
                 self.budget.emit(out, r)?;
@@ -3739,7 +3767,7 @@ impl Exec<'_, '_> {
                         let points = self.history_of(e, name)?;
                         self.budget.step(points.len() as u64)?;
                         let mut by_value: BTreeMap<&Val, Vec<(Tick, FactOp)>> = BTreeMap::new();
-                        for (_, x, t, o) in points.iter() {
+                        for (_, x, t, o, _) in points.iter() {
                             by_value.entry(x).or_default().push((*t, *o));
                         }
                         let mut sets = Vec::new();
@@ -3852,7 +3880,7 @@ impl Exec<'_, '_> {
         self.charge_index_work()?;
         let mut points = Vec::new();
         for c in absent_as_empty(read)?.unwrap_or_default() {
-            points.push((e, self.intern(c.value)?, c.tick, c.op));
+            points.push((e, self.intern(c.value)?, c.tick, c.op, c.precision));
         }
         let points = Rc::new(points);
         let n = MEMO_ENTRY_BYTES + points.len() * POINT_BYTES;
@@ -3888,7 +3916,7 @@ impl Exec<'_, '_> {
             // Sorted by entity: the entity's points are one run.
             let j = i + points[i..].partition_point(|(x, ..)| *x == e);
             let mut by_value: BTreeMap<&Val, Vec<(Tick, FactOp)>> = BTreeMap::new();
-            for (_, v, t, o) in &points[i..j] {
+            for (_, v, t, o, _) in &points[i..j] {
                 by_value.entry(v).or_default().push((*t, *o));
             }
             for (v, changes) in by_value {
@@ -3923,7 +3951,7 @@ impl Exec<'_, '_> {
             .charge_bytes(read.len().saturating_mul(POINT_BYTES))?;
         let mut points = Vec::with_capacity(read.len());
         for (e, c) in read {
-            points.push((e, self.intern(c.value)?, c.tick, c.op));
+            points.push((e, self.intern(c.value)?, c.tick, c.op, c.precision));
         }
         let points = Rc::new(points);
         self.history_scans

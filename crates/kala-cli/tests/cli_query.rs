@@ -683,9 +683,14 @@ fn query_unknown_attribute_and_unsupported_exit_1() {
     let fx = varrow();
     let o = fx.q(&["[:find ?a :where [:edwin :no_such_attr ?a]]"]);
     assert_query_error(&o, "unknown attribute");
+    let o = fx.q(&[
+        "[:find ?a :where [:edwin :ally_of ?a] (or-join [?a] [?a :name \"x\"] [?a :name \"y\"])]",
+    ]);
+    assert_query_error(&o, "unsupported or-join");
     let o =
         fx.q(&["[:find ?a :where [:edwin :ally_of ?a] (or [?a :name \"x\"] [?a :name \"y\"])]"]);
-    assert_query_error(&o, "unsupported or");
+    assert_eq!(code(&o), 0, "or is now supported: {}", stderr(&o));
+    assert!(stdout(&o).contains("0 rows"));
     let o = fx.q(&["[:find ?z :where [:edwin :ally_of ?a]]"]);
     assert_query_error(&o, "unbound find var");
 }

@@ -844,6 +844,20 @@ impl World {
         self.kept_entry(id).cloned()
     }
 
+    /// The current fact in an entry's correction chain, at the latest canon.
+    /// Accepts the same entry IDs as [`World::correct`] and returns the same
+    /// target errors (including a chain already deleted). This is a read only;
+    /// it does not validate or stage a proposed replacement.
+    pub fn current_change(&self, entry: EntryId) -> Result<Change, Error> {
+        let target = self.correction_target(entry)?;
+        Ok(Change {
+            tick: target.fact.tick,
+            op: target.fact.op,
+            precision: target.fact.precision,
+            value: target.value,
+        })
+    }
+
     /// The kept entry with ID `id` (see [`World::entry`]), borrowed.
     fn kept_entry(&self, id: EntryId) -> Option<&EntryInfo> {
         let i = usize::try_from(id.0.checked_sub(1)?).ok()?;
@@ -927,7 +941,23 @@ impl World {
     /// Any other damage, in any transaction, is [`Error::Corrupt`] instead,
     /// with the file untouched.
     pub fn open(path: &Path) -> Result<World, Error> {
-        let (mut world, writer, recovery) = LogWriter::open(path, World::replay)?;
+        Self::open_with(path, true)
+    }
+
+    /// Like [`World::open`], but a *damaged* last transaction (see
+    /// [`CutCause::Damaged`]) is not cut: the open fails with
+    /// [`Error::RecoveryRequired`] and the file is left untouched (no cut,
+    /// no quarantine file). The check runs under the writer lock, so no
+    /// other open can change the tail in between. Use it where a damaged
+    /// tail must be reviewed before it is cut (it may hold an acknowledged
+    /// write); then [`World::open`] and [`World::acknowledge_recovery`].
+    /// Clean logs and torn tails open exactly as with [`World::open`].
+    pub fn open_refusing_damaged(path: &Path) -> Result<World, Error> {
+        Self::open_with(path, false)
+    }
+
+    fn open_with(path: &Path, cut_damaged: bool) -> Result<World, Error> {
+        let (mut world, writer, recovery) = LogWriter::open(path, World::replay, cut_damaged)?;
         world.log = Some(writer);
         world.recovery_unacknowledged = recovery.cause == Some(CutCause::Damaged);
         world.recovery = recovery;
@@ -964,6 +994,22 @@ impl World {
         world.read_only = true;
         world.recovery = recovery;
         Ok(world)
+    }
+
+    /// A detached, writable in-memory copy of the committed state, for previews.
+    /// Writes to this copy cannot touch this world's log or acquire its lock.
+    /// Replays the kept entries with the same validation as opening a world;
+    /// costs O(log size) memory and replay work. Recovery tails are not copied.
+    pub fn preview_copy(&self) -> Result<World, Error> {
+        let entries: Vec<LogEntry> = self
+            .entries
+            .iter()
+            .map(|e| LogEntry {
+                id: e.id,
+                body: e.body.clone(),
+            })
+            .collect();
+        World::replay_with_hash(&entries, self.content_hash)
     }
 
     /// Rebuilds a world from the entries of a log's committed transactions.

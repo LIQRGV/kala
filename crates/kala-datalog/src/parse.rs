@@ -6,7 +6,7 @@
 
 use crate::ast::{
     AggFn, Attr, Call, CanonExpr, Clause, CmpOp, During, Find, FindAgg, FnClause, Func, HistoryPos,
-    Input, Item, Not, OpItem, Pattern, Pred, Query, Rule, Sym, TickExpr,
+    Input, Item, Not, OpItem, Or, Pattern, Pred, Query, Rule, Sym, TickExpr,
 };
 use crate::error::{DatalogError, Span, show};
 use crate::lex::{Bracket, Lexer, Tok};
@@ -40,14 +40,14 @@ const RESERVED: [&str; 21] = [
 
 /// Clause forms `(name ..)` planned for slice 7 (`not-join`, disjunction):
 /// still refused as unsupported, not as rule calls.
-const PLANNED_FORMS: [&str; 4] = ["not-join", "or", "or-join", "and"];
+const PLANNED_FORMS: [&str; 2] = ["not-join", "or-join"];
 
 /// Message tail for grammar that is planned but not built yet.
 const SLICE7: &str = "planned for slice 7";
 
 /// A read EDN form.
 #[derive(Debug)]
-enum Form {
+pub(crate) enum Form {
     Seq {
         bracket: Bracket,
         items: Vec<Form>,
@@ -60,7 +60,7 @@ enum Form {
 }
 
 impl Form {
-    fn span(&self) -> Span {
+    pub(crate) fn span(&self) -> Span {
         match self {
             Form::Seq { span, .. } | Form::Atom { span, .. } => *span,
         }
@@ -121,7 +121,7 @@ fn parse_unlocated(text: &str) -> Result<Query, DatalogError> {
 
 /// Read one complete top-level form. Iterative, so input nesting never
 /// touches the call stack; refuses nesting deeper than [`MAX_DEPTH`].
-fn read_form(lex: &mut Lexer<'_>, len: usize) -> Result<Form, DatalogError> {
+pub(crate) fn read_form(lex: &mut Lexer<'_>, len: usize) -> Result<Form, DatalogError> {
     // (bracket, span of the opening bracket, items so far)
     let mut stack: Vec<(Bracket, Span, Vec<Form>)> = Vec::new();
     loop {
@@ -284,6 +284,7 @@ fn query(form: Form) -> Result<Query, DatalogError> {
         clauses: Vec::new(),
         calls: Vec::new(),
         nots: Vec::new(),
+        ors: Vec::new(),
         durings: Vec::new(),
         fns: Vec::new(),
         span: qspan,
@@ -321,6 +322,7 @@ fn query(form: Form) -> Result<Query, DatalogError> {
                 q.clauses = b.clauses;
                 q.calls = b.calls;
                 q.nots = b.nots;
+                q.ors = b.ors;
                 q.durings = b.durings;
                 q.fns = b.fns;
             }
@@ -555,6 +557,7 @@ struct Body {
     clauses: Vec<Clause>,
     calls: Vec<Call>,
     nots: Vec<Not>,
+    ors: Vec<Or>,
     durings: Vec<During>,
     fns: Vec<FnClause>,
 }
@@ -564,6 +567,7 @@ impl Body {
         self.clauses.is_empty()
             && self.calls.is_empty()
             && self.nots.is_empty()
+            && self.ors.is_empty()
             && self.durings.is_empty()
             && self.fns.is_empty()
     }
@@ -698,6 +702,7 @@ fn rule(f: Form, counts: &mut Counts) -> Result<Rule, DatalogError> {
         clauses: b.clauses,
         calls: b.calls,
         nots: b.nots,
+        ors: b.ors,
         durings: b.durings,
         fns: b.fns,
         span,
@@ -720,7 +725,46 @@ fn clause(f: Form, counts: &mut Counts, body: &mut Body) -> Result<(), DatalogEr
                 }) => Some(s.as_str()),
                 _ => None,
             };
-            if head == Some("not") {
+            if head == Some("or") {
+                let mut branches = Vec::new();
+                for f in items.into_iter().skip(1) {
+                    let branch = match f {
+                        Form::Seq {
+                            bracket: Bracket::Round,
+                            items,
+                            span,
+                        } if matches!(items.first(), Some(Form::Atom { tok: Tok::Sym(s), .. }) if s == "and") =>
+                        {
+                            counts.clause(span)?;
+                            not(items, span, counts)?
+                        }
+                        f => {
+                            let span = f.span();
+                            let mut b = Body::default();
+                            clause(f, counts, &mut b)?;
+                            Not {
+                                clauses: b.clauses,
+                                calls: b.calls,
+                                nots: b.nots,
+                                ors: b.ors,
+                                durings: b.durings,
+                                fns: b.fns,
+                                span,
+                            }
+                        }
+                    };
+                    branches.push(branch);
+                }
+                if branches.is_empty() {
+                    return Err(DatalogError::syntax(span, "or needs at least one branch"));
+                }
+                body.ors.push(Or { branches, span });
+            } else if head == Some("and") {
+                return Err(DatalogError::syntax(
+                    span,
+                    "and is only allowed as an or branch",
+                ));
+            } else if head == Some("not") {
                 body.nots.push(not(items, span, counts)?);
             } else if head == Some("during") {
                 body.durings.push(during(items, span, counts)?);
@@ -746,13 +790,14 @@ fn not(items: Vec<Form>, span: Span, counts: &mut Counts) -> Result<Not, Datalog
     if b.is_empty() {
         return Err(DatalogError::syntax(
             span,
-            "`(not ..)` needs at least one clause",
+            "a conjunction needs at least one clause",
         ));
     }
     Ok(Not {
         clauses: b.clauses,
         calls: b.calls,
         nots: b.nots,
+        ors: b.ors,
         durings: b.durings,
         fns: b.fns,
         span,
@@ -940,18 +985,18 @@ fn at_clause(items: Vec<Form>, span: Span, counts: &mut Counts) -> Result<Clause
 /// `[e a v t op]`. Inside `(at ..)` a history pattern is refused: it reads
 /// every tick, so a tick of its own has no meaning.
 fn pattern(items: Vec<Form>, span: Span, history_ok: bool) -> Result<Pattern, DatalogError> {
-    const SHAPE: &str = "a pattern has 3 elements `[e a v]`, or 4 or 5 for change points \
+    const SHAPE: &str = "a pattern has 3 elements `[e a v]`, or 4 to 6 for change points \
                          `[e a v t]` / `[e a v t op]`";
     match items.len() {
         3 => {}
-        4 | 5 if !history_ok => {
+        4..=6 if !history_ok => {
             return Err(DatalogError::syntax(
                 span,
                 "a history pattern `[e a v t ..]` can't be inside `(at ..)`: history patterns \
                  read every tick",
             ));
         }
-        4 | 5 => {}
+        4..=6 => {}
         _ => return Err(DatalogError::syntax(span, SHAPE)),
     }
     let mut it = items.into_iter();
@@ -991,7 +1036,25 @@ fn pattern(items: Vec<Form>, span: Span, history_ok: bool) -> Result<Pattern, Da
                 }
             };
             let op = it.next().map(op_item).transpose()?;
-            Some(HistoryPos { tick, op })
+            let precision = it.next().map(item).transpose()?;
+            if let Some(p) = &precision {
+                let valid = match p {
+                    Item::Var(_) | Item::Any(_) => true,
+                    Item::Keyword(k, _) => crate::write::precision_name(k).is_some(),
+                    _ => false,
+                };
+                if !valid {
+                    return Err(DatalogError::syntax(
+                        p.span(),
+                        "precision position needs a variable, wildcard or precision keyword",
+                    ));
+                }
+            }
+            Some(HistoryPos {
+                tick,
+                op,
+                precision,
+            })
         }
     };
     Ok(Pattern {
@@ -1182,7 +1245,7 @@ fn fn_clause(
     }))
 }
 
-fn item(f: Form) -> Result<Item, DatalogError> {
+pub(crate) fn item(f: Form) -> Result<Item, DatalogError> {
     let (tok, span) = match f {
         Form::Atom { tok, span } => (tok, span),
         Form::Seq { span, .. } => {

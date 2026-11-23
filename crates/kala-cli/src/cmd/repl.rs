@@ -23,13 +23,13 @@ use crate::cli::{Canon, parse_canon};
 use crate::error::CliError;
 use crate::escape;
 
-const HELP: &str = "Read-only Datalog session (snapshot until .reload)\n\
+const HELP: &str = "Datalog session (read-only snapshot by default; --write holds the writer lock)\n\
 .at [T]          set/clear default story tick\n\
 .canon [C]       set/clear default canon (N or tx#N)\n\
 .param NAME VALUE / .unparam NAME / .params\n\
 .rule [[(name ?x) ...]] / .unrule NAME / .rules\n\
 .explain QUERY   show the plan (multiline allowed)\n\
-.load FILE       run a query file\n\
+.load FILE       run a query or one write transaction\n\
 .schema          show node types and attributes\n\
 .info / .reload  inspect/reopen the snapshot\n\
 .json on|off     select query output format\n\
@@ -130,6 +130,7 @@ enum Pending {
 struct Session<'a> {
     path: &'a Path,
     ctx: Ctx,
+    write: bool,
     defaults: SessionDefaults,
     params: BTreeMap<String, String>,
     json: bool,
@@ -184,6 +185,25 @@ impl Session<'_> {
         Ok(render_result(&self.ctx.world, &rs, self.json))
     }
 
+    fn form(&mut self, text: &str) -> Result<String, CliError> {
+        // Only a recognised write form goes to the write path; anything
+        // else is parsed as a query, so a malformed query keeps the query
+        // parser's own (more specific) message.
+        match kala_datalog::form_kind(text) {
+            Ok(kala_datalog::FormKind::Query) | Err(_) => self.query(text, false),
+            Ok(kala_datalog::FormKind::Write) => {
+                if !self.write {
+                    return Err(user("write form refused; start with --write"));
+                }
+                let form = kala_datalog::parse_write(text).map_err(|e| user(e.to_string()))?;
+                let report =
+                    super::transact::execute(&mut self.ctx.world, &form, self.defaults.at)?;
+                self.ctx.canon = self.ctx.world.latest_tx();
+                Ok(super::transact::render(&report, self.json))
+            }
+        }
+    }
+
     fn append(&mut self, line: &str) -> Result<Action, CliError> {
         let separator = usize::from(!self.buffer.is_empty());
         if self
@@ -211,7 +231,7 @@ impl Session<'_> {
         let kind = self.pending;
         self.pending = Pending::Query;
         match kind {
-            Pending::Query => self.query(&text, false).map(Action::Output),
+            Pending::Query => self.form(&text).map(Action::Output),
             Pending::Explain => self.query(&text, true).map(Action::Output),
             Pending::Rules => {
                 let rules =
@@ -279,6 +299,11 @@ impl Session<'_> {
                 Ok(Action::Continue)
             }
             ".canon" => {
+                if self.write {
+                    return Err(user(
+                        ".canon is refused in write mode; use :canon in a query",
+                    ));
+                }
                 self.defaults.canon = if arg.is_empty() {
                     None
                 } else {
@@ -352,7 +377,7 @@ impl Session<'_> {
                     return Err(user("usage: .load FILE"));
                 }
                 let text = read_text_file(Path::new(arg), MAX_QUERY_BYTES, "the query")?;
-                self.query(&text, false).map(Action::Output)
+                self.form(&text).map(Action::Output)
             }
             ".info" => {
                 no_arg(arg)?;
@@ -363,6 +388,11 @@ impl Session<'_> {
                 )))
             }
             ".reload" => {
+                if self.write {
+                    return Err(user(
+                        ".reload is refused in write mode; queries already see commits",
+                    ));
+                }
                 no_arg(arg)?;
                 self.ctx = Ctx::open(self.path, None)?;
                 Ok(Action::Output(format!(
@@ -474,15 +504,25 @@ pub fn run(
     at: Option<i64>,
     canon: Option<Canon>,
     history_path: Option<&Path>,
+    write: bool,
+    acknowledge_recovery: bool,
 ) -> Result<Done, CliError> {
-    let ctx = Ctx::open(world, None).map_err(|e| CliError::Store(e.message().into()))?;
+    let ctx = if write {
+        let world = super::transact::open_write(world, acknowledge_recovery)?;
+        Ctx {
+            canon: world.latest_tx(),
+            world,
+        }
+    } else {
+        Ctx::open(world, None).map_err(|e| CliError::Store(e.message().into()))?
+    };
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     let mut history = history_path
         .map(|path| History::open(path, world))
         .transpose()?;
     // Save the history on every way out, errors included; an error from the
     // session itself wins over one from saving.
-    let result = drive(world, at, canon, ctx, interactive, &mut history);
+    let result = drive(world, at, canon, ctx, interactive, &mut history, write);
     if let Some(h) = &mut history {
         match (h.save(), &result) {
             (Err(e), Ok(_)) => return Err(e),
@@ -508,6 +548,7 @@ fn drive(
     ctx: Ctx,
     interactive: bool,
     history: &mut Option<History>,
+    write: bool,
 ) -> Result<Done, CliError> {
     let cancel = Arc::new(AtomicBool::new(false));
     let stdin = io::stdin();
@@ -538,6 +579,7 @@ fn drive(
     let mut session = Session {
         path: world,
         ctx,
+        write,
         defaults: SessionDefaults {
             at: at.map(Tick),
             canon: canon.map(|c| TxId(c.0)),
@@ -550,6 +592,12 @@ fn drive(
         pending: Pending::Query,
         cancel,
     };
+    if interactive && write {
+        output(
+            &mut io::stdout().lock(),
+            "Write mode: holding the writer lock; other writers are blocked until exit.\n",
+        )?;
+    }
     let mut failed = false;
     let mut printed = false;
     loop {

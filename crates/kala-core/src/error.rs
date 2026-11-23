@@ -152,6 +152,14 @@ pub enum Error {
     /// until [`World::acknowledge_recovery`](crate::World::acknowledge_recovery)
     /// is called, so new writes don't silently land on top of lost canon.
     RecoveryUnacknowledged,
+    /// [`World::open_refusing_damaged`](crate::World::open_refusing_damaged)
+    /// found a *damaged* last transaction of `bytes` bytes and left the file
+    /// untouched; [`World::open`](crate::World::open) would cut it to a
+    /// quarantine file.
+    RecoveryRequired {
+        /// The size of the damaged tail.
+        bytes: u64,
+    },
     /// The world was opened with
     /// [`World::open_read_only`](crate::World::open_read_only): every write
     /// (a no-op included) is refused and nothing is appended to the log.
@@ -240,6 +248,11 @@ impl fmt::Display for Error {
             Error::UnsupportedVersion(v) => write!(f, "unsupported log format version {v}"),
             Error::Corrupt(why) => write!(f, "corrupt log: {why}"),
             Error::WorldLocked => f.write_str("world is open elsewhere (its log file is locked)"),
+            Error::RecoveryRequired { bytes } => write!(
+                f,
+                "the last transaction is damaged ({bytes} bytes); opening for writing \
+                 would cut it to a quarantine file"
+            ),
             Error::RecoveryUnacknowledged => f.write_str(
                 "opening the log cut off a damaged transaction; acknowledge the recovery \
                  (World::acknowledge_recovery) before writing",

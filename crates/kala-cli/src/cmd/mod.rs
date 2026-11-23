@@ -16,6 +16,7 @@ mod read;
 pub mod repl;
 mod repl_editor;
 mod repl_history;
+pub mod transact;
 
 use crate::cli::Command;
 use crate::error::CliError;
@@ -102,13 +103,31 @@ pub fn dispatch(cmd: &Command) -> Result<Done, CliError> {
         Command::Info { world, json } => info::run(world, *json),
         Command::Query { world, query, json } => query::run(world, query, *json),
         Command::Explain { world, query } => query::explain(world, query),
+        Command::Transact {
+            world,
+            input,
+            dry_run,
+            json,
+            acknowledge_recovery,
+        } => {
+            return transact::run(world, input, *dry_run, *json, *acknowledge_recovery);
+        }
         Command::Repl {
+            write,
             world,
             at,
             canon,
             history,
+            acknowledge_recovery,
         } => {
-            return repl::run(world, *at, *canon, history.as_deref());
+            return repl::run(
+                world,
+                *at,
+                *canon,
+                history.as_deref(),
+                *write,
+                *acknowledge_recovery,
+            );
         }
         Command::Doctor {
             world,
