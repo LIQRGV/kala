@@ -1,46 +1,29 @@
 //! Thin CLI wrapper for the read-only Bolt server.
+use crate::cli::ServeArgs;
 use crate::error::CliError;
 use kala_bolt::{Server, ServerConfig};
 use std::io::{self, Write};
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
 
-pub fn run(
-    dir: &Path,
-    listen: &str,
-    auth: &str,
-    insecure_allow_plaintext: bool,
-    default_db: Option<String>,
-    max_connections: usize,
-    idle_timeout: u64,
-) -> Result<String, CliError> {
-    let addr = if let Some(port) = listen.strip_prefix("localhost:") {
-        SocketAddr::from((
-            [127, 0, 0, 1],
-            port.parse::<u16>()
-                .map_err(|_| CliError::Usage("invalid listen port".into()))?,
-        ))
-    } else {
-        listen.parse::<SocketAddr>().map_err(|_| {
-            CliError::Usage("listen address must be IP:PORT, [IPv6]:PORT or localhost:PORT".into())
-        })?
-    };
+pub fn run(args: &ServeArgs) -> Result<String, CliError> {
+    let dir = args.dir.as_path();
+    let addr = listen_addr(&args.listen)?;
     let config = ServerConfig {
         listen: addr,
-        default_db,
-        insecure_allow_plaintext,
-        max_connections,
-        idle_timeout: Duration::from_secs(idle_timeout),
+        default_db: args.default_db.clone(),
+        insecure_allow_plaintext: args.insecure_allow_plaintext,
+        max_connections: args.max_connections,
+        idle_timeout: Duration::from_secs(args.idle_timeout),
         ..ServerConfig::default()
     };
     // Never create the directory, in either auth mode.
     super::user::require_directory(dir)?;
-    let server = if auth == "accounts" {
+    let server = if args.auth == "accounts" {
         Server::bind_accounts(dir, config)
     } else {
         // `--auth none` never touches accounts: no system.kala is created,
@@ -65,6 +48,20 @@ pub fn run(
     drop(stdout);
     server.run(stop).map_err(server_error)?;
     Ok(String::new())
+}
+/// `--listen`: `IP:PORT`, `[IPv6]:PORT` or `localhost:PORT` (no DNS).
+fn listen_addr(listen: &str) -> Result<SocketAddr, CliError> {
+    if let Some(port) = listen.strip_prefix("localhost:") {
+        Ok(SocketAddr::from((
+            [127, 0, 0, 1],
+            port.parse::<u16>()
+                .map_err(|_| CliError::Usage("invalid listen port".into()))?,
+        )))
+    } else {
+        listen.parse::<SocketAddr>().map_err(|_| {
+            CliError::Usage("listen address must be IP:PORT, [IPv6]:PORT or localhost:PORT".into())
+        })
+    }
 }
 fn server_error(e: io::Error) -> CliError {
     if e.kind() == io::ErrorKind::InvalidInput {

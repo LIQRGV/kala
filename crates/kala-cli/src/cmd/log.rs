@@ -6,7 +6,6 @@
 //! written (a torn or damaged tail is left in the file and not shown).
 
 use std::fmt::Write as _;
-use std::path::Path;
 
 use kala_core::log::EntryBody;
 use kala_core::schema::SchemaEdit;
@@ -16,7 +15,7 @@ use serde_json::json;
 
 use super::read::open_world;
 use super::schema;
-use crate::cli::Canon;
+use crate::cli::LogArgs;
 use crate::error::CliError;
 use crate::escape;
 use crate::out::{JEntity, JValue, Text, entity_text, precision_str, render, value_text};
@@ -190,15 +189,12 @@ fn body_text(b: &JBody) -> String {
     }
 }
 
-pub fn run(
-    world: &Path,
-    from: Option<Canon>,
-    limit: Option<u64>,
-    json: bool,
-) -> Result<String, CliError> {
-    let w = open_world(world)?;
-    let limit = limit.map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX));
-    let from = from.map_or(0, |c| c.0);
+pub fn run(args: &LogArgs) -> Result<String, CliError> {
+    let w = open_world(&args.world)?;
+    let limit = args
+        .limit
+        .map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX));
+    let from = args.from.map_or(0, |c| c.0);
     let mut transactions: Vec<JTxn> = Vec::new();
     // Every returned transaction is a run of entries ending in its
     // `Commit`, which carries the tx.
@@ -224,7 +220,7 @@ pub fn run(
         command: "log",
         transactions,
     };
-    Ok(render(&out, json))
+    Ok(render(&out, args.json))
 }
 
 /// An entity as the log shows it: handle, else ID; no name (the log isn't

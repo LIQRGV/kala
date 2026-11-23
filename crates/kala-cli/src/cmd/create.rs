@@ -1,10 +1,13 @@
 //! Genesis-only creation and atomic, validated script restore.
 use super::{transact, transfer};
-use crate::{error::CliError, escape, out};
+use crate::{
+    cli::{CreateArgs, TransactArgs},
+    error::CliError,
+    escape, out,
+};
 use kala_core::{AttrDef, Cardinality, Kind, Schema, World};
 use kala_datalog::ast::{WriteOp, WriteTxn};
 use serde_json::json;
-use std::path::Path;
 
 fn user(s: &str) -> CliError {
     CliError::User(s.into())
@@ -75,7 +78,8 @@ fn reserved_error() -> CliError {
         kala_core::RESERVED_NAME_PREFIX
     ))
 }
-pub fn run(path: &Path, source: Option<&Path>) -> Result<String, CliError> {
+pub fn run(args: &CreateArgs) -> Result<String, CliError> {
+    let (path, source) = (args.world.as_path(), args.schema.as_deref());
     transfer::absent(path)?;
     let mut ops = Vec::new();
     if let Some(source) = source {
@@ -112,7 +116,9 @@ pub fn run(path: &Path, source: Option<&Path>) -> Result<String, CliError> {
     eprintln!("event=world_created");
     Ok(format!("created {}\n", escape::path(path)))
 }
-pub fn replay(path: &Path, source: &Path, as_json: bool) -> Result<String, CliError> {
+/// `kala transact --create`: replays a dump into a new world.
+pub fn replay(args: &TransactArgs) -> Result<String, CliError> {
+    let (path, source, as_json) = (args.world.as_path(), args.input.as_path(), args.json);
     transfer::absent(path)?;
     let text = transfer::input(source)?;
     let mut forms = kala_datalog::restore_forms(&text);

@@ -1,6 +1,6 @@
 //! A deterministic write-language representation of the committed log.
 use super::{schema, transfer};
-use crate::{error::CliError, escape, out};
+use crate::{cli::DumpArgs, error::CliError, escape, out};
 use kala_core::log::EntryBody;
 use kala_core::schema::SchemaEdit;
 use kala_core::{AttrDef, AttrId, Kind, Op, RefDirection, Value, World};
@@ -322,7 +322,9 @@ pub(super) fn recovery(world: &World) {
         );
     }
 }
-pub fn run(path: &Path, output: Option<&Path>, all: bool, force: bool) -> Result<String, CliError> {
+pub fn run(args: &DumpArgs) -> Result<String, CliError> {
+    let (path, output) = (args.world.as_path(), args.output.as_deref());
+    let (all, force) = (args.all, args.force);
     if all {
         let output =
             output.ok_or_else(|| CliError::Usage("dump --all requires -o OUTDIR".into()))?;

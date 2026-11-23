@@ -1,6 +1,6 @@
 //! Account administration: credentials enter through a bounded line or hidden prompt.
 use crate::{
-    cli::{UserCommand, UserCredentials, UserWrite},
+    cli::{UserArgs, UserCommand, UserCredentials, UserWrite},
     error::CliError,
     escape,
 };
@@ -108,7 +108,8 @@ fn recovery(write: &UserWrite) -> Recovery {
     }
 }
 
-pub fn run(command: &UserCommand) -> Result<String, CliError> {
+pub fn run(args: &UserArgs) -> Result<String, CliError> {
+    let command = &args.command;
     let dir = match command {
         UserCommand::Add { dir, .. }
         | UserCommand::Set { dir, .. }

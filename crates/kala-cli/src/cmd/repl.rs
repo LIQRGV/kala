@@ -19,7 +19,7 @@ use super::query::{parse_params, query_err, read_text_file, render_result};
 use super::read::Ctx;
 use super::repl_editor::SafeHelper;
 use super::repl_history::{History, MAX_HISTORY_ENTRIES, safe_entry};
-use crate::cli::{Canon, parse_canon};
+use crate::cli::{Canon, ReplArgs, parse_canon};
 use crate::error::CliError;
 use crate::escape;
 
@@ -499,14 +499,10 @@ fn output(stream: &mut impl Write, text: &str) -> Result<(), CliError> {
     }
 }
 
-pub fn run(
-    world: &Path,
-    at: Option<i64>,
-    canon: Option<Canon>,
-    history_path: Option<&Path>,
-    write: bool,
-    acknowledge_recovery: bool,
-) -> Result<Done, CliError> {
+pub fn run(args: &ReplArgs) -> Result<Done, CliError> {
+    let (world, at, canon) = (args.world.as_path(), args.at, args.canon);
+    let (history_path, write) = (args.history.as_deref(), args.write);
+    let acknowledge_recovery = args.acknowledge_recovery;
     let ctx = if write {
         let world = super::transact::open_write(world, acknowledge_recovery)?;
         Ctx {

@@ -1,12 +1,11 @@
 //! `kala asof <world> <entity> [<attr>] [@T]`.
 
 use std::fmt::Write as _;
-use std::path::Path;
 
 use serde::Serialize;
 
 use super::read::{Ctx, entity_err, tick_arg};
-use crate::cli::ReadAt;
+use crate::cli::AsofArgs;
 use crate::error::CliError;
 use crate::out::{JAttr, JEntity, Text, attrs_text, entity_text, render};
 
@@ -37,13 +36,9 @@ impl Text for Asof {
     }
 }
 
-pub fn run(
-    world: &Path,
-    entity: &str,
-    attr: Option<&str>,
-    tick: Option<&str>,
-    read: &ReadAt,
-) -> Result<String, CliError> {
+pub fn run(args: &AsofArgs) -> Result<String, CliError> {
+    let (world, entity, read) = (&args.world, args.entity.as_str(), &args.read);
+    let (attr, tick) = (args.attr.as_deref(), args.tick.as_deref());
     // `asof edwin @-210`: clap puts the `@T` in the attribute slot. An
     // attribute whose name starts with `@` is still readable with a tick
     // after it (`asof edwin @odd @5`).

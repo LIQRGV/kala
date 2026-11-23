@@ -22,7 +22,7 @@ use serde::Serialize;
 use super::Done;
 use super::query::{query_err, read_text_file, row_text};
 use super::read::open_world;
-use crate::cli::Canon;
+use crate::cli::{Canon, DoctorArgs};
 use crate::error::CliError;
 use crate::escape;
 use crate::names::{self, LogNames, Names};
@@ -65,14 +65,6 @@ fn text_row_size(row: &[JValue], limit: usize) -> Option<usize> {
         }
     }
     (bytes <= limit).then_some(bytes)
-}
-
-/// `kala doctor`'s options.
-pub struct Options<'a> {
-    pub canon: Option<Canon>,
-    pub since: Option<Canon>,
-    pub checks: Option<&'a Path>,
-    pub json: bool,
 }
 
 #[derive(Serialize)]
@@ -166,10 +158,11 @@ impl Text for Doctor {
     }
 }
 
-pub fn run(world: &Path, o: Options<'_>) -> Result<Done, CliError> {
+pub fn run(o: &DoctorArgs) -> Result<Done, CliError> {
+    let world = o.world.as_path();
     // The file's shape is checked whatever the store's state, before any
     // report is printed.
-    let checks = o.checks.map(read_checks).transpose()?;
+    let checks = o.checks.as_deref().map(read_checks).transpose()?;
     let opts = DoctorOptions {
         canon: o.canon.map(|c| TxId(c.0)),
         since: o.since.map(|c| TxId(c.0)),

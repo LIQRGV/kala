@@ -1,6 +1,6 @@
 //! Terminal writes are adapters over the native transaction API.
 use super::{Done, query::read_text_file, read::core_err as read_core_err};
-use crate::{error::CliError, escape, names, out};
+use crate::{cli::TransactArgs, error::CliError, escape, names, out};
 use kala_core::{Correction, EntityId, Op, Precision, Tick, Txn, Value, World};
 use kala_datalog::ast::{Item, WriteOp, WriteTxn, WriteValue};
 use serde::Serialize;
@@ -487,13 +487,10 @@ pub fn render(report: &Report, json: bool) -> String {
     s
 }
 
-pub fn run(
-    path: &Path,
-    input: &Path,
-    dry_run: bool,
-    json: bool,
-    acknowledge_recovery: bool,
-) -> Result<Done, CliError> {
+pub fn run(args: &TransactArgs) -> Result<Done, CliError> {
+    let (path, input) = (args.world.as_path(), args.input.as_path());
+    let (dry_run, json, acknowledge_recovery) =
+        (args.dry_run, args.json, args.acknowledge_recovery);
     let text = if input == Path::new("-") {
         let mut bytes = Vec::new();
         io::stdin()

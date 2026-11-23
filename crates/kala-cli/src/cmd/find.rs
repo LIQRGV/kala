@@ -1,13 +1,12 @@
 //! `kala find <world> <attr> <value> [-i] [@T]`.
 
 use std::fmt::Write as _;
-use std::path::Path;
 
 use kala_core::Value;
 use serde::Serialize;
 
 use super::read::{Ctx, core_err, parse_value, tick_arg};
-use crate::cli::ReadAt;
+use crate::cli::FindArgs;
 use crate::error::CliError;
 use crate::escape;
 use crate::out::{JEntity, JValue, Text, entity_text, render, value_text};
@@ -50,15 +49,10 @@ impl Text for Find {
     }
 }
 
-pub fn run(
-    world: &Path,
-    attr: &str,
-    value: &str,
-    tick: Option<&str>,
-    ignore_case: bool,
-    read: &ReadAt,
-) -> Result<String, CliError> {
-    let given = tick_arg(tick, read.at)?;
+pub fn run(args: &FindArgs) -> Result<String, CliError> {
+    let (world, attr, value) = (&args.world, args.attr.as_str(), args.value.as_str());
+    let (ignore_case, read) = (args.ignore_case, &args.read);
+    let given = tick_arg(args.tick.as_deref(), read.at)?;
     let ctx = Ctx::open(world, read.canon)?;
     let tick = ctx.tick(given);
     let view = ctx.view();

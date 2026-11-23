@@ -1,12 +1,11 @@
 //! `kala list <world> <NODE_TYPE> [@T]`.
 
 use std::fmt::Write as _;
-use std::path::Path;
 
 use serde::Serialize;
 
 use super::read::{Ctx, core_err, tick_arg};
-use crate::cli::ReadAt;
+use crate::cli::ListArgs;
 use crate::error::CliError;
 use crate::escape;
 use crate::out::{JEntity, Text, entity_text, render};
@@ -38,13 +37,9 @@ impl Text for List {
     }
 }
 
-pub fn run(
-    world: &Path,
-    node_type: &str,
-    tick: Option<&str>,
-    read: &ReadAt,
-) -> Result<String, CliError> {
-    let given = tick_arg(tick, read.at)?;
+pub fn run(args: &ListArgs) -> Result<String, CliError> {
+    let (world, node_type, read) = (&args.world, args.node_type.as_str(), &args.read);
+    let given = tick_arg(args.tick.as_deref(), read.at)?;
     let ctx = Ctx::open(world, read.canon)?;
     // Ascending by ID; the canon decides which entities exist, the tick
     // only their names.
