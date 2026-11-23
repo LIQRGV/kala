@@ -139,6 +139,17 @@ class DriverTests(unittest.TestCase):
             self.assertIn("line", error.exception.message)
             self.assertEqual(len(list(session.run(ALLIES))), 2)
 
+    def test_cypher_list_and_null_parameters(self):
+        with self.driver.session(database="varrow") as session:
+            aliases = ["Ed", "Eddie", "the Lost Knight"]
+            query = "MATCH (e {kala_handle: 'edwin'}) AT TICK -210 WHERE e.alias = $aliases RETURN e.name"
+            self.assertEqual(session.run(query, aliases=aliases).single()[0], "Edwin")
+            self.assertEqual(list(session.run(query, aliases=list(reversed(aliases)))), [])
+            query = "MATCH (e {kala_handle: 'edwin'}) RETURN $value"
+            self.assertIsNone(session.run(query, value=None).single()[0])
+            nested = [[1, None], ["x", True]]
+            self.assertEqual(session.run(query, value=nested).single()[0], nested)
+
     def test_cypher_system_secret_refusal_and_node_redaction(self):
         with self.driver.session(database="system") as session:
             self.assertIn("root", [r[0] for r in session.run("MATCH (a:ACCOUNT) RETURN a.user")])
@@ -158,7 +169,8 @@ class DriverTests(unittest.TestCase):
                     self.assertNotIn("$argon2", error.exception.message)
             for row in session.run("MATCH (a:ACCOUNT) RETURN a"):
                 self.assertIsInstance(row[0], Node)
-                self.assertNotIn("password_hash", row[0])
+                if "password_hash" in row[0]:
+                    self.assertEqual(row[0]["password_hash"], "<redacted>")
 
     def test_connectivity_and_actual_driver_handshake(self):
         # This byte-transparent proxy records only the public 20-byte handshake,

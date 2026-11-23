@@ -4,13 +4,15 @@ use kala_core::Value;
 
 /// A nullable expression. Boolean operators use three-valued logic.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Expr<V = Var> {
+pub enum Expr<V = Var, C = Value> {
     /// A variable.
     Var(V),
     /// A scalar literal.
-    Value(Value),
+    Value(C),
     /// A missing value.
     Null,
+    /// A list expression (including supplied list parameters).
+    List(Vec<Self>),
     /// A scalar query parameter.
     Param(String),
     /// An optional property read at the variable's binding tick.
@@ -32,7 +34,7 @@ pub enum Expr<V = Var> {
     /// True exactly for NULL.
     IsNull(Box<Self>),
 }
-impl<V> Expr<V> {
+impl<V, C> Expr<V, C> {
     /// Every constant attribute read, including nested expressions.
     pub fn attributes<'a>(&'a self, out: &mut Vec<&'a str>) {
         let mut todo = vec![self];
@@ -44,6 +46,7 @@ impl<V> Expr<V> {
                     todo.push(b);
                 }
                 Self::Not(e) | Self::IsNull(e) => todo.push(e),
+                Self::List(values) => todo.extend(values),
                 Self::Var(_) | Self::Value(_) | Self::Null | Self::Param(_) => {}
             }
         }
@@ -58,7 +61,7 @@ pub enum Orientation {
 }
 /// An operation retaining all input bindings. Hidden match variables preserve multiplicity.
 #[derive(Clone, Debug, PartialEq)]
-pub enum RowAction<V = Var> {
+pub enum RowAction<V = Var, C = Value> {
     /// Scan or constrain nodes; every label is required. Unknown labels match nothing.
     Nodes {
         var: V,
@@ -75,11 +78,11 @@ pub enum RowAction<V = Var> {
         tick: TickSource,
     },
     /// Bind the result of a nullable expression.
-    Bind { var: V, expr: Expr<V> },
+    Bind { var: V, expr: Expr<V, C> },
     /// Retain only true (false and NULL are discarded).
-    Select(Expr<V>),
+    Select(Expr<V, C>),
 }
-impl<V> RowAction<V> {
+impl<V, C> RowAction<V, C> {
     /// Every attribute this action can read, independent of its input rows.
     pub fn attributes<'a>(&'a self, out: &mut Vec<&'a str>) {
         match self {

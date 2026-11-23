@@ -73,6 +73,7 @@ impl Parser<'_> {
             Kind::Symbol("*") => {
                 self.err("variable-length relationships and RETURN * are not supported yet")
             }
+            Kind::Symbol(s) => self.err(format!("{s} is not supported yet (expected {expected})")),
             _ => self.err(format!(
                 "construct is not supported yet; expected {expected}"
             )),
@@ -421,6 +422,7 @@ impl Parser<'_> {
             }
             match e {
                 Expr::Not(e) | Expr::IsNull(e) => stack.push((e, d + 1)),
+                Expr::List(values) => stack.extend(values.iter().map(|e| (e, d + 1))),
                 Expr::Compare(_, a, b) | Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
                     stack.push((a, d + 1));
                     stack.push((b, d + 1));

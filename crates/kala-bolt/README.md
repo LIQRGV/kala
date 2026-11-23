@@ -161,7 +161,8 @@ escaped with `kala_core::must_escape` rules.
 RUN parameters use the front-end's inferred kinds: integers for ticks/i64,
 floats for f64, booleans, strings for strings, handles or readable IDs for
 entities, and a nonnegative integer or `tx#N`/`N` string for canon. No numeric
-coercion; null, NaN, byte arrays and other mismatched types are TypeError. Undeclared params are
+coercion; NaN, byte arrays and other mismatched types are TypeError. Cypher
+value parameters also accept NULL and lists, while ticks/canon remain integers. Undeclared params are
 ignored. Fields omit the variable's `?`; aggregate names retain their text.
 
 ## Errors and limits
@@ -218,7 +219,9 @@ sorted sets (no order or duplicates); labels consist of one node type plus
 `label` values. Cardinality-one overlaps also return lists. Ref properties
 return graph references or lists of them. Node/Relationship enrichment always
 uses the plan's default tick; explicit `v.key` uses its binding clause's tick.
-Scalar parameters are supported; NULL/list parameters are not yet supported.
+Cypher parameters support NULL and lists (with input order preserved). Native
+ref-to-edge targets remain edge references in unlabelled relationship endpoints;
+standalone node scans exclude edges.
 Every explicit system-world `password_hash` reference is refused before
 execution, including WHERE, maps, RETURN aliases, IS NULL and ORDER BY/LIMIT.
 Returning account nodes continues to redact hashes.

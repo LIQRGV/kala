@@ -199,3 +199,29 @@ fn boolean_null_truth_tables_filter_only_true() {
         }
     }
 }
+
+#[test]
+fn node_scans_exclude_edges_while_traversals_preserve_native_ref_targets() {
+    let mut w = load_fixture(FIXTURE).unwrap();
+    let a = w.entity_by_handle("a").unwrap();
+    let b = w.entity_by_handle("b").unwrap();
+    let edge: kala_core::EntityId = w.edge_id(a, "parent_of", b).unwrap().into();
+    let mut tx = w.begin();
+    tx.infer_attribute("points_at", &Value::Ref(edge)).unwrap();
+    tx.assert(a, "points_at", Value::Ref(edge), Some(Tick(0)))
+        .unwrap();
+    tx.commit().unwrap();
+    // An unbound node scan excludes edges. Native ref traversals preserve
+    // edge targets, just like the Datalog Expand required by Plan parity.
+    assert_eq!(query(&w, "MATCH (n) RETURN n").len(), 3);
+    for text in [
+        "MATCH (a)-[r:points_at]->(n) RETURN n",
+        "MATCH (a)-[:points_at]->(n) RETURN DISTINCT n",
+    ] {
+        assert_eq!(
+            query(&w, text),
+            vec![vec![Datum::from(Value::Ref(edge))]],
+            "{text}"
+        );
+    }
+}

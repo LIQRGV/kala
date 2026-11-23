@@ -1,8 +1,9 @@
 //! The shared, language-neutral IR every query front-end compiles to, and its
 //! stable text form ([`Plan::explain`]).
 //!
-//! A plan is a tree of [`Op`]s producing **sets** of rows (bindings from
-//! [`Var`] to [`Value`], entities as [`Value::Ref`]). Every read operator
+//! A plan is a tree of [`Op`]s over bindings from [`Var`] to values. Set
+//! operators preserve their original semantics; `Row` adds nullable reads and
+//! expressions, and a final `Output` selects bags, ordering and slicing. Every read operator
 //! carries its own tick ([`TickSource`]); [`Plan::default_tick`] is what
 //! `TickSource::Default` resolves to. Language semantics (set vs bag, NULLs,
 //! relationship reuse) are decided by the front-end, never here.

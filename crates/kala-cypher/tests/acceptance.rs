@@ -374,3 +374,110 @@ fn new_operators_respect_row_step_memory_and_cancellation_limits() {
         );
     }
 }
+
+#[test]
+fn embedded_nullable_and_list_parameters_keep_cypher_semantics() {
+    let w = world();
+    let p = kala_cypher::prepare(
+        &w,
+        "MATCH (e {kala_handle: 'edwin'}) AT TICK -210 WHERE e.alias = $aliases RETURN $value",
+    )
+    .unwrap();
+    let mut params = kala_query::QueryParams::new();
+    let aliases = Datum::List(
+        ["Ed", "Eddie", "the Lost Knight"]
+            .iter()
+            .map(|v| Datum::from(Value::Str((*v).into())))
+            .collect(),
+    );
+    params.insert("aliases".into(), aliases.clone());
+    params.insert("value".into(), Datum::Null);
+    assert_eq!(
+        run(&w, &p.plan, &params, &Limits::default()).unwrap().rows,
+        vec![vec![Datum::Null]]
+    );
+    params.insert("value".into(), aliases.clone());
+    assert_eq!(
+        run(&w, &p.plan, &params, &Limits::default()).unwrap().rows,
+        vec![vec![aliases]]
+    );
+    params.insert(
+        "aliases".into(),
+        Datum::List(
+            ["the Lost Knight", "Eddie", "Ed"]
+                .iter()
+                .map(|v| Datum::from(Value::Str((*v).into())))
+                .collect(),
+        ),
+    );
+    assert!(
+        run(&w, &p.plan, &params, &Limits::default())
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+}
+
+#[test]
+fn return_aliases_do_not_overwrite_match_bindings_in_other_return_items() {
+    let w = world();
+    assert_eq!(
+        query(
+            &w,
+            "MATCH (e {kala_handle: 'edwin'}) AT TICK -210 RETURN e.name AS e, e.kala_handle AS handle ORDER BY e"
+        ),
+        vec![vec![
+            Datum::from(Value::Str("Edwin".into())),
+            Datum::from(Value::Str("edwin".into()))
+        ]]
+    );
+}
+
+#[test]
+fn parameter_list_equality_propagates_null_until_inequality_is_known() {
+    // Lists compare their corresponding elements; unknown equality stays NULL.
+    // https://neo4j.com/docs/cypher-manual/current/values-and-types/ordering-equality-comparison/
+    let w = world();
+    let n = Datum::Null;
+    let one = Datum::from(Value::I64(1));
+    let two = Datum::from(Value::I64(2));
+    for (a, b, expected) in [
+        (vec![n.clone()], vec![n.clone()], None),
+        (
+            vec![n.clone(), one.clone()],
+            vec![one.clone(), one.clone()],
+            None,
+        ),
+        (
+            vec![n.clone(), one.clone()],
+            vec![n.clone(), two],
+            Some(false),
+        ),
+        (vec![n.clone()], vec![n.clone(), one], Some(false)),
+        (
+            vec![Datum::List(vec![n.clone()])],
+            vec![Datum::List(vec![n])],
+            None,
+        ),
+    ] {
+        let mut params = kala_query::QueryParams::new();
+        params.insert("a".into(), Datum::List(a.clone()));
+        params.insert("b".into(), Datum::List(b.clone()));
+        for (expression, want) in [
+            ("$a = $b", expected == Some(true)),
+            ("NOT ($a = $b)", expected == Some(false)),
+        ] {
+            let p = kala_cypher::prepare(
+                &w,
+                &format!("MATCH (e {{kala_handle: 'edwin'}}) WHERE {expression} RETURN e"),
+            )
+            .unwrap();
+            let result = run(&w, &p.plan, &params, &Limits::default()).unwrap();
+            assert_eq!(
+                result.rows.len(),
+                usize::from(want),
+                "{a:?} vs {b:?}, {expression}"
+            );
+        }
+    }
+}

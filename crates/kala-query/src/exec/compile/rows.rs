@@ -1,7 +1,7 @@
 //! Static binding checks for nullable row operations.
 use super::*;
 use crate::{Expr, RowAction};
-impl Compiler<'_> {
+impl Compiler<'_, '_> {
     pub(super) fn op_row(
         &mut self,
         action: &RowAction,
@@ -67,31 +67,116 @@ impl Compiler<'_> {
         }))
     }
     fn row_expr(
-        &self,
+        &mut self,
         e: &Expr,
         bound: &BTreeSet<usize>,
         depth: usize,
-    ) -> Result<Expr<usize>, QueryError> {
+    ) -> Result<Expr<usize, Val>, QueryError> {
         if depth > 32 {
             return Err(QueryError::Plan("expression nesting limit exceeded".into()));
         }
-        let sub = |e| self.row_expr(e, bound, depth + 1).map(Box::new);
+        self.budget.step(1)?;
+        self.budget
+            .charge_bytes(std::mem::size_of::<Expr<usize, Val>>())?;
         Ok(match e {
             Expr::Var(v) => Expr::Var(input_slot(self.slots, bound, v, "expression")?),
-            Expr::Value(v) => Expr::Value(v.clone()),
+            Expr::Value(v) => {
+                Expr::Value(self.row_constant(crate::ParameterValue::Scalar(v), depth)?)
+            }
             Expr::Null => Expr::Null,
-            Expr::Param(p) => Expr::Value(param(self.params, p)?.clone()),
+            Expr::Param(p) => {
+                let value = if let Some(v) = self.parameter_constants.get(p) {
+                    v.clone()
+                } else {
+                    let binding = self
+                        .params
+                        .binding(p)
+                        .ok_or_else(|| QueryError::MissingParam(p.clone()))?;
+                    let value = self.row_constant(binding, depth)?;
+                    self.budget.charge_bytes(64 + p.len())?;
+                    self.parameter_constants.insert(p.clone(), value.clone());
+                    value
+                };
+                Expr::Value(value)
+            }
+            Expr::List(values) => Expr::List(
+                values
+                    .iter()
+                    .map(|e| self.row_expr(e, bound, depth + 1))
+                    .collect::<Result<_, _>>()?,
+            ),
             Expr::Property { entity, key, tick } => Expr::Property {
                 entity: input_slot(self.slots, bound, entity, "property")?,
                 key: key.clone(),
                 tick: self.row_tick(tick)?,
             },
-            Expr::Compare(op, a, b) => Expr::Compare(*op, sub(a)?, sub(b)?),
-            Expr::And(a, b) => Expr::And(sub(a)?, sub(b)?),
-            Expr::Or(a, b) => Expr::Or(sub(a)?, sub(b)?),
-            Expr::Xor(a, b) => Expr::Xor(sub(a)?, sub(b)?),
-            Expr::Not(e) => Expr::Not(sub(e)?),
-            Expr::IsNull(e) => Expr::IsNull(sub(e)?),
+            Expr::Compare(op, a, b) => Expr::Compare(
+                *op,
+                Box::new(self.row_expr(a, bound, depth + 1)?),
+                Box::new(self.row_expr(b, bound, depth + 1)?),
+            ),
+            Expr::And(a, b) => Expr::And(
+                Box::new(self.row_expr(a, bound, depth + 1)?),
+                Box::new(self.row_expr(b, bound, depth + 1)?),
+            ),
+            Expr::Or(a, b) => Expr::Or(
+                Box::new(self.row_expr(a, bound, depth + 1)?),
+                Box::new(self.row_expr(b, bound, depth + 1)?),
+            ),
+            Expr::Xor(a, b) => Expr::Xor(
+                Box::new(self.row_expr(a, bound, depth + 1)?),
+                Box::new(self.row_expr(b, bound, depth + 1)?),
+            ),
+            Expr::Not(e) => Expr::Not(Box::new(self.row_expr(e, bound, depth + 1)?)),
+            Expr::IsNull(e) => Expr::IsNull(Box::new(self.row_expr(e, bound, depth + 1)?)),
         })
+    }
+    fn row_constant(
+        &mut self,
+        value: crate::ParameterValue<'_>,
+        depth: usize,
+    ) -> Result<Val, QueryError> {
+        use crate::{Datum, ParameterValue};
+        if depth > 32 {
+            return Err(QueryError::Plan("parameter nesting limit exceeded".into()));
+        }
+        self.budget.step(1)?;
+        match value {
+            ParameterValue::Scalar(v) | ParameterValue::Datum(Datum::Value(v)) => {
+                if let Value::Str(s) = v {
+                    self.budget.step(s.len() as u64 / 64)?;
+                    // Reserve before the interner copies; release if already charged.
+                    let bytes = s
+                        .len()
+                        .saturating_add(super::super::val::STRING_OVERHEAD_BYTES);
+                    self.budget.charge_bytes(bytes)?;
+                    let (v, new) = self.interner.string(s, true)?;
+                    if !new {
+                        self.budget.release_bytes(bytes);
+                    }
+                    Ok(v)
+                } else {
+                    self.interner.constant(v)
+                }
+            }
+            ParameterValue::Datum(Datum::Null) => Ok(Val::Null),
+            ParameterValue::Datum(Datum::List(values)) => {
+                let bytes =
+                    64usize.saturating_add(values.len().saturating_mul(std::mem::size_of::<Val>()));
+                self.budget.charge_bytes(bytes)?;
+                let mut out = Vec::with_capacity(values.len());
+                for v in values {
+                    out.push(self.row_constant(ParameterValue::Datum(v), depth + 1)?);
+                }
+                let (v, new) = self.interner.list(out)?;
+                if !new {
+                    self.budget.release_bytes(bytes);
+                }
+                Ok(v)
+            }
+            _ => Err(QueryError::TypeMismatch(
+                "unsupported parameter value".into(),
+            )),
+        }
     }
 }

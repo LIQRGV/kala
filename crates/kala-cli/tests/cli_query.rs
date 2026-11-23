@@ -927,3 +927,39 @@ fn cypher_cli_parameters_order_null_list_and_positioned_errors() {
     ]);
     assert_ne!(code(&bad), 0);
 }
+
+#[test]
+fn cypher_cli_json_list_and_null_parameters() {
+    let f = varrow();
+    let aliases = f.json(&[
+        "--lang", "cypher",
+        "MATCH (e {kala_handle: 'edwin'}) AT TICK -210 WHERE e.alias = $aliases RETURN e.kala_handle",
+        "--param", r#"aliases=["Ed","Eddie","the Lost Knight"]"#,
+    ]);
+    assert_eq!(aliases["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(aliases["rows"][0][0]["value"], "edwin");
+    let null = f.json(&[
+        "--lang",
+        "cypher",
+        "MATCH (e {kala_handle: 'edwin'}) RETURN $x",
+        "--param",
+        "x=null",
+    ]);
+    assert_eq!(null["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(null["rows"][0][0]["type"], "null");
+    let nested = f.json(&[
+        "--lang",
+        "cypher",
+        "MATCH (e {kala_handle: 'edwin'}) RETURN $x",
+        "--param",
+        r#"x=[[1,null],["x",true]]"#,
+    ]);
+    assert_eq!(nested["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        nested["rows"][0][0],
+        json!({"type":"list","value":[
+            {"type":"list","value":[{"type":"i64","value":1},{"type":"null","value":null}]},
+            {"type":"list","value":[{"type":"string","value":"x"},{"type":"bool","value":true}]}
+        ]})
+    );
+}

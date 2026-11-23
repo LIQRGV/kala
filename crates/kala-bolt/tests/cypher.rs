@@ -125,3 +125,32 @@ fn returned_node_uses_default_tick_but_property_uses_binding_clause_tick() {
     assert_eq!(props["name"], string("Edwin"));
     assert_eq!(rows[0][1], string("the Grey King"));
 }
+
+#[test]
+fn cypher_list_and_null_parameters_preserve_values_and_list_equality() {
+    let server = Running::start();
+    let mut c = Client::ready(&server);
+    let aliases = Value::List(vec![
+        string("Ed"),
+        string("Eddie"),
+        string("the Lost Knight"),
+    ]);
+    c.run(
+        "MATCH (e {kala_handle: 'edwin'}) AT TICK -210 WHERE e.alias = $aliases RETURN e.name",
+        map(&[("aliases", aliases.clone())]),
+        map(&[]),
+    );
+    assert_eq!(c.pull(-1).0, vec![vec![string("Edwin")]]);
+    c.run(
+        "MATCH (e {kala_handle: 'edwin'}) RETURN $value",
+        map(&[("value", Value::Null)]),
+        map(&[]),
+    );
+    assert_eq!(c.pull(-1).0, vec![vec![Value::Null]]);
+    c.run(
+        "MATCH (e {kala_handle: 'edwin'}) RETURN $value",
+        map(&[("value", aliases.clone())]),
+        map(&[]),
+    );
+    assert_eq!(c.pull(-1).0, vec![vec![aliases]]);
+}

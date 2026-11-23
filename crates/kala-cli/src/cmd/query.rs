@@ -9,7 +9,7 @@ use std::path::Path;
 use kala_core::World;
 use kala_core::{Value, ValueType};
 use kala_datalog::{MAX_QUERY_BYTES, ParamKind, Prepared};
-use kala_query::{Limits, Params, QueryError, ResultSet};
+use kala_query::{Datum, Limits, ParameterInput, Params, QueryError, QueryParams, ResultSet};
 use serde::Serialize;
 
 use super::read::{Ctx, parse_value};
@@ -115,7 +115,7 @@ pub fn explain(world: &Path, q: &QueryArgs) -> Result<String, CliError> {
 
 /// Reads the query text, opens the world, prepares the query and parses
 /// its parameters.
-fn prepare(world: &Path, q: &QueryArgs) -> Result<(Ctx, Prepared, Params), CliError> {
+fn prepare(world: &Path, q: &QueryArgs) -> Result<(Ctx, Prepared, QueryParams), CliError> {
     let text = match (&q.query, &q.file) {
         (Some(t), None) => t.clone(),
         (None, Some(f)) => read_text_file(f, MAX_QUERY_BYTES, "the query")?,
@@ -136,7 +136,11 @@ fn prepare(world: &Path, q: &QueryArgs) -> Result<(Ctx, Prepared, Params), CliEr
         kala_datalog::prepare(&ctx.world, &text)
             .map_err(|e| CliError::User(format!("query: {e}")))?
     };
-    let params = parse_params(&ctx, &prepared.params, &q.params)?;
+    let params = if q.lang == "cypher" {
+        parse_cypher_params(&ctx, &prepared.params, &q.params)?
+    } else {
+        parse_params(&ctx, &prepared.params, &q.params)?.into()
+    };
     Ok((ctx, prepared, params))
 }
 
@@ -262,4 +266,95 @@ pub(crate) fn query_err(e: QueryError, whose: &str) -> CliError {
         )),
         e => CliError::User(format!("{whose}: {e}")),
     }
+}
+
+fn parse_cypher_params(
+    ctx: &Ctx,
+    kinds: &[(String, ParamKind)],
+    given: &[(String, String)],
+) -> Result<QueryParams, CliError> {
+    if given
+        .iter()
+        .try_fold(0usize, |n, (k, v)| {
+            n.checked_add(k.len())?.checked_add(v.len())
+        })
+        .is_none_or(|n| n > 1 << 20)
+    {
+        return Err(CliError::User("query parameters exceed 1 MiB".into()));
+    }
+    let mut params = QueryParams::new();
+    for (name, text) in given {
+        let name = name.strip_prefix(['?', '$']).unwrap_or(name);
+        let kind = kinds
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, k)| k)
+            .ok_or_else(|| CliError::User("unknown Cypher parameter".into()))?;
+        if params.contains_key(name) {
+            return Err(CliError::User("duplicate Cypher parameter".into()));
+        }
+        let nullable = !matches!(kind, ParamKind::Tick | ParamKind::Canon);
+        let value =
+            if nullable && (text == "null" || text.starts_with('[') || text.starts_with('"')) {
+                let value: serde_json::Value = serde_json::from_str(text)
+                    .map_err(|_| CliError::User("invalid JSON query parameter".into()))?;
+                json_parameter(ctx, kind, &value, 0)?
+            } else {
+                Datum::Value(parse_param(ctx, name, kind, text)?)
+            };
+        params.insert(name.into(), value);
+    }
+    for (name, _) in kinds {
+        if !params.contains_key(name) {
+            return Err(CliError::User(format!(
+                "missing parameter {}",
+                escape::value(name)
+            )));
+        }
+    }
+    Ok(params)
+}
+fn json_parameter(
+    ctx: &Ctx,
+    kind: &ParamKind,
+    value: &serde_json::Value,
+    depth: usize,
+) -> Result<Datum, CliError> {
+    use serde_json::Value as Json;
+    let bad = || CliError::User("wrong type for JSON query parameter".into());
+    if depth > 32 {
+        return Err(CliError::User(
+            "query parameter nesting limit exceeded".into(),
+        ));
+    }
+    let value = match value {
+        Json::Null => return Ok(Datum::Null),
+        Json::Array(values) => {
+            return values
+                .iter()
+                .map(|v| json_parameter(ctx, kind, v, depth + 1))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Datum::List);
+        }
+        Json::String(s) if matches!(kind, ParamKind::Scalar | ParamKind::Value(ValueType::Str)) => {
+            Value::Str(s.clone())
+        }
+        Json::String(s) if matches!(kind, ParamKind::Entity | ParamKind::Value(ValueType::Ref)) => {
+            ctx.defined_entity(s).map(Value::Ref)?
+        }
+        Json::Bool(b) if matches!(kind, ParamKind::Scalar | ParamKind::Value(ValueType::Bool)) => {
+            Value::Bool(*b)
+        }
+        Json::Number(n)
+            if matches!(kind, ParamKind::Scalar | ParamKind::Value(ValueType::I64))
+                && n.is_i64() =>
+        {
+            Value::I64(n.as_i64().ok_or_else(bad)?)
+        }
+        Json::Number(n) if matches!(kind, ParamKind::Scalar | ParamKind::Value(ValueType::F64)) => {
+            Value::f64(n.as_f64().ok_or_else(bad)?).map_err(|_| bad())?
+        }
+        _ => return Err(bad()),
+    };
+    Ok(Datum::Value(value))
 }

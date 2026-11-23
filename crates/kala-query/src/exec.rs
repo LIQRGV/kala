@@ -1,10 +1,11 @@
 //! The executor: runs a [`Plan`] against a [`View`] (a pinned canon) through
 //! kala-core's public reads only.
 //!
-//! Every operator produces a **set** of rows; the final rows are sorted
-//! ascending by [`Value`]'s order and duplicate-free. The executor is
-//! language-neutral: bag semantics, NULLs and the like are a front-end's
-//! business, decided before a plan reaches here.
+//! Relational operators retain a set of complete bindings. The opt-in `Output`
+//! operator projects bags or sets, orders and slices; `Row` evaluates nullable
+//! expressions and optional reads. Without `Output`, final rows keep the
+//! original sorted, duplicate-free semantics. Front-ends select these explicit
+//! language-neutral operators.
 //!
 //! Execution is two passes. `compile` checks the plan statically (attribute
 //! names, which variables each operator binds, access feasibility, params)
@@ -51,6 +52,7 @@ use std::sync::atomic::AtomicBool;
 
 use kala_core::{Error as CoreError, Tick, TxId, Value, ValueType, View, WorkMeter, World};
 
+use crate::ParameterInput;
 use crate::datum::Datum;
 use crate::ir::{CanonSource, Plan, TickSource, Var};
 
@@ -123,8 +125,8 @@ impl Default for Limits {
 pub struct ResultSet {
     /// The result columns: the plan's `find` variables, in order.
     pub columns: Vec<Var>,
-    /// The rows, one datum per column, sorted ascending ([`Datum`]'s order,
-    /// lexicographic) with no duplicates.
+    /// The rows, one datum per column. Set plans sort and deduplicate; an
+    /// `Output` root preserves its requested order and multiplicity.
     pub rows: Vec<Vec<Datum>>,
     /// The resolved default tick (what [`TickSource::Default`] read at).
     pub tick: Tick,
@@ -136,7 +138,7 @@ pub struct ResultSet {
 pub fn run_with_cancel(
     world: &World,
     plan: &Plan,
-    params: &Params,
+    params: &dyn ParameterInput,
     limits: &Limits,
     cancel: &AtomicBool,
 ) -> Result<ResultSet, QueryError> {
@@ -158,7 +160,7 @@ pub struct Usage {
 pub fn run_with_usage(
     world: &World,
     plan: &Plan,
-    params: &Params,
+    params: &dyn ParameterInput,
     limits: &Limits,
 ) -> Result<(ResultSet, Usage), QueryError> {
     run_tracked(world, plan, params, limits, &AtomicBool::new(false))
@@ -169,7 +171,7 @@ pub fn run_with_usage(
 pub fn run(
     world: &World,
     plan: &Plan,
-    params: &Params,
+    params: &dyn ParameterInput,
     limits: &Limits,
 ) -> Result<ResultSet, QueryError> {
     run_with_cancel(world, plan, params, limits, &AtomicBool::new(false))
@@ -178,7 +180,7 @@ pub fn run(
 fn run_tracked(
     world: &World,
     plan: &Plan,
-    params: &Params,
+    params: &dyn ParameterInput,
     limits: &Limits,
     cancel: &AtomicBool,
 ) -> Result<(ResultSet, Usage), QueryError> {
@@ -187,10 +189,9 @@ fn run_tracked(
     let canon = match &plan.canon {
         CanonSource::Latest => latest,
         CanonSource::Const(n) => TxId(*n),
-        CanonSource::Param(name) => match params.get(name) {
-            None => return Err(QueryError::MissingParam(name.clone())),
-            Some(Value::I64(n)) if *n >= 0 => TxId(n.unsigned_abs()),
-            Some(_) => {
+        CanonSource::Param(name) => match params.scalar(name)? {
+            Value::I64(n) if *n >= 0 => TxId(n.unsigned_abs()),
+            _ => {
                 return Err(QueryError::ParamType {
                     name: name.clone(),
                     expected: "non-negative i64".into(),
@@ -214,7 +215,7 @@ fn run_tracked(
 pub fn execute(
     view: &View,
     plan: &Plan,
-    params: &Params,
+    params: &dyn ParameterInput,
     limits: &Limits,
 ) -> Result<ResultSet, QueryError> {
     execute_on(
@@ -232,7 +233,7 @@ fn execute_on(
     world: &World,
     view: &View,
     plan: &Plan,
-    params: &Params,
+    params: &dyn ParameterInput,
     limits: &Limits,
     cancel: &AtomicBool,
 ) -> Result<(ResultSet, Usage), QueryError> {
@@ -252,7 +253,7 @@ fn execute_inner(
     world: &World,
     view: &View,
     plan: &Plan,
-    params: &Params,
+    params: &dyn ParameterInput,
     limits: &Limits,
     cancel: &AtomicBool,
     meter: &WorkMeter,
@@ -291,6 +292,16 @@ fn execute_inner(
         crate::Op::Output { input, spec } => (input.as_ref(), Some(spec)),
         root => (root, None),
     };
+    let mut budget = Budget {
+        cancel,
+        peak_bytes: 0,
+        steps: 0,
+        bytes: 0,
+        row_bytes: 0,
+        cmp: CmpWork::default(),
+        memo: Memo::default(),
+        limits: *limits,
+    };
     let prog = compile(
         root,
         world,
@@ -299,6 +310,7 @@ fn execute_inner(
         default_tick,
         &mut slots,
         &mut interner,
+        &mut budget,
     )?;
     let mut find = Vec::with_capacity(plan.find.len());
     for v in output.map_or(&plan.find, |spec| &spec.vars) {
@@ -314,26 +326,19 @@ fn execute_inner(
         }
     }
     let width = slots.len();
+    budget.row_bytes = row_bytes(width);
     let mut ex = Exec {
         world,
         view,
         meter,
         width,
-        budget: Budget {
-            cancel,
-            peak_bytes: 0,
-            steps: 0,
-            bytes: 0,
-            row_bytes: row_bytes(width),
-            cmp: CmpWork::default(),
-            memo: Memo::default(),
-            limits: *limits,
-        },
+        budget,
         interner,
         scans: HashMap::new(),
         history_scans: HashMap::new(),
         during_scans: HashMap::new(),
         checked_types: HashSet::new(),
+        node_types: None,
         rels: prog
             .rels
             .iter()
@@ -422,11 +427,10 @@ fn sort_real(rows: &[Vec<Val>], budget: &mut Budget) -> Result<Vec<usize>, Query
     Ok(a)
 }
 
-fn tick_param(params: &Params, name: &str) -> Result<Tick, QueryError> {
-    match params.get(name) {
-        None => Err(QueryError::MissingParam(name.to_owned())),
-        Some(Value::I64(n)) => Ok(Tick(*n)),
-        Some(_) => Err(QueryError::ParamType {
+fn tick_param(params: &dyn ParameterInput, name: &str) -> Result<Tick, QueryError> {
+    match params.scalar(name)? {
+        Value::I64(n) => Ok(Tick(*n)),
+        _ => Err(QueryError::ParamType {
             name: name.to_owned(),
             expected: "i64".into(),
         }),
@@ -448,15 +452,13 @@ mod scan_meter_tests;
 
 fn count_term(
     term: Option<&crate::Term>,
-    params: &Params,
+    params: &dyn ParameterInput,
     default: usize,
 ) -> Result<usize, QueryError> {
     let Some(term) = term else { return Ok(default) };
     let value = match term {
         crate::Term::Const(v) => v,
-        crate::Term::Param(p) => params
-            .get(p)
-            .ok_or_else(|| QueryError::MissingParam(p.clone()))?,
+        crate::Term::Param(p) => params.scalar(p)?,
         _ => {
             return Err(QueryError::Plan(
                 "pagination needs an integer literal or parameter".into(),
@@ -475,7 +477,7 @@ fn output_rows(
     find: &[usize],
     spec: &crate::OutputSpec,
     slots: &Slots,
-    params: &Params,
+    params: &dyn ParameterInput,
     budget: &mut Budget,
 ) -> Result<Vec<Vec<Datum>>, QueryError> {
     let skip = count_term(spec.skip.as_ref(), params, 0)?;

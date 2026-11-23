@@ -15,6 +15,17 @@ pub(crate) fn compile(world: &World, text: &str, q: &Query) -> Result<Prepared, 
         params: Vec::new(),
         serial: 0,
         canon: CanonSource::Latest,
+        used: q
+            .matches
+            .iter()
+            .flat_map(|m| &m.paths)
+            .flat_map(|p| {
+                p.nodes
+                    .iter()
+                    .filter_map(|n| n.name.clone())
+                    .chain(p.edges.iter().filter_map(|e| e.name.clone()))
+            })
+            .collect(),
     }
     .run(q)
 }
@@ -25,6 +36,7 @@ struct Compiler<'a> {
     bindings: BTreeMap<String, (Var, TickSource, bool)>,
     params: Vec<(String, ParamKind)>,
     serial: usize,
+    used: BTreeSet<String>,
     canon: CanonSource,
 }
 impl Compiler<'_> {
@@ -32,8 +44,13 @@ impl Compiler<'_> {
         CypherError::new(self.text, 0, ErrorKind::Syntax, s)
     }
     fn fresh(&mut self) -> Var {
-        self.serial += 1;
-        Var(format!("\0{}", self.serial))
+        loop {
+            self.serial += 1;
+            let name = format!("\0{}", self.serial);
+            if self.used.insert(name.clone()) {
+                return Var(name);
+            }
+        }
     }
     fn row(&mut self, action: RowAction) {
         self.root = Op::Row {
@@ -108,6 +125,12 @@ impl Compiler<'_> {
             ),
             Expr::Value(v) => Expr::Value(v.clone()),
             Expr::Null => Expr::Null,
+            Expr::List(values) => Expr::List(
+                values
+                    .iter()
+                    .map(|e| self.expr(e))
+                    .collect::<Result<_, _>>()?,
+            ),
             Expr::Param(p) => {
                 self.param(p, ParamKind::Scalar)?;
                 Expr::Param(p.clone())
@@ -227,9 +250,7 @@ impl Compiler<'_> {
                 let mut handles = BTreeSet::new();
                 for (n, v) in path.nodes.iter().zip(&vars) {
                     for (i, (key, value)) in n.props.iter().enumerate() {
-                        if key == "kala_handle"
-                            && matches!(value, Expr::Value(Value::Str(_)) | Expr::Param(_))
-                        {
+                        if key == "kala_handle" && matches!(value, Expr::Value(Value::Str(_))) {
                             let value = match value {
                                 Expr::Value(v) => Term::Const(v.clone()),
                                 Expr::Param(p) => {

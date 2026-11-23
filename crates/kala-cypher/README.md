@@ -81,8 +81,15 @@ precede ordering and pagination. Budgets error rather than silently truncate.
 - Bolt Node and Relationship objects are enriched at the plan's **default**
   tick even when bound in a later clause with a different tick. Explicit
   `RETURN v.key` reads at the variable's binding clause tick.
-- The current parameter API accepts scalar stored values; NULL and list
-  parameters are not supported. Typed contexts check the declared type.
+- Native ref attributes can target edge entities. Both named and anonymous
+  relationship traversals preserve those references, so an unlabelled endpoint
+  may bind an edge; a standalone all-node scan still excludes edges. This keeps
+  the same fact-expansion semantics and exact Plan parity as Datalog.
+
+Parameters accept scalars, NULL and lists. Property lists are sorted sets;
+supplied parameter lists retain their input order for equality. Comparisons
+with NULL inside lists use three-valued equality. The embedded `QueryParams`
+API supports these values; the existing scalar `Params` alias remains valid.
 
 The CLI uses `kala query WORLD --lang cypher QUERY` and
 `kala explain WORLD --lang cypher QUERY`; its default remains Datalog.

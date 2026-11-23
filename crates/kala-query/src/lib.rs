@@ -27,3 +27,6 @@ pub use prepared::{ParamKind, Prepared};
 
 pub mod rows;
 pub use rows::{Expr, Orientation, OutputSpec, RowAction};
+
+mod params;
+pub use params::{ParameterInput, ParameterValue, QueryParams};

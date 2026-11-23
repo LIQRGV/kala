@@ -514,6 +514,8 @@ use the [Cypher read subset](../kala-cypher/README.md). `--lang datalog` is the
 default, preserving scripts and the Datalog-only REPL. `-f`, `--param NAME=VALUE`
 and `query --json` work with either language. Parameters are typed by usage;
 unconstrained scalar parameters infer bool/integer/float, otherwise string.
+Cypher also accepts JSON lists and `null` in `--param`; quote a JSON string to
+distinguish the string `"null"` from NULL. List input order is preserved.
 JSON keeps the existing document/column/row shape; NULL cells are
 `{"type":"null","value":null}` and lists are `{"type":"list","value":[...]}`
 containing typed cells. Output preserves ORDER BY and duplicate Cypher rows.

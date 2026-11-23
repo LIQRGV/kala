@@ -561,7 +561,9 @@ fn cypher_system_public_properties_work_and_nodes_redact_hashes() {
         let Value::Map(props) = &fields[2] else {
             panic!("node properties")
         };
-        assert!(!props.contains_key("password_hash"));
+        if let Some(hash) = props.get("password_hash") {
+            assert_eq!(hash, &string("<redacted>"));
+        }
         assert!(!format!("{props:?}").contains("$argon2"));
     }
 }

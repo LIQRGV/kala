@@ -83,7 +83,7 @@ fn int_float(i: i64, f: f64) -> std::cmp::Ordering {
 impl Exec<'_, '_> {
     pub(super) fn eval_row(
         &mut self,
-        action: &RowAction<usize>,
+        action: &RowAction<usize, Val>,
         rows: BTreeSet<Row>,
     ) -> Result<BTreeSet<Row>, QueryError> {
         let mut out = BTreeSet::new();
@@ -188,6 +188,19 @@ impl Exec<'_, '_> {
         if id.is_edge() || !self.view.is_defined(id) {
             return Ok(false);
         }
+        if self.node_types.is_none() && !labels.is_empty() {
+            let mut types = HashSet::new();
+            for (name, _, _) in self
+                .world
+                .at_canon(self.view.canon())
+                .node_type_definitions()
+            {
+                self.budget.step(1)?;
+                self.budget.charge_bytes(64 + name.len())?;
+                types.insert(name.to_owned());
+            }
+            self.node_types = Some(types);
+        }
         let typed = self.world.format_id(id);
         let node_type = typed.rsplit_once('#').map(|(s, _)| s).unwrap_or("");
         for label in labels {
@@ -196,10 +209,9 @@ impl Exec<'_, '_> {
                 continue;
             }
             if self
-                .world
-                .at_canon(self.view.canon())
-                .node_type_definitions()
-                .any(|(name, _, _)| name == label)
+                .node_types
+                .as_ref()
+                .is_some_and(|types| types.contains(label))
             {
                 return Ok(false);
             }
@@ -219,6 +231,9 @@ impl Exec<'_, '_> {
     }
     fn property(&mut self, id: EntityId, key: &str, t: Tick) -> Result<Val, QueryError> {
         self.budget.step(1)?;
+        if let Some(value) = self.budget.memo(key).and_then(|m| m.property.get(&(id, t))) {
+            return Ok(value.clone());
+        }
         if !self.view.is_defined(id) {
             return Ok(Val::Null);
         }
@@ -275,31 +290,56 @@ impl Exec<'_, '_> {
         if values.is_empty() {
             return Ok(Val::Null);
         }
-        // Property lists are sorted sets. Precharge worst-case comparison work;
-        // the merge sort itself also checks cancellation on every comparison.
+        // All transient buffers and sort indices are charged only while alive.
+        let n = values.len();
         let order = crate::exec::sort_values(&values, &mut self.budget)?;
-        let values: Vec<_> = order.into_iter().map(|i| values[i].clone()).collect();
-        if many || values.len() > 1 {
-            self.budget.step(values.len() as u64)?;
-            let bytes = 64 + values.len().saturating_mul(std::mem::size_of::<Val>());
-            self.budget.charge_bytes(bytes)?;
-            let (value, new) = self.interner.list(values)?;
+        let list_bytes = 64 + n.saturating_mul(std::mem::size_of::<Val>());
+        self.budget.charge_bytes(list_bytes)?;
+        let sorted: Vec<_> = order.into_iter().map(|i| values[i].clone()).collect();
+        drop(values);
+        self.budget
+            .release_bytes(n.saturating_mul(64 + std::mem::size_of::<usize>()));
+        let value = if many || sorted.len() > 1 {
+            self.budget.step(sorted.len() as u64)?;
+            let (value, new) = self.interner.list(sorted)?;
             if !new {
-                self.budget.release_bytes(bytes);
+                self.budget.release_bytes(list_bytes);
             }
-            Ok(value)
+            value
         } else {
-            Ok(values[0].clone())
+            self.budget.release_bytes(list_bytes);
+            sorted[0].clone()
+        };
+        if let Some(memo) = self.budget.memo_slot(
+            key,
+            crate::exec::budget::MEMO_ENTRY_BYTES + std::mem::size_of::<Val>(),
+        ) {
+            memo.property.insert((id, t), value.clone());
         }
+        Ok(value)
     }
-    fn expression(&mut self, e: &Expr<usize>, row: &Row) -> Result<Val, QueryError> {
+    fn expression(&mut self, e: &Expr<usize, Val>, row: &Row) -> Result<Val, QueryError> {
         self.budget.step(1)?;
         Ok(match e {
             Expr::Var(s) => row[*s]
                 .clone()
                 .ok_or_else(|| QueryError::Plan("unbound expression".into()))?,
-            Expr::Value(v) => self.intern(v.clone())?,
+            Expr::Value(v) => v.clone(),
             Expr::Null => Val::Null,
+            Expr::List(values) => {
+                self.budget
+                    .charge_bytes(64 + values.len().saturating_mul(std::mem::size_of::<Val>()))?;
+                let values = values
+                    .iter()
+                    .map(|e| self.expression(e, row))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let bytes = 64 + values.len().saturating_mul(std::mem::size_of::<Val>());
+                let (v, new) = self.interner.list(values)?;
+                if !new {
+                    self.budget.release_bytes(bytes);
+                }
+                v
+            }
             Expr::Param(_) => unreachable!("parameters resolved by compile"),
             Expr::Property {
                 entity,
@@ -344,6 +384,12 @@ impl Exec<'_, '_> {
                             + result_row_bytes(std::slice::from_ref(&b)))
                             / 64) as u64,
                     )?;
+                    if matches!(op, CmpOp::Eq | CmpOp::Ne) {
+                        let equal = equal(&a, &b, &mut self.budget)?;
+                        return Ok(bool_value(
+                            equal.map(|v| if *op == CmpOp::Ne { !v } else { v }),
+                        ));
+                    }
                     let o = order(&a, &b, &mut self.budget.cmp);
                     self.budget.charge_cmp()?;
                     Val::Bool(match op {
@@ -357,5 +403,36 @@ impl Exec<'_, '_> {
                 }
             }
         })
+    }
+}
+
+/// A known differing list element decides false even if another element is NULL.
+fn equal(
+    a: &Val,
+    b: &Val,
+    budget: &mut crate::exec::budget::Budget,
+) -> Result<Option<bool>, QueryError> {
+    budget.step(1)?;
+    match (a, b) {
+        (Val::Null, _) | (_, Val::Null) => Ok(None),
+        (Val::List(_, a), Val::List(_, b)) => {
+            if a.len() != b.len() {
+                return Ok(Some(false));
+            }
+            let mut result = Some(true);
+            for (a, b) in a.iter().zip(b.iter()) {
+                match equal(a, b, budget)? {
+                    Some(false) => return Ok(Some(false)),
+                    None => result = None,
+                    _ => {}
+                }
+            }
+            Ok(result)
+        }
+        _ => {
+            let eq = order(a, b, &mut budget.cmp).is_eq();
+            budget.charge_cmp()?;
+            Ok(Some(eq))
+        }
     }
 }

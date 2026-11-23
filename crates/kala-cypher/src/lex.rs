@@ -217,7 +217,7 @@ pub(crate) fn lex(text: &str) -> Result<Vec<Token>, CypherError> {
                     break;
                 }
             }
-            let s = symbol.ok_or_else(|| error(i, "unsupported token"))?;
+            let s = symbol.ok_or_else(|| error(i, "token is not supported yet"))?;
             i += s.len();
             Kind::Symbol(s)
         };
