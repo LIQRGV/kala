@@ -52,7 +52,11 @@ pub struct ReadAt {
 #[command(group(ArgGroup::new("source").required(true).args(["query", "file"])))]
 pub struct QueryArgs {
     /// Query language (the REPL remains Datalog-only).
-    #[arg(long, default_value = "datalog", value_parser = ["datalog", "cypher"])]
+    #[arg(
+        long,
+        default_value = crate::cmd::language::NAMES[0],
+        value_parser = clap::builder::PossibleValuesParser::new(crate::cmd::language::NAMES)
+    )]
     pub lang: String,
     /// The query text.
     pub query: Option<String>,

@@ -127,20 +127,9 @@ fn prepare(world: &Path, q: &QueryArgs) -> Result<(Ctx, Prepared, QueryParams), 
         }
     };
     let ctx = Ctx::open(world, None)?;
-    // Datalog messages escape the input they echo; `main` escapes the
-    // whole line again.
-    let prepared = if q.lang == "cypher" {
-        kala_cypher::prepare(&ctx.world, &text)
-            .map_err(|e| CliError::User(format!("query: {e}")))?
-    } else {
-        kala_datalog::prepare(&ctx.world, &text)
-            .map_err(|e| CliError::User(format!("query: {e}")))?
-    };
-    let params = if q.lang == "cypher" {
-        parse_cypher_params(&ctx, &prepared.params, &q.params)?
-    } else {
-        parse_params(&ctx, &prepared.params, &q.params)?.into()
-    };
+    let front_end = super::language::front_end(&q.lang)?;
+    let prepared = front_end.prepare(&ctx.world, &text)?;
+    let params = front_end.params(&ctx, &prepared.params, &q.params)?;
     Ok((ctx, prepared, params))
 }
 
@@ -309,7 +298,7 @@ pub(crate) fn query_err(e: QueryError, whose: &str) -> CliError {
     }
 }
 
-fn parse_cypher_params(
+pub(crate) fn parse_cypher_params(
     ctx: &Ctx,
     kinds: &[(String, ParamKind)],
     given: &[(String, String)],

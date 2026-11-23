@@ -10,6 +10,7 @@ pub mod export;
 pub mod find;
 pub mod history;
 pub mod info;
+pub(crate) mod language;
 pub mod list;
 pub mod load;
 pub mod log;
