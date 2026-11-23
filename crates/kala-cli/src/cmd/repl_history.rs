@@ -25,51 +25,82 @@ pub(super) struct History {
     bytes: usize,
 }
 
+fn open_err(e: impl std::fmt::Display) -> CliError {
+    CliError::User(format!("history: {e}"))
+}
+
+/// Opens the history file, creating it private (0600) if it is missing,
+/// and never through a symlink.
+fn open_private(path: &Path) -> Result<File, CliError> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    // On non-Unix platforms std does not expose no-follow opens. Refuse
+    // existing paths there instead of silently weakening the guarantee.
+    match options.create_new(true).open(path) {
+        Ok(file) => Ok(file),
+        #[cfg(unix)]
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            options.create_new(false).open(path).map_err(open_err)
+        }
+        Err(e) => Err(open_err(e)),
+    }
+}
+
+/// Requires a regular file of bounded size that is neither the world nor
+/// hard-linked elsewhere, and narrows its permissions to 0600.
+fn check_private(file: &File, world: &Path) -> Result<(), CliError> {
+    let meta = file.metadata().map_err(open_err)?;
+    if !meta.is_file() {
+        return Err(open_err("not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let world_meta = std::fs::metadata(world).map_err(open_err)?;
+        if meta.nlink() != 1 || (meta.dev() == world_meta.dev() && meta.ino() == world_meta.ino()) {
+            return Err(open_err(
+                "history must not alias the world or have hard links",
+            ));
+        }
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(open_err)?;
+    }
+    #[cfg(not(unix))]
+    let _ = world;
+    if meta.len() > MAX_HISTORY_BYTES as u64 {
+        return Err(open_err("history exceeds 1 MiB"));
+    }
+    Ok(())
+}
+
+/// The saved entries, one JSON string per line.
+fn parse_entries(text: &str) -> impl Iterator<Item = Result<String, CliError>> + '_ {
+    // A save cut short (a full disk) leaves an unterminated last line.
+    // Only that line may fail to parse; it is dropped. Every
+    // newline-terminated line is parsed strictly.
+    let (complete, tail) = match text.rfind('\n') {
+        Some(i) if i + 1 < text.len() => (&text[..=i], Some(&text[i + 1..])),
+        None if !text.is_empty() => ("", Some(text)),
+        _ => (text, None),
+    };
+    let tail = tail.and_then(|t| serde_json::from_str::<String>(t).ok());
+    complete
+        .lines()
+        .map(|line| serde_json::from_str::<String>(line).map_err(open_err))
+        .chain(tail.map(Ok))
+}
+
 impl History {
     pub(super) fn open(path: &Path, world: &Path) -> Result<Self, CliError> {
-        fn io(e: impl std::fmt::Display) -> CliError {
-            CliError::User(format!("history: {e}"))
-        }
-        let mut options = OpenOptions::new();
-        options.read(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        }
-        // On non-Unix platforms std does not expose no-follow opens. Refuse
-        // existing paths there instead of silently weakening the guarantee.
-        let file = match options.create_new(true).open(path) {
-            Ok(file) => file,
-            #[cfg(unix)]
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                options.create_new(false).open(path).map_err(io)?
-            }
-            Err(e) => return Err(io(e)),
-        };
-        let meta = file.metadata().map_err(io)?;
-        if !meta.is_file() {
-            return Err(io("not a regular file"));
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            let world_meta = std::fs::metadata(world).map_err(io)?;
-            if meta.nlink() != 1
-                || (meta.dev() == world_meta.dev() && meta.ino() == world_meta.ino())
-            {
-                return Err(io("history must not alias the world or have hard links"));
-            }
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(io)?;
-        }
-        #[cfg(not(unix))]
-        let _ = world;
-        if meta.len() > MAX_HISTORY_BYTES as u64 {
-            return Err(io("history exceeds 1 MiB"));
-        }
+        let file = open_private(path)?;
+        check_private(&file, world)?;
         let mut history = Self {
             file,
             entries: VecDeque::new(),
@@ -79,33 +110,20 @@ impl History {
         (&mut history.file)
             .take(MAX_HISTORY_BYTES as u64 + 1)
             .read_to_end(&mut contents)
-            .map_err(io)?;
+            .map_err(open_err)?;
         if contents.len() > MAX_HISTORY_BYTES {
-            return Err(io("history exceeds 1 MiB"));
+            return Err(open_err("history exceeds 1 MiB"));
         }
-        let text = String::from_utf8(contents).map_err(io)?;
-        // A save cut short (a full disk) leaves an unterminated last line.
-        // Only that line may fail to parse; it is dropped. Every
-        // newline-terminated line is parsed strictly.
-        let (complete, tail) = match text.rfind('\n') {
-            Some(i) if i + 1 < text.len() => (&text[..=i], Some(&text[i + 1..])),
-            None if !text.is_empty() => ("", Some(text.as_str())),
-            _ => (text.as_str(), None),
-        };
-        let tail = tail.and_then(|t| serde_json::from_str::<String>(t).ok());
-        let parsed = complete
-            .lines()
-            .map(|line| serde_json::from_str::<String>(line).map_err(io))
-            .chain(tail.map(Ok));
-        for entry in parsed {
+        let text = String::from_utf8(contents).map_err(open_err)?;
+        for entry in parse_entries(&text) {
             // One JSON string per line preserves multiline queries without
             // granting history files any command-execution semantics.
             let entry = entry?;
             if entry.len() > MAX_QUERY_BYTES {
-                return Err(io("history entry exceeds the query limit"));
+                return Err(open_err("history entry exceeds the query limit"));
             }
             if !safe_entry(&entry) {
-                return Err(io(
+                return Err(open_err(
                     "history entry contains unsafe control or formatting characters",
                 ));
             }
