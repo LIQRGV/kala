@@ -11,7 +11,7 @@ use crate::ir::{Access, Agg, AggFn, AttrRef, Func, Op, OpTerm, Predicate, Term, 
 use super::agg::{agg_takes, agg_wants};
 use super::program::{AggStep, Attr, Pos, Program, Slots, Step, TickPos, Variant, pop};
 use super::val::{CmpWork, Interner, Val, ValKind, compare};
-use super::{ParameterInput, QueryError, tick_param, type_name};
+use super::{ParameterInput, QueryError, tick_param};
 
 /// One item of a plan's walk, in execution order.
 enum Visit<'p> {
@@ -1075,7 +1075,7 @@ fn entity_pos(
         Term::Const(c) => {
             return Err(QueryError::TypeMismatch(format!(
                 "{what} position needs an entity, got {}",
-                type_name(c.value_type())
+                c.value_type().name()
             )));
         }
         Term::Op(_) | Term::Precision(_) => {
@@ -1111,14 +1111,14 @@ fn value_pos(
         Term::Const(c) => {
             return Err(QueryError::TypeMismatch(format!(
                 "value position needs {}, got {}",
-                type_name(ty),
-                type_name(c.value_type())
+                ty.name(),
+                c.value_type().name()
             )));
         }
         Term::Op(_) | Term::Precision(_) => {
             return Err(QueryError::TypeMismatch(format!(
                 "value position needs {}, got an op",
-                type_name(ty)
+                ty.name()
             )));
         }
         Term::Param(name) => match param(params, name)? {
@@ -1126,7 +1126,7 @@ fn value_pos(
             _ => {
                 return Err(QueryError::ParamType {
                     name: name.clone(),
-                    expected: type_name(ty).into(),
+                    expected: ty.name().into(),
                 });
             }
         },
@@ -1147,7 +1147,7 @@ fn tick_term_pos(
         Term::Const(c) => {
             return Err(QueryError::TypeMismatch(format!(
                 "History tick position needs i64, got {}",
-                type_name(c.value_type())
+                c.value_type().name()
             )));
         }
         Term::Op(_) | Term::Precision(_) => {

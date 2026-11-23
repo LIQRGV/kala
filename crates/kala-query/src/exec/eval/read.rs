@@ -10,12 +10,12 @@ use kala_core::{Direction, EntityId, IntervalSet, Op as FactOp, Tick, Value};
 use crate::ir::Access;
 
 use super::{Exec, absent_as_empty, bind_all, not_an_entity, resolve, value_of};
+use crate::exec::QueryError;
 use crate::exec::budget::MEMO_ENTRY_BYTES;
 use crate::exec::program::{Attr, Pos};
 use crate::exec::val::{
     PAIR_BYTES, POINT_BYTES, Pairs, Points, Row, SET_ENTRY_BYTES, Sets, Val, ValKind, set_bytes,
 };
-use crate::exec::{QueryError, type_name};
 
 impl Exec<'_, '_> {
     /// The `(entity, value)` pairs of `attr` holding at `t` that `access`
@@ -44,7 +44,7 @@ impl Exec<'_, '_> {
                 return Err(QueryError::TypeMismatch(format!(
                     ":{} needs {} values, got {}",
                     attr.name,
-                    type_name(attr.value_type),
+                    attr.value_type.name(),
                     v.kind().name()
                 )));
             }
@@ -214,7 +214,7 @@ impl Exec<'_, '_> {
                 return Err(QueryError::TypeMismatch(format!(
                     ":{} needs {} values, got {}",
                     attr.name,
-                    type_name(attr.value_type),
+                    attr.value_type.name(),
                     v.kind().name()
                 )));
             }
@@ -298,7 +298,7 @@ impl Exec<'_, '_> {
                 return Err(QueryError::TypeMismatch(format!(
                     ":{} needs {} values, got {}",
                     attr.name,
-                    type_name(attr.value_type),
+                    attr.value_type.name(),
                     v.kind().name()
                 )));
             }

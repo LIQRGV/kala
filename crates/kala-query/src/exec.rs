@@ -50,7 +50,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 
-use kala_core::{Error as CoreError, Tick, TxId, Value, ValueType, View, WorkMeter, World};
+use kala_core::{Error as CoreError, Tick, TxId, Value, View, WorkMeter, World};
 
 use crate::ParameterInput;
 use crate::datum::Datum;
@@ -434,16 +434,6 @@ fn tick_param(params: &dyn ParameterInput, name: &str) -> Result<Tick, QueryErro
             name: name.to_owned(),
             expected: "i64".into(),
         }),
-    }
-}
-
-fn type_name(t: ValueType) -> &'static str {
-    match t {
-        ValueType::Bool => "bool",
-        ValueType::I64 => "i64",
-        ValueType::F64 => "f64",
-        ValueType::Str => "string",
-        ValueType::Ref => "ref",
     }
 }
 

@@ -1,6 +1,6 @@
 use super::*;
 use crate::ir::{Access, AttrRef, Op, Term};
-use kala_core::{AttrDef, Cardinality, Kind, Schema, WorkInterruptReason};
+use kala_core::{AttrDef, Cardinality, Kind, Schema, ValueType, WorkInterruptReason};
 use proptest::prelude::*;
 use std::sync::atomic::Ordering as AtomicOrdering;
 
