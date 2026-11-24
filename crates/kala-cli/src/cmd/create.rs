@@ -8,6 +8,7 @@ use crate::{
 use kala_core::{AttrDef, Cardinality, Kind, Schema, World};
 use kala_datalog::ast::{WriteOp, WriteTxn};
 use serde_json::json;
+use std::path::Path;
 
 fn user(s: &str) -> CliError {
     CliError::User(s.into())
@@ -122,6 +123,18 @@ pub fn replay(args: &TransactArgs) -> Result<String, CliError> {
     transfer::absent(path)?;
     let text = transfer::input(source)?;
     let mut forms = kala_datalog::restore_forms(&text);
+    let (stage, mut world, system) = restore_genesis(path, forms.next())?;
+    restore_transactions(&mut world, forms, system)?;
+    let transactions = world.latest_tx().0;
+    let entries = world.entries().count();
+    place_restore(path, stage, world, system)?;
+    restored_report(path, transactions, entries, system, as_json)
+}
+
+fn restore_genesis(
+    path: &Path,
+    first: Option<Result<WriteTxn, kala_datalog::DatalogError>>,
+) -> Result<(transfer::Staging, World, bool), CliError> {
     // Diagnostics never echo the content of an accounts database dump (it
     // holds password hashes). Until the genesis says what the dump is, a
     // failure is reported without content, even for a malicious input that
@@ -131,8 +144,7 @@ pub fn replay(args: &TransactArgs) -> Result<String, CliError> {
             "invalid restore form (content withheld); expected a valid genesis followed by write transactions",
         )
     };
-    let first = forms
-        .next()
+    let first = first
         .ok_or_else(|| user("dump must start with [:genesis ...]"))?
         .map_err(|_| withheld())?;
     if !first.genesis {
@@ -142,12 +154,20 @@ pub fn replay(args: &TransactArgs) -> Result<String, CliError> {
     let stage = transfer::Staging::new(path)?;
     let genesis =
         schema(first.ops).map_err(|_| user("invalid genesis schema (content withheld)"))?;
-    let mut world = World::create(&stage.path, genesis).map_err(|_| user("cannot create restore world: invalid genesis or unavailable storage (content withheld)"))?;
+    let world = World::create(&stage.path, genesis).map_err(|_| user("cannot create restore world: invalid genesis or unavailable storage (content withheld)"))?;
     let system = kala_system::is_system(&world);
     // Only Kala's own accounts database may carry reserved names.
     if reserved_names && !system {
         return Err(reserved_error());
     }
+    Ok((stage, world, system))
+}
+
+fn restore_transactions(
+    world: &mut World,
+    forms: impl Iterator<Item = Result<WriteTxn, kala_datalog::DatalogError>>,
+    system: bool,
+) -> Result<(), CliError> {
     // An ordinary world's dump holds no secrets: name the failing form and
     // the reason, so an author can fix an edited dump.
     let failed = |i: usize, e: &str| {
@@ -164,11 +184,17 @@ pub fn replay(args: &TransactArgs) -> Result<String, CliError> {
         if form.genesis {
             return Err(user("genesis must be the first and only genesis form"));
         }
-        transact::execute_restore(&mut world, &form, None)
-            .map_err(|e| failed(i + 1, e.message()))?;
+        transact::execute_restore(world, &form, None).map_err(|e| failed(i + 1, e.message()))?;
     }
-    let transactions = world.latest_tx().0;
-    let entries = world.entries().count();
+    Ok(())
+}
+
+fn place_restore(
+    path: &Path,
+    stage: transfer::Staging,
+    world: World,
+    system: bool,
+) -> Result<(), CliError> {
     if path.file_name().is_some_and(|n| n == "system.kala") && !system {
         return Err(user("system.kala requires an accounts database dump"));
     }
@@ -186,6 +212,16 @@ pub fn replay(args: &TransactArgs) -> Result<String, CliError> {
             .map_err(transfer::io)?;
     }
     stage.place(path, false, system)?;
+    Ok(())
+}
+
+fn restored_report(
+    path: &Path,
+    transactions: u64,
+    entries: usize,
+    system: bool,
+    as_json: bool,
+) -> Result<String, CliError> {
     eprintln!("event=world_restored transactions={transactions} entries={entries} system={system}");
     if system {
         eprintln!("warning: restored an accounts database; protect it like the server directory");
