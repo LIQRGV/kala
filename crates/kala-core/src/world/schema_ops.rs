@@ -55,16 +55,16 @@ fn check_new_node_type_name(name: &str) -> Result<(), Error> {
 }
 
 impl SchemaSnapshot {
-    fn capture(world: &World) -> Self {
+    fn capture(catalog: &Catalog) -> Self {
         Self {
-            attributes: world.catalog.attributes.clone(),
-            history: world.catalog.attribute_history.clone(),
-            origins: world.catalog.node_origins.clone(),
-            settings: world.catalog.settings.clone(),
-            node_count: world.catalog.node_types.len(),
+            attributes: catalog.attributes.clone(),
+            history: catalog.attribute_history.clone(),
+            origins: catalog.node_origins.clone(),
+            settings: catalog.settings.clone(),
+            node_count: catalog.node_types.len(),
         }
     }
-    /// Whether the schema edits since this snapshot (now applied to `world`)
+    /// Whether the schema edits since this snapshot (now applied to `catalog`)
     /// can change overlap warnings beyond the sides the transaction's facts
     /// touch: any change to an existing attribute other than its inferred or
     /// deprecated flag (cardinality and reverse labels decide which sides are
@@ -73,10 +73,10 @@ impl SchemaSnapshot {
     /// attributes and node types, deprecations and settings can't: a new
     /// attribute has no stored facts, so only its staged ones (touched
     /// sides) can overlap.
-    pub(super) fn changes_overlaps(&self, world: &World) -> bool {
+    pub(super) fn changes_overlaps(&self, catalog: &Catalog) -> bool {
         self.attributes
             .iter()
-            .zip(&world.catalog.attributes)
+            .zip(&catalog.attributes)
             .any(|(old, new)| {
                 old.name != new.name
                     || old.value_type != new.value_type
@@ -88,56 +88,95 @@ impl SchemaSnapshot {
                     || old.reverse_cardinality != new.reverse_cardinality
             })
     }
-    pub(super) fn restore(self, world: &mut World) {
-        world.catalog.attributes = self.attributes;
-        world.catalog.attribute_history = self.history;
-        world.catalog.node_origins = self.origins;
-        world.catalog.settings = self.settings;
-        world.catalog.node_types.truncate(self.node_count);
-        world.rebuild_schema_names();
+    pub(super) fn restore(self, catalog: &mut Catalog) {
+        catalog.attributes = self.attributes;
+        catalog.attribute_history = self.history;
+        catalog.node_origins = self.origins;
+        catalog.settings = self.settings;
+        catalog.node_types.truncate(self.node_count);
+        catalog.rebuild_schema_names();
     }
 }
 
-impl World {
+/// The schema half of the catalog: validating and applying schema edits.
+/// Live edits and replay both go through [`Catalog::apply_schema_edit`].
+impl Catalog {
+    /// Rebuilds the name tables (attributes, inverses, node types) from the
+    /// definitions, after an edit or a restore changed them.
     fn rebuild_schema_names(&mut self) {
-        self.catalog.attr_by_name.clear();
-        self.catalog.inverse_by_name.clear();
-        for (i, def) in self.catalog.attributes.iter().enumerate() {
+        self.attr_by_name.clear();
+        self.inverse_by_name.clear();
+        for (i, def) in self.attributes.iter().enumerate() {
             let id = AttrId(i as u32);
-            self.catalog.attr_by_name.insert(def.name.clone(), id);
+            self.attr_by_name.insert(def.name.clone(), id);
             if let Some(name) = &def.inverse {
-                self.catalog.inverse_by_name.insert(name.clone(), id);
+                self.inverse_by_name.insert(name.clone(), id);
             }
         }
-        self.catalog.node_type_by_name = self
-            .catalog
+        self.node_type_by_name = self
             .node_types
             .iter()
             .enumerate()
             .map(|(i, n)| (n.name.clone(), NodeTypeId(i as u16)))
             .collect();
     }
-    /// The transaction that first defined this attribute.
-    pub fn attribute_first_tx(&self, name: &str) -> Option<TxId> {
-        let id = self.catalog.attr_by_name.get(name)?;
-        Some(self.catalog.attribute_history[id.0 as usize].first()?.0)
+
+    /// The transaction that first defined attribute `name`.
+    fn attribute_first_tx(&self, name: &str) -> Option<TxId> {
+        let id = self.attr_by_name.get(name)?;
+        Some(self.attribute_history[id.0 as usize].first()?.0)
     }
-    /// Latest value of a generic setting. Schema inference defaults to `infer`.
-    pub fn world_setting(&self, key: &str) -> Option<&str> {
-        self.catalog
-            .settings
+
+    /// Latest value of a generic setting (see [`World::world_setting`]).
+    pub(super) fn setting(&self, key: &str) -> Option<&str> {
+        self.settings
             .iter()
             .rev()
             .find(|(_, k, _)| k == key)
             .map(|(_, _, v)| v.as_str())
             .or_else(|| (key == "schema").then_some("infer"))
     }
-    fn validate_attr_edit(&self, id: AttrId, def: &AttrDef, migration: bool) -> Result<(), Error> {
+
+    /// Whether the world refuses to infer declarations (`schema = strict`).
+    fn is_strict(&self) -> bool {
+        self.setting("schema") == Some("strict")
+    }
+
+    /// Checks that defining attribute `id` as `def` is a valid edit: the
+    /// next ID or an existing one, valid and unused names, and then the
+    /// rules for a redefinition or a new attribute. `migration` relaxes the
+    /// rules a migration's own edits are exempt from; `has_facts` says
+    /// whether the attribute already has stored fact entries.
+    fn validate_attr_edit(
+        &self,
+        id: AttrId,
+        def: &AttrDef,
+        migration: bool,
+        has_facts: bool,
+    ) -> Result<(), Error> {
         let index = id.0 as usize;
-        if index > self.catalog.attributes.len() {
+        if index > self.attributes.len() {
             return Err(Error::Schema("attribute ID is not the next ID".into()));
         }
-        let old = self.catalog.attributes.get(index);
+        let old = self.attributes.get(index);
+        self.check_attr_name(id, old, def, migration)?;
+        self.check_inverse_name(id, old, def)?;
+        match old {
+            Some(old) => check_attr_redefinition(old, def, migration, has_facts),
+            None => self.check_new_attr(def),
+        }
+    }
+
+    /// The name and direction rules of an attribute edit: a name the edit
+    /// introduces is a valid new name (a migration's rename to `x@old` is
+    /// exempt), and no other attribute or inverse has it.
+    fn check_attr_name(
+        &self,
+        id: AttrId,
+        old: Option<&AttrDef>,
+        def: &AttrDef,
+        migration: bool,
+    ) -> Result<(), Error> {
         let same_name = old.is_some_and(|old| old.name == def.name);
         if !same_name && !migration {
             check_new_name(&def.name)?;
@@ -147,179 +186,288 @@ impl World {
         }
         check_direction(def)?;
         if self
-            .catalog
             .attr_by_name
             .get(&def.name)
             .is_some_and(|other| *other != id)
-            || self.catalog.inverse_by_name.contains_key(&def.name)
+            || self.inverse_by_name.contains_key(&def.name)
         {
             return Err(Error::DuplicateName(def.name.clone()));
         }
-        if let Some(inverse) = &def.inverse {
-            if old.is_some_and(|old| old.inverse.as_ref() == Some(inverse)) {
-                check_name(inverse)?;
-            } else {
-                check_new_name(inverse)?;
-            }
-            if inverse == &def.name
-                || self.catalog.attr_by_name.contains_key(inverse)
-                || self
-                    .catalog
-                    .inverse_by_name
-                    .get(inverse)
-                    .is_some_and(|other| *other != id)
-            {
-                return Err(Error::DuplicateName(inverse.clone()));
-            }
-        }
-        if let Some(old) = old {
-            if !old.inferred && def.inferred {
-                return Err(Error::Schema(
-                    "a declared attribute cannot become inferred".into(),
-                ));
-            }
-            let mut renamed = old.clone();
-            renamed.name = def.name.clone();
-            let mut relabelled = old.clone();
-            relabelled.cardinality = def.cardinality;
-            if old.deprecated && &renamed != def && &relabelled != def {
-                return Err(Error::DeprecatedAttribute(old.name.clone()));
-            }
-            if old.name != def.name && &renamed != def && !migration {
-                return Err(Error::Schema(
-                    "rename cannot also change the definition".into(),
-                ));
-            }
-            if !migration {
-                let mut deprecated = old.clone();
-                deprecated.deprecated = true;
-                if old.deprecated != def.deprecated && def != &deprecated {
-                    return Err(Error::Schema(
-                        "deprecation cannot also change the definition".into(),
-                    ));
-                }
-                if def.inferred {
-                    let mut cardinality = old.clone();
-                    cardinality.cardinality = def.cardinality;
-                    if def != &renamed && def != &deprecated && def != &cardinality {
-                        return Err(Error::Schema("an inferred definition can only be renamed, deprecated or relabelled; redeclaration must mark it declared".into()));
-                    }
-                }
-            }
-            if structural_change(old, def) && self.indexes.attr_counts.contains_key(&id) {
-                return Err(migrate_hint(&old.name));
-            }
-            if old.inverse.is_some() && old.inverse != def.inverse && !migration {
-                return Err(Error::Schema(
-                    "renaming or removing an inverse is not supported; use migrate".into(),
-                ));
-            }
+        Ok(())
+    }
+
+    /// The inverse-name rules of an attribute edit: an inverse the edit
+    /// introduces is a valid new name, and it is no attribute's name (its
+    /// own included) and no other attribute's inverse.
+    fn check_inverse_name(
+        &self,
+        id: AttrId,
+        old: Option<&AttrDef>,
+        def: &AttrDef,
+    ) -> Result<(), Error> {
+        let Some(inverse) = &def.inverse else {
+            return Ok(());
+        };
+        if old.is_some_and(|old| old.inverse.as_ref() == Some(inverse)) {
+            check_name(inverse)?;
         } else {
-            if def.deprecated {
-                return Err(Error::Schema("a new attribute cannot be deprecated".into()));
-            }
-            if def.inferred {
-                let mut expected = AttrDef::new(
-                    &def.name,
-                    def.value_type,
-                    Kind::State,
-                    if def.value_type == ValueType::Ref {
-                        Cardinality::Many
-                    } else {
-                        Cardinality::One
-                    },
-                );
-                expected.inferred = true;
-                if self.world_setting("schema") == Some("strict") || *def != expected {
-                    return Err(Error::Schema(
-                        "invalid inferred attribute definition or inference in strict mode".into(),
-                    ));
-                }
+            check_new_name(inverse)?;
+        }
+        if inverse == &def.name
+            || self.attr_by_name.contains_key(inverse)
+            || self
+                .inverse_by_name
+                .get(inverse)
+                .is_some_and(|other| *other != id)
+        {
+            return Err(Error::DuplicateName(inverse.clone()));
+        }
+        Ok(())
+    }
+
+    /// The rules for a new attribute: never born deprecated, and an
+    /// inferred one has exactly the inference defaults and needs a world
+    /// that isn't strict.
+    fn check_new_attr(&self, def: &AttrDef) -> Result<(), Error> {
+        if def.deprecated {
+            return Err(Error::Schema("a new attribute cannot be deprecated".into()));
+        }
+        if def.inferred {
+            let mut expected = AttrDef::new(
+                &def.name,
+                def.value_type,
+                Kind::State,
+                if def.value_type == ValueType::Ref {
+                    Cardinality::Many
+                } else {
+                    Cardinality::One
+                },
+            );
+            expected.inferred = true;
+            if self.is_strict() || *def != expected {
+                return Err(Error::Schema(
+                    "invalid inferred attribute definition or inference in strict mode".into(),
+                ));
             }
         }
         Ok(())
     }
+
+    /// Validates and applies one schema edit of transaction `tx`.
+    /// `migration` marks an edit that is part of a migration's own
+    /// sequence; `has_facts` says whether an attribute already has stored
+    /// fact entries (the indexes know, not the catalog).
+    pub(super) fn apply_schema_edit(
+        &mut self,
+        edit: &SchemaEdit,
+        tx: TxId,
+        migration: bool,
+        has_facts: impl Fn(AttrId) -> bool,
+    ) -> Result<(), Error> {
+        match edit {
+            SchemaEdit::Attribute { id, def } => {
+                self.apply_attr_edit(*id, def, tx, migration, has_facts(*id))
+            }
+            SchemaEdit::NodeType { id, name, inferred } => {
+                self.apply_node_type_edit(*id, name, *inferred, tx)
+            }
+            SchemaEdit::Setting { key, value } => self.apply_setting(key, value, tx),
+            SchemaEdit::Migration { .. } => Err(Error::Schema(
+                "migration must be replayed as a validated copy sequence".into(),
+            )),
+        }
+    }
+
+    /// Applies an attribute edit: a new attribute (the next ID) or a
+    /// redefinition, which must change something.
+    fn apply_attr_edit(
+        &mut self,
+        id: AttrId,
+        def: &AttrDef,
+        tx: TxId,
+        migration: bool,
+        has_facts: bool,
+    ) -> Result<(), Error> {
+        self.validate_attr_edit(id, def, migration, has_facts)?;
+        let i = id.0 as usize;
+        if i == self.attributes.len() {
+            self.attributes.push(def.clone());
+            self.attribute_history.push(vec![(tx, def.clone())]);
+        } else {
+            if self.attributes[i] == *def {
+                return Err(Error::Schema("a schema no-op is not a log entry".into()));
+            }
+            self.attributes[i] = def.clone();
+            // Names resolve through the latest namespace, including old canons.
+            for (_, old) in &mut self.attribute_history[i] {
+                old.name.clone_from(&def.name);
+            }
+            self.attribute_history[i].push((tx, def.clone()));
+        }
+        self.rebuild_schema_names();
+        Ok(())
+    }
+
+    /// Applies a node type edit: a new node type (the next ID), or an
+    /// inferred one being confirmed as declared.
+    fn apply_node_type_edit(
+        &mut self,
+        id: NodeTypeId,
+        name: &str,
+        inferred: bool,
+        tx: TxId,
+    ) -> Result<(), Error> {
+        // Genesis node types are declared, so they never reach the
+        // redefinition branch: every edit here is a new name or an
+        // inferred one being confirmed.
+        check_new_node_type_name(name)?;
+        let i = usize::from(id.0);
+        if id.0 > MAX_NODE_TYPE || i > self.node_types.len() {
+            return Err(Error::Schema(
+                "node type ID out of sequence or range".into(),
+            ));
+        }
+        if i == self.node_types.len() {
+            if inferred && self.is_strict() {
+                return Err(Error::Schema(
+                    "cannot infer a node type in strict mode".into(),
+                ));
+            }
+            if self.node_type_by_name.contains_key(name) {
+                return Err(Error::DuplicateName(name.to_owned()));
+            }
+            self.node_types.push(NodeType {
+                name: name.to_owned(),
+                defined_in: Vec::new(),
+            });
+            self.node_origins.push(vec![(tx, inferred)]);
+            self.node_type_by_name.insert(name.to_owned(), id);
+        } else {
+            if self.node_types[i].name != *name
+                || inferred
+                || !self.node_origins[i].last().is_some_and(|(_, v)| *v)
+            {
+                return Err(Error::Schema("invalid node type redefinition".into()));
+            }
+            self.node_origins[i].push((tx, false));
+        }
+        Ok(())
+    }
+
+    /// Applies a world setting, which must be valid and change something.
+    fn apply_setting(&mut self, key: &str, value: &str, tx: TxId) -> Result<(), Error> {
+        if key.is_empty()
+            || value.is_empty()
+            || (key == "schema" && value != "strict" && value != "infer")
+        {
+            return Err(Error::Schema("schema setting must be :strict or :infer; setting keys and values must be nonempty".into()));
+        }
+        if self.setting(key) == Some(value) {
+            return Err(Error::Schema("a setting no-op is not a log entry".into()));
+        }
+        self.settings.push((tx, key.to_owned(), value.to_owned()));
+        Ok(())
+    }
+
+    /// Whether the two catalogs declare the same schema (doctor compares a
+    /// world with its rebuild).
+    fn schema_matches(&self, other: &Self) -> bool {
+        self.attributes == other.attributes
+            && self.attribute_history == other.attribute_history
+            && self.node_origins == other.node_origins
+            && self.settings == other.settings
+            && self.attr_by_name == other.attr_by_name
+            && self.inverse_by_name == other.inverse_by_name
+            && self.node_type_by_name == other.node_type_by_name
+            && self
+                .node_types
+                .iter()
+                .map(|n| &n.name)
+                .eq(other.node_types.iter().map(|n| &n.name))
+    }
+}
+
+/// The rules for redefining existing attribute `old` as `def`: what one
+/// edit may change, and what is refused once the attribute has facts.
+fn check_attr_redefinition(
+    old: &AttrDef,
+    def: &AttrDef,
+    migration: bool,
+    has_facts: bool,
+) -> Result<(), Error> {
+    if !old.inferred && def.inferred {
+        return Err(Error::Schema(
+            "a declared attribute cannot become inferred".into(),
+        ));
+    }
+    let mut renamed = old.clone();
+    renamed.name = def.name.clone();
+    let mut relabelled = old.clone();
+    relabelled.cardinality = def.cardinality;
+    if old.deprecated && &renamed != def && &relabelled != def {
+        return Err(Error::DeprecatedAttribute(old.name.clone()));
+    }
+    if old.name != def.name && &renamed != def && !migration {
+        return Err(Error::Schema(
+            "rename cannot also change the definition".into(),
+        ));
+    }
+    if !migration {
+        check_single_purpose_edit(old, def, &renamed)?;
+    }
+    if structural_change(old, def) && has_facts {
+        return Err(migrate_hint(&old.name));
+    }
+    if old.inverse.is_some() && old.inverse != def.inverse && !migration {
+        return Err(Error::Schema(
+            "renaming or removing an inverse is not supported; use migrate".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Outside a migration, one edit does one thing: a deprecation changes
+/// nothing else, and an inferred definition is only renamed (`renamed`:
+/// `old` under `def`'s name), deprecated or relabelled.
+fn check_single_purpose_edit(old: &AttrDef, def: &AttrDef, renamed: &AttrDef) -> Result<(), Error> {
+    let mut deprecated = old.clone();
+    deprecated.deprecated = true;
+    if old.deprecated != def.deprecated && def != &deprecated {
+        return Err(Error::Schema(
+            "deprecation cannot also change the definition".into(),
+        ));
+    }
+    if def.inferred {
+        let mut cardinality = old.clone();
+        cardinality.cardinality = def.cardinality;
+        if def != renamed && def != &deprecated && def != &cardinality {
+            return Err(Error::Schema("an inferred definition can only be renamed, deprecated or relabelled; redeclaration must mark it declared".into()));
+        }
+    }
+    Ok(())
+}
+
+impl World {
+    /// The transaction that first defined this attribute.
+    pub fn attribute_first_tx(&self, name: &str) -> Option<TxId> {
+        self.catalog.attribute_first_tx(name)
+    }
+    /// Latest value of a generic setting. Schema inference defaults to `infer`.
+    pub fn world_setting(&self, key: &str) -> Option<&str> {
+        self.catalog.setting(key)
+    }
+    /// Validates and applies one schema edit of transaction `tx` (see
+    /// [`Catalog::apply_schema_edit`]); the indexes say which attributes
+    /// already have facts.
     pub(super) fn apply_schema_edit(
         &mut self,
         edit: &SchemaEdit,
         tx: TxId,
         migration: bool,
     ) -> Result<(), Error> {
-        match edit {
-            SchemaEdit::Attribute { id, def } => {
-                self.validate_attr_edit(*id, def, migration)?;
-                let i = id.0 as usize;
-                if i == self.catalog.attributes.len() {
-                    self.catalog.attributes.push(def.clone());
-                    self.catalog.attribute_history.push(vec![(tx, def.clone())]);
-                } else {
-                    if self.catalog.attributes[i] == *def {
-                        return Err(Error::Schema("a schema no-op is not a log entry".into()));
-                    }
-                    self.catalog.attributes[i] = def.clone();
-                    // Names resolve through the latest namespace, including old canons.
-                    for (_, old) in &mut self.catalog.attribute_history[i] {
-                        old.name.clone_from(&def.name);
-                    }
-                    self.catalog.attribute_history[i].push((tx, def.clone()));
-                }
-                self.rebuild_schema_names();
-            }
-            SchemaEdit::NodeType { id, name, inferred } => {
-                // Genesis node types are declared, so they never reach the
-                // redefinition branch: every edit here is a new name or an
-                // inferred one being confirmed.
-                check_new_node_type_name(name)?;
-                let i = usize::from(id.0);
-                if id.0 > MAX_NODE_TYPE || i > self.catalog.node_types.len() {
-                    return Err(Error::Schema(
-                        "node type ID out of sequence or range".into(),
-                    ));
-                }
-                if i == self.catalog.node_types.len() {
-                    if *inferred && self.world_setting("schema") == Some("strict") {
-                        return Err(Error::Schema(
-                            "cannot infer a node type in strict mode".into(),
-                        ));
-                    }
-                    if self.catalog.node_type_by_name.contains_key(name) {
-                        return Err(Error::DuplicateName(name.clone()));
-                    }
-                    self.catalog.node_types.push(NodeType {
-                        name: name.clone(),
-                        defined_in: Vec::new(),
-                    });
-                    self.catalog.node_origins.push(vec![(tx, *inferred)]);
-                    self.catalog.node_type_by_name.insert(name.clone(), *id);
-                } else {
-                    if self.catalog.node_types[i].name != *name
-                        || *inferred
-                        || !self.catalog.node_origins[i].last().is_some_and(|(_, v)| *v)
-                    {
-                        return Err(Error::Schema("invalid node type redefinition".into()));
-                    }
-                    self.catalog.node_origins[i].push((tx, false));
-                }
-            }
-            SchemaEdit::Setting { key, value } => {
-                if key.is_empty()
-                    || value.is_empty()
-                    || (key == "schema" && value != "strict" && value != "infer")
-                {
-                    return Err(Error::Schema("schema setting must be :strict or :infer; setting keys and values must be nonempty".into()));
-                }
-                if self.world_setting(key) == Some(value) {
-                    return Err(Error::Schema("a setting no-op is not a log entry".into()));
-                }
-                self.catalog.settings.push((tx, key.clone(), value.clone()));
-            }
-            SchemaEdit::Migration { .. } => {
-                return Err(Error::Schema(
-                    "migration must be replayed as a validated copy sequence".into(),
-                ));
-            }
-        }
-        Ok(())
+        let indexes = &self.indexes;
+        self.catalog
+            .apply_schema_edit(edit, tx, migration, |attr| indexes.has_facts(attr))
     }
 }
 
@@ -336,7 +484,7 @@ fn migrate_hint(name: &str) -> Error {
 impl Drop for Txn<'_> {
     fn drop(&mut self) {
         if let Some(before) = self.schema_before.take() {
-            before.restore(self.world);
+            before.restore(&mut self.world.catalog);
         }
     }
 }
@@ -356,7 +504,7 @@ impl Txn<'_> {
             return Err(migrate_hint(&old.name));
         }
         if self.schema_before.is_none() {
-            self.schema_before = Some(SchemaSnapshot::capture(self.world));
+            self.schema_before = Some(SchemaSnapshot::capture(&self.world.catalog));
         }
         self.world.apply_schema_edit(&edit, self.tx, migration)?;
         self.order.push(OrderedEntry::Schema(edit));
@@ -826,7 +974,7 @@ impl<'w> View<'w> {
 
 impl World {
     pub(super) fn all_overlaps(&self) -> Vec<Overlap> {
-        self.at_canon(self.latest_tx)
+        self.at_canon(self.latest_tx())
             .attributes()
             .flat_map(|def| self.overlaps(&def.name).unwrap_or_default())
             .collect()
@@ -881,7 +1029,7 @@ impl Txn<'_> {
                 },
             },
         });
-        log::encode_txn(self.world.next_entry(), self.tx, items)
+        log::encode_txn(self.world.journal.next_entry(), self.tx, items)
     }
 }
 
@@ -898,26 +1046,7 @@ impl<'w> MeteredView<'w> {
 
 impl World {
     pub(crate) fn schema_matches(&self, other: &Self) -> bool {
-        self.catalog.attributes == other.catalog.attributes
-            && self.catalog.attribute_history == other.catalog.attribute_history
-            && self.catalog.node_origins == other.catalog.node_origins
-            && self.catalog.settings == other.catalog.settings
-            && self.catalog.attr_by_name == other.catalog.attr_by_name
-            && self.catalog.inverse_by_name == other.catalog.inverse_by_name
-            && self.catalog.node_type_by_name == other.catalog.node_type_by_name
-            && self.catalog.node_types.iter().map(|n| &n.name).eq(other
-                .catalog
-                .node_types
-                .iter()
-                .map(|n| &n.name))
-    }
-    /// Test hook: alter derived metadata without writing the source log.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn tamper_schema(&mut self) {
-        self.catalog
-            .settings
-            .push((self.latest_tx, "schema".into(), "strict".into()));
+        self.catalog.schema_matches(&other.catalog)
     }
 }
 

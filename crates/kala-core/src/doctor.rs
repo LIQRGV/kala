@@ -51,7 +51,7 @@ use crate::id::{AttrId, EdgeId, EntityId};
 use crate::key;
 use crate::log::{self, EntryId, SurveyedTxn, TaggedFinding};
 use crate::overlap::Overlap;
-use crate::store::OrderedMap;
+use crate::store::{OrderedKv, OrderedMap};
 use crate::tick::Tick;
 use crate::value::{Value, ValueType};
 use crate::value_table::{ContentHash, fnv1a64};

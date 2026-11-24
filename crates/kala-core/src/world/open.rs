@@ -36,6 +36,71 @@ impl ReplayTxn {
             ))
         }
     }
+
+    /// While a migration's copy sequence is being replayed, checks `body`
+    /// is its next expected entry and returns `true`; `false` outside one.
+    fn take_expected_copy(&mut self, body: &EntryBody) -> Result<bool, ReplayFault> {
+        let Some(expected) = self.migration_expected.pop_front() else {
+            return Ok(false);
+        };
+        if expected != *body {
+            return Err(invalid("migration copy does not match its source history"));
+        }
+        Ok(true)
+    }
+
+    /// Records that the transaction stored `fact`: a stored assert of a
+    /// `ref` fact asserts its edge's triple.
+    fn note_assert(&mut self, fact: &FactDef) {
+        if let (Some(target), Op::Assert) = (fact.target, fact.op) {
+            self.unasserted_edges
+                .remove(&(fact.entity, fact.attr, target));
+        }
+    }
+}
+
+/// A fact as a `Fact`, `Revised` or `DELETED` entry says it, for the replay
+/// handlers.
+#[derive(Clone, Copy, Debug)]
+struct LoggedFact<'a> {
+    entity: EntityId,
+    attr: AttrId,
+    value: &'a Value,
+    tick: Tick,
+    op: Op,
+    precision: Precision,
+}
+
+impl LoggedFact<'_> {
+    /// Whether the entry spells a pair of the bidirectional attribute `def`
+    /// the other way round than a live write stores it (smaller ID first).
+    fn is_unnormalised(&self, def: &AttrDef) -> bool {
+        def.direction == Some(RefDirection::Bidirectional)
+            && matches!(self.value, Value::Ref(target) if self.entity > *target)
+    }
+}
+
+/// Which revision a replayed `Revised` entry is.
+#[derive(Clone, Copy, Debug)]
+struct LoggedRevision {
+    /// The `Revised` entry itself.
+    entry: EntryId,
+    /// The base entry of the chain it revises.
+    of: EntryId,
+    rev: u32,
+    /// Whether it directly follows the `DELETED` marker of the same `of`
+    /// and `rev`: a moved key.
+    after_its_marker: bool,
+}
+
+/// A replay rule no more specific fault covers.
+fn invalid(why: impl std::fmt::Display) -> ReplayFault {
+    ReplayFault::Invalid(why.to_string())
+}
+
+/// A correction entry that breaks a correction rule.
+fn bad_correction(why: impl std::fmt::Display) -> ReplayFault {
+    ReplayFault::BadCorrection(why.to_string())
 }
 
 /// Replay: `rev` must be the next revision of `chain` (base entry `of`).
@@ -153,34 +218,6 @@ fn genesis_schema(entries: &[LogEntry]) -> Result<Schema, Error> {
     Ok(schema)
 }
 
-/// A fact as a `Fact` or `Revised` entry says it: `(entity, attr, value,
-/// tick, op, precision)`.
-type FactFields<'b> = (EntityId, AttrId, &'b Value, Tick, Op, Precision);
-
-/// The fact a `Fact` or `Revised` entry says; `None` for any other entry.
-pub(super) fn as_fact(body: &EntryBody) -> Option<FactFields<'_>> {
-    match body {
-        EntryBody::Fact {
-            entity,
-            attr,
-            value,
-            tick,
-            op,
-            precision,
-        }
-        | EntryBody::Revised {
-            entity,
-            attr,
-            value,
-            tick,
-            op,
-            precision,
-            ..
-        } => Some((*entity, *attr, value, *tick, *op, *precision)),
-        _ => None,
-    }
-}
-
 impl World {
     /// Creates a new world backed by a new log file at `path`.
     ///
@@ -205,7 +242,7 @@ impl World {
     /// so the failed commit doesn't reappear on reopen.
     pub fn create(path: &Path, schema: Schema) -> Result<World, Error> {
         let (mut world, genesis) = World::with_genesis(schema)?;
-        world.log = Some(LogWriter::create(path, &genesis)?);
+        world.journal.attach_log(LogWriter::create(path, &genesis)?);
         Ok(world)
     }
 
@@ -268,9 +305,8 @@ impl World {
 
     fn open_with(path: &Path, cut_damaged: bool) -> Result<World, Error> {
         let (mut world, writer, recovery) = LogWriter::open(path, World::replay, cut_damaged)?;
-        world.log = Some(writer);
-        world.recovery_unacknowledged = recovery.cause == Some(CutCause::Damaged);
-        world.recovery = recovery;
+        world.journal.attach_log(writer);
+        world.gate = WriteGate::after_recovery(recovery);
         Ok(world)
     }
 
@@ -301,8 +337,7 @@ impl World {
     /// [`Error::Corrupt`] for any damage other than a torn or damaged tail.
     pub fn open_read_only(path: &Path) -> Result<World, Error> {
         let (mut world, recovery) = LogWriter::read_committed(path, World::replay)?;
-        world.read_only = true;
-        world.recovery = recovery;
+        world.gate = WriteGate::read_only(recovery);
         Ok(world)
     }
 
@@ -311,15 +346,7 @@ impl World {
     /// Replays the kept entries with the same validation as opening a world;
     /// costs O(log size) memory and replay work. Recovery tails are not copied.
     pub fn preview_copy(&self) -> Result<World, Error> {
-        let entries: Vec<LogEntry> = self
-            .entries
-            .iter()
-            .map(|e| LogEntry {
-                id: e.id,
-                body: e.body.clone(),
-            })
-            .collect();
-        World::replay_with_hash(&entries, self.indexes.content_hash)
+        World::replay_with_hash(&self.journal.log_entries(), self.indexes.content_hash)
     }
 
     /// Rebuilds a world from the entries of a log's committed transactions.
@@ -355,18 +382,16 @@ impl World {
         let mut world = World::in_memory(genesis_schema(defines)?)
             .map_err(|e| Error::Corrupt(format!("genesis schema: {e}")))?;
         // Keep the genesis entries as the file has them, not as this build
-        // would re-encode them: `entry` reports what the log says. Pushed
+        // would re-encode them: `entry` reports what the log says. Kept
         // as given, not through `record_one`: `World::open`'s scan has
         // already refused entry IDs that don't start at 1, but doctor's
         // survey reports them (`EntryIdGap`) and rebuilds anyway, and a
         // rebuild copes with ascending IDs that have gaps (see
-        // `World::kept_entry`).
-        world.entries.clear();
-        world.entries.extend(genesis.iter().map(|e| EntryInfo {
-            id: e.id,
-            tx: TxId(0),
-            body: e.body.clone(),
-        }));
+        // `Journal::kept_entry`).
+        world.journal.clear_entries();
+        for e in genesis {
+            world.journal.keep(e.clone(), TxId(0));
+        }
         Ok(world)
     }
 
@@ -384,7 +409,7 @@ impl World {
         let tx = self.next_tx();
         self.apply_entry(entry, txn)
             .map_err(|fault| Error::Corrupt(format!("entry#{}: {fault}", entry.id.0)))?;
-        self.record_one(entry.clone(), tx);
+        self.journal.record_one(entry.clone(), tx);
         Ok(())
     }
 
@@ -395,7 +420,7 @@ impl World {
     /// committed at `tx` whatever happened to its entries, so the next one
     /// replays at its own tx even after a skipped transaction (a gap).
     ///
-    /// Entries kept this way may have ID gaps; [`World::kept_entry`] copes.
+    /// Entries kept this way may have ID gaps; `Journal::kept_entry` copes.
     /// Only a doctor rebuild, never a live world, takes this path.
     pub(crate) fn replay_txn_collecting(
         &mut self,
@@ -403,72 +428,44 @@ impl World {
         entries: &[LogEntry],
         mut refused: impl FnMut(EntryId, ReplayFault),
     ) {
-        if tx <= self.latest_tx {
+        if tx <= self.latest_tx() {
             // A scan only hands over ascending txs; refuse rather than rewind.
             if let Some(first) = entries.first() {
                 refused(
                     first.id,
-                    ReplayFault::Invalid(format!("{tx:?} after {:?}", self.latest_tx)),
+                    ReplayFault::Invalid(format!("{tx:?} after {:?}", self.latest_tx())),
                 );
             }
             return;
         }
         // Facts are keyed at `next_tx()`: make that `tx`.
-        self.latest_tx = TxId(tx.0 - 1);
+        self.journal.set_latest_tx(TxId(tx.0 - 1));
         let mut txn = ReplayTxn::default();
         for entry in entries {
             match self.apply_entry(entry, &mut txn) {
-                Ok(()) => self.entries.push(EntryInfo {
-                    id: entry.id,
-                    tx,
-                    body: entry.body.clone(),
-                }),
+                Ok(()) => self.journal.keep(entry.clone(), tx),
                 Err(fault) => refused(entry.id, fault),
             }
         }
         // Also when its Commit was refused: the transaction is over.
-        self.latest_tx = tx;
+        self.journal.set_latest_tx(tx);
     }
 
     /// Every kept entry grouped by transaction, in log order: what doctor
     /// replays for an in-memory world (a file-backed one is re-read from
     /// disk instead).
     pub(crate) fn kept_txns(&self) -> Vec<SurveyedTxn> {
-        let mut txns: Vec<SurveyedTxn> = Vec::new();
-        for e in &self.entries {
-            let entry = LogEntry {
-                id: e.id,
-                body: e.body.clone(),
-            };
-            match txns.last_mut() {
-                Some(t) if t.tx == e.tx => t.entries.push(entry),
-                _ => txns.push(SurveyedTxn {
-                    tx: e.tx,
-                    entries: vec![entry],
-                }),
-            }
-        }
-        txns
+        self.journal.kept_txns()
     }
 
     /// Validates and applies one replayed entry (see
-    /// [`World::replay_entry`]).
+    /// [`World::replay_entry`]): the rules every entry gets, then the
+    /// handler of its kind.
     fn apply_entry(&mut self, entry: &LogEntry, txn: &mut ReplayTxn) -> Result<(), ReplayFault> {
-        let corrupt = |why: &dyn std::fmt::Display| ReplayFault::Invalid(why.to_string());
-        let bad_correction =
-            |why: &dyn std::fmt::Display| ReplayFault::BadCorrection(why.to_string());
-        let unknown_attr = |attr: &AttrId| ReplayFault::DanglingAttr(*attr);
         if !matches!(entry.body, EntryBody::Commit { .. }) {
             txn.has_entries = true;
         }
-        let copied = if let Some(expected) = txn.migration_expected.pop_front() {
-            if expected != entry.body {
-                return Err(corrupt(&"migration copy does not match its source history"));
-            }
-            true
-        } else {
-            false
-        };
+        let copied = txn.take_expected_copy(&entry.body)?;
         // Only the entry right after a DELETED marker may share its rev.
         let prev_deleted = txn.prev_deleted.take();
         match &entry.body {
@@ -476,41 +473,15 @@ impl World {
                 source,
                 def,
                 skip_unconvertible,
-            }) => {
-                txn.migration_expected = self
-                    .migration_expected(*source, def, *skip_unconvertible)
-                    .map_err(ReplayFault::Refused)?;
-                Ok(())
-            }
+            }) => self.replay_migration_marker(*source, def, *skip_unconvertible, txn),
             EntryBody::Schema(edit) => self
                 .apply_schema_edit(edit, self.next_tx(), copied)
                 .map_err(ReplayFault::Refused),
-            EntryBody::DefineNodeType { .. } | EntryBody::DefineAttr { .. } => Err(corrupt(
-                &"genesis definition outside the genesis transaction; use a schema revision",
+            EntryBody::DefineNodeType { .. } | EntryBody::DefineAttr { .. } => Err(invalid(
+                "genesis definition outside the genesis transaction; use a schema revision",
             )),
             EntryBody::DefineEntity { id, handle } => {
-                // Validate as a live create would, then check the log
-                // assigned exactly the ID a live create assigns.
-                let name = self
-                    .catalog
-                    .node_types
-                    .get(usize::from(id.node_type().0))
-                    .filter(|_| !id.is_edge())
-                    .map(|nt| nt.name.clone())
-                    .ok_or_else(|| corrupt(&format!("entity {id:?} has an unknown node type")))?;
-                let def = self
-                    .prepare_entity(&StagedIds::default(), &name, handle.as_deref())
-                    .map_err(ReplayFault::Refused)?;
-                if def.id != *id {
-                    return Err(corrupt(&format!(
-                        "entity {id:?} defined where {:?} was next",
-                        def.id
-                    )));
-                }
-                // Both replay paths key the transaction at `next_tx`.
-                let tx = self.next_tx();
-                self.apply_entity(def, tx);
-                Ok(())
+                self.replay_define_entity(*id, handle.as_deref())
             }
             EntryBody::DefineEdge {
                 id,
@@ -518,50 +489,13 @@ impl World {
                 attr,
                 target,
             } => {
-                // Exactly what a live interning writes: a ref attribute,
-                // endpoints defined by earlier entries, a triple not yet
-                // interned, and the next edge sequence.
-                let def = self
-                    .catalog
-                    .attributes
-                    .get(attr.0 as usize)
-                    .ok_or_else(|| unknown_attr(attr))?;
-                if def.value_type != ValueType::Ref {
-                    return Err(corrupt(&format!(
-                        "edge on non-ref attribute {:?}",
-                        def.name
-                    )));
-                }
-                for end in [source, target] {
-                    if !self.is_defined_staged(&StagedIds::default(), *end) {
-                        return Err(ReplayFault::DanglingId(*end));
-                    }
-                }
-                // A bidirectional pair is interned once, normalised.
-                if def.direction == Some(RefDirection::Bidirectional) && source > target {
-                    return Err(corrupt(&"bidirectional edge with source > target"));
-                }
-                let triple = (*source, *attr, *target);
-                if let Some(existing) = self.catalog.edge_by_triple.get(&triple) {
-                    return Err(corrupt(&format!("triple already interned as {existing:?}")));
-                }
-                if id.seq() != self.last_edge_seq(&StagedIds::default()) + 1 {
-                    return Err(corrupt(&format!("{id:?} out of sequence")));
-                }
-                if !copied {
-                    txn.unasserted_edges.insert(triple, *id);
-                }
-                let tx = self.next_tx();
-                self.apply_edge(
-                    EdgeDef {
-                        id: *id,
-                        source: *source,
-                        attr: *attr,
-                        target: *target,
-                    },
-                    tx,
-                );
-                Ok(())
+                let def = EdgeDef {
+                    id: *id,
+                    source: *source,
+                    attr: *attr,
+                    target: *target,
+                };
+                self.replay_define_edge(def, copied, txn)
             }
             EntryBody::Fact {
                 entity,
@@ -571,95 +505,15 @@ impl World {
                 op,
                 precision,
             } => {
-                let def = self
-                    .catalog
-                    .attributes
-                    .get(attr.0 as usize)
-                    .ok_or_else(|| unknown_attr(attr))?;
-                // A live write stores a bidirectional fact normalised; checked
-                // before `prepare_fact`, which would normalise it silently.
-                if def.direction == Some(RefDirection::Bidirectional)
-                    && let Value::Ref(target) = value
-                    && entity > target
-                {
-                    return Err(corrupt(&"bidirectional fact with entity > value"));
-                }
-                // A migration copies edge properties of deprecated
-                // attributes too; only entries matching the regenerated copy
-                // sequence (`copied`) may write them.
-                let deprecated = if copied {
-                    DeprecatedWrites::MigrationCopy
-                } else {
-                    DeprecatedWrites::Refuse
+                let logged = LoggedFact {
+                    entity: *entity,
+                    attr: *attr,
+                    value,
+                    tick: *tick,
+                    op: *op,
+                    precision: *precision,
                 };
-                let mut fact = self
-                    .prepare_fact_as(
-                        &StagedIds::default(),
-                        *entity,
-                        &def.name,
-                        value,
-                        *tick,
-                        *op,
-                        deprecated,
-                    )
-                    .map_err(ReplayFault::from_write)?;
-                fact.precision = *precision;
-                // A live write logs a ref fact's DefineEdge ahead of its
-                // first stored assert, and a stored retract needs a stored
-                // assert, so every stored ref fact's triple has an edge
-                // defined by an earlier entry.
-                if let Value::Ref(target) = value
-                    && self
-                        .edge_of(&StagedIds::default(), fact.entity, fact.attr, *target)
-                        .is_none()
-                {
-                    return Err(corrupt(&"ref fact with no edge defined before it"));
-                }
-                // A live write never stores a fact at a key whose current
-                // entry has the opposite op: a same-tick conflict. (The same
-                // op again is a no-op, caught below.) A key whose current
-                // entry is a DELETED marker holds nothing. Judged at the
-                // latest canon; the current transaction's entries are
-                // already in.
-                let mut prefix = key::e_value_prefix(fact.entity, fact.attr, fact.key_value());
-                let all = TxId(u64::MAX);
-                if let Some(stored) =
-                    op_at_tick(&[&self.indexes.e_index], &mut prefix, fact.tick, all)
-                    && stored != fact.op
-                {
-                    return Err(corrupt(&format!(
-                        "a same-tick conflict: {:?} at {:?} where {stored:?} is current",
-                        fact.op, fact.tick
-                    )));
-                }
-                // A live write never stores a no-op: an assert of a value
-                // that holds at its tick, or a retract of one that doesn't.
-                // Judged like a live write, against everything before it
-                // (the current transaction's earlier facts are already in).
-                let held = holds(
-                    &[&self.indexes.e_index],
-                    &mut prefix,
-                    fact.tick,
-                    all,
-                    Work::NONE,
-                );
-                if !copied && held == (fact.op == Op::Assert) {
-                    return Err(corrupt(&format!(
-                        "a no-op {:?} at {:?} (the value {} held there)",
-                        fact.op,
-                        fact.tick,
-                        if held { "already" } else { "never" }
-                    )));
-                }
-                // A live transaction stores at most one entry per key.
-                // Claimed last, so a refused fact claims nothing.
-                txn.claim_key(&fact).map_err(|why| corrupt(&why))?;
-                if let (Some(target), Op::Assert) = (fact.target, fact.op) {
-                    txn.unasserted_edges
-                        .remove(&(fact.entity, fact.attr, target));
-                }
-                self.index_entry(&fact, Mark::from(fact.op), self.next_tx());
-                Ok(())
+                self.replay_fact(logged, copied, txn)
             }
             EntryBody::Deleted {
                 of,
@@ -669,46 +523,16 @@ impl World {
                 value,
                 tick,
             } => {
-                let def = self
-                    .catalog
-                    .attributes
-                    .get(attr.0 as usize)
-                    .ok_or_else(|| unknown_attr(attr))?;
-                if def.direction == Some(RefDirection::Bidirectional)
-                    && let Value::Ref(target) = value
-                    && entity > target
-                {
-                    return Err(bad_correction(
-                        &"bidirectional DELETED marker with entity > value",
-                    ));
-                }
-                let chain = self.replay_chain(*of).map_err(|why| bad_correction(&why))?;
-                let current = chain.current.ok_or_else(|| {
-                    bad_correction(&format!("the chain of entry#{} is already deleted", of.0))
-                })?;
-                check_next_rev(chain, *of, *rev)?;
-                // The marker sits at the key of the chain's current fact.
-                // (Its op is unused: the marker is indexed as Deleted.)
-                let fact = self
-                    .stored_fact_def(*entity, *attr, value, *tick, Op::Assert)
-                    .map_err(ReplayFault::Refused)?;
-                if self.op_if_at_key(current, &fact).is_none() {
-                    return Err(bad_correction(&format!(
-                        "DELETED marker not at the current key of entry#{}",
-                        of.0
-                    )));
-                }
-                txn.claim_key(&fact).map_err(|why| corrupt(&why))?;
-                self.index_entry(&fact, Mark::Deleted, self.next_tx());
-                self.chains.insert(
-                    *of,
-                    Chain {
-                        rev: *rev,
-                        current: None,
-                    },
-                );
-                txn.prev_deleted = Some((*of, *rev));
-                Ok(())
+                let at = LoggedFact {
+                    entity: *entity,
+                    attr: *attr,
+                    value,
+                    tick: *tick,
+                    // Unused: the marker is indexed as Deleted.
+                    op: Op::Assert,
+                    precision: Precision::Exact,
+                };
+                self.replay_deleted(*of, *rev, at, txn)
             }
             EntryBody::Revised {
                 of,
@@ -720,140 +544,386 @@ impl World {
                 op,
                 precision,
             } => {
-                let def = self
-                    .catalog
-                    .attributes
-                    .get(attr.0 as usize)
-                    .ok_or_else(|| unknown_attr(attr))?;
-                if def.direction == Some(RefDirection::Bidirectional)
-                    && let Value::Ref(target) = value
-                    && entity > target
-                {
-                    return Err(bad_correction(
-                        &"bidirectional revised fact with entity > value",
-                    ));
-                }
-                // Validated like a live write (type, defined IDs, string
-                // length, RetractEvent); not judged by the hold-based no-op
-                // rules, which don't apply to corrections.
-                let mut fact = self
-                    .prepare_fact_as(
-                        &StagedIds::default(),
-                        *entity,
-                        &def.name,
-                        value,
-                        *tick,
-                        *op,
-                        DeprecatedWrites::Correction,
-                    )
-                    .map_err(ReplayFault::from_write)?;
-                fact.precision = *precision;
-                // A live correction interns the edge of a revised assert's
-                // triple before it, as for a fact; a revised retract may be
-                // the triple's only entry (no edge).
-                if let (Some(target), Op::Assert) = (fact.target, fact.op)
-                    && self
-                        .edge_of(&StagedIds::default(), fact.entity, fact.attr, target)
-                        .is_none()
-                {
-                    return Err(corrupt(
-                        &"revised ref assert with no edge defined before it",
-                    ));
-                }
-                let chain = self.replay_chain(*of).map_err(|why| bad_correction(&why))?;
-                if prev_deleted == Some((*of, *rev)) {
-                    // A moved key, right after the DELETED marker of the old
-                    // one (which already took this rev). The same-tick rule
-                    // at the new key: a live writer errs on the opposite op
-                    // and writes no Revised for the same one, so any current
-                    // entry there means no live writer wrote this.
-                    let mut prefix = key::e_value_prefix(fact.entity, fact.attr, fact.key_value());
-                    let all = TxId(u64::MAX);
-                    if let Some(stored) =
-                        op_at_tick(&[&self.indexes.e_index], &mut prefix, fact.tick, all)
-                    {
-                        return Err(corrupt(&format!(
-                            "a moved revision onto {:?} where {stored:?} is current",
-                            fact.tick
-                        )));
-                    }
-                } else {
-                    // Otherwise it revises the current fact in place: same
-                    // key, its own next rev, another op or precision.
-                    let current = chain.current.ok_or_else(|| {
-                        bad_correction(&format!(
-                            "a revision of the deleted chain of entry#{} not right after its \
-                             DELETED marker",
-                            of.0
-                        ))
-                    })?;
-                    check_next_rev(chain, *of, *rev)?;
-                    let Some((c_op, c_precision)) = self.op_if_at_key(current, &fact) else {
-                        return Err(bad_correction(&format!(
-                            "a revision of entry#{} at another key not right after its \
-                             DELETED marker",
-                            of.0
-                        )));
-                    };
-                    if (fact.op, fact.precision) == (c_op, c_precision) {
-                        return Err(corrupt(&format!(
-                            "a revision of entry#{} that changes nothing",
-                            of.0
-                        )));
-                    }
-                }
-                txn.claim_key(&fact).map_err(|why| corrupt(&why))?;
-                // Only an accepted revised assert asserts its edge's triple
-                // (as for a Fact): a refused one must leave the edge
-                // unasserted, so doctor's collecting replay judges the
-                // Commit like a fresh rebuild.
-                if let (Some(target), Op::Assert) = (fact.target, fact.op) {
-                    txn.unasserted_edges
-                        .remove(&(fact.entity, fact.attr, target));
-                }
-                self.index_entry(&fact, Mark::from(fact.op), self.next_tx());
-                self.chains.insert(
-                    *of,
-                    Chain {
-                        rev: *rev,
-                        current: Some(entry.id),
-                    },
-                );
-                Ok(())
+                let logged = LoggedFact {
+                    entity: *entity,
+                    attr: *attr,
+                    value,
+                    tick: *tick,
+                    op: *op,
+                    precision: *precision,
+                };
+                let revision = LoggedRevision {
+                    entry: entry.id,
+                    of: *of,
+                    rev: *rev,
+                    after_its_marker: prev_deleted == Some((*of, *rev)),
+                };
+                self.replay_revised(revision, logged, txn)
             }
-            EntryBody::Commit { tx, .. } => {
-                if *tx != self.next_tx() {
-                    return Err(corrupt(&format!("{tx:?} out of sequence")));
-                }
-                // A live commit with nothing staged appends nothing.
-                if !txn.has_entries {
-                    return Err(corrupt(&"a transaction with nothing but its Commit"));
-                }
-                // A live write interns an edge only for a stored assert of
-                // its triple in the same transaction.
-                if let Some(id) = txn.unasserted_edges.values().min() {
-                    return Err(corrupt(&format!(
-                        "{id:?} defined in a transaction that doesn't assert its triple"
-                    )));
-                }
-                *txn = ReplayTxn::default();
-                self.latest_tx = *tx;
-                Ok(())
-            }
+            EntryBody::Commit { tx, .. } => self.replay_commit(*tx, txn),
         }
     }
 
-    /// Replay: the state of the chain a correction names as `of`, which
-    /// must be an earlier base `Fact` entry (a live correction only names
-    /// committed entries, and resolves a chain to its base).
-    fn replay_chain(&self, of: EntryId) -> Result<Chain, String> {
-        let base = self
-            .kept_entry(of)
-            .filter(|b| b.tx <= self.latest_tx)
-            .ok_or_else(|| format!("corrects entry#{}, not an earlier entry", of.0))?;
-        if !matches!(base.body, EntryBody::Fact { .. }) {
-            return Err(format!("corrects entry#{}, not a base fact", of.0));
+    /// Replays a migration marker: regenerates the copy sequence the
+    /// migration wrote, which the transaction's next entries must match
+    /// one by one (see [`ReplayTxn::take_expected_copy`]).
+    fn replay_migration_marker(
+        &mut self,
+        source: AttrId,
+        def: &AttrDef,
+        skip_unconvertible: bool,
+        txn: &mut ReplayTxn,
+    ) -> Result<(), ReplayFault> {
+        txn.migration_expected = self
+            .migration_expected(source, def, skip_unconvertible)
+            .map_err(ReplayFault::Refused)?;
+        Ok(())
+    }
+
+    /// Replays an entity `DEFINE`.
+    fn replay_define_entity(
+        &mut self,
+        id: EntityId,
+        handle: Option<&str>,
+    ) -> Result<(), ReplayFault> {
+        // Validate as a live create would, then check the log
+        // assigned exactly the ID a live create assigns.
+        let name = self
+            .catalog
+            .node_types
+            .get(usize::from(id.node_type().0))
+            .filter(|_| !id.is_edge())
+            .map(|nt| nt.name.clone())
+            .ok_or_else(|| invalid(format!("entity {id:?} has an unknown node type")))?;
+        let def = self
+            .catalog
+            .prepare_entity(&StagedIds::default(), &name, handle)
+            .map_err(ReplayFault::Refused)?;
+        if def.id != id {
+            return Err(invalid(format!(
+                "entity {id:?} defined where {:?} was next",
+                def.id
+            )));
         }
-        Ok(self.chain(of))
+        // Both replay paths key the transaction at `next_tx`.
+        let tx = self.next_tx();
+        self.catalog.apply_entity(def, tx);
+        Ok(())
+    }
+
+    /// Replays an edge `DEFINE`. Unless it is part of a migration's copy
+    /// (`copied`), the transaction must go on to assert the edge's triple.
+    fn replay_define_edge(
+        &mut self,
+        edge: EdgeDef,
+        copied: bool,
+        txn: &mut ReplayTxn,
+    ) -> Result<(), ReplayFault> {
+        // Exactly what a live interning writes: a ref attribute,
+        // endpoints defined by earlier entries, a triple not yet
+        // interned, and the next edge sequence.
+        let def = self.replay_attr(edge.attr)?;
+        if def.value_type != ValueType::Ref {
+            return Err(invalid(format!("edge on non-ref attribute {:?}", def.name)));
+        }
+        for end in [edge.source, edge.target] {
+            if !self.catalog.is_defined_staged(&StagedIds::default(), end) {
+                return Err(ReplayFault::DanglingId(end));
+            }
+        }
+        // A bidirectional pair is interned once, normalised.
+        if def.direction == Some(RefDirection::Bidirectional) && edge.source > edge.target {
+            return Err(invalid("bidirectional edge with source > target"));
+        }
+        let triple = (edge.source, edge.attr, edge.target);
+        if let Some(existing) = self.catalog.edge_by_triple.get(&triple) {
+            return Err(invalid(format!("triple already interned as {existing:?}")));
+        }
+        if edge.id.seq() != self.catalog.last_edge_seq(&StagedIds::default()) + 1 {
+            return Err(invalid(format!("{:?} out of sequence", edge.id)));
+        }
+        if !copied {
+            txn.unasserted_edges.insert(triple, edge.id);
+        }
+        let tx = self.next_tx();
+        self.catalog.apply_edge(edge, tx);
+        Ok(())
+    }
+
+    /// Replays a `Fact` entry: validated like a live write and judged by
+    /// the same-tick and no-op rules (a migration's verified copy, `copied`,
+    /// may be a redundant assert).
+    fn replay_fact(
+        &mut self,
+        logged: LoggedFact<'_>,
+        copied: bool,
+        txn: &mut ReplayTxn,
+    ) -> Result<(), ReplayFault> {
+        let def = self.replay_attr(logged.attr)?;
+        // A live write stores a bidirectional fact normalised; checked
+        // before `prepare_fact`, which would normalise it silently.
+        if logged.is_unnormalised(def) {
+            return Err(invalid("bidirectional fact with entity > value"));
+        }
+        // A migration copies edge properties of deprecated
+        // attributes too; only entries matching the regenerated copy
+        // sequence (`copied`) may write them.
+        let deprecated = if copied {
+            DeprecatedWrites::MigrationCopy
+        } else {
+            DeprecatedWrites::Refuse
+        };
+        let fact = self.prepare_logged(&def.name, logged, deprecated)?;
+        // A live write logs a ref fact's DefineEdge ahead of its
+        // first stored assert, and a stored retract needs a stored
+        // assert, so every stored ref fact's triple has an edge
+        // defined by an earlier entry.
+        if fact.target.is_some() && !self.has_edge(&fact) {
+            return Err(invalid("ref fact with no edge defined before it"));
+        }
+        self.check_fact_changes_something(&fact, copied)?;
+        // A live transaction stores at most one entry per key.
+        // Claimed last, so a refused fact claims nothing.
+        txn.claim_key(&fact).map_err(invalid)?;
+        txn.note_assert(&fact);
+        self.index_entry(&fact, Mark::from(fact.op), self.next_tx());
+        Ok(())
+    }
+
+    /// Replay: the same-tick and no-op rules of a live write for `fact`,
+    /// judged against everything before it.
+    fn check_fact_changes_something(
+        &self,
+        fact: &FactDef,
+        copied: bool,
+    ) -> Result<(), ReplayFault> {
+        // A live write never stores a fact at a key whose current
+        // entry has the opposite op: a same-tick conflict. (The same
+        // op again is a no-op, caught below.) A key whose current
+        // entry is a DELETED marker holds nothing. Judged at the
+        // latest canon; the current transaction's entries are
+        // already in.
+        let mut prefix = key::e_value_prefix(fact.entity, fact.attr, fact.key_value());
+        let all = TxId(u64::MAX);
+        if let Some(stored) = op_at_tick(&[&self.indexes.e_index], &mut prefix, fact.tick, all)
+            && stored != fact.op
+        {
+            return Err(invalid(format!(
+                "a same-tick conflict: {:?} at {:?} where {stored:?} is current",
+                fact.op, fact.tick
+            )));
+        }
+        // A live write never stores a no-op: an assert of a value
+        // that holds at its tick, or a retract of one that doesn't.
+        // Judged like a live write, against everything before it
+        // (the current transaction's earlier facts are already in).
+        let held = holds(
+            &[&self.indexes.e_index],
+            &mut prefix,
+            fact.tick,
+            all,
+            Work::NONE,
+        );
+        if !copied && held == (fact.op == Op::Assert) {
+            return Err(invalid(format!(
+                "a no-op {:?} at {:?} (the value {} held there)",
+                fact.op,
+                fact.tick,
+                if held { "already" } else { "never" }
+            )));
+        }
+        Ok(())
+    }
+
+    /// Replays a `DELETED` marker: revision `rev` of the chain of base
+    /// entry `of`, at the key `at` of the chain's current fact.
+    fn replay_deleted(
+        &mut self,
+        of: EntryId,
+        rev: u32,
+        at: LoggedFact<'_>,
+        txn: &mut ReplayTxn,
+    ) -> Result<(), ReplayFault> {
+        let def = self.replay_attr(at.attr)?;
+        if at.is_unnormalised(def) {
+            return Err(bad_correction(
+                "bidirectional DELETED marker with entity > value",
+            ));
+        }
+        let chain = self.journal.replay_chain(of).map_err(bad_correction)?;
+        let current = chain.current.ok_or_else(|| {
+            bad_correction(format!("the chain of entry#{} is already deleted", of.0))
+        })?;
+        check_next_rev(chain, of, rev)?;
+        // The marker sits at the key of the chain's current fact.
+        // (Its op is unused: the marker is indexed as Deleted.)
+        let fact = self
+            .stored_fact_def(at.entity, at.attr, at.value, at.tick, at.op)
+            .map_err(ReplayFault::Refused)?;
+        if self.journal.op_if_at_key(current, &fact).is_none() {
+            return Err(bad_correction(format!(
+                "DELETED marker not at the current key of entry#{}",
+                of.0
+            )));
+        }
+        txn.claim_key(&fact).map_err(invalid)?;
+        self.index_entry(&fact, Mark::Deleted, self.next_tx());
+        self.journal.set_chain(of, rev, None);
+        txn.prev_deleted = Some((of, rev));
+        Ok(())
+    }
+
+    /// Replays a `Revised` entry: the new current fact of its chain, either
+    /// in place (same key, another op or precision) or at a moved key right
+    /// after the `DELETED` marker of the old one.
+    fn replay_revised(
+        &mut self,
+        revision: LoggedRevision,
+        logged: LoggedFact<'_>,
+        txn: &mut ReplayTxn,
+    ) -> Result<(), ReplayFault> {
+        let LoggedRevision { entry, of, rev, .. } = revision;
+        let def = self.replay_attr(logged.attr)?;
+        if logged.is_unnormalised(def) {
+            return Err(bad_correction(
+                "bidirectional revised fact with entity > value",
+            ));
+        }
+        // Validated like a live write (type, defined IDs, string
+        // length, RetractEvent); not judged by the hold-based no-op
+        // rules, which don't apply to corrections.
+        let fact = self.prepare_logged(&def.name, logged, DeprecatedWrites::Correction)?;
+        // A live correction interns the edge of a revised assert's
+        // triple before it, as for a fact; a revised retract may be
+        // the triple's only entry (no edge).
+        if fact.target.is_some() && fact.op == Op::Assert && !self.has_edge(&fact) {
+            return Err(invalid("revised ref assert with no edge defined before it"));
+        }
+        let chain = self.journal.replay_chain(of).map_err(bad_correction)?;
+        if revision.after_its_marker {
+            self.check_moved_revision(&fact)?;
+        } else {
+            self.check_in_place_revision(chain, of, rev, &fact)?;
+        }
+        txn.claim_key(&fact).map_err(invalid)?;
+        // Only an accepted revised assert asserts its edge's triple
+        // (as for a Fact): a refused one must leave the edge
+        // unasserted, so doctor's collecting replay judges the
+        // Commit like a fresh rebuild.
+        txn.note_assert(&fact);
+        self.index_entry(&fact, Mark::from(fact.op), self.next_tx());
+        self.journal.set_chain(of, rev, Some(entry));
+        Ok(())
+    }
+
+    /// Replay: the rule for a `Revised` at a moved key, right after the
+    /// `DELETED` marker of the old one (which already took this rev).
+    fn check_moved_revision(&self, fact: &FactDef) -> Result<(), ReplayFault> {
+        // The same-tick rule at the new key: a live writer errs on the
+        // opposite op and writes no Revised for the same one, so any
+        // current entry there means no live writer wrote this.
+        let mut prefix = key::e_value_prefix(fact.entity, fact.attr, fact.key_value());
+        let all = TxId(u64::MAX);
+        if let Some(stored) = op_at_tick(&[&self.indexes.e_index], &mut prefix, fact.tick, all) {
+            return Err(invalid(format!(
+                "a moved revision onto {:?} where {stored:?} is current",
+                fact.tick
+            )));
+        }
+        Ok(())
+    }
+
+    /// Replay: the rules for a `Revised` that revises its chain's current
+    /// fact in place: same key, its own next rev, another op or precision.
+    fn check_in_place_revision(
+        &self,
+        chain: Chain,
+        of: EntryId,
+        rev: u32,
+        fact: &FactDef,
+    ) -> Result<(), ReplayFault> {
+        let current = chain.current.ok_or_else(|| {
+            bad_correction(format!(
+                "a revision of the deleted chain of entry#{} not right after its \
+                 DELETED marker",
+                of.0
+            ))
+        })?;
+        check_next_rev(chain, of, rev)?;
+        let Some((c_op, c_precision)) = self.journal.op_if_at_key(current, fact) else {
+            return Err(bad_correction(format!(
+                "a revision of entry#{} at another key not right after its \
+                 DELETED marker",
+                of.0
+            )));
+        };
+        if (fact.op, fact.precision) == (c_op, c_precision) {
+            return Err(invalid(format!(
+                "a revision of entry#{} that changes nothing",
+                of.0
+            )));
+        }
+        Ok(())
+    }
+
+    /// Replays a `Commit`: checks the transaction it ends could have been
+    /// written, then makes `tx` the latest and resets `txn` for the next.
+    fn replay_commit(&mut self, tx: TxId, txn: &mut ReplayTxn) -> Result<(), ReplayFault> {
+        if tx != self.next_tx() {
+            return Err(invalid(format!("{tx:?} out of sequence")));
+        }
+        // A live commit with nothing staged appends nothing.
+        if !txn.has_entries {
+            return Err(invalid("a transaction with nothing but its Commit"));
+        }
+        // A live write interns an edge only for a stored assert of
+        // its triple in the same transaction.
+        if let Some(id) = txn.unasserted_edges.values().min() {
+            return Err(invalid(format!(
+                "{id:?} defined in a transaction that doesn't assert its triple"
+            )));
+        }
+        *txn = ReplayTxn::default();
+        self.journal.set_latest_tx(tx);
+        Ok(())
+    }
+
+    /// Replay: the definition of the attribute an entry names.
+    fn replay_attr(&self, attr: AttrId) -> Result<&AttrDef, ReplayFault> {
+        self.catalog
+            .attributes
+            .get(attr.0 as usize)
+            .ok_or(ReplayFault::DanglingAttr(attr))
+    }
+
+    /// Replay: the logged fact validated as a live write of attribute
+    /// `attr` (its name) would be, carrying the entry's precision.
+    fn prepare_logged(
+        &self,
+        attr: &str,
+        logged: LoggedFact<'_>,
+        deprecated: DeprecatedWrites,
+    ) -> Result<FactDef, ReplayFault> {
+        let request = FactRequest {
+            entity: logged.entity,
+            attr,
+            value: logged.value,
+            tick: logged.tick,
+            op: logged.op,
+            precision: logged.precision,
+            deprecated,
+        };
+        self.prepare_fact(&StagedIds::default(), request)
+            .map_err(ReplayFault::from_write)
+    }
+
+    /// Replay: whether the triple of the `ref` fact `fact` has an edge
+    /// defined by an earlier entry (`false` for a non-ref fact).
+    fn has_edge(&self, fact: &FactDef) -> bool {
+        fact.target.is_some_and(|target| {
+            self.catalog
+                .edge_of(&StagedIds::default(), fact.entity, fact.attr, target)
+                .is_some()
+        })
     }
 }

@@ -119,14 +119,17 @@ impl View<'_> {
             .is_some_and(|&tx| tx <= self.canon)
     }
 
-    /// [`World::resolve`] for a read at this canon: a known attribute, and
+    /// [`Catalog::resolve`] for a read at this canon: a known attribute, and
     /// `entity` defined at the canon (else [`Error::UnknownEntity`]).
     pub(super) fn resolve(
         &self,
         entity: EntityId,
         attr: &str,
     ) -> Result<(AttrId, &AttrDef), Error> {
-        let resolved = self.world.resolve(&StagedIds::default(), entity, attr)?;
+        let resolved = self
+            .world
+            .catalog
+            .resolve(&StagedIds::default(), entity, attr)?;
         if !self.id_visible(entity) {
             return Err(Error::UnknownEntity(entity));
         }
@@ -230,8 +233,8 @@ impl View<'_> {
         check_type(attr, def, v)?;
         // A bidirectional pair is stored once, normalised: look it up there.
         let mut prefix = match v {
-            Value::Ref(target) if world.is_bidirectional(attr_id) => {
-                let (source, target) = world.stored_pair(attr_id, entity, *target);
+            Value::Ref(target) if world.catalog.is_bidirectional(attr_id) => {
+                let (source, target) = world.catalog.stored_pair(attr_id, entity, *target);
                 key::e_value_prefix(source, attr_id, &Value::Ref(target).encode()?)
             }
             _ => {
@@ -287,7 +290,7 @@ impl View<'_> {
     /// [`View::attr_scan`], so the two can't disagree.
     fn values_holding(&self, entity: EntityId, attr_id: AttrId, t: Tick) -> Vec<Value> {
         let world = self.world;
-        if world.is_bidirectional(attr_id) {
+        if world.catalog.is_bidirectional(attr_id) {
             // Ref encoding order is entity ID order, so sorting the IDs
             // sorts by value encoding.
             let mut partners = Vec::new();
@@ -306,7 +309,7 @@ impl View<'_> {
         if self.work.finish(Ok(())).is_err() {
             return Vec::new();
         }
-        if world.keys_by_ref(attr_id) {
+        if world.catalog.keys_by_ref(attr_id) {
             // Value references sort by hash, not by value: restore the
             // value-encoding order every other attribute has by key order
             // (`Ord for Value` is that order).
@@ -344,7 +347,7 @@ impl View<'_> {
             self.require_definition(attr_id)?;
             // IDs ascend and each entity's values come sorted, so `out` is
             // sorted and duplicate-free as built.
-            for id in world.defined_ids() {
+            for id in world.catalog.defined_ids() {
                 if !self.work.id() {
                     break;
                 }
@@ -365,7 +368,7 @@ impl View<'_> {
         }
         // Inverse names belong to directed attributes only, so each stored
         // pair `source -> id` is read once, from `R|id|attr|`.
-        for id in world.defined_ids() {
+        for id in world.catalog.defined_ids() {
             if !self.work.id() {
                 break;
             }
@@ -394,10 +397,29 @@ impl View<'_> {
         attr: &str,
         t: Tick,
     ) -> Result<Vec<Change>, Error> {
-        let world = self.world;
         let (attr_id, _) = self.resolve(entity, attr)?;
         // (value encoding, change), sorted by the encoding at the end.
         let mut out: Vec<(Vec<u8>, Change)> = Vec::new();
+        self.stored_details(entity, attr_id, t, &mut out);
+        if self.world.catalog.is_bidirectional(attr_id) {
+            self.mirrored_details(entity, attr_id, t, &mut out);
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.dedup_by(|a, b| a.0 == b.0);
+        Ok(out.into_iter().map(|(_, c)| c).collect())
+    }
+
+    /// [`View::as_of_detail`] for the values stored under `entity` (its `E`
+    /// histories): pushes `(value encoding, change)` for each one holding
+    /// at tick `t`.
+    fn stored_details(
+        &self,
+        entity: EntityId,
+        attr_id: AttrId,
+        t: Tick,
+        out: &mut Vec<(Vec<u8>, Change)>,
+    ) {
+        let world = self.world;
         self.for_each_e_history(entity, attr_id, |p| {
             let Some((k, Op::Assert)) =
                 self.entry_at(&world.indexes.e_index, &world.indexes.e_latest, p, t)
@@ -417,63 +439,65 @@ impl View<'_> {
             };
             out.push((bytes.to_vec(), change));
         });
-        if world.is_bidirectional(attr_id) {
-            // The pairs stored under a smaller partner, through their R
-            // mirrors; a self pair was found on the E side.
-            let prefix = key::r_attr_prefix(entity, attr_id);
-            let source_end = |_: &[u8]| key::R_SOURCE_PREFIX_LEN;
-            let mut on_history = |p: &mut Vec<u8>| {
-                let Some((k, Op::Assert)) =
-                    self.entry_at(&world.indexes.r_index, &world.indexes.r_latest, p, t)
-                else {
-                    return;
-                };
-                let Some(source) = key::r_source(p).filter(|s| *s != entity) else {
-                    return;
-                };
-                let tick = tick_after(k, p.len());
-                // A latest-revision key has no tx (and the latest path
-                // ignores it); a main R key ends in its entry's.
-                let tx = key::e_key_tx(k).filter(|_| !self.latest);
-                let value = Value::Ref(source);
-                let bytes = value
-                    .encode()
-                    .expect("invariant: a ref value always encodes");
-                let change = Change {
-                    tick,
-                    op: Op::Assert,
-                    value,
-                    precision: self.r_precision(
-                        source,
-                        attr_id,
-                        entity,
-                        tick,
-                        tx.unwrap_or(TxId(0)),
-                    ),
-                };
-                out.push((bytes, change));
+    }
+
+    /// [`View::as_of_detail`] for the partners of `entity` in a
+    /// bidirectional attribute whose pair is stored under the partner:
+    /// pushes `(value encoding, change)` for each one holding at tick `t`.
+    fn mirrored_details(
+        &self,
+        entity: EntityId,
+        attr_id: AttrId,
+        t: Tick,
+        out: &mut Vec<(Vec<u8>, Change)>,
+    ) {
+        let world = self.world;
+        // The pairs stored under a smaller partner, through their R
+        // mirrors; a self pair was found on the E side.
+        let prefix = key::r_attr_prefix(entity, attr_id);
+        let source_end = |_: &[u8]| key::R_SOURCE_PREFIX_LEN;
+        let mut on_history = |p: &mut Vec<u8>| {
+            let Some((k, Op::Assert)) =
+                self.entry_at(&world.indexes.r_index, &world.indexes.r_latest, p, t)
+            else {
+                return;
             };
-            if self.latest {
-                for_each_history(
-                    &world.indexes.r_latest,
-                    &prefix,
-                    source_end,
-                    self.work,
-                    &mut on_history,
-                );
-            } else {
-                for_each_history(
-                    &world.indexes.r_index,
-                    &prefix,
-                    source_end,
-                    self.work,
-                    &mut on_history,
-                );
-            }
+            let Some(source) = key::r_source(p).filter(|s| *s != entity) else {
+                return;
+            };
+            let tick = tick_after(k, p.len());
+            // A latest-revision key has no tx (and the latest path
+            // ignores it); a main R key ends in its entry's.
+            let tx = key::e_key_tx(k).filter(|_| !self.latest);
+            let value = Value::Ref(source);
+            let bytes = value
+                .encode()
+                .expect("invariant: a ref value always encodes");
+            let change = Change {
+                tick,
+                op: Op::Assert,
+                value,
+                precision: self.r_precision(source, attr_id, entity, tick, tx.unwrap_or(TxId(0))),
+            };
+            out.push((bytes, change));
+        };
+        if self.latest {
+            for_each_history(
+                &world.indexes.r_latest,
+                &prefix,
+                source_end,
+                self.work,
+                &mut on_history,
+            );
+        } else {
+            for_each_history(
+                &world.indexes.r_index,
+                &prefix,
+                source_end,
+                self.work,
+                &mut on_history,
+            );
         }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out.dedup_by(|a, b| a.0 == b.0);
-        Ok(out.into_iter().map(|(_, c)| c).collect())
     }
 
     /// The key and op of the current entry of the latest tick `<= t` in
@@ -541,10 +565,10 @@ impl View<'_> {
         let mut out = Vec::new();
         match v {
             Value::Ref(x) => {
-                if !world.is_defined_staged(&StagedIds::default(), *x) {
+                if !world.catalog.is_defined_staged(&StagedIds::default(), *x) {
                     return Ok(out);
                 }
-                let both = world.is_bidirectional(attr_id);
+                let both = world.catalog.is_bidirectional(attr_id);
                 self.for_each_partner_holding(*x, attr_id, both, true, t, |s| out.push(s));
                 // Two sides (and a self pair, stored under both) may repeat.
                 out.sort_unstable();
@@ -868,7 +892,7 @@ impl View<'_> {
     ) -> Result<Vec<(EntityId, EdgeId)>, Error> {
         let world = self.world;
         self.resolve_attribute(attr)?;
-        let (attr_id, dir) = world.resolve_neighbor_attr(attr, dir)?;
+        let (attr_id, dir) = world.catalog.resolve_neighbor_attr(attr, dir)?;
         self.require_definition(attr_id)?;
         if !self.id_visible(entity) {
             return Err(Error::UnknownEntity(entity));
@@ -878,7 +902,7 @@ impl View<'_> {
         }
         // A bidirectional pair is stored once, under its normalised
         // (min, max) order, so every direction reads both sides.
-        let (read_out, read_in) = if world.is_bidirectional(attr_id) {
+        let (read_out, read_in) = if world.catalog.is_bidirectional(attr_id) {
             (true, true)
         } else {
             (dir.reads_out(), dir.reads_in())
@@ -962,7 +986,7 @@ impl View<'_> {
             return Err(Error::UnknownAttribute(attr.into()));
         }
         let mut out = Vec::new();
-        for id in world.defined_ids() {
+        for id in world.catalog.defined_ids() {
             if !self.work.id() {
                 break;
             }
@@ -1029,7 +1053,7 @@ impl View<'_> {
                 Some((Cow::Borrowed(bytes), change))
             })
             .collect();
-        if world.is_bidirectional(attr_id) {
+        if world.catalog.is_bidirectional(attr_id) {
             // The pairs stored under a smaller partner: their R mirrors.
             // A self pair's R mirror is the E entry already collected.
             for (source, tick, op, precision) in self.r_current(entity, attr_id) {
@@ -1104,7 +1128,7 @@ impl View<'_> {
         if !self.is_checked(attr_id, Side::Forward) && !self.is_checked(attr_id, Side::Reverse) {
             return Ok(out);
         }
-        for entity in world.defined_ids() {
+        for entity in world.catalog.defined_ids() {
             if !self.work.id() {
                 break;
             }
@@ -1183,7 +1207,8 @@ impl View<'_> {
         let canon = self.canon;
         let world = self.world;
         world
-            .entries
+            .journal
+            .entries()
             .iter()
             .take_while(move |e| e.tx <= canon)
             .filter_map(|e| {
@@ -1210,13 +1235,13 @@ impl View<'_> {
 
     /// Every cardinality overlap in this canon ([`View::overlaps`] of every
     /// attribute, in schema order), each with the newest tx `<=` canon of an
-    /// entry touching its `(entity, attr, side)` as [`World::touched_sides`]
+    /// entry touching its `(entity, attr, side)` as `Catalog::touched_sides`
     /// judges a write: doctor's `since` tag.
     pub(crate) fn tagged_overlaps(&self) -> Vec<(TxId, Overlap)> {
         let world = self.world;
         let mut touched: HashMap<(EntityId, AttrId, Side), TxId> = HashMap::new();
         for (e, fact) in self.visible_keyed_entries() {
-            for side in world.touched_sides(std::iter::once(&fact)) {
+            for side in world.catalog.touched_sides(std::iter::once(&fact)) {
                 let tx = touched.entry(side).or_insert(e.tx);
                 *tx = (*tx).max(e.tx);
             }
