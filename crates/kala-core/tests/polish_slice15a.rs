@@ -76,3 +76,95 @@ fn staged_handle_lookups_follow_the_transaction_only() {
     assert_eq!(tx.entity_by_handle("kael"), None);
     assert!(tx.find_or_create_entity("CHARACTER", "kael").unwrap().1);
 }
+
+fn bio_schema() -> Schema {
+    Schema::new()
+        .node_type("CHARACTER")
+        .attribute(AttrDef::new(
+            "name",
+            ValueType::Str,
+            Kind::State,
+            Cardinality::One,
+        ))
+        .attribute(AttrDef::new("bio", ValueType::Str, Kind::State, Cardinality::One).unindexed())
+        .attribute(AttrDef::new(
+            "alias",
+            ValueType::Str,
+            Kind::State,
+            Cardinality::Many,
+        ))
+}
+
+/// A world where every cardinality-one side holds one value: each character
+/// has a name and a large unindexed biography.
+fn single_valued_world(n: usize) -> (World, Vec<kala_core::EntityId>) {
+    let mut w = World::in_memory(bio_schema()).unwrap();
+    let mut tx = w.begin();
+    let mut ids = Vec::new();
+    for i in 0..n {
+        let e = tx
+            .create_entity("CHARACTER", Some(&format!("c{i}")))
+            .unwrap();
+        tx.assert(e, "name", Value::Str(format!("Name {i}")), Some(Tick(1)))
+            .unwrap();
+        tx.assert(e, "bio", Value::Str("b".repeat(4096)), Some(Tick(1)))
+            .unwrap();
+        ids.push(e);
+    }
+    tx.commit().unwrap();
+    (w, ids)
+}
+
+/// A rename, cardinality change or migration compares the whole world before
+/// and after. A side with one value forms no overlap pair, so neither
+/// snapshot may keep its decoded value (here: 50 names and 50 4 KiB
+/// biographies, twice).
+#[test]
+fn a_world_scope_commit_retains_no_single_valued_side() {
+    let (mut w, ids) = single_valued_world(50);
+    assert_eq!(w.world_warning_snapshot_size(), (0, 0));
+    // The commit itself is unaffected.
+    let mut tx = w.begin();
+    tx.rename_attribute("alias", "nickname").unwrap();
+    let result = tx.commit().unwrap();
+    assert_eq!(result.warnings, kala_core::Warnings::default());
+    // Only a side with two or more values is kept.
+    w.assert(ids[7], "name", Value::Str("Second".into()), Some(Tick(5)))
+        .unwrap();
+    assert_eq!(w.world_warning_snapshot_size(), (1, 2));
+}
+
+/// Dropping single-valued sides must not change the diff: a side that goes
+/// from one value to two (and back) under a world-scope commit still reports
+/// the overlap it introduced (and resolved).
+#[test]
+fn a_world_scope_commit_still_reports_a_side_crossing_one_value() {
+    let (mut w, ids) = single_valued_world(3);
+    let mut tx = w.begin();
+    tx.rename_attribute("alias", "nickname").unwrap();
+    tx.assert(ids[1], "name", Value::Str("Second".into()), Some(Tick(5)))
+        .unwrap();
+    let result = tx.commit().unwrap();
+    assert_eq!(result.warnings.introduced.len(), 1, "{:?}", result.warnings);
+    assert!(result.warnings.resolved.is_empty());
+    let overlap = result.warnings.introduced[0].clone();
+    assert_eq!(overlap.entity, ids[1]);
+    assert_eq!(overlap.attr, "name");
+    assert_eq!(overlap.a, Value::Str("Name 1".into()));
+    assert_eq!(overlap.b, Value::Str("Second".into()));
+    assert_eq!(overlap.during.from, Tick(5));
+
+    let mut tx = w.begin();
+    tx.rename_attribute("nickname", "alias").unwrap();
+    tx.retract(ids[1], "name", Value::Str("Name 1".into()), Some(Tick(5)))
+        .unwrap();
+    let result = tx.commit().unwrap();
+    assert!(
+        result.warnings.introduced.is_empty(),
+        "{:?}",
+        result.warnings
+    );
+    assert_eq!(result.warnings.resolved, [overlap]);
+    // Two values with touching intervals: still a side worth comparing.
+    assert_eq!(w.world_warning_snapshot_size(), (1, 2));
+}

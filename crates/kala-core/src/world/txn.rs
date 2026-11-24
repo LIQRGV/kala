@@ -86,7 +86,7 @@ enum Verdict {
 /// One `(entity, attr, side)` check a commit touches, with the values
 /// (encoded, ascending, deduplicated) whose intervals it may change there.
 #[derive(Debug)]
-struct TouchedSide {
+pub(super) struct TouchedSide {
     side: (EntityId, AttrId, Side),
     values: Vec<Vec<u8>>,
 }
@@ -963,7 +963,7 @@ impl Txn<'_> {
 /// Which overlap checks a commit's write warnings compare before and after
 /// it is applied.
 #[derive(Debug)]
-enum WarningScope {
+pub(super) enum WarningScope {
     /// No warnings ([`Txn::commit_quiet`]).
     Off,
     /// The sides the transaction's entries touch, with the values they
@@ -976,14 +976,21 @@ enum WarningScope {
 
 type WarningKey = (EntityId, AttrId, u8);
 type WarningIntervals = Vec<(Value, Vec<Interval>)>;
-type WarningSnapshot = BTreeMap<WarningKey, WarningIntervals>;
+pub(super) type WarningSnapshot = BTreeMap<WarningKey, WarningIntervals>;
 impl WarningScope {
-    fn intervals(&self, world: &World) -> WarningSnapshot {
+    pub(super) fn intervals(&self, world: &World) -> WarningSnapshot {
         let view = world.at_canon(world.latest_tx());
         let mut snapshot = BTreeMap::new();
         let mut capture = |entity, attr, side| {
             let intervals = view.warning_intervals(entity, attr, side);
-            if !intervals.is_empty() {
+            // An overlap needs two values, so a side with fewer forms no pair
+            // in this snapshot and the before/after diff is the same without
+            // it (a side that grows from one value to two is compared against
+            // an empty "before", where the single value had no pair either).
+            // Not keeping it matters for the world scope, which would
+            // otherwise hold every entity's decoded values (large unindexed
+            // strings included) twice.
+            if intervals.len() >= 2 {
                 snapshot.insert((entity, attr, u8::from(side == Side::Reverse)), intervals);
             }
         };

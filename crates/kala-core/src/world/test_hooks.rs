@@ -6,6 +6,16 @@ use super::*;
 use crate::doctor::{IndexName, Tamper};
 
 impl World {
+    /// What a world-scope commit (a rename, cardinality change or migration)
+    /// keeps in ONE of its two warning snapshots of this world, as
+    /// `(sides, values)`. A side with fewer than two values can form no
+    /// overlap pair and must not be kept. Not part of the supported API.
+    #[doc(hidden)]
+    pub fn world_warning_snapshot_size(&self) -> (usize, usize) {
+        let snapshot = txn::WarningScope::World.intervals(self);
+        (snapshot.len(), snapshot.values().map(Vec::len).sum())
+    }
+
     /// Makes the next log append fail as `fault` says, to test failure
     /// handling. An in-memory world has no log and ignores it. Not part of
     /// the supported API.
