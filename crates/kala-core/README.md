@@ -185,24 +185,9 @@ assert_eq!(world.format_id(greg), "CHARACTER#3");
   `World::open_read_only`: the same replay as a snapshot, with no lock and
   no change to the file (`recovery()` reports what `open` would cut); every
   write fails with `Error::ReadOnly`.
-- Several handles on one file: a writable world takes the file's exclusive
-  (advisory) lock only while it opens and while one transaction commits,
-  waiting up to `World::set_busy_timeout` (default 5 s) for another holder
-  before `Error::WorldLocked`. `World::catch_up` applies what other handles
-  committed since (it reads only the new transactions, takes no lock and
-  never changes the file); `World::begin` and the auto-committed writes do
-  it first. A commit that finds newer transactions than its transaction
-  began on commits over them (final IDs in `CommitResult::ids`), unless
-  they wrote something it read: then it fails with `Error::Conflict` and
-  writes nothing (run it again; `Concurrency::Weak` skips that check).
-  Only a commit, under the lock, cuts a torn tail; a damaged one
-  fails it with `Error::RecoveryRequired` until
-  `World::acknowledge_recovery`. A handle whose file was cut below what it
-  applied, rewritten or replaced gets `Error::LogDiverged` and must be
-  reopened. A handle (or a `open_read_only` snapshot) that applied a
-  transaction whose fsync then failed, or that a recovery later cut, may
-  have shown it to readers before finding out: that window is the same as
-  for a reader opened just before a crash.
+- Several handles on one file (`World::catch_up`, `World::set_busy_timeout`,
+  `Concurrency`, `Error::Conflict`, `Error::LogDiverged`): see
+  "Concurrent writers" below.
 - Writes: `World::create_entity`, `World::assert`, `World::retract` (and the
   `_with_precision` forms), `World::correct` with `Correction::{Delete,
   Replace}`; `World::begin` returns a `Txn` grouping writes into one
@@ -226,6 +211,197 @@ assert_eq!(world.format_id(greg), "CHARACTER#3");
   `kala transact --create` with this one.
 - `doctor`, `doctor_log`: the read-only integrity checker (`Report`,
   `Finding`, `Severity`).
+
+## Concurrent writers
+
+One world file may be open in several handles at once, in one process or many:
+any number of readers and any number of writers. Writers take turns, one commit
+at a time (the SQLite model); nothing below needs a server.
+
+```rust
+use kala_core::{
+    AttrDef, Cardinality, Concurrency, ConflictKey, Error, Kind, Schema, Tick, Value,
+    ValueType, World,
+};
+
+let dir = tempfile::tempdir()?;
+let path = dir.path().join("world.kala");
+let schema = Schema::new()
+    .node_type("CHARACTER")
+    .node_type("PLACE")
+    .attribute(AttrDef::new("located_in", ValueType::Ref, Kind::State, Cardinality::One));
+let mut a = World::create(&path, schema)?;
+let mut txn = a.begin();
+let greg = txn.create_entity("CHARACTER", Some("greg"))?;
+let varrow = txn.create_entity("PLACE", Some("varrow"))?;
+let ashford = txn.create_entity("PLACE", Some("ashford"))?;
+let carnath = txn.create_entity("PLACE", Some("carnath"))?;
+txn.assert(greg, "located_in", Value::Ref(varrow), Some(Tick(600)))?;
+txn.commit()?;
+
+// A second writable handle on the same file: no lock is held between commits.
+let mut b = World::open(&path)?;
+
+// b reads where Greg is and decides to move him to Carnath...
+let mut move_b = b.begin();
+move_b.note_read(greg, "located_in")?;
+move_b.retract(greg, "located_in", Value::Ref(varrow), Some(Tick(610)))?;
+move_b.assert(greg, "located_in", Value::Ref(carnath), Some(Tick(610)))?;
+
+// ...while a moves him to Ashford and commits first.
+let mut move_a = a.begin();
+move_a.retract(greg, "located_in", Value::Ref(varrow), Some(Tick(605)))?;
+move_a.assert(greg, "located_in", Value::Ref(ashford), Some(Tick(605)))?;
+move_a.commit()?;
+
+// b's commit finds a newer transaction on something it read: a conflict.
+// Nothing is written, and b is caught up with a's commit.
+let Err(Error::Conflict(conflict)) = move_b.commit() else {
+    panic!("the read was invalidated");
+};
+assert!(matches!(conflict.key, ConflictKey::EntityAttribute { .. }));
+assert_eq!(b.as_of(greg, "located_in", Tick(605))?, [Value::Ref(ashford)]);
+
+// Run again on the new state: he leaves Ashford, not Varrow.
+let mut again = b.begin();
+again.note_read(greg, "located_in")?;
+again.retract(greg, "located_in", Value::Ref(ashford), Some(Tick(610)))?;
+again.assert(greg, "located_in", Value::Ref(carnath), Some(Tick(610)))?;
+again.commit()?;
+
+// A blind write never conflicts, whatever was committed meanwhile.
+let mut blind = a.begin();
+blind.assert(carnath, "located_in", Value::Ref(varrow), Some(Tick(1)))?;
+b.assert(ashford, "located_in", Value::Ref(varrow), Some(Tick(1)))?;
+assert_eq!(blind.concurrency(), Concurrency::Optimistic);
+blind.commit()?;
+assert_eq!(a.catch_up()?, 0, "the commit caught up first");
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+**The lock is per commit.** A writable world holds the log file's exclusive lock
+only while it opens (the scan and any recovery cut), while one transaction
+commits, and while the file is created. Between transactions it holds nothing,
+so an idle handle never blocks another writer. A commit that finds the lock
+held tries again, sleeping briefly, for up to the **busy timeout**
+(`World::set_busy_timeout`, `World::open_waiting`; default 5 s, zero = one
+attempt), then fails with `Error::WorldLocked` having written nothing. The lock
+is advisory (`flock` on Linux): it keeps out other Kala handles, not other
+programs, and it dies with its process, so a crashed writer never leaves the
+world locked.
+
+**Catch-up.** `World::catch_up` applies the transactions other handles appended
+since this one last looked and returns how many. It reads only those
+transactions (plus one re-read of the handle's own last transaction), validates
+them exactly as `World::open` validates a log, takes no lock and never changes
+the file. `World::begin` and the auto-committed writes do it first, and every
+commit does it again under the lock. Without the lock an incomplete last
+transaction is "not yet" (another writer may be mid-append): it is ignored,
+not judged. Only a commit, holding the lock, cuts a torn tail; a damaged one
+fails the commit with `Error::RecoveryRequired` until
+`World::acknowledge_recovery`. A read-only handle (`World::open_read_only`) can
+catch up too.
+
+**A diverged handle.** If the file is no longer the log a handle applied
+(shorter than its last transaction, that transaction replaced, the header
+changed, or the path now names another file: a recovery or fsync-failure cut
+in another process, or the file was replaced), `catch_up` and every write fail
+with `Error::LogDiverged`. The handle keeps answering reads from what it had
+applied, which the file no longer backs, and never writes again: reopen the
+world.
+
+**Committing over newer commits.** A transaction works on the world as it was
+when it began. Everything it allocates is provisional until commit: entity
+numbers, edge IDs, entry IDs, its tx. If other transactions were committed
+meanwhile, the commit re-applies the transaction's operations to the caught-up
+world under the store's own rules (duplicate handle, same-tick conflict, an
+entry already deleted, a deprecated attribute, strict schema, value types) and
+assigns final IDs:
+
+- a created entity gets the next free number of its type; an edge gets a new
+  ID, or **reuses** the edge a newer commit already interned for the same
+  triple (one `DEFINE` in the log, and the transaction's edge properties land
+  on the shared edge);
+- `CommitResult::ids` maps every provisional ID that changed to its final one
+  (`IdMap::resolve`); `CommitResult::finalized` says what each operation
+  stored (a write may have become "0 changed" because a newer commit wrote the
+  same fact). A caller that already showed a provisional ID to someone who
+  can't be given the map sets `Txn::set_ids_exposed`: a renumbering is then a
+  conflict instead;
+- **the latest tick stays the one the transaction began with.** A write with
+  no tick keeps that tick even if a newer commit moved the world's latest tick,
+  and the result carries `CommitResult::latest_tick_moved` (`latest tick moved
+  601 → 610 while this transaction ran`). The ordinary rules then decide: the
+  same op on the same value at that tick is "0 changed", the opposite op is the
+  same-tick conflict error, a new overlap is a warning.
+
+**What conflicts.** Under `Concurrency::Optimistic` (the default) a transaction
+records what it *reads*, and its commit fails with `Error::Conflict` if a
+transaction committed since it began wrote through one of those keys. The
+goal is that committed transactions are serializable in commit order. The
+keys, each with what invalidates it:
+
+| The transaction read | Recorded by | Conflicts with a newer |
+| --- | --- | --- |
+| an entity's attribute ("where is Greg?") | `Txn::values_at`, `Txn::note_read` | entry on that entity and attribute |
+| who points at an entity ("who is in Varrow?") | `Txn::note_reverse_read` | entry with that target under the attribute |
+| a value lookup ("the entity named Edwin") | `Txn::note_value_read` | entry with that attribute and value |
+| a whole attribute | `Txn::note_read_attribute` | entry or schema change on it |
+| every entity of a node type | `Txn::note_type_scan` | entity created with that type |
+| a handle found free | `Txn::find_or_create_entity`, `Txn::entity_by_handle` | entity created with that handle |
+| an entry's revision chain | `Txn::correct` | correction of that entry |
+| everything | `Txn::note_read_all` | commit of any kind |
+
+Three examples, as the Datalog write forms make them:
+
+- **`:set`** reads the attribute to compute what to retract. Two writers both
+  run `[:set :greg :located_in …]` from the same state: the second to commit
+  read "Greg is in Varrow", which the first changed, so it conflicts instead
+  of leaving Greg in two places. Run again, it retracts the first writer's
+  value.
+- **Find-or-create** (`[:create :CHARACTER :lisa :if-missing]`) reads "the
+  handle `lisa` is free". If another writer creates `lisa` first, the second
+  conflicts; run again, it reports that she exists.
+- **A type scan**: a transaction that lists every `CHARACTER` to decide
+  something (say, "nobody is left in Varrow, so close the gates") calls
+  `note_type_scan("CHARACTER")`; a newer commit that creates a character is a
+  phantom for that decision and conflicts. A new `PLACE` doesn't.
+
+A conflict names the key as the transaction gave it and the operation that
+read (`Conflict::operation`), never what the other transaction wrote. Nothing
+is written and the handle is caught up: begin a new transaction and do the
+same reads and writes again.
+
+**Blind writes never conflict.** A transaction that only writes (an assert
+with a tick, a create with a new handle) has read nothing, so no newer commit
+can invalidate it; it commits over anything, subject only to the store's
+rules. Past 1,024 keys (`MAX_READ_KEYS`) a read set is kept per attribute
+(and type scans as "any new entity"), so a very large one conflicts more
+often, never less.
+
+**Weak mode.** `Txn::set_concurrency(Concurrency::Weak)` records no reads and
+checks none: the commit still catches up, re-applies, renumbers and warns
+about the latest tick, and the store's rules still refuse a duplicate handle,
+a same-tick opposite op or a second correction of an entry; but a write
+decided from a stale read goes through (a lost update: both `:set`s commit
+and Greg is in two places, with the usual overlap warning). It is an explicit
+choice per transaction; the world's `:concurrency` setting accepts only
+`optimistic`.
+
+**The reader window.** A handle that applied a transaction whose fsync then
+failed in the writer, or that a later recovery cut, may have shown it to
+readers before finding out (after which it is diverged). That window is the
+same as for a reader opened just before a crash, and is not closed.
+
+**The checksum chain.** Each transaction's commit checksum also covers the
+previous transaction's (the first chains from the file header), so the last
+transaction a handle applied stands for its whole history: re-reading that
+one transaction (`World::chain_tip`, `log::chain_tip_holds`) proves the file
+still begins with what the handle knows, at a cost independent of the log's
+length, and `kala doctor` verifies every link. The checksum is CRC32: it
+detects accidental rewrites (a cut and re-append, a replaced file, disk
+damage), not forgery. Someone who can write the file can recompute the chain;
+file permissions are the boundary against that.
 
 Transaction commit results count fact and correction entries in `changed` and
 reported schema actions in `declared` (no-ops count zero). Deprecated attributes

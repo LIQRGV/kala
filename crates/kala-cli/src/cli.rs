@@ -150,7 +150,7 @@ pub enum Command {
     Query(QueryArgs),
     /// Commit Datalog write transactions from a file or stdin (-).
     Transact(TransactArgs),
-    /// Ask Datalog questions, optionally holding the world open for writing.
+    /// Ask Datalog questions; with --write, also commit write forms.
     Repl(ReplArgs),
     /// Print a Datalog query's plan without running it.
     Explain(ExplainArgs),

@@ -265,6 +265,90 @@ The first run creates Kael. The second reports `exists`, `0 changed` and
 node type is an error. For several aliases, use a vector with `:set`; `[]`
 clears the set. Use `:assert` when you only want to add one member.
 
+## Two terminals, one world
+
+You don't have to close a write session to write from somewhere else. Kala
+takes the world's writer lock only while one transaction commits, so two
+terminals (or a session and a script) can work on the same file. Start on a
+fresh copy of the sample world and open a write session in the first terminal:
+
+```sh
+kala repl varrow.kala --write
+```
+
+Leave it open. In the second terminal, put a new arrival in `arrival.edn`:
+
+```clojure
+[:at 900 [:create :CHARACTER :ilse] [:assert :ilse :located_in :varrow]]
+```
+
+```sh
+kala transact varrow.kala arrival.edn
+```
+
+It commits as tx#13 (`form 1: committed tx#13: 1 changed`) although the session
+is open. Back in the first terminal, the session catches up before every
+command, so it already knows Ilse:
+
+```clojure
+[:find ?p :at 900 :where [:ilse :located_in ?p]]
+```
+
+The row is `varrow`. Now move her from the session:
+
+```clojure
+[:set :ilse :located_in :ashford :at 910]
+```
+
+It reports `2 changed` at tx#14, and the second terminal sees it at once,
+because reads never wait for anyone:
+
+```sh
+kala asof varrow.kala ilse located_in @910
+```
+
+**What each terminal sees.** A write session sees every commit, its own and
+others', from its next command on. A read-only `kala repl varrow.kala` is a
+snapshot of the moment it opened until you type `.reload`. One-shot commands
+(`kala asof`, `kala query`, `kala transact`) read the file as it is when they
+run.
+
+**When both write at once.** Two writers only wait for each other during the
+instant of a commit (up to 5 seconds by default; `--busy-timeout 30s` waits
+longer, `--busy-timeout 0` not at all). Facts you simply add never clash. What
+can clash is a form that *looks before it writes*: `:set` reads what the
+attribute holds to know what to retract, and `:if-missing` reads whether the
+handle is free. If the other terminal changes exactly that between your form's
+start and its commit, Kala refuses your form rather than write a move that was
+decided from stale information:
+
+```text
+error: conflict: op 1 (:set) read :ilse :located_in, which another transaction changed; nothing was written; run it again
+```
+
+Nothing of the form was written, so do what it says: run the same form again.
+It now reads the other terminal's result and retracts that. (`kala transact`
+prints the same message with the form's number and exits with code 4, so a
+script can retry; with several forms in a file it also says which form to
+start again from, because the ones before it are already committed.)
+
+If the other writer moved the story's latest tick while your form ran, a write
+with no tick stays where it was when the form started, and the report says so:
+`warning: latest tick moved 900 → 910 while this transaction ran`. Give the
+write an `:at` if you meant the new end of history.
+
+If you would rather have the last write win than be asked to run a form again,
+say so for one transaction, for a session (`.concurrency weak`) or for a
+script (`kala transact varrow.kala script.edn --concurrency weak`):
+
+```clojure
+[[:concurrency :weak] [:set :ilse :located_in :carnath :at 920]]
+```
+
+Kala's own rules still hold in weak mode, but two overlapping `:set`s can then
+leave Ilse in two places; the write reports that as an overlap warning, and
+`kala doctor` lists it.
+
 ## Correct a mistake and read the older draft
 
 Save `leave.edn`:

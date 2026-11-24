@@ -50,6 +50,7 @@ at 65,536 bytes. Session parameters and rule definitions are also bounded.
 | `.explain QUERY` | Print a plan with the session defaults, rules and parameters applied. |
 | `.load FILE` | Run one UTF-8 query file (regular files only, at most 65,536 bytes). |
 | `.json on` / `.json off` | Select JSON / text query results, using the same format as `kala query`. |
+| `.concurrency [optimistic\|weak]` | With `--write` only: show (no argument) or set how the session's write forms treat other writers; see "Several writers on one world". |
 | `.schema` | List node types and each attribute's type, kind, cardinality, direction, inverse, reverse cardinality and indexing. |
 | `.info` | Print information about the opened snapshot, as `kala info` does. |
 | `.reload` | Reopen the world and report its latest transaction and tick. |
@@ -127,7 +128,8 @@ A single op is one transaction; a vector of ops commits atomically:
  [:assert :kael :located_in :varrow :precision :year]]
 ```
 
-The first failed form stops the command (exit 1), preserving earlier commits.
+The first failed form stops the command (exit 1; exit 4 for a conflict, exit 3
+if the world can't be written: see "Exit codes"), preserving earlier commits.
 Each successful form prints its number, transaction, changed count, per-op tick,
 precision and entry IDs, new edge IDs, and introduced/resolved overlap warnings.
 A correction that moves a key appends two entries (so reports 2 changed); entity
@@ -192,7 +194,8 @@ exist).
 JSON includes `introduced_omitted` and `resolved_omitted` only when nonzero.
 
 `--json` prints one document per successful form, with fields `form`, `dry_run`,
-`tx`, `changed`, `declared`, `entries`, `edges`, `ops`, `schema` and `warnings`. Each op has `position`,
+`tx`, `changed`, `declared`, `entries`, `edges`, `ops`, `schema` and `warnings`
+(and `latest_tick_moved` when another writer moved the latest tick; see below). Each op has `position`,
 `kind`, `tick`, `precision`, `changed`, `declared`, `entries` and `entity` (null unless created).
 Entry IDs are integers; new edges are `edge#N` strings. Warnings have `introduced`
 and `resolved` arrays of the same messages as `kala load`. Errors stay on stderr.
@@ -212,15 +215,157 @@ rerun with `--acknowledge-recovery`. That cuts the damaged bytes to a
 never acknowledged) is cut without asking.
 
 `kala repl WORLD --write` takes the exclusive writer lock only while a
-transaction commits, and queries see each successful commit immediately. Another
-writer (a `kala transact` on the same world) can commit while the session is
-open; the session applies what it committed before its next command. A write
-waits up to 5 seconds for a lock another writer holds, then exits 3 with a
-locked world message. Without `--write`, write forms are refused. `.at` supplies the
+transaction commits, and queries see each successful commit immediately. An
+open session **no longer blocks other writers**: a `kala transact` (or another
+write session) on the same world commits while it is open, and the session
+applies what they committed before each of its commands, reads and writes
+alike. Without `--write`, write forms are refused. `.at` supplies the
 write default: an op's `:at` wins over the transaction's `:at`, then session `.at`,
 then the latest tick captured when the transaction began. `.canon` and `.reload`
 are refused in write mode; an explicit query `:canon` still reads an older draft.
 `.json` applies to writes too, and `.load FILE` accepts one write transaction.
+`.concurrency` and `--busy-timeout` are described next.
+
+### Several writers on one world
+
+Any number of `kala` processes may write one world file. They take turns, one
+transaction at a time: the writer lock is held only while a form commits (and
+while a world opens), never by an idle session. Nothing needs to be running in
+between; this is the SQLite model.
+
+**Waiting for the lock: `--busy-timeout`.** A write that finds another writer
+mid-commit waits for it, by default up to 5 seconds, then gives up with exit 3
+(`world is locked by another writer: … nothing was written; run the command
+again, or wait longer with --busy-timeout`). `--busy-timeout DURATION` sets the
+wait on every command that writes a world file: `kala transact`, `kala repl
+--write`, `kala load` (for `--force`), `kala create` and the `kala user` write
+subcommands (for `system.kala`). A duration is a whole number with a unit:
+`500ms`, `5s`, `2m`; a bare number is seconds; `0` means don't wait at all; the
+most is `60m`. `kala create` and `kala transact --create` build the new world in
+a private file, so they have nothing to wait for and accept the flag only so a
+script can pass it everywhere.
+
+```sh
+kala transact varrow.kala scene.edn --busy-timeout 30s
+kala repl varrow.kala --write --busy-timeout 500ms
+```
+
+**What another writer's commit does to yours.** Each form is one transaction
+that starts from the world as it is at that moment. If another writer commits
+between a form's start and its commit, Kala commits the form over that
+transaction when it safely can:
+
+- The IDs in the report are the committed ones. If both writers created a
+  character, the second is simply given the next number; if both made the same
+  relationship, they share one edge.
+- A write with no tick stays on the latest tick the form started with, even if
+  the other writer moved the world's latest tick meanwhile. The report then
+  ends with a warning, so a write that was meant to be "now" and is no longer
+  the end of history is visible at once:
+
+  ```text
+  form 1: committed tx#14: 1 changed
+    op 1 (:assert): tick 601, 1 changed, entry#52
+  warning: latest tick moved 601 → 610 while this transaction ran
+  ```
+
+  JSON carries the same as `"latest_tick_moved": {"from": 601, "to": 610}`
+  (the field is absent otherwise). Only facts warn: creates and schema forms
+  store no tick, and a fact with its own `:at` (or under a form `:at`) is where
+  you put it.
+
+**Conflicts (exit 4).** What Kala will not do is commit a form that was decided
+from something the other writer has since changed. Forms that *read* before
+they write are `[:set …]` (it reads what the attribute holds, to know what to
+retract), `[:create … :if-missing]` (it reads whether the handle is free) and
+`[:correct …]` (it reads the entry). If a transaction committed meanwhile wrote
+what one of them read, the form is refused, nothing of it is written, and the
+message says which op read what:
+
+```text
+kala: error: form 1 failed; 0 prior forms committed: conflict: op 1 (:set) read :greg :located_in, which another transaction changed; nothing was written; run it again
+```
+
+Running the same form again is always safe: it now reads the other writer's
+result (a `:set` retracts the value that writer set; an `:if-missing` create
+reports that the entity exists). In a file of several forms, the forms before
+the refused one are already committed, so the message adds where to start
+again (`run form 3 and those after it: the 2 before it are already
+committed`); running the whole file again would apply those twice. One more
+thing to expect on a re-run: a `:set` with no tick lands on the latest tick, and
+if the other writer set its value at that same tick, the re-run is the ordinary
+same-tick conflict error (exit 1), because tick order can't decide between the
+two; give the `:set` its own `:at`.
+
+With `--json`, the refused form also gets a document on stdout (the message
+still goes to stderr):
+
+```json
+{"form":1,"error":"conflict","key":"entity-attribute","op":1,"kind":"set","applied":1,"prior_forms_committed":0,"message":"form 1 failed; …"}
+```
+
+`key` is the kind of read that was invalidated (`entity-attribute`, `handle`,
+`entry`; later query layers add `reverse`, `value`, `attribute`, `type-scan`,
+`any-define`, `undeclared`, `all`, `exposed-id`), `op` and `kind` the op that
+read (null if no single op did), `applied` how many transactions the other
+writers committed meanwhile.
+
+Plain asserts, retracts and creates read nothing, so they **never conflict**:
+two writers adding different facts, or even the same fact, both commit (the
+second "same fact" is `0 changed`; opposite ops on one value at one tick are
+the same-tick conflict error, as always).
+
+**Weak mode.** `--concurrency weak` on `kala transact`, `.concurrency weak` in a
+write session (or `kala repl --write --concurrency weak`), or
+`[:concurrency :weak]` as the first op of one transaction turns the read check
+off: the store's own rules still hold (duplicate handles, same-tick conflicts,
+an entry corrected twice), but a `:set` decided from a stale read goes through,
+which can leave a cardinality-one attribute with two values (reported as the
+usual overlap warning). The default is `optimistic`, and a form's own
+`[:concurrency …]` wins over the flag and the session setting:
+
+```clojure
+[[:concurrency :weak]
+ [:set :greg :located_in :carnath]]
+```
+
+`[:concurrency …]` must be the first op of a transaction vector (after a
+leading `:at T`), appears once, and takes `:weak` or `:optimistic`; anywhere
+else it is a syntax error. It is not an op: the report numbers the ops after
+it from 1. `kala dump` never writes it (a dump holds what was stored, not how
+it was committed), so dumps and restores are unchanged.
+
+```text
+kala> .concurrency
+concurrency: optimistic
+kala> .concurrency weak
+```
+
+In a write session a conflict is an error like any other: the session stays
+open and you run the form again. (A piped session still exits 1 if any command
+failed; use `kala transact` when a script needs to tell a conflict apart.)
+
+**Replacing a world that is open elsewhere.** `kala load --force` replaces a
+world while holding its writer lock, so never in the middle of another
+process's commit: if a commit is in progress it waits the busy timeout and
+then refuses (exit 1, the old world untouched). A process that merely has the
+world open (an idle `kala repl --write`) holds no lock, so the world **is**
+replaced under it. That process's next command finds that its file is gone
+and writes nothing:
+
+```text
+error: varrow.kala: the world file was cut back, rewritten or replaced by another process (for example `kala load --force`) while this command had it open; nothing was written; run the command again (in a REPL session: quit and start it again)
+```
+
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success. `kala doctor` with warnings or hints only is also 0. |
+| 1 | Your input was wrong: a bad form or fixture, an unknown entity, a store rule (a same-tick conflict, a duplicate handle), a missing file, `kala doctor` error findings, any failed command of a piped REPL session. |
+| 2 | The command line was wrong: an unknown flag or value, an existing destination where a new file is required. |
+| 3 | The world can't be used: a corrupt or foreign log, an older log format, an I/O error, a failed write to stdout/stderr; or it can't be written right now: its writer lock stayed held for the whole busy timeout, its file was replaced under the command, or its damaged last transaction needs `--acknowledge-recovery`. Nothing was written. |
+| 4 | A conflict: another writer changed something a write form had read. Nothing of that form was written; running it again is safe. |
 
 Write input uses the query lexer (strings, escapes, comments, commas). Input is
 capped at 65,536 bytes, nesting at 32 levels, ops per transaction at 256 and forms
@@ -487,9 +632,17 @@ To carry one across, dump it with the older `kala` binary that wrote it and load
 the dump with this one, which reproduces the same entry IDs and tx numbers:
 
 ```sh
-old-kala dump world.kala -o world.dump.edn
-kala transact --create new-world.kala world.dump.edn
+old-kala dump world.kala -o world.dump.edn            # the kala that wrote the file
+kala transact --create new-world.kala world.dump.edn  # this kala
+kala doctor new-world.kala                            # "clean"
+kala info new-world.kala                              # format version: 6
 ```
+
+`old-kala` stands for the previous binary under whatever name you kept it (this
+`kala` cannot read the old file, so dump before replacing the binary, or build
+the previous release to dump). The new world is a new file; the old one is left
+as it was. A dump taken from the new world differs from the old dump only in
+its `;; Source format version` comment line.
 
 For a server directory, `old-kala dump --all DIR -o BACKUP` and one
 `kala transact --create` per dump, `system.dump.edn` included (see below).

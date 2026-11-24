@@ -580,7 +580,10 @@ impl fmt::Display for Error {
                 Ok(())
             }
             Error::Corrupt(why) => write!(f, "corrupt log: {why}"),
-            Error::WorldLocked => f.write_str("world is open elsewhere (its log file is locked)"),
+            Error::WorldLocked => f.write_str(
+                "world is locked by another writer (its log file's lock stayed held for the \
+                 whole busy timeout); nothing was written",
+            ),
             Error::RecoveryRequired { bytes } => write!(
                 f,
                 "the last transaction is damaged ({bytes} bytes); opening for writing \

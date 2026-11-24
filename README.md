@@ -208,7 +208,8 @@ The native Rust API (`kala-core`) can also write directly. See
 - [x] Neo4j driver metadata and routing (CALL, SHOW DATABASES, ROUTE; TCP only)
 - [x] Shared write applier, Datalog `:set` / `:if-missing`, bounded commit warnings and write-privilege groundwork (slice 15a)
 - [x] Shared Bolt transport seam, multiple listeners and Unix sockets (slice 16)
-- [ ] Writes over Bolt and explicit transactions (slices 15b–15d)
+- [x] Several writers on one world: writer lock per commit with a busy timeout, log catch-up, chained checksums (log format 6), optimistic conflict detection with an explicit weak mode, `--concurrency` / `--busy-timeout` and a conflict exit code (slice 15b)
+- [ ] Writes over Bolt and explicit transactions (slices 15c–15d)
 - [ ] Web clients (WebSocket and remaining Browser stubs), then Gremlin when requested
 - [x] Accounts, host matching, Argon2id passwords and database privileges
 - [ ] TLS for encrypted Bolt connections
