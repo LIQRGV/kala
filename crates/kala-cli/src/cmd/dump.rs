@@ -1,14 +1,16 @@
 //! A deterministic write-language representation of the committed log.
 use super::{schema, transfer};
-use crate::{error::CliError, escape, out};
+use crate::{cli::DumpArgs, error::CliError, escape, out};
 use kala_core::log::EntryBody;
 use kala_core::schema::SchemaEdit;
-use kala_core::{AttrDef, AttrId, Kind, Op, RefDirection, Value, World};
+use kala_core::{
+    AttrDef, AttrId, EntityId, EntryId, EntryInfo, Kind, Op, RefDirection, Value, World,
+};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub(super) fn quoted(value: &str) -> String {
     let mut text = String::from("\"");
@@ -188,123 +190,147 @@ fn script(world: &World) -> Result<String, CliError> {
         world.latest_tx().0,
         entries.len()
     );
-    let mut attrs = BTreeMap::new();
-    let mut subjects = BTreeMap::new();
+    let mut replayed = Replayed {
+        world,
+        attrs: BTreeMap::new(),
+        subjects: BTreeMap::new(),
+    };
     let mut current_tx = 0;
     for (i, entry) in entries.iter().enumerate() {
         if entry.tx.0 != current_tx {
             current_tx = entry.tx.0;
             let _ = writeln!(s, ";; tx#{current_tx}\n[");
         }
-        let generated = copies.contains(&entry.id);
-        let op = if generated {
-            None
-        } else {
-            match &entry.body {
-                EntryBody::DefineNodeType { name: n, .. } => {
-                    Some(format!("[:node-type {}]", name(n)))
-                }
-                EntryBody::DefineAttr { def, .. } => Some(attribute(def)),
-                EntryBody::Schema(edit) => Some(schema_edit(edit, &attrs)),
-                EntryBody::DefineEntity { id, handle } => {
-                    let ty = world
-                        .node_types()
-                        .nth(usize::from(id.node_type().0))
-                        .ok_or_else(|| CliError::Store("undefined node type".into()))?;
-                    Some(format!(
-                        "[:create {}{}]",
-                        name(ty),
-                        handle
-                            .as_ref()
-                            .map_or(String::new(), |h| format!(" {}", name(h)))
-                    ))
-                }
-                EntryBody::Fact {
-                    entity,
-                    attr,
-                    value: v,
-                    tick,
-                    op,
-                    precision,
-                } => Some(format!(
-                    "[:{} {} {} {} :at {} :precision :{}]",
-                    if *op == Op::Assert {
-                        "assert"
-                    } else {
-                        "retract"
-                    },
-                    reference(world, *entity),
-                    name(&attrs[attr].name),
-                    value(world, v),
-                    tick.0,
-                    out::precision_str(*precision)
-                )),
-                EntryBody::Deleted { of, rev, .. } => {
-                    let replacement = entries.get(i + 1).is_some_and(|next| matches!(next.body, EntryBody::Revised { of: n, rev: r, .. } if n == *of && r == *rev));
-                    if replacement {
-                        None
-                    } else {
-                        Some(format!("[:correct {} :delete]", of.0))
-                    }
-                }
-                EntryBody::Revised {
-                    of,
-                    entity,
-                    value: v,
-                    tick,
-                    op,
-                    precision,
-                    ..
-                } => {
-                    // A bidirectional correction can normalize the pair by
-                    // swapping its subject and value. Correct takes the old
-                    // subject implicitly, so undo that normalization when
-                    // choosing the replacement reference for the script.
-                    let replacement = if subjects.get(of).is_some_and(|old| old != entity) {
-                        Value::Ref(*entity)
-                    } else {
-                        v.clone()
-                    };
-                    Some(format!(
-                        "[:correct {} :replace :value {} :at {} :op :{} :precision :{}]",
-                        of.0,
-                        value(world, &replacement),
-                        tick.0,
-                        if *op == Op::Assert {
-                            "assert"
-                        } else {
-                            "retract"
-                        },
-                        out::precision_str(*precision)
-                    ))
-                }
-                EntryBody::Commit { .. } => {
-                    s.push_str("]\n");
-                    None
-                }
-                EntryBody::DefineEdge { .. } => None,
+        // Migration copies are generated by their `[:migrate ...]` form.
+        if !copies.contains(&entry.id) {
+            if let EntryBody::Commit { .. } = entry.body {
+                s.push_str("]\n");
             }
-        };
-        if let Some(op) = op {
-            let _ = writeln!(s, "  {op}");
+            if let Some(op) = replayed.form(entry, entries.get(i + 1))? {
+                let _ = writeln!(s, "  {op}");
+            }
         }
         // Migration copies are omitted as forms but their new names take
         // effect immediately, even before the end of this transaction.
+        replayed.track(entry);
+    }
+    Ok(s)
+}
+
+/// What the entries scripted so far have established, as a replay of the
+/// script would know it.
+struct Replayed<'a> {
+    world: &'a World,
+    /// Each attribute's latest definition.
+    attrs: BTreeMap<AttrId, AttrDef>,
+    /// The current subject of each base fact, by its entry ID.
+    subjects: BTreeMap<EntryId, EntityId>,
+}
+
+impl Replayed<'_> {
+    /// The write form that replays `entry`, if it needs one of its own.
+    /// `next` is the entry after it in the log.
+    fn form(
+        &self,
+        entry: &EntryInfo,
+        next: Option<&EntryInfo>,
+    ) -> Result<Option<String>, CliError> {
+        let world = self.world;
+        Ok(match &entry.body {
+            EntryBody::DefineNodeType { name: n, .. } => Some(format!("[:node-type {}]", name(n))),
+            EntryBody::DefineAttr { def, .. } => Some(attribute(def)),
+            EntryBody::Schema(edit) => Some(schema_edit(edit, &self.attrs)),
+            EntryBody::DefineEntity { id, handle } => {
+                let ty = world
+                    .node_types()
+                    .nth(usize::from(id.node_type().0))
+                    .ok_or_else(|| CliError::Store("undefined node type".into()))?;
+                Some(format!(
+                    "[:create {}{}]",
+                    name(ty),
+                    handle
+                        .as_ref()
+                        .map_or(String::new(), |h| format!(" {}", name(h)))
+                ))
+            }
+            EntryBody::Fact {
+                entity,
+                attr,
+                value: v,
+                tick,
+                op,
+                precision,
+            } => Some(format!(
+                "[:{} {} {} {} :at {} :precision :{}]",
+                op_name(*op),
+                reference(world, *entity),
+                name(&self.attrs[attr].name),
+                value(world, v),
+                tick.0,
+                out::precision_str(*precision)
+            )),
+            EntryBody::Deleted { of, rev, .. } => {
+                let replacement = next.is_some_and(|next| matches!(next.body, EntryBody::Revised { of: n, rev: r, .. } if n == *of && r == *rev));
+                if replacement {
+                    None
+                } else {
+                    Some(format!("[:correct {} :delete]", of.0))
+                }
+            }
+            EntryBody::Revised {
+                of,
+                entity,
+                value: v,
+                tick,
+                op,
+                precision,
+                ..
+            } => {
+                // A bidirectional correction can normalize the pair by
+                // swapping its subject and value. Correct takes the old
+                // subject implicitly, so undo that normalization when
+                // choosing the replacement reference for the script.
+                let replacement = if self.subjects.get(of).is_some_and(|old| old != entity) {
+                    Value::Ref(*entity)
+                } else {
+                    v.clone()
+                };
+                Some(format!(
+                    "[:correct {} :replace :value {} :at {} :op :{} :precision :{}]",
+                    of.0,
+                    value(world, &replacement),
+                    tick.0,
+                    op_name(*op),
+                    out::precision_str(*precision)
+                ))
+            }
+            EntryBody::Commit { .. } | EntryBody::DefineEdge { .. } => None,
+        })
+    }
+
+    /// Records what `entry` changes for the forms after it.
+    fn track(&mut self, entry: &EntryInfo) {
         match &entry.body {
             EntryBody::Fact { entity, .. } => {
-                subjects.insert(entry.id, *entity);
+                self.subjects.insert(entry.id, *entity);
             }
             EntryBody::Revised { of, entity, .. } => {
-                subjects.insert(*of, *entity);
+                self.subjects.insert(*of, *entity);
             }
             EntryBody::DefineAttr { id, def }
             | EntryBody::Schema(SchemaEdit::Attribute { id, def }) => {
-                attrs.insert(*id, def.clone());
+                self.attrs.insert(*id, def.clone());
             }
             _ => {}
         }
     }
-    Ok(s)
+}
+fn op_name(op: Op) -> &'static str {
+    if op == Op::Assert {
+        "assert"
+    } else {
+        "retract"
+    }
 }
 pub(super) fn open(path: &Path) -> Result<World, CliError> {
     World::open_read_only(path).map_err(|e| {
@@ -322,7 +348,9 @@ pub(super) fn recovery(world: &World) {
         );
     }
 }
-pub fn run(path: &Path, output: Option<&Path>, all: bool, force: bool) -> Result<String, CliError> {
+pub fn run(args: &DumpArgs) -> Result<String, CliError> {
+    let (path, output) = (args.world.as_path(), args.output.as_deref());
+    let (all, force) = (args.all, args.force);
     if all {
         let output =
             output.ok_or_else(|| CliError::Usage("dump --all requires -o OUTDIR".into()))?;
@@ -337,24 +365,7 @@ pub fn run(path: &Path, output: Option<&Path>, all: bool, force: bool) -> Result
         return Err(CliError::Usage("--force needs -o FILE".into()));
     }
     if let Some(output) = output {
-        let source_meta = fs::metadata(path).map_err(transfer::io)?;
-        if let Ok(target_meta) = fs::metadata(output) {
-            #[cfg(unix)]
-            let same = {
-                use std::os::unix::fs::MetadataExt;
-                source_meta.dev() == target_meta.dev() && source_meta.ino() == target_meta.ino()
-            };
-            #[cfg(not(unix))]
-            let same = {
-                let _ = (source_meta, target_meta);
-                fs::canonicalize(path).ok() == fs::canonicalize(output).ok()
-            };
-            if same {
-                return Err(CliError::Usage(
-                    "dump output must differ from the source world".into(),
-                ));
-            }
-        }
+        refuse_same_file(path, output)?;
     }
     let world = open(path)?;
     if kala_system::is_system(&world) {
@@ -370,6 +381,28 @@ pub fn run(path: &Path, output: Option<&Path>, all: bool, force: bool) -> Result
         world.entries().count()
     );
     Ok(result)
+}
+/// Refuses `-o` naming the world being dumped (under any spelling or link).
+fn refuse_same_file(path: &Path, output: &Path) -> Result<(), CliError> {
+    let source_meta = fs::metadata(path).map_err(transfer::io)?;
+    if let Ok(target_meta) = fs::metadata(output) {
+        #[cfg(unix)]
+        let same = {
+            use std::os::unix::fs::MetadataExt;
+            source_meta.dev() == target_meta.dev() && source_meta.ino() == target_meta.ino()
+        };
+        #[cfg(not(unix))]
+        let same = {
+            let _ = (source_meta, target_meta);
+            fs::canonicalize(path).ok() == fs::canonicalize(output).ok()
+        };
+        if same {
+            return Err(CliError::Usage(
+                "dump output must differ from the source world".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 fn dump_all(directory: &Path, output: &Path) -> Result<String, CliError> {
     // A terminal slash or `/.` would make a symlink an intermediate
@@ -393,64 +426,13 @@ fn dump_all(directory: &Path, output: &Path) -> Result<String, CliError> {
             worlds.insert(db.to_owned(), entry.path());
         }
     }
-    let mut builder = fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    match builder.create(output) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(transfer::io(e)),
-    }
-    // On Unix, open the directory itself (never through a symlink) and pin
-    // it, so swapping its pathname cannot redirect account hashes during the
-    // backup. Other platforms cannot open a directory as a file and rely on a
-    // trusted output parent.
-    #[cfg(unix)]
-    let dir = {
-        use std::os::unix::fs::OpenOptionsExt;
-        let dir = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
-            .open(output)
-            .map_err(transfer::io)?;
-        if !dir.metadata().map_err(transfer::io)?.is_dir() {
-            return Err(CliError::User("OUTDIR must be a directory".into()));
-        }
-        dir
-    };
-    #[cfg(not(unix))]
-    if !fs::symlink_metadata(output).map_err(transfer::io)?.is_dir() {
-        return Err(CliError::User("OUTDIR must be a directory".into()));
-    }
-    #[cfg(target_os = "linux")]
-    let stable = {
-        use std::os::fd::AsRawFd;
-        std::path::PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
-    };
-    #[cfg(not(target_os = "linux"))]
-    let stable = output.to_path_buf();
-    if fs::read_dir(&stable)
-        .map_err(transfer::io)?
-        .next()
-        .is_some()
-    {
-        return Err(CliError::User("OUTDIR must be empty".into()));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        dir.set_permissions(fs::Permissions::from_mode(0o700))
-            .map_err(transfer::io)?;
-    }
+    let out_dir = OutDir::prepare(output)?;
     let mut summary = String::new();
     for (name, path) in worlds {
         let world = open(&path)?;
         recovery(&world);
         let text = script(&world)?;
-        let mut file = transfer::private_file(&stable.join(format!("{name}.dump.edn")))?;
+        let mut file = transfer::private_file(&out_dir.stable.join(format!("{name}.dump.edn")))?;
         file.write_all(text.as_bytes())
             .and_then(|()| file.sync_all())
             .map_err(transfer::io)?;
@@ -466,7 +448,87 @@ fn dump_all(directory: &Path, output: &Path) -> Result<String, CliError> {
             escape::path(&output.join(format!("{name}.dump.edn")))
         );
     }
-    #[cfg(unix)]
-    dir.sync_all().map_err(transfer::io)?;
+    out_dir.sync()?;
     Ok(summary)
+}
+
+/// The private, empty directory `dump --all` writes into.
+struct OutDir {
+    /// The directory itself, held open for the whole backup.
+    #[cfg(unix)]
+    dir: fs::File,
+    /// The path the dump files are created under: one that keeps naming the
+    /// opened directory where the platform has such a path.
+    stable: PathBuf,
+}
+
+impl OutDir {
+    /// Creates `output` (mode 0700) if needed, and requires it to be an
+    /// empty directory.
+    fn prepare(output: &Path) -> Result<OutDir, CliError> {
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(output) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(transfer::io(e)),
+        }
+        // On Unix, open the directory itself (never through a symlink) and pin
+        // it, so swapping its pathname cannot redirect account hashes during the
+        // backup. Other platforms cannot open a directory as a file and rely on a
+        // trusted output parent.
+        #[cfg(unix)]
+        let dir = {
+            use std::os::unix::fs::OpenOptionsExt;
+            let dir = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+                .open(output)
+                .map_err(transfer::io)?;
+            if !dir.metadata().map_err(transfer::io)?.is_dir() {
+                return Err(CliError::User("OUTDIR must be a directory".into()));
+            }
+            dir
+        };
+        #[cfg(not(unix))]
+        if !fs::symlink_metadata(output).map_err(transfer::io)?.is_dir() {
+            return Err(CliError::User("OUTDIR must be a directory".into()));
+        }
+        #[cfg(target_os = "linux")]
+        let stable = {
+            use std::os::fd::AsRawFd;
+            PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+        };
+        #[cfg(not(target_os = "linux"))]
+        let stable = output.to_path_buf();
+        if fs::read_dir(&stable)
+            .map_err(transfer::io)?
+            .next()
+            .is_some()
+        {
+            return Err(CliError::User("OUTDIR must be empty".into()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            dir.set_permissions(fs::Permissions::from_mode(0o700))
+                .map_err(transfer::io)?;
+        }
+        Ok(OutDir {
+            #[cfg(unix)]
+            dir,
+            stable,
+        })
+    }
+
+    /// Makes the directory's new entries durable.
+    fn sync(&self) -> Result<(), CliError> {
+        #[cfg(unix)]
+        self.dir.sync_all().map_err(transfer::io)?;
+        Ok(())
+    }
 }

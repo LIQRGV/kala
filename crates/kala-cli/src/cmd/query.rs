@@ -13,7 +13,7 @@ use kala_query::{Datum, Limits, ParameterInput, Params, QueryError, QueryParams,
 use serde::Serialize;
 
 use super::read::{Ctx, parse_value};
-use crate::cli::{QueryArgs, parse_canon};
+use crate::cli::{ExplainArgs, QueryArgs, QueryInput, parse_canon};
 use crate::error::CliError;
 use crate::escape;
 use crate::out::{JValue, Labeler, Text, render, value_text};
@@ -75,8 +75,9 @@ pub(crate) fn table(world: &World, rs: &ResultSet) -> (Vec<String>, Vec<Vec<JVal
 
 /// `kala query`: runs the query and prints its rows. Entities are shown
 /// (names, labels) at the query's resolved default tick and canon.
-pub fn run(world: &Path, q: &QueryArgs, json: bool) -> Result<String, CliError> {
-    let (ctx, prepared, params) = prepare(world, q)?;
+pub fn run(args: &QueryArgs) -> Result<String, CliError> {
+    let json = args.json;
+    let (ctx, prepared, params) = prepare(&args.world, &args.query)?;
     let rs = kala_query::run(&ctx.world, &prepared.plan, &params, &Limits::default())
         .map_err(|e| query_err(e, "query"))?;
     Ok(render_result(&ctx.world, &rs, json))
@@ -108,14 +109,14 @@ pub(crate) fn column_name(name: &str) -> String {
 
 /// `kala explain`: prints the plan. Every parameter must be given and is
 /// checked as `query` checks it, but nothing is executed.
-pub fn explain(world: &Path, q: &QueryArgs) -> Result<String, CliError> {
-    let (ctx, prepared, _params) = prepare(world, q)?;
+pub fn explain(args: &ExplainArgs) -> Result<String, CliError> {
+    let (ctx, prepared, _params) = prepare(&args.world, &args.query)?;
     Ok(prepared.plan.explain(&ctx.world))
 }
 
 /// Reads the query text, opens the world, prepares the query and parses
 /// its parameters.
-fn prepare(world: &Path, q: &QueryArgs) -> Result<(Ctx, Prepared, QueryParams), CliError> {
+fn prepare(world: &Path, q: &QueryInput) -> Result<(Ctx, Prepared, QueryParams), CliError> {
     let text = match (&q.query, &q.file) {
         (Some(t), None) => t.clone(),
         (None, Some(f)) => read_text_file(f, MAX_QUERY_BYTES, "the query")?,

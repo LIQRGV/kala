@@ -1,10 +1,9 @@
 //! Read-only schema inspection and write-report presentation.
 use super::read::Ctx;
-use crate::{cli::Canon, error::CliError, escape, out};
+use crate::{cli::SchemaArgs, error::CliError, escape, out};
 use kala_core::{AttrDef, Cardinality, Kind, RefDirection, SchemaChange};
 use serde_json::{Value, json};
 use std::fmt::Write as _;
-use std::path::Path;
 
 pub(super) fn cardinality(c: Cardinality) -> &'static str {
     match c {
@@ -13,10 +12,10 @@ pub(super) fn cardinality(c: Cardinality) -> &'static str {
     }
 }
 
-pub fn run(path: &Path, canon: Option<Canon>, as_json: bool) -> Result<String, CliError> {
-    let ctx = Ctx::open(path, canon)?;
+pub fn run(args: &SchemaArgs) -> Result<String, CliError> {
+    let ctx = Ctx::open(&args.world, args.canon)?;
     let view = ctx.view();
-    if as_json {
+    if args.json {
         return Ok(out::to_json(&document(&ctx.world, ctx.canon)));
     }
     let mut text = format!("schema at canon tx#{}\nnode types:\n", ctx.canon.0);

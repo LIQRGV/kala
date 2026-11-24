@@ -14,15 +14,15 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use kala_core::{DoctorOptions, Finding, IndexName, Severity, TxId, doctor_log};
+use kala_core::{DoctorOptions, Finding, IndexName, Severity, TxId, World, doctor_log};
 use kala_datalog::{MAX_CHECKS_BYTES, Prepared};
-use kala_query::{CanonSource, Limits, Params, QueryError, Usage};
+use kala_query::{CanonSource, Limits, Params, QueryError, ResultSet, Usage};
 use serde::Serialize;
 
 use super::Done;
 use super::query::{query_err, read_text_file, row_text};
 use super::read::open_world;
-use crate::cli::Canon;
+use crate::cli::{Canon, DoctorArgs};
 use crate::error::CliError;
 use crate::escape;
 use crate::names::{self, LogNames, Names};
@@ -65,14 +65,6 @@ fn text_row_size(row: &[JValue], limit: usize) -> Option<usize> {
         }
     }
     (bytes <= limit).then_some(bytes)
-}
-
-/// `kala doctor`'s options.
-pub struct Options<'a> {
-    pub canon: Option<Canon>,
-    pub since: Option<Canon>,
-    pub checks: Option<&'a Path>,
-    pub json: bool,
 }
 
 #[derive(Serialize)]
@@ -166,10 +158,11 @@ impl Text for Doctor {
     }
 }
 
-pub fn run(world: &Path, o: Options<'_>) -> Result<Done, CliError> {
+pub fn run(o: &DoctorArgs) -> Result<Done, CliError> {
+    let world = o.world.as_path();
     // The file's shape is checked whatever the store's state, before any
     // report is printed.
-    let checks = o.checks.map(read_checks).transpose()?;
+    let checks = o.checks.as_deref().map(read_checks).transpose()?;
     let opts = DoctorOptions {
         canon: o.canon.map(|c| TxId(c.0)),
         since: o.since.map(|c| TxId(c.0)),
@@ -242,29 +235,10 @@ fn run_checks(
     json: bool,
 ) -> Result<Vec<JHint>, CliError> {
     let world = open_world(path)?;
-    let mut prepared: Vec<Prepared> = Vec::with_capacity(checks.len());
-    for c in checks {
-        // `prepare` locates errors in the query text; relocate them in the
-        // checks file, where the author can find them.
-        let mut p = kala_datalog::prepare(&world, &c.query).map_err(|e| {
-            let e = e.offset_by(c.query_span.start).locate(text);
-            CliError::User(format!("{}: {e}", whose(c)))
-        })?;
-        if !p.params.is_empty() {
-            return Err(CliError::User(format!(
-                "{}: a story check takes no `:in` parameters",
-                whose(c)
-            )));
-        }
-        if let Some(canon) = canon {
-            p.plan.canon = CanonSource::Const(canon.0);
-        }
-        prepared.push(p);
-    }
+    let prepared = prepare_checks(&world, text, checks, canon)?;
     let mut hints = Vec::new();
     let mut remaining = Limits::default();
-    let (mut rendered_rows, mut rendered_bytes) = (0usize, 0usize);
-    let mut truncated = false;
+    let mut cap = OutputCap::new(json);
     for (c, p) in checks.iter().zip(&prepared) {
         let result = if remaining.max_steps == 0 {
             Err(QueryError::StepBudget { limit: 0 })
@@ -281,33 +255,25 @@ fn run_checks(
             Err(e @ (QueryError::StepBudget { .. } | QueryError::MemoryBudget { .. }))
                 if !stops_later_checks(&e) =>
             {
-                hints.push(JHint {
-                    kind: "memory_exhausted",
-                    message: Some(format!(
+                hints.push(JHint::notice(
+                    "memory_exhausted",
+                    c,
+                    format!(
                         "story check :{} skipped: it exceeded the memory budget",
                         escape::value(&c.name)
-                    )),
-                    check: c.name.clone(),
-                    rows_total: 0,
-                    columns: Vec::new(),
-                    rows: Vec::new(),
-                    text_rows: Vec::new(),
-                });
+                    ),
+                ));
                 continue;
             }
             Err(QueryError::StepBudget { .. } | QueryError::MemoryBudget { .. }) => {
-                hints.push(JHint {
-                    kind: "budget_exhausted",
-                    message: Some(format!(
+                hints.push(JHint::notice(
+                    "budget_exhausted",
+                    c,
+                    format!(
                         "story checks stopped: budget exhausted at :{}",
                         escape::value(&c.name)
-                    )),
-                    check: c.name.clone(),
-                    rows_total: 0,
-                    columns: Vec::new(),
-                    rows: Vec::new(),
-                    text_rows: Vec::new(),
-                });
+                    ),
+                ));
                 break;
             }
             Err(e) => return Err(query_err(e, &whose(c))),
@@ -316,84 +282,164 @@ fn run_checks(
         if rs.rows.is_empty() {
             continue;
         }
-        let rows_total = rs.rows.len();
-        let columns = rs
-            .columns
-            .iter()
-            .map(|v| super::query::column_name(&v.0))
-            .collect();
-        let mut rows = Vec::new();
-        let mut text_rows = Vec::new();
-        // A row that doesn't fit what is left of the output allowance is
-        // skipped on its own; later (smaller) rows still print. Only the
-        // total row cap ends rendering for every later check.
-        let mut omitted = false;
-        if rendered_rows < TOTAL_ROWS {
-            let labeler = Labeler::new(&world, rs.canon, rs.tick);
-            for row in rs
-                .rows
-                .iter()
-                .take(if json { JSON_ROWS } else { TEXT_ROWS })
-            {
-                if rendered_rows == TOTAL_ROWS {
-                    omitted = true;
-                    break;
-                }
-                let row: Vec<JValue> = row.iter().map(|d| labeler.datum(d)).collect();
-                let allowance = TOTAL_BYTES - rendered_bytes;
-                let bytes = if json {
-                    // Include a separator per row, conservatively even
-                    // for the first row of a hint's array.
-                    allowance
-                        .checked_sub(1)
-                        .and_then(|n| json_size_within(&row, n))
-                        .map(|n| n + 1)
-                } else {
-                    text_row_size(&row, allowance)
-                };
-                let Some(bytes) = bytes else {
-                    omitted = true;
-                    continue;
-                };
-                rendered_rows += 1;
-                rendered_bytes += bytes;
-                if json {
-                    rows.push(row);
-                } else {
-                    text_rows.push(row_text(&row));
-                }
-            }
-        } else {
-            omitted = true;
-        }
+        let shown = cap.render(&world, &rs);
         hints.push(JHint {
             kind: "story_check",
             message: None,
             check: c.name.clone(),
-            rows_total,
-            columns,
-            rows,
-            text_rows,
+            rows_total: rs.rows.len(),
+            columns: rs
+                .columns
+                .iter()
+                .map(|v| super::query::column_name(&v.0))
+                .collect(),
+            rows: shown.rows,
+            text_rows: shown.text_rows,
         });
         // One notice, after the first check that lost rows to the cap.
-        if omitted && !truncated {
-            truncated = true;
-            hints.push(JHint {
-                kind: "output_truncated",
-                message: Some(format!(
+        if shown.omitted && !cap.truncated {
+            cap.truncated = true;
+            hints.push(JHint::notice(
+                "output_truncated",
+                c,
+                format!(
                     "story-check rows omitted from :{} on (output cap: {TOTAL_ROWS} rows, {} MiB)",
                     escape::value(&c.name),
                     TOTAL_BYTES >> 20
-                )),
-                check: c.name.clone(),
-                rows_total: 0,
-                columns: Vec::new(),
-                rows: Vec::new(),
-                text_rows: Vec::new(),
-            });
+                ),
+            ));
         }
     }
     Ok(hints)
+}
+
+/// Prepares every check before any runs, each pinned to `canon` if given.
+fn prepare_checks(
+    world: &World,
+    text: &str,
+    checks: &[kala_datalog::Check],
+    canon: Option<Canon>,
+) -> Result<Vec<Prepared>, CliError> {
+    let mut prepared: Vec<Prepared> = Vec::with_capacity(checks.len());
+    for c in checks {
+        // `prepare` locates errors in the query text; relocate them in the
+        // checks file, where the author can find them.
+        let mut p = kala_datalog::prepare(world, &c.query).map_err(|e| {
+            let e = e.offset_by(c.query_span.start).locate(text);
+            CliError::User(format!("{}: {e}", whose(c)))
+        })?;
+        if !p.params.is_empty() {
+            return Err(CliError::User(format!(
+                "{}: a story check takes no `:in` parameters",
+                whose(c)
+            )));
+        }
+        if let Some(canon) = canon {
+            p.plan.canon = CanonSource::Const(canon.0);
+        }
+        prepared.push(p);
+    }
+    Ok(prepared)
+}
+
+/// The output allowance shared by every story check of one run
+/// ([`TOTAL_ROWS`], [`TOTAL_BYTES`]), and how much of it is used.
+struct OutputCap {
+    json: bool,
+    rows: usize,
+    bytes: usize,
+    /// The `output_truncated` notice has been given.
+    truncated: bool,
+}
+
+/// The rows of one check that fit the allowance, in the output's format.
+struct Shown {
+    rows: Vec<Vec<JValue>>,
+    text_rows: Vec<String>,
+    /// The cap left out at least one row that would have been shown.
+    omitted: bool,
+}
+
+impl OutputCap {
+    fn new(json: bool) -> OutputCap {
+        OutputCap {
+            json,
+            rows: 0,
+            bytes: 0,
+            truncated: false,
+        }
+    }
+
+    /// Renders the first rows of a check's result, charging them to the
+    /// allowance.
+    fn render(&mut self, world: &World, rs: &ResultSet) -> Shown {
+        let mut shown = Shown {
+            rows: Vec::new(),
+            text_rows: Vec::new(),
+            omitted: false,
+        };
+        // A row that doesn't fit what is left of the output allowance is
+        // skipped on its own; later (smaller) rows still print. Only the
+        // total row cap ends rendering for every later check.
+        if self.rows >= TOTAL_ROWS {
+            shown.omitted = true;
+            return shown;
+        }
+        let labeler = Labeler::new(world, rs.canon, rs.tick);
+        for row in rs
+            .rows
+            .iter()
+            .take(if self.json { JSON_ROWS } else { TEXT_ROWS })
+        {
+            if self.rows == TOTAL_ROWS {
+                shown.omitted = true;
+                break;
+            }
+            let row: Vec<JValue> = row.iter().map(|d| labeler.datum(d)).collect();
+            let Some(bytes) = self.row_size(&row) else {
+                shown.omitted = true;
+                continue;
+            };
+            self.rows += 1;
+            self.bytes += bytes;
+            if self.json {
+                shown.rows.push(row);
+            } else {
+                shown.text_rows.push(row_text(&row));
+            }
+        }
+        shown
+    }
+
+    /// The row's rendered size, if it fits what is left of the allowance.
+    fn row_size(&self, row: &[JValue]) -> Option<usize> {
+        let allowance = TOTAL_BYTES - self.bytes;
+        if self.json {
+            // Include a separator per row, conservatively even
+            // for the first row of a hint's array.
+            allowance
+                .checked_sub(1)
+                .and_then(|n| json_size_within(&row, n))
+                .map(|n| n + 1)
+        } else {
+            text_row_size(row, allowance)
+        }
+    }
+}
+
+impl JHint {
+    /// A hint that carries a message about `check` instead of rows.
+    fn notice(kind: &'static str, check: &kala_datalog::Check, message: String) -> JHint {
+        JHint {
+            kind,
+            message: Some(message),
+            check: check.name.clone(),
+            rows_total: 0,
+            columns: Vec::new(),
+            rows: Vec::new(),
+            text_rows: Vec::new(),
+        }
+    }
 }
 
 /// Whether running out of a budget stops every later story check: only the

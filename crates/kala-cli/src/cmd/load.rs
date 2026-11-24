@@ -19,12 +19,14 @@ use kala_core::log::EntryBody;
 use kala_fixture::MAX_FIXTURE_BYTES;
 use kala_fixture::{FixtureError, FixtureErrorKind};
 
+use crate::cli::LoadArgs;
 use crate::error::CliError;
 use crate::escape;
 use crate::names;
 
 /// Runs `kala load` and returns the text to print on stdout.
-pub fn run(fixture: &Path, world: &Path, force: bool) -> Result<String, CliError> {
+pub fn run(args: &LoadArgs) -> Result<String, CliError> {
+    let (fixture, world, force) = (args.fixture.as_path(), args.world.as_path(), args.force);
     let file_name = world_file_name(world)?;
     if file_name == "system.kala" {
         return Err(CliError::User("system is reserved; use `kala user`".into()));

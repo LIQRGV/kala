@@ -1,13 +1,12 @@
 //! `kala edge <world> <edge#N | SOURCE ATTR TARGET> [@T]`.
 
 use std::fmt::Write as _;
-use std::path::Path;
 
 use kala_core::{EdgeId, EntityId, Value};
 use serde::Serialize;
 
 use super::read::{Ctx, core_err, tick_arg};
-use crate::cli::ReadAt;
+use crate::cli::EdgeArgs;
 use crate::error::CliError;
 use crate::escape;
 use crate::out::{JAttr, JEntity, Text, attrs_text, entity_text, render};
@@ -55,7 +54,9 @@ enum Spec<'a> {
     Triple(&'a str, &'a str, &'a str),
 }
 
-pub fn run(world: &Path, args: &[String], read: &ReadAt) -> Result<String, CliError> {
+pub fn run(args: &EdgeArgs) -> Result<String, CliError> {
+    let (world, read) = (&args.world, &args.read);
+    let args = args.edge.as_slice();
     // clap allows 1..=4 words: an `@T` may end them, the rest is an edge ID
     // or a triple.
     let (spec, tick) = match args.split_last() {
