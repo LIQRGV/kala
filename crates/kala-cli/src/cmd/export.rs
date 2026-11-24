@@ -1,10 +1,9 @@
 //! Read-only, typed JSON snapshots (not an import format).
 use super::{dump, read::core_err, schema, transfer};
-use crate::{cli::Canon, error::CliError, out};
+use crate::{cli::ExportArgs, error::CliError, out};
 use kala_core::log::EntryBody;
 use kala_core::{Cardinality, EntityId, Tick, Value};
 use serde_json::{Map, Value as Json, json};
-use std::path::Path;
 
 fn attributes(labels: &out::Labeler<'_>, entity: EntityId) -> Result<Map<String, Json>, CliError> {
     let mut attributes = Map::new();
@@ -26,14 +25,11 @@ fn attributes(labels: &out::Labeler<'_>, entity: EntityId) -> Result<Map<String,
     }
     Ok(attributes)
 }
-pub fn run(
-    path: &Path,
-    at: Option<i64>,
-    canon: Option<Canon>,
-    output: Option<&Path>,
-) -> Result<String, CliError> {
+pub fn run(args: &ExportArgs) -> Result<String, CliError> {
+    let (path, at, canon) = (args.world.as_path(), args.at, args.canon);
+    let output = args.output.as_deref();
     let world = dump::open(path)?;
-    if kala_bolt::system::is_system(&world) {
+    if kala_system::is_system(&world) {
         return Err(CliError::User(
             "export refuses the system accounts database".into(),
         ));

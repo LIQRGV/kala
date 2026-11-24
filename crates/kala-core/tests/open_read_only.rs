@@ -22,6 +22,7 @@ mod common;
 use common::{Span, spans};
 use kala_core::log::EntryBody;
 use kala_core::*;
+use kala_fixture::{load_fixture, load_fixture_to};
 use proptest::prelude::*;
 use std::path::{Path, PathBuf};
 

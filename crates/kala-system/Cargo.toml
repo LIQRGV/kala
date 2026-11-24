@@ -1,0 +1,16 @@
+[package]
+name = "kala-system"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+kala-core = { path = "../kala-core" }
+
+# Security-consultant approved: Argon2id PHC hashing and OS-random salts.
+argon2 = { version = "=0.5.3", default-features = false, features = ["std", "password-hash", "rand"] }
+
+[dev-dependencies]
+proptest = "1.12.0"

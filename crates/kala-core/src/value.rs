@@ -44,6 +44,20 @@ pub enum ValueType {
     Ref,
 }
 
+impl ValueType {
+    /// The type's name as written in schemas, write forms and messages
+    /// (`bool`, `i64`, `f64`, `string`, `ref`).
+    pub fn name(self) -> &'static str {
+        match self {
+            ValueType::Bool => "bool",
+            ValueType::I64 => "i64",
+            ValueType::F64 => "f64",
+            ValueType::Str => "string",
+            ValueType::Ref => "ref",
+        }
+    }
+}
+
 /// A single attribute value.
 ///
 /// Build floats with [`Value::f64`], which rejects NaN and normalizes `-0.0`.

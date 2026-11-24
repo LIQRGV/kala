@@ -129,7 +129,8 @@
 //! The loader never panics, whatever the input.
 //!
 //! ```
-//! use kala_core::{Direction, Tick, load_fixture};
+//! use kala_core::{Direction, Tick};
+//! use kala_fixture::load_fixture;
 //!
 //! let world = load_fixture(
 //!     r#"
@@ -150,6 +151,8 @@
 //! assert_eq!(allies.len(), 1);
 //! ```
 
+#![forbid(unsafe_code)]
+
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
@@ -158,14 +161,10 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_saphyr::options::{DuplicateKeyPolicy, MergeKeyPolicy, NonFiniteFloatPolicy};
 
-use crate::echo::Echo;
-use crate::error::Error;
-use crate::id::EntityId;
-use crate::log::EntryId;
-use crate::schema::{AttrDef, Cardinality, Kind, Schema};
-use crate::tick::{Precision, Tick};
-use crate::value::{Value, ValueType};
-use crate::world::{Correction, Op, Txn, World};
+use kala_core::log::EntryId;
+use kala_core::schema::{AttrDef, Cardinality, Kind, Schema};
+use kala_core::world::{Correction, Op, Txn, World};
+use kala_core::{Echo, EntityId, Error, Precision, Tick, Value, ValueType};
 
 /// The largest fixture the loader reads, in bytes (checked before parsing).
 pub const MAX_FIXTURE_BYTES: usize = 16 * 1024 * 1024;

@@ -2,7 +2,8 @@
 
 mod common;
 use common::*;
-use kala_core::{World, load_fixture};
+use kala_core::World;
+use kala_fixture::load_fixture;
 use std::fs;
 
 fn varrow_mem() -> World {

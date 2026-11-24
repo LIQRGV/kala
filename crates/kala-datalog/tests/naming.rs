@@ -11,7 +11,7 @@ fn rows(world: &World, query: &str) -> Vec<Vec<Datum>> {
     run(
         world,
         &prepared.plan,
-        &Default::default(),
+        &kala_query::Params::new(),
         &Default::default(),
     )
     .unwrap()

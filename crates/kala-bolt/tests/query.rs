@@ -89,7 +89,7 @@ transactions:
     ops:
       - assert: [alice, handle, user-alias]
 "#;
-    drop(kala_core::load_fixture_to(yaml, &dir.path().join("typed.kala")).unwrap());
+    drop(kala_fixture::load_fixture_to(yaml, &dir.path().join("typed.kala")).unwrap());
     let server = Running::in_dir(
         dir,
         ServerConfig {
@@ -195,7 +195,7 @@ transactions:
       - assert: [alice, brave, true]
       - assert: [alice, name, Alice]
 "#;
-    drop(kala_core::load_fixture_to(yaml, &dir.path().join("typed.kala")).unwrap());
+    drop(kala_fixture::load_fixture_to(yaml, &dir.path().join("typed.kala")).unwrap());
     let server = Running::in_dir(
         dir,
         ServerConfig {
@@ -305,8 +305,11 @@ fn ambiguous_default_is_refused_and_explicit_default_is_honored() {
         let dir = tempfile::tempdir().unwrap();
         for db in ["varrow", "other"] {
             drop(
-                kala_core::load_fixture_to(common::VARROW, &dir.path().join(format!("{db}.kala")))
-                    .unwrap(),
+                kala_fixture::load_fixture_to(
+                    common::VARROW,
+                    &dir.path().join(format!("{db}.kala")),
+                )
+                .unwrap(),
             );
         }
         let config = ServerConfig {
@@ -377,7 +380,7 @@ fn node_property_larger_than_wire_budget_fails_before_streaming_and_reset_recove
         "schema:\n  node_types: [CHARACTER]\n  attributes:\n    - {{ name: name, type: string }}\n    - {{ name: biography, type: string, indexed: false }}\nentities:\n  CHARACTER: [edwin]\ntransactions:\n  - tick: 0\n    ops:\n      - assert: [edwin, name, Edwin]\n      - assert: [edwin, biography, \"{}\"]\n",
         "x".repeat(1024 * 1024)
     );
-    drop(kala_core::load_fixture_to(&yaml, &dir.path().join("large.kala")).unwrap());
+    drop(kala_fixture::load_fixture_to(&yaml, &dir.path().join("large.kala")).unwrap());
     let server = Running::in_dir(
         dir,
         ServerConfig {

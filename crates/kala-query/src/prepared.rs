@@ -22,7 +22,7 @@ pub enum ParamKind {
 /// A query compiled and planned, with the kinds of its parameters.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Prepared {
-    /// The plan, ready for [`crate::run`] or [`crate::run_with_values`].
+    /// The plan, ready for [`crate::run`] or [`crate::run_with`].
     pub plan: Plan,
     /// Inferred parameter kinds in front-end declaration/discovery order.
     pub params: Vec<(String, ParamKind)>,

@@ -26,7 +26,7 @@ use kala_core::Precision;
 use crate::datum::{Datum, op_rank};
 use crate::ir::CmpOp;
 
-use super::{QueryError, type_name};
+use super::QueryError;
 
 /// The kind of a [`Val`]: a value of one type, an op or an interval set.
 /// Ordered as [`Datum`] orders its kinds (values by type in [`ValueType`]
@@ -47,7 +47,7 @@ impl ValKind {
         match self {
             ValKind::Null => "null",
             ValKind::List => "list",
-            ValKind::Value(t) => type_name(t),
+            ValKind::Value(t) => t.name(),
             ValKind::Op => "op",
             ValKind::Precision => "precision",
             ValKind::Intervals => "interval set",

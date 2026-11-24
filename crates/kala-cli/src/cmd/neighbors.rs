@@ -1,13 +1,12 @@
 //! `kala neighbors <world> <entity> <attr> [--in|--out|--both] [@T]`.
 
 use std::fmt::Write as _;
-use std::path::Path;
 
 use kala_core::{Direction, EntityId};
 use serde::Serialize;
 
 use super::read::{Ctx, entity_err, tick_arg};
-use crate::cli::ReadAt;
+use crate::cli::NeighborsArgs;
 use crate::error::CliError;
 use crate::escape;
 use crate::out::{JEntity, Text, entity_text, render};
@@ -51,22 +50,13 @@ impl Text for Neighbors {
     }
 }
 
-/// The direction flags, already checked by clap to be at most one.
-pub struct Flags {
-    pub incoming: bool,
-    pub both: bool,
-}
-
-pub fn run(
-    world: &Path,
-    entity: &str,
-    attr: &str,
-    tick: Option<&str>,
-    flags: Flags,
-    read: &ReadAt,
-) -> Result<String, CliError> {
-    let given = tick_arg(tick, read.at)?;
-    let (dir, dir_name) = match (flags.incoming, flags.both) {
+pub fn run(args: &NeighborsArgs) -> Result<String, CliError> {
+    let (world, entity, attr) = (&args.world, args.entity.as_str(), args.attr.as_str());
+    let read = &args.read;
+    let given = tick_arg(args.tick.as_deref(), read.at)?;
+    // The direction flags, already checked by clap to be at most one
+    // (`--out` is the default, so its flag changes nothing).
+    let (dir, dir_name) = match (args.incoming, args.both) {
         (true, _) => (Direction::In, "in"),
         (_, true) => (Direction::Both, "both"),
         _ => (Direction::Out, "out"),

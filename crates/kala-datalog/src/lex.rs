@@ -154,16 +154,13 @@ impl<'a> Lexer<'a> {
     /// A string literal starting at the opening quote `start`.
     fn string(&mut self, start: usize) -> Result<Token, DatalogError> {
         let text = self.text;
-        let unterminated =
-            || DatalogError::syntax(Span::new(start, text.len()), "unterminated string");
         let mut out = String::new();
         let mut chars = text[start + 1..]
             .char_indices()
             .map(|(i, c)| (start + 1 + i, c));
         loop {
             let Some((i, c)) = chars.next() else {
-                self.unfinished_string = true;
-                return Err(unterminated());
+                return Err(self.unterminated(start));
             };
             match c {
                 '"' => {
@@ -173,61 +170,74 @@ impl<'a> Lexer<'a> {
                         span: Span::new(start, i + 1),
                     });
                 }
-                '\\' => {
-                    let Some((j, e)) = chars.next() else {
-                        self.unfinished_string = true;
-                        return Err(unterminated());
-                    };
-                    let after = j + e.len_utf8();
-                    match e {
-                        '"' => out.push('"'),
-                        '\\' => out.push('\\'),
-                        'n' => out.push('\n'),
-                        't' => out.push('\t'),
-                        'r' => out.push('\r'),
-                        'u' | 'U' => {
-                            let mut code = 0u32;
-                            let mut end = after;
-                            for _ in 0..if e == 'u' { 4 } else { 8 } {
-                                let Some((k, h)) = chars.next() else {
-                                    self.unfinished_string = true;
-                                    return Err(unterminated());
-                                };
-                                end = k + h.len_utf8();
-                                let Some(d) = h.to_digit(16) else {
-                                    return Err(DatalogError::syntax(
-                                        Span::new(i, end),
-                                        "Unicode escape needs 4 (\\u) or 8 (\\U) hex digits",
-                                    ));
-                                };
-                                code = code * 16 + d;
-                            }
-                            match char::from_u32(code) {
-                                Some(ch) => out.push(ch),
-                                None => {
-                                    return Err(DatalogError::syntax(
-                                        Span::new(i, end),
-                                        format!(
-                                            "Unicode value {code:08X} is not a scalar character"
-                                        ),
-                                    ));
-                                }
-                            }
-                        }
-                        other => {
-                            return Err(DatalogError::syntax(
-                                Span::new(i, after),
-                                format!(
-                                    "unknown escape `\\{}` (use \\\" \\\\ \\n \\t \\r or \\uXXXX or \\UXXXXXXXX)",
-                                    show(other.encode_utf8(&mut [0; 4]))
-                                ),
-                            ));
-                        }
-                    }
-                }
+                '\\' => out.push(self.escape(&mut chars, start, i)?),
                 c => out.push(c),
             }
         }
+    }
+
+    /// The input ended inside the string that opened at `start`: more input
+    /// could still finish it.
+    fn unterminated(&mut self, start: usize) -> DatalogError {
+        self.unfinished_string = true;
+        DatalogError::syntax(Span::new(start, self.text.len()), "unterminated string")
+    }
+
+    /// The character an escape stands for. Its backslash, at offset
+    /// `backslash` of the string opened at `start`, is already read; the
+    /// rest comes from `chars` (offset, character).
+    fn escape(
+        &mut self,
+        chars: &mut impl Iterator<Item = (usize, char)>,
+        start: usize,
+        backslash: usize,
+    ) -> Result<char, DatalogError> {
+        let Some((j, e)) = chars.next() else {
+            return Err(self.unterminated(start));
+        };
+        let after = j + e.len_utf8();
+        Ok(match e {
+            '"' => '"',
+            '\\' => '\\',
+            'n' => '\n',
+            't' => '\t',
+            'r' => '\r',
+            'u' | 'U' => {
+                let mut code = 0u32;
+                let mut end = after;
+                for _ in 0..if e == 'u' { 4 } else { 8 } {
+                    let Some((k, h)) = chars.next() else {
+                        return Err(self.unterminated(start));
+                    };
+                    end = k + h.len_utf8();
+                    let Some(d) = h.to_digit(16) else {
+                        return Err(DatalogError::syntax(
+                            Span::new(backslash, end),
+                            "Unicode escape needs 4 (\\u) or 8 (\\U) hex digits",
+                        ));
+                    };
+                    code = code * 16 + d;
+                }
+                match char::from_u32(code) {
+                    Some(ch) => ch,
+                    None => {
+                        return Err(DatalogError::syntax(
+                            Span::new(backslash, end),
+                            format!("Unicode value {code:08X} is not a scalar character"),
+                        ));
+                    }
+                }
+            }
+            other => {
+                return Err(DatalogError::syntax(
+                    Span::new(backslash, after),
+                    format!(
+                        "unknown escape `\\{}` (use \\\" \\\\ \\n \\t \\r or \\uXXXX or \\UXXXXXXXX)",
+                        show(other.encode_utf8(&mut [0; 4]))
+                    ),
+                ));
+            }
+        })
     }
 
     /// A bare token (keyword, variable, number, symbol, ...) at `start`.
@@ -500,59 +510,8 @@ impl CompletenessScanner {
     }
 
     fn character(&mut self, c: char) {
-        match &mut self.mode {
-            ScanMode::Comment => {
-                if c == '\n' {
-                    self.mode = ScanMode::Trivia;
-                }
-                return;
-            }
-            ScanMode::String => {
-                match c {
-                    '"' => self.end_token(),
-                    '\\' => self.mode = ScanMode::Escape,
-                    _ => {}
-                }
-                return;
-            }
-            ScanMode::Escape => {
-                self.mode = match c {
-                    '"' | '\\' | 'n' | 't' | 'r' => ScanMode::String,
-                    'u' => ScanMode::Unicode { code: 0, left: 4 },
-                    'U' => ScanMode::Unicode { code: 0, left: 8 },
-                    _ => {
-                        self.invalid = true;
-                        ScanMode::Trivia
-                    }
-                };
-                return;
-            }
-            ScanMode::Unicode { code, left } => {
-                let Some(digit) = c.to_digit(16) else {
-                    self.invalid = true;
-                    return;
-                };
-                *code = *code * 16 + digit;
-                *left -= 1;
-                if *left == 0 {
-                    self.invalid = char::from_u32(*code).is_none();
-                    self.mode = ScanMode::String;
-                }
-                return;
-            }
-            ScanMode::Bare(bare) => {
-                if !is_delimiter(c) {
-                    bare.push(c);
-                    return;
-                }
-                if !bare.valid() {
-                    self.invalid = true;
-                    return;
-                }
-                self.end_token();
-                // The delimiter belongs to the next token/trivia.
-            }
-            ScanMode::Trivia => {}
+        if self.continue_token(c) {
+            return;
         }
         if c.is_whitespace() || c == ',' {
             return;
@@ -565,6 +524,73 @@ impl CompletenessScanner {
             self.invalid = true;
             return;
         }
+        self.start_token(c);
+    }
+
+    /// Feeds `c` to the comment, string or bare token in progress. Returns
+    /// `false` when `c` is still to be looked at: between tokens, or when it
+    /// is the delimiter that just ended a bare token.
+    fn continue_token(&mut self, c: char) -> bool {
+        match &mut self.mode {
+            ScanMode::Comment => {
+                if c == '\n' {
+                    self.mode = ScanMode::Trivia;
+                }
+                true
+            }
+            ScanMode::String => {
+                match c {
+                    '"' => self.end_token(),
+                    '\\' => self.mode = ScanMode::Escape,
+                    _ => {}
+                }
+                true
+            }
+            ScanMode::Escape => {
+                self.mode = match c {
+                    '"' | '\\' | 'n' | 't' | 'r' => ScanMode::String,
+                    'u' => ScanMode::Unicode { code: 0, left: 4 },
+                    'U' => ScanMode::Unicode { code: 0, left: 8 },
+                    _ => {
+                        self.invalid = true;
+                        ScanMode::Trivia
+                    }
+                };
+                true
+            }
+            ScanMode::Unicode { code, left } => {
+                let Some(digit) = c.to_digit(16) else {
+                    self.invalid = true;
+                    return true;
+                };
+                *code = *code * 16 + digit;
+                *left -= 1;
+                if *left == 0 {
+                    self.invalid = char::from_u32(*code).is_none();
+                    self.mode = ScanMode::String;
+                }
+                true
+            }
+            ScanMode::Bare(bare) => {
+                if !is_delimiter(c) {
+                    bare.push(c);
+                    return true;
+                }
+                if !bare.valid() {
+                    self.invalid = true;
+                    return true;
+                }
+                self.end_token();
+                // The delimiter belongs to the next token/trivia.
+                false
+            }
+            ScanMode::Trivia => false,
+        }
+    }
+
+    /// Starts the token `c` opens: a bracket (a token by itself), a string
+    /// or a bare token.
+    fn start_token(&mut self, c: char) {
         match c {
             '[' | '(' => {
                 if self.stack.len() == crate::MAX_DEPTH {

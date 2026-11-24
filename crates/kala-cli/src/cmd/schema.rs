@@ -1,20 +1,10 @@
 //! Read-only schema inspection and write-report presentation.
 use super::read::Ctx;
-use crate::{cli::Canon, error::CliError, escape, out};
-use kala_core::{AttrDef, Cardinality, Kind, RefDirection, SchemaChange, ValueType};
+use crate::{cli::SchemaArgs, error::CliError, escape, out};
+use kala_core::{AttrDef, Cardinality, Kind, RefDirection, SchemaChange};
 use serde_json::{Value, json};
 use std::fmt::Write as _;
-use std::path::Path;
 
-pub(super) fn type_name(t: ValueType) -> &'static str {
-    match t {
-        ValueType::Bool => "bool",
-        ValueType::I64 => "i64",
-        ValueType::F64 => "f64",
-        ValueType::Str => "string",
-        ValueType::Ref => "ref",
-    }
-}
 pub(super) fn cardinality(c: Cardinality) -> &'static str {
     match c {
         Cardinality::One => "one",
@@ -22,10 +12,10 @@ pub(super) fn cardinality(c: Cardinality) -> &'static str {
     }
 }
 
-pub fn run(path: &Path, canon: Option<Canon>, as_json: bool) -> Result<String, CliError> {
-    let ctx = Ctx::open(path, canon)?;
+pub fn run(args: &SchemaArgs) -> Result<String, CliError> {
+    let ctx = Ctx::open(&args.world, args.canon)?;
     let view = ctx.view();
-    if as_json {
+    if args.json {
         return Ok(out::to_json(&document(&ctx.world, ctx.canon)));
     }
     let mut text = format!("schema at canon tx#{}\nnode types:\n", ctx.canon.0);
@@ -75,7 +65,7 @@ pub(super) fn def_text(d: &AttrDef) -> String {
     let mut text = format!(
         ":{} {} {} {}",
         escape::value(&d.name),
-        type_name(d.value_type),
+        d.value_type.name(),
         kind_name(d.kind),
         cardinality(d.cardinality)
     );
@@ -102,7 +92,7 @@ pub(super) fn def_text(d: &AttrDef) -> String {
 pub(super) fn def_json(d: &AttrDef) -> Value {
     json!({
         "name": d.name,
-        "type": type_name(d.value_type),
+        "type": d.value_type.name(),
         "attribute_kind": kind_name(d.kind),
         "cardinality": cardinality(d.cardinality),
         "direction": d.direction.map(direction_name),
@@ -121,7 +111,7 @@ pub(super) fn change_json(change: &SchemaChange) -> Value {
             value_type,
             inferred,
         } => {
-            json!({"kind":"attribute","name":name,"type":type_name(*value_type),"inferred":inferred})
+            json!({"kind":"attribute","name":name,"type":value_type.name(),"inferred":inferred})
         }
         SchemaChange::NodeType { name, inferred } => {
             json!({"kind":"node_type","name":name,"inferred":inferred})
@@ -144,7 +134,7 @@ pub(super) fn change_json(change: &SchemaChange) -> Value {
             to,
             report,
         } => {
-            json!({"kind":"migrate","name":name,"from":type_name(*from),"to":type_name(*to),"change_points":report.change_points,"edges":report.edges,"edge_properties":report.edge_properties,"skipped":report.skipped,"dropped_inverse":report.dropped_inverse,"dropped_reverse_cardinality":report.dropped_reverse_cardinality.map(cardinality),"inferred":false})
+            json!({"kind":"migrate","name":name,"from":from.name(),"to":to.name(),"change_points":report.change_points,"edges":report.edges,"edge_properties":report.edge_properties,"skipped":report.skipped,"dropped_inverse":report.dropped_inverse,"dropped_reverse_cardinality":report.dropped_reverse_cardinality.map(cardinality),"inferred":false})
         }
     }
 }
@@ -158,7 +148,7 @@ pub(super) fn change_text(change: &SchemaChange) -> String {
         } => format!(
             "declared :{} as {} ({})",
             escape::value(name),
-            type_name(*value_type),
+            value_type.name(),
             origin(*inferred)
         ),
         SchemaChange::NodeType { name, inferred } => format!(
@@ -190,8 +180,8 @@ pub(super) fn change_text(change: &SchemaChange) -> String {
             let mut text = format!(
                 "migrated :{} ({} -> {}): {} change points copied, {} edges created, {} edge-property facts copied, {} skipped",
                 escape::value(name),
-                type_name(*from),
-                type_name(*to),
+                from.name(),
+                to.name(),
                 report.change_points,
                 report.edges,
                 report.edge_properties,
@@ -220,7 +210,7 @@ pub(super) fn document(world: &kala_core::World, canon: kala_core::TxId) -> Valu
         .map(|(name, inferred, first)| json!({"name":name,"inferred":inferred,"first_tx":first.0}))
         .collect();
     let attrs:Vec<_>=view.attributes().map(|d|json!({
-        "name":d.name,"type":type_name(d.value_type),"kind":if d.kind==Kind::State {"state"} else {"event"},
+        "name":d.name,"type":d.value_type.name(),"kind":if d.kind==Kind::State {"state"} else {"event"},
         "cardinality":cardinality(d.cardinality),"direction":d.direction.map(|v|if v==RefDirection::Directed {"directed"} else {"bidirectional"}),
         "inverse":d.inverse,"reverse_cardinality":d.reverse_cardinality.map(cardinality),"indexed":d.indexed,"deprecated":d.deprecated,
         "inferred":d.inferred,"first_tx":world.attribute_first_tx(&d.name).map(|tx|tx.0)

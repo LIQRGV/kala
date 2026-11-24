@@ -50,7 +50,7 @@ pub struct ReadAt {
 /// A query's text (inline or from a file) and its parameters.
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("source").required(true).args(["query", "file"])))]
-pub struct QueryArgs {
+pub struct QueryInput {
     /// Query language (the REPL remains Datalog-only).
     #[arg(
         long,
@@ -79,264 +79,344 @@ fn parse_param(s: &str) -> Result<(String, String), String> {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Write a replayable world script.
-    Dump {
-        world: PathBuf,
-        #[arg(short = 'o')]
-        output: Option<PathBuf>,
-        #[arg(long)]
-        all: bool,
-        #[arg(long)]
-        force: bool,
-    },
+    Dump(DumpArgs),
     /// Create an empty world, optionally declaring its genesis schema.
-    Create {
-        world: PathBuf,
-        #[arg(long)]
-        schema: Option<PathBuf>,
-    },
+    Create(CreateArgs),
     /// Export a JSON snapshot at a tick and canon.
-    Export {
-        world: PathBuf,
-        #[arg(long, allow_negative_numbers = true)]
-        at: Option<i64>,
-        #[arg(long, value_parser = parse_canon)]
-        canon: Option<Canon>,
-        #[arg(short = 'o')]
-        output: Option<PathBuf>,
-    },
+    Export(ExportArgs),
     /// Show schema definitions and settings at a canon.
-    Schema {
-        world: PathBuf,
-        #[arg(long, value_name="C", value_parser=parse_canon)]
-        canon: Option<Canon>,
-        #[arg(long)]
-        json: bool,
-    },
+    Schema(SchemaArgs),
     /// Serve read-only Cypher and Datalog queries over Bolt 5.
-    Serve {
-        /// Directory containing <database>.kala world files.
-        dir: PathBuf,
-        /// IP:port, [IPv6]:port, or localhost:port.
-        #[arg(long, default_value = "127.0.0.1:7687")]
-        listen: String,
-        /// Authentication policy (accounts by default; none is loopback-only).
-        #[arg(long, default_value = "accounts", value_parser = ["accounts", "none"])]
-        auth: String,
-        /// Allow passwords over plaintext on a non-loopback listener.
-        #[arg(long)]
-        insecure_allow_plaintext: bool,
-        #[arg(long)]
-        default_db: Option<String>,
-        /// Maximum simultaneous client connections.
-        #[arg(long, default_value_t = 64)]
-        max_connections: usize,
-        /// Seconds allowed to receive a complete message.
-        #[arg(long, default_value_t = 600)]
-        idle_timeout: u64,
-    },
+    Serve(ServeArgs),
     /// Manage the server directory's accounts and database privileges.
-    User {
-        #[command(subcommand)]
-        command: UserCommand,
-    },
+    User(UserArgs),
     /// Build a world file from a YAML fixture.
-    Load {
-        /// The YAML fixture to load.
-        fixture: PathBuf,
-        /// The world file to create.
-        world: PathBuf,
-        /// Replace the world file if it exists.
-        #[arg(long)]
-        force: bool,
-    },
+    Load(LoadArgs),
     /// An entity's values at a tick (every attribute, or one).
-    Asof {
-        /// The world file.
-        world: PathBuf,
-        /// A handle (`edwin`), an ID (`CHARACTER#1`) or an edge (`edge#9`).
-        entity: String,
-        /// The attribute (default: every attribute holding a value).
-        attr: Option<String>,
-        /// The tick, as `@T`.
-        #[arg(value_name = "@T")]
-        tick: Option<String>,
-        #[command(flatten)]
-        read: ReadAt,
-    },
+    Asof(AsofArgs),
     /// An entity's neighbors through a ref attribute at a tick.
-    Neighbors {
-        /// The world file.
-        world: PathBuf,
-        /// A handle (`edwin`), an ID (`CHARACTER#1`) or an edge (`edge#9`).
-        entity: String,
-        /// The attribute.
-        attr: String,
-        /// The tick, as `@T`.
-        #[arg(value_name = "@T")]
-        tick: Option<String>,
-        /// Follow incoming edges.
-        #[arg(long = "in", conflicts_with_all = ["out", "both"])]
-        incoming: bool,
-        /// Follow outgoing edges.
-        #[arg(long, conflicts_with = "both")]
-        out: bool,
-        /// Follow edges both ways.
-        #[arg(long)]
-        both: bool,
-        #[command(flatten)]
-        read: ReadAt,
-    },
+    Neighbors(NeighborsArgs),
     /// Every change point of an entity's attribute.
-    History {
-        /// The world file.
-        world: PathBuf,
-        /// A handle (`edwin`), an ID (`CHARACTER#1`) or an edge (`edge#9`).
-        entity: String,
-        /// The attribute.
-        attr: String,
-        /// Read at this canon: `tx#N` or `N` (default: the latest).
-        #[arg(long, value_name = "C", value_parser = parse_canon)]
-        canon: Option<Canon>,
-        /// Print one JSON document instead of text.
-        #[arg(long)]
-        json: bool,
-    },
+    History(HistoryArgs),
     /// Entities whose attribute holds a value at a tick.
-    Find {
-        /// The world file.
-        world: PathBuf,
-        /// The attribute.
-        attr: String,
-        /// The value to look for.
-        value: String,
-        /// The tick, as `@T`.
-        #[arg(value_name = "@T")]
-        tick: Option<String>,
-        /// Case-insensitive match.
-        #[arg(short = 'i')]
-        ignore_case: bool,
-        #[command(flatten)]
-        read: ReadAt,
-    },
+    Find(FindArgs),
     /// Every entity of a node type at a tick.
-    List {
-        /// The world file.
-        world: PathBuf,
-        /// The node type (`CHARACTER`).
-        #[arg(value_name = "NODE_TYPE")]
-        node_type: String,
-        /// The tick, as `@T`.
-        #[arg(value_name = "@T")]
-        tick: Option<String>,
-        #[command(flatten)]
-        read: ReadAt,
-    },
+    List(ListArgs),
     /// An edge's triple and its properties at a tick.
-    Edge {
-        /// The world file.
-        world: PathBuf,
-        /// `edge#N`, or `SOURCE ATTR TARGET`, optionally followed by `@T`.
-        #[arg(value_name = "EDGE", required = true, num_args = 1..=4)]
-        edge: Vec<String>,
-        #[command(flatten)]
-        read: ReadAt,
-    },
+    Edge(EdgeArgs),
     /// Check the world's integrity (read-only).
-    Doctor {
-        /// The world file.
-        world: PathBuf,
-        /// Check schema rules at this canon: `tx#N` or `N`.
-        #[arg(long, value_name = "C", value_parser = parse_canon)]
-        canon: Option<Canon>,
-        /// Check only what changed since this canon: `tx#N` or `N`.
-        #[arg(long, value_name = "C", value_parser = parse_canon)]
-        since: Option<Canon>,
-        /// Also run the story checks in this file (`[[:name [:find ...]] ...]`);
-        /// each one returning rows is a hint.
-        #[arg(long, value_name = "FILE")]
-        checks: Option<PathBuf>,
-        /// Print one JSON document instead of text.
-        #[arg(long)]
-        json: bool,
-    },
+    Doctor(DoctorArgs),
     /// The log's transactions in order.
-    Log {
-        /// The world file.
-        world: PathBuf,
-        /// Start at this transaction: `tx#N` or `N`.
-        #[arg(long, value_name = "C", value_parser = parse_canon)]
-        from: Option<Canon>,
-        /// Show at most N transactions.
-        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64))]
-        limit: Option<u64>,
-        /// Print one JSON document instead of text.
-        #[arg(long)]
-        json: bool,
-    },
+    Log(LogArgs),
     /// Format version, latest tx and tick, counts, recovery report.
-    Info {
-        /// The world file.
-        world: PathBuf,
-        /// Print one JSON document instead of text.
-        #[arg(long)]
-        json: bool,
-    },
+    Info(InfoArgs),
     /// Run a Datalog query.
-    Query {
-        /// The world file.
-        world: PathBuf,
-        #[command(flatten)]
-        query: QueryArgs,
-        /// Print one JSON document instead of text.
-        #[arg(long)]
-        json: bool,
-    },
+    Query(QueryArgs),
     /// Commit Datalog write transactions from a file or stdin (-).
-    Transact {
-        /// Replay a dump into a new world, preserving its genesis.
-        #[arg(long, conflicts_with_all = ["dry_run", "acknowledge_recovery"])]
-        create: bool,
-        world: PathBuf,
-        input: PathBuf,
-        /// Preview the forms in order (each sees the ones before it)
-        /// without changing the log.
-        #[arg(long)]
-        dry_run: bool,
-        #[arg(long)]
-        json: bool,
-        /// Accept cutting a damaged last transaction (see `kala info`) to a
-        /// quarantine file before writing.
-        #[arg(long)]
-        acknowledge_recovery: bool,
-    },
+    Transact(TransactArgs),
     /// Ask Datalog questions, optionally holding the world open for writing.
-    Repl {
-        /// Enable writes and hold the world's exclusive writer lock.
-        #[arg(long, conflicts_with = "canon")]
-        write: bool,
-        /// The world file.
-        world: PathBuf,
-        /// Initial default story tick.
-        #[arg(long, value_name = "T", allow_negative_numbers = true)]
-        at: Option<i64>,
-        /// Initial default canon: `tx#N` or `N`.
-        #[arg(long, value_name = "C", value_parser = parse_canon)]
-        canon: Option<Canon>,
-        /// Opt in to private, bounded query history at this path.
-        #[arg(long, value_name = "FILE")]
-        history: Option<PathBuf>,
-        /// With --write: accept cutting a damaged last transaction (see
-        /// `kala info`) to a quarantine file.
-        #[arg(long, requires = "write")]
-        acknowledge_recovery: bool,
-    },
+    Repl(ReplArgs),
     /// Print a Datalog query's plan without running it.
-    Explain {
-        /// The world file.
-        world: PathBuf,
-        #[command(flatten)]
-        query: QueryArgs,
-    },
+    Explain(ExplainArgs),
+}
+
+// `kala dump`.
+#[derive(Debug, Args)]
+pub struct DumpArgs {
+    pub world: PathBuf,
+    #[arg(short = 'o')]
+    pub output: Option<PathBuf>,
+    #[arg(long)]
+    pub all: bool,
+    #[arg(long)]
+    pub force: bool,
+}
+
+// `kala create`.
+#[derive(Debug, Args)]
+pub struct CreateArgs {
+    pub world: PathBuf,
+    #[arg(long)]
+    pub schema: Option<PathBuf>,
+}
+
+// `kala export`.
+#[derive(Debug, Args)]
+pub struct ExportArgs {
+    pub world: PathBuf,
+    #[arg(long, allow_negative_numbers = true)]
+    pub at: Option<i64>,
+    #[arg(long, value_parser = parse_canon)]
+    pub canon: Option<Canon>,
+    #[arg(short = 'o')]
+    pub output: Option<PathBuf>,
+}
+
+// `kala schema`.
+#[derive(Debug, Args)]
+pub struct SchemaArgs {
+    pub world: PathBuf,
+    #[arg(long, value_name="C", value_parser=parse_canon)]
+    pub canon: Option<Canon>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+// `kala serve`.
+#[derive(Debug, Args)]
+pub struct ServeArgs {
+    /// Directory containing <database>.kala world files.
+    pub dir: PathBuf,
+    /// IP:port, [IPv6]:port, or localhost:port.
+    #[arg(long, default_value = "127.0.0.1:7687")]
+    pub listen: String,
+    /// Authentication policy (accounts by default; none is loopback-only).
+    #[arg(long, default_value = "accounts", value_parser = ["accounts", "none"])]
+    pub auth: String,
+    /// Allow passwords over plaintext on a non-loopback listener.
+    #[arg(long)]
+    pub insecure_allow_plaintext: bool,
+    #[arg(long)]
+    pub default_db: Option<String>,
+    /// Maximum simultaneous client connections.
+    #[arg(long, default_value_t = 64)]
+    pub max_connections: usize,
+    /// Seconds allowed to receive a complete message.
+    #[arg(long, default_value_t = 600)]
+    pub idle_timeout: u64,
+}
+
+// `kala user`.
+#[derive(Debug, Args)]
+pub struct UserArgs {
+    #[command(subcommand)]
+    pub command: UserCommand,
+}
+
+// `kala load`.
+#[derive(Debug, Args)]
+pub struct LoadArgs {
+    /// The YAML fixture to load.
+    pub fixture: PathBuf,
+    /// The world file to create.
+    pub world: PathBuf,
+    /// Replace the world file if it exists.
+    #[arg(long)]
+    pub force: bool,
+}
+
+// `kala asof`.
+#[derive(Debug, Args)]
+pub struct AsofArgs {
+    /// The world file.
+    pub world: PathBuf,
+    /// A handle (`edwin`), an ID (`CHARACTER#1`) or an edge (`edge#9`).
+    pub entity: String,
+    /// The attribute (default: every attribute holding a value).
+    pub attr: Option<String>,
+    /// The tick, as `@T`.
+    #[arg(value_name = "@T")]
+    pub tick: Option<String>,
+    #[command(flatten)]
+    pub read: ReadAt,
+}
+
+// `kala neighbors`.
+#[derive(Debug, Args)]
+pub struct NeighborsArgs {
+    /// The world file.
+    pub world: PathBuf,
+    /// A handle (`edwin`), an ID (`CHARACTER#1`) or an edge (`edge#9`).
+    pub entity: String,
+    /// The attribute.
+    pub attr: String,
+    /// The tick, as `@T`.
+    #[arg(value_name = "@T")]
+    pub tick: Option<String>,
+    /// Follow incoming edges.
+    #[arg(long = "in", conflicts_with_all = ["out", "both"])]
+    pub incoming: bool,
+    /// Follow outgoing edges.
+    #[arg(long, conflicts_with = "both")]
+    pub out: bool,
+    /// Follow edges both ways.
+    #[arg(long)]
+    pub both: bool,
+    #[command(flatten)]
+    pub read: ReadAt,
+}
+
+// `kala history`.
+#[derive(Debug, Args)]
+pub struct HistoryArgs {
+    /// The world file.
+    pub world: PathBuf,
+    /// A handle (`edwin`), an ID (`CHARACTER#1`) or an edge (`edge#9`).
+    pub entity: String,
+    /// The attribute.
+    pub attr: String,
+    /// Read at this canon: `tx#N` or `N` (default: the latest).
+    #[arg(long, value_name = "C", value_parser = parse_canon)]
+    pub canon: Option<Canon>,
+    /// Print one JSON document instead of text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+// `kala find`.
+#[derive(Debug, Args)]
+pub struct FindArgs {
+    /// The world file.
+    pub world: PathBuf,
+    /// The attribute.
+    pub attr: String,
+    /// The value to look for.
+    pub value: String,
+    /// The tick, as `@T`.
+    #[arg(value_name = "@T")]
+    pub tick: Option<String>,
+    /// Case-insensitive match.
+    #[arg(short = 'i')]
+    pub ignore_case: bool,
+    #[command(flatten)]
+    pub read: ReadAt,
+}
+
+// `kala list`.
+#[derive(Debug, Args)]
+pub struct ListArgs {
+    /// The world file.
+    pub world: PathBuf,
+    /// The node type (`CHARACTER`).
+    #[arg(value_name = "NODE_TYPE")]
+    pub node_type: String,
+    /// The tick, as `@T`.
+    #[arg(value_name = "@T")]
+    pub tick: Option<String>,
+    #[command(flatten)]
+    pub read: ReadAt,
+}
+
+// `kala edge`.
+#[derive(Debug, Args)]
+pub struct EdgeArgs {
+    /// The world file.
+    pub world: PathBuf,
+    /// `edge#N`, or `SOURCE ATTR TARGET`, optionally followed by `@T`.
+    #[arg(value_name = "EDGE", required = true, num_args = 1..=4)]
+    pub edge: Vec<String>,
+    #[command(flatten)]
+    pub read: ReadAt,
+}
+
+// `kala doctor`.
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    /// The world file.
+    pub world: PathBuf,
+    /// Check schema rules at this canon: `tx#N` or `N`.
+    #[arg(long, value_name = "C", value_parser = parse_canon)]
+    pub canon: Option<Canon>,
+    /// Check only what changed since this canon: `tx#N` or `N`.
+    #[arg(long, value_name = "C", value_parser = parse_canon)]
+    pub since: Option<Canon>,
+    /// Also run the story checks in this file (`[[:name [:find ...]] ...]`);
+    /// each one returning rows is a hint.
+    #[arg(long, value_name = "FILE")]
+    pub checks: Option<PathBuf>,
+    /// Print one JSON document instead of text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+// `kala log`.
+#[derive(Debug, Args)]
+pub struct LogArgs {
+    /// The world file.
+    pub world: PathBuf,
+    /// Start at this transaction: `tx#N` or `N`.
+    #[arg(long, value_name = "C", value_parser = parse_canon)]
+    pub from: Option<Canon>,
+    /// Show at most N transactions.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64))]
+    pub limit: Option<u64>,
+    /// Print one JSON document instead of text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+// `kala info`.
+#[derive(Debug, Args)]
+pub struct InfoArgs {
+    /// The world file.
+    pub world: PathBuf,
+    /// Print one JSON document instead of text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+// `kala query`.
+#[derive(Debug, Args)]
+pub struct QueryArgs {
+    /// The world file.
+    pub world: PathBuf,
+    #[command(flatten)]
+    pub query: QueryInput,
+    /// Print one JSON document instead of text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+// `kala transact`.
+#[derive(Debug, Args)]
+pub struct TransactArgs {
+    /// Replay a dump into a new world, preserving its genesis.
+    #[arg(long, conflicts_with_all = ["dry_run", "acknowledge_recovery"])]
+    pub create: bool,
+    pub world: PathBuf,
+    pub input: PathBuf,
+    /// Preview the forms in order (each sees the ones before it)
+    /// without changing the log.
+    #[arg(long)]
+    pub dry_run: bool,
+    #[arg(long)]
+    pub json: bool,
+    /// Accept cutting a damaged last transaction (see `kala info`) to a
+    /// quarantine file before writing.
+    #[arg(long)]
+    pub acknowledge_recovery: bool,
+}
+
+// `kala repl`.
+#[derive(Debug, Args)]
+pub struct ReplArgs {
+    /// Enable writes and hold the world's exclusive writer lock.
+    #[arg(long, conflicts_with = "canon")]
+    pub write: bool,
+    /// The world file.
+    pub world: PathBuf,
+    /// Initial default story tick.
+    #[arg(long, value_name = "T", allow_negative_numbers = true)]
+    pub at: Option<i64>,
+    /// Initial default canon: `tx#N` or `N`.
+    #[arg(long, value_name = "C", value_parser = parse_canon)]
+    pub canon: Option<Canon>,
+    /// Opt in to private, bounded query history at this path.
+    #[arg(long, value_name = "FILE")]
+    pub history: Option<PathBuf>,
+    /// With --write: accept cutting a damaged last transaction (see
+    /// `kala info`) to a quarantine file.
+    #[arg(long, requires = "write")]
+    pub acknowledge_recovery: bool,
+}
+
+// `kala explain`.
+#[derive(Debug, Args)]
+pub struct ExplainArgs {
+    /// The world file.
+    pub world: PathBuf,
+    #[command(flatten)]
+    pub query: QueryInput,
 }
 
 /// Authentication input is never taken from argv.

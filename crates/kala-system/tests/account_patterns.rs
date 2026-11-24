@@ -1,4 +1,4 @@
-use kala_bolt::auth::{AccountName, HostPattern, Identity};
+use kala_system::auth::{AccountName, HostPattern, Identity};
 use proptest::prelude::*;
 use std::net::{IpAddr, Ipv4Addr};
 

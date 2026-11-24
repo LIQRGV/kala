@@ -218,7 +218,7 @@ impl<'w> Labeler<'w> {
     }
 
     pub fn value(&self, v: &Value) -> JValue {
-        if kala_bolt::system::is_system(self.world)
+        if kala_system::is_system(self.world)
             && matches!(v, Value::Str(s) if s.starts_with("$argon2"))
         {
             return JValue::redacted();
@@ -228,7 +228,7 @@ impl<'w> Labeler<'w> {
 
     /// Attribute-aware redaction also covers damaged hash values.
     pub fn attribute_value(&self, attr: &str, value: &Value) -> JValue {
-        if attr == "password_hash" && kala_bolt::system::is_system(self.world) {
+        if attr == "password_hash" && kala_system::is_system(self.world) {
             JValue::redacted()
         } else {
             self.value(value)

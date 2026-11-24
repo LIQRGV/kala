@@ -4,6 +4,7 @@ mod common;
 
 use kala_core::log::EntryBody;
 use kala_core::*;
+use kala_fixture::load_fixture_to;
 use std::path::{Path, PathBuf};
 
 const VARROW: &str = include_str!("fixtures/varrow.yaml");

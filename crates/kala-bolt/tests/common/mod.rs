@@ -28,7 +28,7 @@ impl Running {
     pub fn with_config(mut config: ServerConfig) -> Self {
         config.listen = "127.0.0.1:0".parse().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        drop(kala_core::load_fixture_to(VARROW, &dir.path().join("varrow.kala")).unwrap());
+        drop(kala_fixture::load_fixture_to(VARROW, &dir.path().join("varrow.kala")).unwrap());
         Self::in_dir(dir, config)
     }
 
@@ -39,7 +39,7 @@ impl Running {
 
     pub fn with_auth(auth: Arc<dyn kala_bolt::auth::Authenticator>) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        drop(kala_core::load_fixture_to(VARROW, &dir.path().join("varrow.kala")).unwrap());
+        drop(kala_fixture::load_fixture_to(VARROW, &dir.path().join("varrow.kala")).unwrap());
         let config = ServerConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             ..ServerConfig::default()

@@ -2,7 +2,7 @@
 mod common;
 use common::*;
 use kala_core::{AttrDef, Cardinality, Kind, Schema, Tick, Value, ValueType, World};
-use kala_query::{Access, Limits, Op, OpTerm, Params, QueryError, run, run_with_cancel};
+use kala_query::{Access, Limits, Op, OpTerm, Params, QueryError, RunOptions, run, run_with};
 use std::sync::atomic::AtomicBool;
 
 fn world() -> World {
@@ -61,13 +61,13 @@ fn a_set_cancel_flag_reports_cancelled() {
         &["e", "s"],
         expand(tv("e"), "score", tv("s"), at(0), Access::Scan),
     );
-    let result = run_with_cancel(
+    let result = run_with(
         &w,
         &p,
         &Params::new(),
-        &Limits::default(),
-        &AtomicBool::new(true),
-    );
+        RunOptions::new(Limits::default()).with_cancel(&AtomicBool::new(true)),
+    )
+    .map(|(rs, _)| rs);
     assert!(
         matches!(result, Err(QueryError::Cancelled)),
         "wrong cancellation error: {result:?}"

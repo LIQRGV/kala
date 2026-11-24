@@ -27,6 +27,7 @@ mod common;
 
 use kala_core::log::{EntryBody, read_log};
 use kala_core::*;
+use kala_fixture::{load_fixture, load_fixture_to};
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 

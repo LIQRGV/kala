@@ -1,5 +1,5 @@
 //! Regressions from the slice-13 security review.
-use kala_core::load_fixture;
+use kala_fixture::load_fixture;
 use kala_query::{Datum, Limits, Params, QueryError, run};
 
 #[test]
@@ -105,7 +105,7 @@ fn large_reused_parameters_are_budgeted_even_when_match_is_empty() {
                 .collect(),
         ),
     );
-    let result = kala_query::run_with_values(
+    let result = kala_query::run(
         &world,
         &p.plan,
         &params,

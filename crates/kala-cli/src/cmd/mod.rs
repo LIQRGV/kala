@@ -48,148 +48,28 @@ impl From<String> for Done {
 /// Runs a parsed command.
 pub fn dispatch(cmd: &Command) -> Result<Done, CliError> {
     let text = match cmd {
-        Command::Dump {
-            world,
-            output,
-            all,
-            force,
-        } => dump::run(world, output.as_deref(), *all, *force),
-        Command::Create { world, schema } => create::run(world, schema.as_deref()),
-        Command::Export {
-            world,
-            at,
-            canon,
-            output,
-        } => export::run(world, *at, *canon, output.as_deref()),
-        Command::Schema { world, canon, json } => schema::run(world, *canon, *json),
-        Command::Serve {
-            dir,
-            listen,
-            auth,
-            insecure_allow_plaintext,
-            default_db,
-            max_connections,
-            idle_timeout,
-        } => serve::run(
-            dir,
-            listen,
-            auth,
-            *insecure_allow_plaintext,
-            default_db.clone(),
-            *max_connections,
-            *idle_timeout,
-        ),
-        Command::User { command } => user::run(command),
-        Command::Load {
-            fixture,
-            world,
-            force,
-        } => load::run(fixture, world, *force),
-        Command::Asof {
-            world,
-            entity,
-            attr,
-            tick,
-            read,
-        } => asof::run(world, entity, attr.as_deref(), tick.as_deref(), read),
-        Command::Neighbors {
-            world,
-            entity,
-            attr,
-            tick,
-            incoming,
-            out: _,
-            both,
-            read,
-        } => neighbors::run(
-            world,
-            entity,
-            attr,
-            tick.as_deref(),
-            neighbors::Flags {
-                incoming: *incoming,
-                both: *both,
-            },
-            read,
-        ),
-        Command::History {
-            world,
-            entity,
-            attr,
-            canon,
-            json,
-        } => history::run(world, entity, attr, *canon, *json),
-        Command::Find {
-            world,
-            attr,
-            value,
-            tick,
-            ignore_case,
-            read,
-        } => find::run(world, attr, value, tick.as_deref(), *ignore_case, read),
-        Command::List {
-            world,
-            node_type,
-            tick,
-            read,
-        } => list::run(world, node_type, tick.as_deref(), read),
-        Command::Edge { world, edge, read } => edge::run(world, edge, read),
-        Command::Log {
-            world,
-            from,
-            limit,
-            json,
-        } => log::run(world, *from, *limit, *json),
-        Command::Info { world, json } => info::run(world, *json),
-        Command::Query { world, query, json } => query::run(world, query, *json),
-        Command::Explain { world, query } => query::explain(world, query),
-        Command::Transact {
-            create,
-            world,
-            input,
-            dry_run,
-            json,
-            acknowledge_recovery,
-        } => {
-            if *create {
-                return create::replay(world, input, *json).map(Done::from);
-            }
-            return transact::run(world, input, *dry_run, *json, *acknowledge_recovery);
-        }
-        Command::Repl {
-            write,
-            world,
-            at,
-            canon,
-            history,
-            acknowledge_recovery,
-        } => {
-            return repl::run(
-                world,
-                *at,
-                *canon,
-                history.as_deref(),
-                *write,
-                *acknowledge_recovery,
-            );
-        }
-        Command::Doctor {
-            world,
-            canon,
-            since,
-            checks,
-            json,
-        } => {
-            return doctor::run(
-                world,
-                doctor::Options {
-                    canon: *canon,
-                    since: *since,
-                    checks: checks.as_deref(),
-                    json: *json,
-                },
-            );
-        }
+        Command::Dump(args) => dump::run(args),
+        Command::Create(args) => create::run(args),
+        Command::Export(args) => export::run(args),
+        Command::Schema(args) => schema::run(args),
+        Command::Serve(args) => serve::run(args),
+        Command::User(args) => user::run(args),
+        Command::Load(args) => load::run(args),
+        Command::Asof(args) => asof::run(args),
+        Command::Neighbors(args) => neighbors::run(args),
+        Command::History(args) => history::run(args),
+        Command::Find(args) => find::run(args),
+        Command::List(args) => list::run(args),
+        Command::Edge(args) => edge::run(args),
+        Command::Log(args) => log::run(args),
+        Command::Info(args) => info::run(args),
+        Command::Query(args) => query::run(args),
+        Command::Explain(args) => query::explain(args),
+        Command::Transact(args) if args.create => create::replay(args),
+        // These report findings or an exit status of their own.
+        Command::Transact(args) => return transact::run(args),
+        Command::Repl(args) => return repl::run(args),
+        Command::Doctor(args) => return doctor::run(args),
     };
     text.map(Done::from)
 }

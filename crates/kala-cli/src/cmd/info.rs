@@ -16,6 +16,7 @@ use kala_core::log::{EntryBody, LOG_FORMAT_VERSION};
 use serde::Serialize;
 
 use super::read::open_world;
+use crate::cli::InfoArgs;
 use crate::error::CliError;
 use crate::escape;
 use crate::out::{Text, render};
@@ -116,9 +117,9 @@ fn counts(bodies: impl Iterator<Item = EntryBody>) -> Counts {
     c
 }
 
-pub fn run(world: &Path, json: bool) -> Result<String, CliError> {
-    let w = open_world(world)?;
-    Ok(snapshot(world, &w, json))
+pub fn run(args: &InfoArgs) -> Result<String, CliError> {
+    let w = open_world(&args.world)?;
+    Ok(snapshot(&args.world, &w, args.json))
 }
 
 /// Renders the already-open snapshot used by a REPL session.

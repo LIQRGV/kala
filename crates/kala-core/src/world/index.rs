@@ -57,7 +57,7 @@ pub(crate) struct StoredIndexes<'w> {
     pub(crate) vfold_latest: &'w LatestIndex,
 }
 
-/// Borrows an owned key bound as a slice bound, for [`OrderedMap::scan`].
+/// Borrows an owned key bound as a slice bound, for [`OrderedKv::scan`].
 fn as_slice(b: &Bound<Vec<u8>>) -> Bound<&[u8]> {
     match b {
         Bound::Included(k) => Bound::Included(k),
@@ -76,8 +76,8 @@ fn as_slice(b: &Bound<Vec<u8>>) -> Bound<&[u8]> {
 /// `history_end(key)` is the length of a key's history prefix. Each round
 /// finds the next distinct history, seeks it, then jumps past all of its
 /// keys, so the cost is one seek per distinct `x` ever stored.
-pub(super) fn for_each_holding<V>(
-    index: &OrderedMap<V>,
+pub(super) fn for_each_holding<M: OrderedKv>(
+    index: &M,
     attr_prefix: &[u8],
     history_end: impl Fn(&[u8]) -> usize,
     work: Work<'_>,
@@ -95,8 +95,8 @@ pub(super) fn for_each_holding<V>(
 /// history prefix of every distinct history under `attr_prefix`, in key
 /// order (`f` may use it as a seek buffer, restoring it before returning).
 /// Charges `work` one key per round (the key that ends the walk included).
-pub(super) fn for_each_history<V>(
-    index: &OrderedMap<V>,
+pub(super) fn for_each_history<M: OrderedKv>(
+    index: &M,
     attr_prefix: &[u8],
     history_end: impl Fn(&[u8]) -> usize,
     work: Work<'_>,
@@ -130,8 +130,8 @@ pub(super) fn tick_after(k: &[u8], prefix_len: usize) -> Tick {
 
 /// Every `(key, op)` of a latest-revision index under `prefix`, in key
 /// order. Charges `work` one per key examined.
-pub(super) fn under<'i>(
-    index: &'i LatestIndex,
+pub(super) fn under<'i, M: OrderedKv<Value = Op>>(
+    index: &'i M,
     prefix: &'i [u8],
     work: Work<'i>,
 ) -> impl Iterator<Item = (&'i [u8], &'i Op)> + 'i {
@@ -144,7 +144,7 @@ pub(super) fn under<'i>(
 /// Makes `mark` the current entry of latest-revision key `at_key`: a fact
 /// is stored (replacing the previous current entry), a `DELETED` marker
 /// empties the key.
-fn set_latest(index: &mut LatestIndex, at_key: &[u8], mark: Mark) {
+fn set_latest(index: &mut impl OrderedKv<Value = Op>, at_key: &[u8], mark: Mark) {
     match mark.op() {
         Some(op) => index.set(at_key, op),
         None => {
@@ -160,7 +160,7 @@ fn set_latest(index: &mut LatestIndex, at_key: &[u8], mark: Mark) {
 /// so there is nothing to skip. Reuses `value_prefix` as the seek key
 /// buffer; it is restored before returning.
 pub(super) fn holds_latest(
-    index: &LatestIndex,
+    index: &impl OrderedKv<Value = Op>,
     value_prefix: &mut Vec<u8>,
     t: Tick,
     work: Work<'_>,
@@ -170,8 +170,8 @@ pub(super) fn holds_latest(
 
 /// The seek of [`holds_latest`]: the key and op of the current entry of the
 /// latest tick `<= t` under `value_prefix`, if any.
-pub(super) fn latest_seek<'i>(
-    index: &'i LatestIndex,
+pub(super) fn latest_seek<'i, M: OrderedKv<Value = Op>>(
+    index: &'i M,
     value_prefix: &mut Vec<u8>,
     t: Tick,
     work: Work<'_>,
@@ -206,8 +206,8 @@ pub(super) fn current_entries<'i>(
 /// the entries of one key are adjacent, newest tx first, so the first
 /// visible one of each run is that key's current entry. Charges `work` one
 /// per entry examined (the one that ends the walk included).
-pub(super) fn current_entries_metered<'i>(
-    index: &'i Index,
+pub(super) fn current_entries_metered<'i, M: OrderedKv<Value = Mark>>(
+    index: &'i M,
     prefix: &'i [u8],
     canon: TxId,
     work: Work<'i>,
@@ -265,7 +265,7 @@ pub(crate) fn decode_vfold_row(k: &[u8]) -> Option<(AttrId, String, Value, Entit
 
 /// Whether the `E`-layout `index` holds any entry (any tx) at `fact`'s key
 /// `E|e|a|v|^tick`.
-pub(super) fn has_key(index: &Index, fact: &FactDef) -> bool {
+pub(super) fn has_key(index: &impl OrderedKv<Value = Mark>, fact: &FactDef) -> bool {
     let mut at_key = key::e_value_prefix(fact.entity, fact.attr, fact.key_value());
     key::push_seek_tick(&mut at_key, fact.tick);
     index
@@ -278,8 +278,8 @@ pub(super) fn has_key(index: &Index, fact: &FactDef) -> bool {
 /// `value_prefix` (`E|e|a|v|`) at exactly tick `t`, if any; `None` if there
 /// is none or it is a `DELETED` marker. Reuses `value_prefix` as the seek
 /// key buffer; it is restored before returning.
-pub(super) fn op_at_tick(
-    layers: &[&Index],
+pub(super) fn op_at_tick<M: OrderedKv<Value = Mark>>(
+    layers: &[&M],
     value_prefix: &mut Vec<u8>,
     t: Tick,
     canon: TxId,
@@ -297,8 +297,8 @@ pub(super) fn op_at_tick(
 /// tick `<= t` under `value_prefix` (`E|e|a|v|`) is an assert, ticks whose
 /// current entry is a `DELETED` marker skipped. Reuses `value_prefix` as
 /// the seek key buffer; it is restored before returning.
-pub(super) fn holds(
-    layers: &[&Index],
+pub(super) fn holds<M: OrderedKv<Value = Mark>>(
+    layers: &[&M],
     value_prefix: &mut Vec<u8>,
     t: Tick,
     canon: TxId,
@@ -326,15 +326,21 @@ pub(super) fn holds(
 /// same tick are not current, so the walk jumps past the tick instead of
 /// falling through to them. At the latest canon with no corrections nothing
 /// is skipped: still one seek.
-fn seek(layers: &[&Index], from: &[u8], prefix: &[u8], canon: TxId, work: Work<'_>) -> Option<Op> {
+fn seek<M: OrderedKv<Value = Mark>>(
+    layers: &[&M],
+    from: &[u8],
+    prefix: &[u8],
+    canon: TxId,
+    work: Work<'_>,
+) -> Option<Op> {
     seek_entry(layers, from, prefix, canon, work).map(|(_, op)| op)
 }
 
 /// [`seek`], also returning the key of the entry found. Charges `work`
 /// one per key examined: the one landed on, every newer-tx or deleted
 /// entry stepped over, and the one past the prefix that ends a miss.
-pub(super) fn seek_entry<'i>(
-    layers: &[&'i Index],
+pub(super) fn seek_entry<'i, M: OrderedKv<Value = Mark>>(
+    layers: &[&'i M],
     from: &[u8],
     prefix: &[u8],
     canon: TxId,
@@ -399,7 +405,7 @@ pub(super) struct Indexes {
     pub(super) e_latest_precision: Precisions,
     /// Value index `V|attr|value|entity|^tick|^tx -> mark`: a copy of every
     /// `E` entry of an indexed, non-ref attribute (see
-    /// [`World::value_indexed`]), keyed by value so "every entity with
+    /// [`Catalog::value_indexed`]), keyed by value so "every entity with
     /// `attr = v`" is a prefix walk. Written only by [`World::index_entry`]
     /// next to its `E` entry, so it is derived and rebuilt with `E`.
     pub(super) v_index: Index,
@@ -455,6 +461,80 @@ impl Indexes {
         }
     }
 
+    /// The world's latest tick: the highest tick any key holds a fact at
+    /// (latest canon), or `Tick(0)` if there is none (see
+    /// [`World::latest_tick`]).
+    pub(super) fn latest_tick(&self) -> Tick {
+        self.tick_counts
+            .last_key_value()
+            .map_or(Tick(0), |(tick, _)| *tick)
+    }
+
+    /// The planner's estimates for attribute `attr` (see
+    /// [`World::attr_stats`]).
+    pub(super) fn attr_stats(&self, attr: AttrId) -> AttrStats {
+        self.attr_counts
+            .get(&attr)
+            .map_or_else(AttrStats::default, AttrCounts::stats)
+    }
+
+    /// Whether any fact entry was ever stored for attribute `attr`.
+    pub(super) fn has_facts(&self, attr: AttrId) -> bool {
+        self.attr_counts.contains_key(&attr)
+    }
+
+    /// Sets the content hash of indexes being rebuilt, before any fact is
+    /// applied.
+    fn set_rebuild_hash(&mut self, hash: ContentHash) {
+        debug_assert!(
+            self.values.is_empty(),
+            "invariant: the content hash is set before any value is referenced"
+        );
+        self.content_hash = hash;
+    }
+
+    /// The value reference the `E` keys of value `v` (encoded as
+    /// `encoding`) of attribute `def` carry: `None` unless `def` is an
+    /// unindexed string attribute. A value the table (or the
+    /// writing transaction, `staged`) already holds keeps its reference; a
+    /// new one gets the next ordinal of its content hash, counting the
+    /// values `staged` adds, which is exactly what it gets when its entry
+    /// is applied (commit and replay assign in log order). A new value has
+    /// no stored history, so judging it under that reference finds nothing,
+    /// as it should.
+    ///
+    /// Fails with [`Error::Id`] only if every ordinal of the hash is spent
+    /// (`u32::MAX + 1` distinct values sharing one content hash).
+    pub(super) fn value_ref(
+        &self,
+        staged: &StagedIds,
+        def: &AttrDef,
+        v: &Value,
+        encoding: &[u8],
+    ) -> Result<Option<[u8; key::VALUE_REF_LEN]>, Error> {
+        let Value::Str(text) = v else {
+            return Ok(None);
+        };
+        if def.indexed || def.value_type != ValueType::Str {
+            return Ok(None);
+        }
+        if let Some(r) = self
+            .values
+            .get(encoding)
+            .or_else(|| staged.values.get(encoding))
+        {
+            return Ok(Some(r.to_key_bytes()));
+        }
+        let hash = (self.content_hash)(text.as_bytes());
+        // Staged values of a hash continue the committed ordinals.
+        let next = self
+            .values
+            .next_ordinal(hash)
+            .max(staged.values.next_ordinal(hash));
+        let ordinal = u32::try_from(next).map_err(|_| IdError::SeqOutOfRange(next))?;
+        Ok(Some(ValueRef { hash, ordinal }.to_key_bytes()))
+    }
+
     /// The stored index maps, borrowed for doctor's comparison.
     fn stored(&self) -> StoredIndexes<'_> {
         StoredIndexes {
@@ -477,7 +557,7 @@ impl Indexes {
     /// decides, not the indexes.
     fn insert(&mut self, fact: &FactDef, mark: Mark, tx: TxId, value_indexed: bool) {
         // A new unindexed value enters the table with the reference its
-        // keys were built with (see `World::value_ref`).
+        // keys were built with (see `Indexes::value_ref`).
         if let Some(r) = fact.value_ref() {
             self.values.insert(&fact.value, r);
         }
@@ -555,44 +635,7 @@ impl World {
     /// Sets the content hash of a world being rebuilt, before any fact is
     /// applied (a world holding just its genesis).
     pub(crate) fn set_rebuild_hash(&mut self, hash: ContentHash) {
-        debug_assert!(
-            self.indexes.values.is_empty(),
-            "invariant: the content hash is set before any value is referenced"
-        );
-        self.indexes.content_hash = hash;
-    }
-
-    /// Replaces the content hash of this world's value references with `f`
-    /// and rebuilds its indexes and value table from its kept entries, as a
-    /// replay with that hash would: a test hook, so a forced-collision world
-    /// (`|_| 0`) can be checked to answer exactly like a normal one.
-    /// [`crate::doctor`] rebuilds this world with `f` too. Only this World
-    /// object changes: nothing is logged, and a reopen uses the real hash.
-    /// Not part of the supported API.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn set_content_hash(&mut self, f: fn(&[u8]) -> u64) {
-        let entries: Vec<LogEntry> = self
-            .entries
-            .iter()
-            .map(|e| LogEntry {
-                id: e.id,
-                body: e.body.clone(),
-            })
-            .collect();
-        let rebuilt = World::replay_with_hash(&entries, f)
-            .expect("invariant: a world's kept entries replay cleanly");
-        // The rebuild holds the same schema, IDs and entries; what is kept
-        // from this World is what isn't derived from the log.
-        let log = self.log.take();
-        let recovery = std::mem::take(&mut self.recovery);
-        let unacknowledged = self.recovery_unacknowledged;
-        let read_only = self.read_only;
-        *self = rebuilt;
-        self.log = log;
-        self.recovery = recovery;
-        self.recovery_unacknowledged = unacknowledged;
-        self.read_only = read_only;
+        self.indexes.set_rebuild_hash(hash);
     }
 
     /// The stored indexes, for doctor to compare against a rebuild.
@@ -609,25 +652,8 @@ impl World {
     /// hold the same entries, and the latest-revision indexes and the
     /// latest tick follow the keys' current entries.
     pub(super) fn index_entry(&mut self, fact: &FactDef, mark: Mark, tx: TxId) {
-        let value_indexed = self.value_indexed(fact.attr);
+        let value_indexed = self.catalog.value_indexed(fact.attr);
         self.indexes.insert(fact, mark, tx, value_indexed);
-    }
-
-    /// Whether `attr`'s entries are mirrored in `V`: it is declared
-    /// indexed and isn't a `ref` attribute (`R` is the value index of a
-    /// `ref` attribute).
-    fn value_indexed(&self, attr: AttrId) -> bool {
-        let def = &self.catalog.attributes[attr.0 as usize];
-        def.indexed && def.value_type != ValueType::Ref
-    }
-
-    /// Whether `attr`'s `E` keys carry value references: it is an
-    /// unindexed string attribute.
-    pub(super) fn keys_by_ref(&self, attr: AttrId) -> bool {
-        self.catalog
-            .attributes
-            .get(attr.0 as usize)
-            .is_some_and(|def| !def.indexed && def.value_type == ValueType::Str)
     }
 
     /// The full value encoding an `E`-key value part of attribute `attr`
@@ -638,7 +664,10 @@ impl World {
     /// table lacks: only reachable by tampering, so readers skip such keys
     /// (doctor reports them).
     fn e_part_encoding<'a>(&'a self, attr: AttrId, part: &'a [u8]) -> Option<&'a [u8]> {
-        match (self.keys_by_ref(attr), ValueRef::from_key_bytes(part)) {
+        match (
+            self.catalog.keys_by_ref(attr),
+            ValueRef::from_key_bytes(part),
+        ) {
             (true, Some(r)) => self.indexes.values.resolve(r),
             (false, None) => Some(part),
             _ => None,
@@ -678,7 +707,7 @@ impl World {
         attr: AttrId,
         encoding: &'a [u8],
     ) -> Option<Cow<'a, [u8]>> {
-        if !self.keys_by_ref(attr) {
+        if !self.catalog.keys_by_ref(attr) {
             return Some(Cow::Borrowed(encoding));
         }
         let r = self.indexes.values.get(encoding)?;
@@ -796,90 +825,5 @@ impl World {
             })
             .collect();
         IndexDump { e, r, v, v_fold }
-    }
-
-    /// Damages one stored index in memory, for doctor's tests: the
-    /// indexes are copies of the log, and this is how a copy goes wrong
-    /// without the log changing. Only that index changes (nothing else is
-    /// kept in step), and nothing is logged. A row number past the end does
-    /// nothing. Not part of the supported API.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn tamper_index(&mut self, t: Tamper) {
-        fn remove_nth<V>(index: &mut OrderedMap<V>, nth: usize) {
-            let key = index.keys().nth(nth).map(<[u8]>::to_vec);
-            if let Some(k) = key {
-                index.remove(&k);
-            }
-        }
-        fn flip_nth<V: Copy>(index: &mut OrderedMap<V>, nth: usize, flip: fn(V) -> V) {
-            let Some(k) = index.keys().nth(nth).map(<[u8]>::to_vec) else {
-                return;
-            };
-            if let Some(v) = index.get(&k).copied() {
-                index.set(&k, flip(v));
-            }
-        }
-        fn flip_mark(m: Mark) -> Mark {
-            match m {
-                Mark::Assert => Mark::Retract,
-                // A DELETED marker has no op; it becomes a fact.
-                Mark::Retract | Mark::Deleted => Mark::Assert,
-            }
-        }
-        fn flip_op(o: Op) -> Op {
-            match o {
-                Op::Assert => Op::Retract,
-                Op::Retract => Op::Assert,
-            }
-        }
-        match t {
-            Tamper::InsertRawKey { index, key } => match index {
-                IndexName::E => {
-                    self.indexes.e_index.insert(key, Mark::Assert);
-                }
-                IndexName::R => {
-                    self.indexes.r_index.insert(key, Mark::Assert);
-                }
-                IndexName::ELatest => {
-                    self.indexes.e_latest.insert(key, Op::Assert);
-                }
-                IndexName::RLatest => {
-                    self.indexes.r_latest.insert(key, Op::Assert);
-                }
-                IndexName::V => {
-                    self.indexes.v_index.insert(key, Mark::Assert);
-                }
-                IndexName::VLatest => {
-                    self.indexes.v_latest.insert(key, Op::Assert);
-                }
-                IndexName::VFold => {
-                    self.indexes.vfold_index.insert(key, Mark::Assert);
-                }
-                IndexName::VFoldLatest => {
-                    self.indexes.vfold_latest.insert(key, Op::Assert);
-                }
-            },
-            Tamper::RemoveRow { index, nth } => match index {
-                IndexName::E => remove_nth(&mut self.indexes.e_index, nth),
-                IndexName::R => remove_nth(&mut self.indexes.r_index, nth),
-                IndexName::ELatest => remove_nth(&mut self.indexes.e_latest, nth),
-                IndexName::RLatest => remove_nth(&mut self.indexes.r_latest, nth),
-                IndexName::V => remove_nth(&mut self.indexes.v_index, nth),
-                IndexName::VLatest => remove_nth(&mut self.indexes.v_latest, nth),
-                IndexName::VFold => remove_nth(&mut self.indexes.vfold_index, nth),
-                IndexName::VFoldLatest => remove_nth(&mut self.indexes.vfold_latest, nth),
-            },
-            Tamper::FlipOp { index, nth } => match index {
-                IndexName::E => flip_nth(&mut self.indexes.e_index, nth, flip_mark),
-                IndexName::R => flip_nth(&mut self.indexes.r_index, nth, flip_mark),
-                IndexName::ELatest => flip_nth(&mut self.indexes.e_latest, nth, flip_op),
-                IndexName::RLatest => flip_nth(&mut self.indexes.r_latest, nth, flip_op),
-                IndexName::V => flip_nth(&mut self.indexes.v_index, nth, flip_mark),
-                IndexName::VLatest => flip_nth(&mut self.indexes.v_latest, nth, flip_op),
-                IndexName::VFold => flip_nth(&mut self.indexes.vfold_index, nth, flip_mark),
-                IndexName::VFoldLatest => flip_nth(&mut self.indexes.vfold_latest, nth, flip_op),
-            },
-        }
     }
 }

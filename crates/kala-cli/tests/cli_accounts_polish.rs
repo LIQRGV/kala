@@ -25,7 +25,7 @@ fn fixture() -> String {
 
 fn varrow_dir() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    drop(kala_core::load_fixture_to(&fixture(), &dir.path().join("varrow.kala")).unwrap());
+    drop(kala_fixture::load_fixture_to(&fixture(), &dir.path().join("varrow.kala")).unwrap());
     dir
 }
 
@@ -320,8 +320,8 @@ fn auth_none_serve_does_not_read_an_unreadable_system_kala() {
 #[test]
 fn auth_none_serve_skips_a_user_world_named_system_with_one_stderr_line() {
     let dir = tempfile::tempdir().unwrap();
-    drop(kala_core::load_fixture_to(&fixture(), &dir.path().join("system.kala")).unwrap());
-    drop(kala_core::load_fixture_to(&fixture(), &dir.path().join("varrow.kala")).unwrap());
+    drop(kala_fixture::load_fixture_to(&fixture(), &dir.path().join("system.kala")).unwrap());
+    drop(kala_fixture::load_fixture_to(&fixture(), &dir.path().join("varrow.kala")).unwrap());
     let before = tree(dir.path());
     let s = Serve::start(dir.path(), &["--auth", "none"]);
     assert!(

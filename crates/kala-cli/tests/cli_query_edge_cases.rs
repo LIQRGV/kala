@@ -3,7 +3,7 @@
 mod common;
 
 use common::*;
-use kala_core::load_fixture;
+use kala_fixture::load_fixture;
 use serde_json::Value as Json;
 use std::ffi::OsString;
 use std::path::PathBuf;

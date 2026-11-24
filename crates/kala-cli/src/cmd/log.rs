@@ -6,7 +6,6 @@
 //! written (a torn or damaged tail is left in the file and not shown).
 
 use std::fmt::Write as _;
-use std::path::Path;
 
 use kala_core::log::EntryBody;
 use kala_core::schema::SchemaEdit;
@@ -16,7 +15,7 @@ use serde_json::json;
 
 use super::read::open_world;
 use super::schema;
-use crate::cli::Canon;
+use crate::cli::LogArgs;
 use crate::error::CliError;
 use crate::escape;
 use crate::out::{JEntity, JValue, Text, entity_text, precision_str, render, value_text};
@@ -190,15 +189,12 @@ fn body_text(b: &JBody) -> String {
     }
 }
 
-pub fn run(
-    world: &Path,
-    from: Option<Canon>,
-    limit: Option<u64>,
-    json: bool,
-) -> Result<String, CliError> {
-    let w = open_world(world)?;
-    let limit = limit.map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX));
-    let from = from.map_or(0, |c| c.0);
+pub fn run(args: &LogArgs) -> Result<String, CliError> {
+    let w = open_world(&args.world)?;
+    let limit = args
+        .limit
+        .map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX));
+    let from = args.from.map_or(0, |c| c.0);
     let mut transactions: Vec<JTxn> = Vec::new();
     // Every returned transaction is a run of entries ending in its
     // `Commit`, which carries the tx.
@@ -224,7 +220,7 @@ pub fn run(
         command: "log",
         transactions,
     };
-    Ok(render(&out, json))
+    Ok(render(&out, args.json))
 }
 
 /// An entity as the log shows it: handle, else ID; no name (the log isn't
@@ -244,7 +240,7 @@ fn fact(n: &World, entity: EntityId, attr: AttrId, value: &Value, tick: Tick) ->
     JFact {
         entity: ent(n, entity),
         attr: attr_name(n, attr),
-        value: if kala_bolt::system::is_system(n) && n.attr_name(attr) == Some("password_hash") {
+        value: if kala_system::is_system(n) && n.attr_name(attr) == Some("password_hash") {
             JValue::redacted()
         } else {
             JValue::new(value, |e| ent(n, e))
@@ -294,14 +290,12 @@ fn schema_body(n: &World, edit: &SchemaEdit) -> JBody {
             skip_unconvertible,
         } => {
             let source_name = attr_name(n, *source);
-            let from = n
-                .attribute(&source_name)
-                .map(|d| schema::type_name(d.value_type));
+            let from = n.attribute(&source_name).map(|d| d.value_type.name());
             let mut change = schema::def_json(def);
             change["kind"] = "migrate".into();
             change["source"] = source_name.clone().into();
             change["from"] = from.into();
-            change["to"] = schema::type_name(def.value_type).into();
+            change["to"] = def.value_type.name().into();
             change["skip_unconvertible"] = (*skip_unconvertible).into();
             let skip = if *skip_unconvertible {
                 ", skipping unconvertible values"

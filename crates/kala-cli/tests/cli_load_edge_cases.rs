@@ -3,8 +3,9 @@
 
 mod common;
 use common::*;
-use kala_core::fixture::MAX_FIXTURE_BYTES;
-use kala_core::{World, load_fixture_to};
+use kala_core::World;
+use kala_fixture::MAX_FIXTURE_BYTES;
+use kala_fixture::load_fixture_to;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;

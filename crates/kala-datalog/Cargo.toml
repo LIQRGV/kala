@@ -14,5 +14,6 @@ kala-core = { path = "../kala-core" }
 kala-query = { path = "../kala-query" }
 
 [dev-dependencies]
+kala-fixture = { path = "../kala-fixture" }
 proptest = "1.12.0"
 tempfile = "3.27.0"

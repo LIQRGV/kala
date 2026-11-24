@@ -1,8 +1,9 @@
 //! Slice 13 polish, confirm step: edge cases the implementation revealed.
-use kala_core::{Value, World, load_fixture};
+use kala_core::{Value, World};
+use kala_fixture::load_fixture;
 use kala_query::{
     CanonSource, CmpOp, Datum, Expr, Limits, Op, OutputSpec, Params, Plan, QueryParams, RowAction,
-    TickSource, Var, run, run_with_values,
+    TickSource, Var, run,
 };
 
 const EDGES: &str = r#"
@@ -344,7 +345,7 @@ fn list_parameters_with_null_or_mixed_elements_order_to_null() {
         let mut qp = QueryParams::new();
         qp.insert("l".into(), l);
         qp.insert("m".into(), m);
-        run_with_values(&w, &p.plan, &qp, &Limits::default())
+        run(&w, &p.plan, &qp, &Limits::default())
             .unwrap()
             .rows
             .len()

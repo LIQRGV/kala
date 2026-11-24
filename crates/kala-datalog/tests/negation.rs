@@ -24,6 +24,7 @@
 
 use kala_core::*;
 use kala_datalog::{ErrorKind, prepare};
+use kala_fixture::load_fixture;
 use kala_query::{Limits, Params, run};
 use std::collections::{BTreeMap, BTreeSet};
 

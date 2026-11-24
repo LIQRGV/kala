@@ -138,7 +138,7 @@ fn client_that_never_reads_releases_slot_after_write_timeout() {
     for n in 0..128 {
         yaml.push_str(&format!("      - assert: [e{n}, name, \"e{n}\"]\n"));
     }
-    drop(kala_core::load_fixture_to(&yaml, &dir.path().join("large.kala")).unwrap());
+    drop(kala_fixture::load_fixture_to(&yaml, &dir.path().join("large.kala")).unwrap());
     let server = Running::in_dir(
         dir,
         ServerConfig {

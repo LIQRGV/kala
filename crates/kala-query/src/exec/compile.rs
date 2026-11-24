@@ -11,7 +11,7 @@ use crate::ir::{Access, Agg, AggFn, AttrRef, Func, Op, OpTerm, Predicate, Term, 
 use super::agg::{agg_takes, agg_wants};
 use super::program::{AggStep, Attr, Pos, Program, Slots, Step, TickPos, Variant, pop};
 use super::val::{CmpWork, Interner, Val, ValKind, compare};
-use super::{ParameterInput, QueryError, tick_param, type_name};
+use super::{ParameterInput, QueryError, tick_param};
 
 /// One item of a plan's walk, in execution order.
 enum Visit<'p> {
@@ -125,25 +125,31 @@ pub(super) fn plan_depth(root: &Op) -> usize {
     deepest
 }
 
+/// What a plan is compiled against: the world and canon its names resolve
+/// in, the query's parameters and its resolved default tick.
+#[derive(Clone, Copy)]
+pub(super) struct CompileEnv<'c> {
+    pub(super) world: &'c World,
+    pub(super) canon: TxId,
+    pub(super) params: &'c dyn ParameterInput,
+    pub(super) default_tick: Tick,
+}
+
 /// Compiles `root` into a flat program. Errors come in the order a
 /// recursive walk (inputs first, left to right) would find them.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn compile(
     root: &Op,
-    world: &World,
-    canon: TxId,
-    params: &dyn ParameterInput,
-    default_tick: Tick,
+    env: CompileEnv<'_>,
     slots: &mut Slots,
     interner: &mut Interner,
     budget: &mut super::budget::Budget,
 ) -> Result<Program, QueryError> {
     let walk = post_order(root);
     let mut c = Compiler {
-        world,
-        canon,
-        params,
-        default_tick,
+        world: env.world,
+        canon: env.canon,
+        params: env.params,
+        default_tick: env.default_tick,
         slots,
         interner,
         budget,
@@ -250,23 +256,7 @@ impl Compiler<'_, '_> {
                 self.unions.push(None);
                 Step::UnionBegin
             }
-            Visit::UnionAdd => {
-                let b = pop(&mut self.stack);
-                let first = self
-                    .unions
-                    .last_mut()
-                    .expect("invariant: UnionAdd follows its UnionBegin");
-                match first {
-                    Some(prev) if *prev != b => {
-                        return Err(QueryError::Plan(
-                            "Union inputs must bind the same variables".into(),
-                        ));
-                    }
-                    Some(_) => {}
-                    None => *first = Some(b),
-                }
-                Step::UnionAdd
-            }
+            Visit::UnionAdd => self.union_add()?,
             Visit::NotBody => {
                 let input = self
                     .stack
@@ -277,40 +267,7 @@ impl Compiler<'_, '_> {
                 Step::NotBegin
             }
             Visit::FixBegin(op) => self.fix_begin(op)?,
-            Visit::RuleEnd { rel, rule } => {
-                let bound = pop(&mut self.stack);
-                let fix = self
-                    .fixes
-                    .last()
-                    .expect("invariant: RuleEnd is inside its Fixpoint");
-                let id = fix.rels[rel];
-                let meta = &self.rels[id];
-                let pc = self.pc;
-                for (s, v) in meta.cols.iter().zip(&meta.vars) {
-                    if !bound.contains(s) {
-                        return Err(QueryError::Plan(format!(
-                            "Fixpoint relation `{}`: rule {} doesn't bind ?{}",
-                            meta.name,
-                            rule + 1,
-                            v.0
-                        )));
-                    }
-                }
-                let cols = meta.cols.clone();
-                let fix = self
-                    .fixes
-                    .last_mut()
-                    .expect("invariant: RuleEnd is inside its Fixpoint");
-                let start = fix.rule_start;
-                fix.variants
-                    .extend(
-                        fix.pending
-                            .drain(..)
-                            .map(|(rel, occ)| Variant { start, occ, rel }),
-                    );
-                fix.rule_start = pc + 1;
-                Step::RuleEnd { rel: id, cols }
-            }
+            Visit::RuleEnd { rel, rule } => self.rule_end(rel, rule)?,
             Visit::FixBody => {
                 let fix = self
                     .fixes
@@ -328,6 +285,62 @@ impl Compiler<'_, '_> {
                 step
             }
         }))
+    }
+
+    /// One `Union` input is done: it must bind what the first one binds.
+    fn union_add(&mut self) -> Result<Step, QueryError> {
+        let b = pop(&mut self.stack);
+        let first = self
+            .unions
+            .last_mut()
+            .expect("invariant: UnionAdd follows its UnionBegin");
+        match first {
+            Some(prev) if *prev != b => {
+                return Err(QueryError::Plan(
+                    "Union inputs must bind the same variables".into(),
+                ));
+            }
+            Some(_) => {}
+            None => *first = Some(b),
+        }
+        Ok(Step::UnionAdd)
+    }
+
+    /// Rule number `rule` of relation number `rel` of the innermost open
+    /// `Fixpoint` is done: it must bind every column of its relation, and
+    /// its recursive reads become the rule's variants.
+    fn rule_end(&mut self, rel: usize, rule: usize) -> Result<Step, QueryError> {
+        let bound = pop(&mut self.stack);
+        let fix = self
+            .fixes
+            .last()
+            .expect("invariant: RuleEnd is inside its Fixpoint");
+        let id = fix.rels[rel];
+        let meta = &self.rels[id];
+        let pc = self.pc;
+        for (s, v) in meta.cols.iter().zip(&meta.vars) {
+            if !bound.contains(s) {
+                return Err(QueryError::Plan(format!(
+                    "Fixpoint relation `{}`: rule {} doesn't bind ?{}",
+                    meta.name,
+                    rule + 1,
+                    v.0
+                )));
+            }
+        }
+        let cols = meta.cols.clone();
+        let fix = self
+            .fixes
+            .last_mut()
+            .expect("invariant: RuleEnd is inside its Fixpoint");
+        let start = fix.rule_start;
+        fix.variants.extend(
+            fix.pending
+                .drain(..)
+                .map(|(rel, occ)| Variant { start, occ, rel }),
+        );
+        fix.rule_start = pc + 1;
+        Ok(Step::RuleEnd { rel: id, cols })
     }
 
     /// A `Fixpoint` starts: checks its relations and gives each an id.
@@ -427,7 +440,6 @@ impl Compiler<'_, '_> {
     /// top of the stack, which this pops), returning its step and its bound
     /// slots.
     fn op(&mut self, op: &Op) -> Result<(Step, BTreeSet<usize>), QueryError> {
-        let slots = &mut *self.slots;
         let stack = &mut self.stack;
         Ok(match op {
             Op::Unit => match self.seeds.last() {
@@ -439,33 +451,9 @@ impl Compiler<'_, '_> {
                 return Err(QueryError::Plan("Output must be the plan root".into()));
             }
             Op::Not { .. } => self.op_not()?,
-            Op::Difference { .. } | Op::Intersect { .. } => {
-                let rb = pop(stack);
-                let lb = pop(stack);
-                let shared: Vec<usize> = lb.intersection(&rb).copied().collect();
-                let step = if matches!(op, Op::Difference { .. }) {
-                    Step::Difference { shared }
-                } else {
-                    Step::Intersect { shared }
-                };
-                (step, lb)
-            }
-            Op::NodeScan { var, node_type, .. } => {
-                let mut bound = pop(stack);
-                let slot = slots.slot(var);
-                let was = !bound.insert(slot);
-                note_kind(
-                    &mut self.kinds,
-                    &Pos::Free(slot),
-                    Some(ValKind::Value(ValueType::Ref)),
-                );
-                let step = Step::NodeScan {
-                    slot,
-                    bound: was,
-                    node_type: node_type.clone(),
-                };
-                (step, bound)
-            }
+            Op::Difference { .. } => self.op_semi(|shared| Step::Difference { shared }),
+            Op::Intersect { .. } => self.op_semi(|shared| Step::Intersect { shared }),
+            Op::NodeScan { var, node_type, .. } => self.op_node_scan(var, node_type),
             Op::NodeSeek { var, entity, .. } => self.op_node_seek(var, entity)?,
             Op::Expand {
                 entity,
@@ -476,13 +464,7 @@ impl Compiler<'_, '_> {
                 ..
             } => self.op_expand(entity, attr, value, tick, access)?,
             Op::Filter { pred, .. } => self.op_filter(pred)?,
-            Op::Join { .. } => {
-                let rb = pop(stack);
-                let lb = pop(stack);
-                let shared: Vec<usize> = lb.intersection(&rb).copied().collect();
-                let bound = lb.union(&rb).copied().collect();
-                (Step::Join { shared }, bound)
-            }
+            Op::Join { .. } => self.op_join(),
             Op::Project { vars, .. } => self.op_project(vars)?,
             // The end of a union: its inputs were checked by `UnionAdd`.
             Op::Union { .. } => {
@@ -523,6 +505,43 @@ impl Compiler<'_, '_> {
             } => self.op_apply(func, args, out)?,
             Op::Aggregate { group, aggs, .. } => self.op_aggregate(group, aggs)?,
         })
+    }
+
+    /// Compiles a `Difference` or an `Intersect` (`step` builds either
+    /// from the shared slots): an anti- or semi-join binding what its left
+    /// side binds.
+    fn op_semi(&mut self, step: impl FnOnce(Vec<usize>) -> Step) -> (Step, BTreeSet<usize>) {
+        let rb = pop(&mut self.stack);
+        let lb = pop(&mut self.stack);
+        let shared: Vec<usize> = lb.intersection(&rb).copied().collect();
+        (step(shared), lb)
+    }
+
+    /// Compiles a `Join`.
+    fn op_join(&mut self) -> (Step, BTreeSet<usize>) {
+        let rb = pop(&mut self.stack);
+        let lb = pop(&mut self.stack);
+        let shared: Vec<usize> = lb.intersection(&rb).copied().collect();
+        let bound = lb.union(&rb).copied().collect();
+        (Step::Join { shared }, bound)
+    }
+
+    /// Compiles a `NodeScan`.
+    fn op_node_scan(&mut self, var: &Var, node_type: &str) -> (Step, BTreeSet<usize>) {
+        let mut bound = pop(&mut self.stack);
+        let slot = self.slots.slot(var);
+        let was = !bound.insert(slot);
+        note_kind(
+            &mut self.kinds,
+            &Pos::Free(slot),
+            Some(ValKind::Value(ValueType::Ref)),
+        );
+        let step = Step::NodeScan {
+            slot,
+            bound: was,
+            node_type: node_type.to_owned(),
+        };
+        (step, bound)
     }
 
     /// Compiles the end of a `Not`: its body (on top) and its input.
@@ -1075,7 +1094,7 @@ fn entity_pos(
         Term::Const(c) => {
             return Err(QueryError::TypeMismatch(format!(
                 "{what} position needs an entity, got {}",
-                type_name(c.value_type())
+                c.value_type().name()
             )));
         }
         Term::Op(_) | Term::Precision(_) => {
@@ -1111,14 +1130,14 @@ fn value_pos(
         Term::Const(c) => {
             return Err(QueryError::TypeMismatch(format!(
                 "value position needs {}, got {}",
-                type_name(ty),
-                type_name(c.value_type())
+                ty.name(),
+                c.value_type().name()
             )));
         }
         Term::Op(_) | Term::Precision(_) => {
             return Err(QueryError::TypeMismatch(format!(
                 "value position needs {}, got an op",
-                type_name(ty)
+                ty.name()
             )));
         }
         Term::Param(name) => match param(params, name)? {
@@ -1126,7 +1145,7 @@ fn value_pos(
             _ => {
                 return Err(QueryError::ParamType {
                     name: name.clone(),
-                    expected: type_name(ty).into(),
+                    expected: ty.name().into(),
                 });
             }
         },
@@ -1147,7 +1166,7 @@ fn tick_term_pos(
         Term::Const(c) => {
             return Err(QueryError::TypeMismatch(format!(
                 "History tick position needs i64, got {}",
-                type_name(c.value_type())
+                c.value_type().name()
             )));
         }
         Term::Op(_) | Term::Precision(_) => {

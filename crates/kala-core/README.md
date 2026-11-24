@@ -116,12 +116,13 @@ assert!(doctor(&world, &DoctorOptions::default()).is_clean());
 
 ## The same world from a YAML fixture
 
-`load_fixture` builds a world from an operation-oriented YAML document by
-calling the same native API; see the `fixture` module docs for the full
+`kala_fixture::load_fixture` (the `kala-fixture` crate) builds a world from an operation-oriented YAML document by
+calling the same native API; see the `kala-fixture` crate docs for the full
 format (schema, entities, transactions, labels and corrections).
 
 ```rust
-use kala_core::{Direction, Tick, load_fixture};
+use kala_core::{Direction, Tick};
+use kala_fixture::load_fixture;
 
 let world = load_fixture(
     r#"
@@ -195,7 +196,8 @@ assert_eq!(world.format_id(greg), "CHARACTER#3");
   `entity_by_handle` / `format_id` for IDs.
 - `World::at_canon(tx)`: a `View` with the same reads at an older canon;
   `View::edge` / `View::edge_id` see only edges defined up to that canon.
-- `load_fixture`, `load_fixture_to`: build a world from YAML.
+- `kala_fixture::load_fixture`, `load_fixture_to` (the `kala-fixture` crate):
+  build a world from YAML.
 - `doctor`, `doctor_log`: the read-only integrity checker (`Report`,
   `Finding`, `Severity`).
 

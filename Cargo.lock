@@ -420,11 +420,12 @@ checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
 name = "kala-bolt"
 version = "0.1.0"
 dependencies = [
- "argon2",
  "kala-core",
- "kala-cypher",
  "kala-datalog",
+ "kala-fixture",
+ "kala-lang",
  "kala-query",
+ "kala-system",
  "proptest",
  "tempfile",
 ]
@@ -437,9 +438,11 @@ dependencies = [
  "ctrlc",
  "kala-bolt",
  "kala-core",
- "kala-cypher",
  "kala-datalog",
+ "kala-fixture",
+ "kala-lang",
  "kala-query",
+ "kala-system",
  "libc",
  "proptest",
  "rpassword",
@@ -456,9 +459,8 @@ dependencies = [
  "caseless",
  "crc32fast",
  "kala-core",
+ "kala-fixture",
  "proptest",
- "serde",
- "serde-saphyr",
  "tempfile",
  "unicode-normalization",
 ]
@@ -469,6 +471,7 @@ version = "0.1.0"
 dependencies = [
  "kala-core",
  "kala-datalog",
+ "kala-fixture",
  "kala-query",
  "proptest",
  "tempfile",
@@ -479,9 +482,32 @@ name = "kala-datalog"
 version = "0.1.0"
 dependencies = [
  "kala-core",
+ "kala-fixture",
  "kala-query",
  "proptest",
  "tempfile",
+]
+
+[[package]]
+name = "kala-fixture"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "kala-core",
+ "proptest",
+ "serde",
+ "serde-saphyr",
+ "tempfile",
+]
+
+[[package]]
+name = "kala-lang"
+version = "0.1.0"
+dependencies = [
+ "kala-core",
+ "kala-cypher",
+ "kala-datalog",
+ "kala-query",
 ]
 
 [[package]]
@@ -489,8 +515,18 @@ name = "kala-query"
 version = "0.1.0"
 dependencies = [
  "kala-core",
+ "kala-fixture",
  "proptest",
  "tempfile",
+]
+
+[[package]]
+name = "kala-system"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "kala-core",
+ "proptest",
 ]
 
 [[package]]

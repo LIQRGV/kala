@@ -444,11 +444,11 @@ fn held_write_lock_is_exit_three() {
     let path = dir.path().join("w.kala");
     // Retain the fixture writer: no unlock/reopen window while other test
     // threads spawn children, briefly inheriting a file descriptor at fork.
-    let _held = kala_core::load_fixture_to(EMPTY, &path).unwrap();
+    let _held = kala_fixture::load_fixture_to(EMPTY, &path).unwrap();
     let f = Fx {
         dir,
         path,
-        mem: kala_core::load_fixture(EMPTY).unwrap(),
+        mem: kala_fixture::load_fixture(EMPTY).unwrap(),
     };
     let o = transact(&f, "[:assert :greg :age 18]", &[]);
     assert_eq!(code(&o), 3, "{}", stderr(&o));

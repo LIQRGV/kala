@@ -1,13 +1,12 @@
 //! `kala history <world> <entity> <attr> [--canon C]`.
 
 use std::fmt::Write as _;
-use std::path::Path;
 
 use kala_core::Op;
 use serde::Serialize;
 
 use super::read::{Ctx, entity_err};
-use crate::cli::Canon;
+use crate::cli::HistoryArgs;
 use crate::error::CliError;
 use crate::escape;
 use crate::out::{JEntity, JTick, JValue, Text, entity_text, render, tick_text, value_text};
@@ -55,14 +54,9 @@ impl Text for History {
     }
 }
 
-pub fn run(
-    world: &Path,
-    entity: &str,
-    attr: &str,
-    canon: Option<Canon>,
-    json: bool,
-) -> Result<String, CliError> {
-    let ctx = Ctx::open(world, canon)?;
+pub fn run(args: &HistoryArgs) -> Result<String, CliError> {
+    let (entity, attr) = (args.entity.as_str(), args.attr.as_str());
+    let ctx = Ctx::open(&args.world, args.canon)?;
     let id = ctx.entity(entity)?;
     let changes = ctx.view().history(id, attr).map_err(entity_err(entity))?;
     // A history spans every tick, so names are shown as they are at the
@@ -85,5 +79,5 @@ pub fn run(
             })
             .collect(),
     };
-    Ok(render(&out, json))
+    Ok(render(&out, args.json))
 }

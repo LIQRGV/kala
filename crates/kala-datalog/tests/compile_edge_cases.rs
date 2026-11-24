@@ -1,6 +1,7 @@
 //! Slice 6 items 4-6 CONFIRM: edge cases pinning accepted implementer choices.
 use kala_core::*;
 use kala_datalog::{ErrorKind, ParamKind, prepare};
+use kala_fixture::load_fixture;
 use kala_query::{Limits, Op, Params, Plan, TickSource, run};
 use std::collections::BTreeSet;
 

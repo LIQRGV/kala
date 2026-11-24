@@ -2,8 +2,9 @@
 //! handle *string* belongs) is a TypeMismatch whose message tells the author
 //! what to write instead, using the handle from the query.
 
-use kala_core::{World, load_fixture};
+use kala_core::World;
 use kala_datalog::{ErrorKind, prepare};
+use kala_fixture::load_fixture;
 
 const VARROW: &str = include_str!("../../kala-core/tests/fixtures/varrow.yaml");
 
@@ -35,7 +36,7 @@ fn handle_keyword_in_value_position_hints_both_spellings() {
 fn the_string_form_still_works() {
     let w = world();
     let p = prepare(&w, r#"[:find ?p :where [?p :kala_handle "varrow"]]"#).expect("compiles");
-    let rs = kala_query::run(&w, &p.plan, &Default::default(), &Default::default()).unwrap();
+    let rs = kala_query::run(&w, &p.plan, &kala_query::Params::new(), &Default::default()).unwrap();
     assert_eq!(rs.rows.len(), 1);
 }
 
