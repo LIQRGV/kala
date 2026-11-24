@@ -126,7 +126,7 @@ pub fn on_log_hook(point: LogHook, f: impl FnOnce() + 'static) {
 
 /// Runs the hook a test armed for `point` on this thread, if any.
 #[cfg(feature = "test-hooks")]
-pub(super) fn fire(point: LogHook) {
+pub(crate) fn fire(point: LogHook) {
     let hook = HOOKS.with(|hooks| {
         let mut hooks = hooks.borrow_mut();
         let at = hooks.iter().position(|(p, _)| *p == point)?;

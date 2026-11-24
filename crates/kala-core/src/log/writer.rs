@@ -1,6 +1,7 @@
-//! The append side of the log file: creating it, opening it (replaying
-//! what is committed and cutting an incomplete tail to a quarantine file)
-//! and appending durable transactions.
+//! The append side of the log file: creating it, opening it, cutting an
+//! incomplete tail to a quarantine file and appending durable
+//! transactions; and the reads of the file that handles sharing it make
+//! (a whole-file scan, the tail after a handle's last transaction).
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions, TryLockError};
@@ -11,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use super::encode::EncodedTxn;
 use super::fault::ArmedFaults;
-use super::file::{open_regular, read_log_file, read_to_len, sync_parent_dir};
+use super::file::{open_regular, read_to_len, sync_parent_dir};
 use super::format::{BEGIN_LEN, HEADER_LEN};
 use super::scan::{Scan, ScanFrom, check_header, is_same_txn, scan, scan_txns};
 use super::{ChainTip, LOG_FORMAT_VERSION, LOG_MAGIC, LogEntry};
@@ -99,6 +100,27 @@ fn try_read_lock(file: &File) -> Result<Option<ReadLock<'_>>, Error> {
         Ok(()) => Ok(Some(ReadLock(file))),
         Err(TryLockError::WouldBlock) => Ok(None),
         Err(TryLockError::Error(e)) => Err(Error::from(e)),
+    }
+}
+
+/// Whether `path` names the open `file` (by device and inode, on Unix; one
+/// `stat` and one `fstat`). Elsewhere always `true`.
+fn names_file(path: &Path, file: &File) -> Result<bool, Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let at_path = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        let open = file.metadata()?;
+        Ok((at_path.dev(), at_path.ino()) == (open.dev(), open.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, file);
+        Ok(true)
     }
 }
 
@@ -256,10 +278,98 @@ pub(crate) fn file_len(path: &Path) -> Result<u64, Error> {
     Ok(std::fs::metadata(path)?.len())
 }
 
+/// A whole log file as one scan found it (see [`scan_file`]).
+#[derive(Debug)]
+pub(crate) struct Scanned {
+    /// The entries of the committed transactions, in log order.
+    pub(crate) entries: Vec<LogEntry>,
+    /// The last committed transaction; `None` if there is none.
+    pub(crate) tip: Option<ChainTip>,
+    /// The bytes after it: an incomplete last transaction, or empty.
+    pub(crate) rest: Vec<u8>,
+    /// Why `rest` isn't a committed transaction; `None` if it is empty.
+    pub(crate) cause: Option<CutCause>,
+}
+
+/// Reads the whole log `file`, up to the length it has now, and judges it
+/// by the recovery rules: fails as [`read_log`](super::read_log) does.
+/// Takes no lock and modifies nothing.
+pub(crate) fn scan_file(mut file: &File) -> Result<Scanned, Error> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = read_to_len(file)?;
+    let Scan {
+        entries,
+        valid_len,
+        cause,
+        tip,
+    } = scan(&bytes)?;
+    let rest = bytes.split_off(valid_len);
+    Ok(Scanned {
+        entries,
+        tip,
+        cause: cause.filter(|_| !rest.is_empty()),
+        rest,
+    })
+}
+
+/// How long a read-only open waits for the shared lock it settles its
+/// first, lock-free read under (see `World::open_read_only`). A commit
+/// holds the writer lock for a write and an fsync; an open that can't have
+/// the shared lock within this goes with what it read.
+pub(crate) const READ_SETTLE_WAIT: Duration = Duration::from_millis(100);
+
+/// A log file open for reading only, for a world that never writes it.
+#[derive(Debug)]
+pub(crate) struct LogFile(File);
+
+/// The shared lock of a [`LogFile`], held (see [`ReadLock`]).
+pub(crate) struct SettleLock<'f>(#[allow(dead_code)] ReadLock<'f>);
+
+impl LogFile {
+    /// Opens the log file at `path` for reading, as a regular file only.
+    pub(crate) fn open(path: &Path) -> Result<LogFile, Error> {
+        Ok(LogFile(open_regular(path, OpenOptions::new().read(true))?))
+    }
+
+    /// [`scan_file`] of this file.
+    pub(crate) fn scan(&self) -> Result<Scanned, Error> {
+        scan_file(&self.0)
+    }
+
+    /// Takes the file's shared lock, trying for up to `wait`: `None` if a
+    /// writer held its exclusive lock all that time.
+    pub(crate) fn settle_lock(&self, wait: Duration) -> Result<Option<SettleLock<'_>>, Error> {
+        let started = Instant::now();
+        let mut pause = Duration::from_millis(1);
+        loop {
+            if let Some(lock) = try_read_lock(&self.0)? {
+                return Ok(Some(SettleLock(lock)));
+            }
+            let left = wait.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return Ok(None);
+            }
+            std::thread::sleep(pause.min(left));
+            pause = (pause * 2).min(MAX_LOCK_POLL);
+        }
+    }
+
+    /// [`read_tail`] of this file after `tip`, under the shared lock
+    /// `_held`: what is read is the file's state, no append is in flight.
+    pub(crate) fn read_tail(
+        &self,
+        _held: &SettleLock<'_>,
+        tip: &ChainTip,
+        next_entry: u64,
+    ) -> Result<Tail, Error> {
+        read_tail(&self.0, tip, next_entry, true)
+    }
+}
+
 /// The append side of an open log file.
 ///
 /// It keeps the file open but holds its lock only while it works on it:
-/// creating it, opening it (which may cut an incomplete tail) and each
+/// creating it, the end of an open (which may cut a torn tail) and each
 /// commit take a [`WriterLock`] and release it when done, so several
 /// handles, in this process or others, take turns appending to one log.
 /// Everything that appends or cuts asks for the held lock as proof.
@@ -323,94 +433,45 @@ impl LogWriter {
         })
     }
 
-    /// Opens an existing log file at `path` for reading and appending (never
-    /// creating it), passes the entries of its committed transactions (in
-    /// log order) to `replay`, and returns `replay`'s result with a writer
-    /// that appends after them.
+    /// Opens the existing log file at `path` for reading and appending
+    /// (never creating it; only a regular file, see `open_regular`), without
+    /// reading it and without its lock. The writer knows nothing of the
+    /// file's contents yet: [`LogWriter::scan`] reads them and
+    /// [`LogWriter::stand_at`] puts the writer at their end. Commits wait up
+    /// to `busy_timeout` for the lock.
     ///
-    /// The file is locked exclusively before anything is read, waiting up
-    /// to `busy_timeout` for another holder; if it is still held then this
-    /// fails with [`Error::WorldLocked`] and the file is untouched. The lock
-    /// is released when this returns (the scan and any cut happen under
-    /// it); the returned writer takes it again for each commit, waiting up
-    /// to `busy_timeout` too.
-    ///
-    /// Fails as [`read_log`](super::read_log) does, or with `replay`'s error. Only once both
-    /// succeeded is a *torn* tail (bytes past the last committed transaction,
-    /// see the module docs) cut off, so the next append lands right after
-    /// the last commit. The cut bytes are first saved, durably, to a
-    /// quarantine file (see [`quarantine`]); if that fails, the open fails
-    /// with [`Error::Io`] and the log is not cut. On any error the log is
-    /// untouched. A clean log is never modified, so opening is idempotent.
-    /// The returned [`RecoveryReport`] says what was cut and where it went.
-    ///
-    /// A *damaged* tail (see [`CutCause::Damaged`]) is never cut here: it
-    /// may have been acknowledged, so its bytes stay in the file, where
-    /// every handle sees them under the lock, until a commit cuts them
-    /// with its caller's acknowledgement (`World::apply_tail`). With
-    /// `report_damaged` it is reported (its length and cause, no
-    /// quarantine file) and the writer stands right before it; without, the
-    /// open fails with [`Error::RecoveryRequired`]. Torn tails are cut
-    /// either way.
-    pub(crate) fn open<T>(
-        path: &Path,
-        replay: impl FnOnce(&[LogEntry]) -> Result<T, Error>,
-        report_damaged: bool,
-        busy_timeout: Duration,
-    ) -> Result<(T, LogWriter, RecoveryReport), Error> {
-        // One handle for reading, cutting and appending, so the bytes
-        // replayed are the bytes appended after. `append` without `create`
-        // never creates the file.
-        // Only a regular file: see `open_regular`.
+    /// One handle for reading, cutting and appending, so the bytes replayed
+    /// are the bytes appended after. `append` without `create` never
+    /// creates the file.
+    pub(crate) fn open_file(path: &Path, busy_timeout: Duration) -> Result<LogWriter, Error> {
         let file = Arc::new(open_regular(
             path,
             OpenOptions::new().read(true).append(true),
         )?);
-        let held = lock(&file, busy_timeout)?;
-        // The length is taken under the lock, so no writer appends past it.
-        let bytes = read_to_len(&file)?;
-        let Scan {
-            entries,
-            valid_len,
-            cause,
-            tip,
-        } = scan(&bytes)?;
-        if !report_damaged && valid_len != bytes.len() && cause == Some(CutCause::Damaged) {
-            return Err(Error::RecoveryRequired {
-                bytes: (bytes.len() - valid_len) as u64,
-            });
-        }
-        let replayed = replay(&entries)?;
-        let mut writer = LogWriter {
+        Ok(LogWriter {
             file,
             path: path.to_owned(),
-            // `valid_len <= bytes.len()`, a `usize` that came from an
-            // in-memory buffer, so it fits a `u64`.
-            len: valid_len as u64,
-            tip,
+            len: HEADER_LEN as u64,
+            tip: None,
             failed: None,
             busy_timeout,
             faults: ArmedFaults::default(),
-        };
-        let mut report = RecoveryReport::default();
-        match cause.filter(|_| valid_len != bytes.len()) {
-            // Never acknowledged to anyone: cut now.
-            Some(CutCause::Torn) => {
-                report = writer.cut_tail(&held, &bytes[valid_len..], CutCause::Torn)?;
-            }
-            // May have been acknowledged: reported, and left in the file
-            // for every handle on it to see under the lock, until one of
-            // them cuts it with its caller's acknowledgement.
-            Some(CutCause::Damaged) => {
-                report = RecoveryReport {
-                    bytes_cut: (bytes.len() - valid_len) as u64,
-                    quarantine: None,
-                    cause: Some(CutCause::Damaged),
-                };
-            }
-            None => {}
-        }
-        Ok((replayed, writer, report))
+        })
+    }
+
+    /// Reads the whole file as it is now and judges it by the recovery
+    /// rules (see [`scan_file`]). Without the writer lock the result is a
+    /// first look that the caller settles under it; with it, it is the
+    /// file's state.
+    pub(crate) fn scan(&self) -> Result<Scanned, Error> {
+        scan_file(&self.file)
+    }
+
+    /// Puts the writer at the end of the committed log a scan found: `tip`
+    /// is its last transaction.
+    pub(crate) fn stand_at(&mut self, tip: Option<ChainTip>) {
+        self.tip = tip;
+        self.len = tip.map_or(HEADER_LEN as u64, |tip| tip.end);
     }
 
     /// Cuts `tail`, the incomplete last transaction that follows the last
@@ -485,22 +546,8 @@ impl LogWriter {
     }
 
     /// Whether the writer's path still names the file it has open.
-    fn path_is_this_file(&self) -> Result<bool, Error> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let at_path = match std::fs::metadata(&self.path) {
-                Ok(m) => m,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-                Err(e) => return Err(e.into()),
-            };
-            let open = self.file.metadata()?;
-            Ok((at_path.dev(), at_path.ino()) == (open.dev(), open.ino()))
-        }
-        #[cfg(not(unix))]
-        {
-            Ok(true)
-        }
+    pub(crate) fn path_is_this_file(&self) -> Result<bool, Error> {
+        names_file(&self.path, &self.file)
     }
 
     /// Test hook: fails as an armed "after lock" fault says (a panic, or
@@ -519,38 +566,6 @@ impl LogWriter {
     pub(crate) fn advance(&mut self, tip: ChainTip) {
         self.len = tip.end;
         self.tip = Some(tip);
-    }
-
-    /// The read-only counterpart of [`LogWriter::open`]: reads the log file
-    /// at `path` (never creating it) without taking the lock, passes the
-    /// entries of its committed transactions to `replay`, and returns
-    /// `replay`'s result with the [`RecoveryReport`] that `open` would
-    /// produce for the same bytes, minus the quarantine: `bytes_cut` and
-    /// `cause` say what `open` would cut, `quarantine` is `None`. Nothing is
-    /// written, cut or created.
-    ///
-    /// Fails exactly as `open` does before it would modify the file (as
-    /// [`read_log`](super::read_log) does, or with `replay`'s error); never with
-    /// [`Error::WorldLocked`].
-    pub(crate) fn read_committed<T>(
-        path: &Path,
-        replay: impl FnOnce(&[LogEntry]) -> Result<T, Error>,
-    ) -> Result<(T, RecoveryReport, Option<ChainTip>), Error> {
-        let bytes = read_log_file(path)?;
-        let Scan {
-            entries,
-            valid_len,
-            cause,
-            tip,
-        } = scan(&bytes)?;
-        let replayed = replay(&entries)?;
-        let mut report = RecoveryReport::default();
-        if valid_len != bytes.len() {
-            // As in `open`: a `usize` length of an in-memory buffer fits a u64.
-            report.bytes_cut = (bytes.len() - valid_len) as u64;
-            report.cause = cause;
-        }
-        Ok((replayed, report, tip))
     }
 
     /// The last committed transaction in the file (see [`ChainTip`]).

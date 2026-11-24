@@ -569,3 +569,108 @@ fn an_append_is_refused_when_the_file_shrank_under_the_lock() {
         f.set_len(last.start as u64).unwrap();
     });
 }
+
+// ---- F: a writable open replays without the writer lock ----
+
+#[test]
+fn a_writable_open_lets_others_commit_while_it_replays_and_catches_up_with_them() {
+    let (_dir, path, mut w, greg) = world();
+    w.assert(greg, "tag", s("before"), Some(Tick(1))).unwrap();
+    // Another handle commits when the open has replayed the log; it gives
+    // up at once if the lock is held.
+    w.set_busy_timeout(std::time::Duration::ZERO);
+    let during = Rc::new(RefCell::new(None));
+    let out = during.clone();
+    on_log_hook(LogHook::OpenReplayed, move || {
+        let res = w.assert(greg, "tag", s("during-open"), Some(Tick(2)));
+        *out.borrow_mut() = Some(res.map(|r| r.entries));
+    });
+    let mut opened = World::open(&path).unwrap();
+    assert_eq!(
+        *during.borrow(),
+        Some(Ok(vec![EntryId(10)])),
+        "a commit during the replay is not kept out"
+    );
+    // The open ends at the file's state under the lock: it has the
+    // transaction committed while it replayed.
+    assert_eq!(opened.latest_tx(), TxId(3));
+    assert_eq!(opened.recovery(), &RecoveryReport::default());
+    let fresh = World::open_read_only(&path).unwrap();
+    assert_eq!(state(&opened, greg), state(&fresh, greg));
+    assert_eq!(opened.catch_up(), Ok(0));
+    let res = opened
+        .assert(greg, "tag", s("after"), Some(Tick(3)))
+        .unwrap();
+    assert_eq!(res.entries, vec![EntryId(12)]);
+    assert_clean(&opened);
+}
+
+#[test]
+fn a_writable_open_still_cuts_a_torn_tail_and_reports_a_damaged_one() {
+    // Torn: cut at open, under the lock, as before.
+    let (_dir, path, mut w, greg) = world();
+    w.assert(greg, "tag", s("torn"), Some(Tick(1))).unwrap();
+    drop(w);
+    let full = bytes(&path);
+    let last = *common::spans(&full).last().unwrap();
+    std::fs::write(&path, &full[..full.len() - 3]).unwrap();
+    let opened = World::open(&path).unwrap();
+    assert_eq!(opened.recovery().cause, Some(CutCause::Torn));
+    assert_eq!(opened.latest_tx(), TxId(1));
+    assert!(bytes(&path) == full[..last.start]);
+    let q = quarantine_files(&path);
+    assert!(bytes(&q[0]) == full[last.start..full.len() - 3]);
+    // A torn tail written while the open replayed is cut too.
+    drop(opened);
+    let cut = bytes(&path);
+    let p2 = path.clone();
+    let torn = full[last.start..full.len() - 3].to_vec();
+    on_log_hook(LogHook::OpenReplayed, move || {
+        use std::io::Write;
+        let mut f = OpenOptions::new().append(true).open(&p2).unwrap();
+        f.write_all(&torn).unwrap();
+    });
+    let opened = World::open(&path).unwrap();
+    assert_eq!(opened.recovery().cause, Some(CutCause::Torn));
+    assert!(bytes(&path) == cut);
+    assert_eq!(quarantine_files(&path).len(), 2);
+    assert_clean(&opened);
+}
+
+/// Opens the world (read-only or for writing) from another thread while a
+/// commit sits between its write and its failing fsync for `pause`.
+fn open_during_a_failing_commit(read_only: bool, pause: std::time::Duration) -> World {
+    use std::sync::mpsc::channel;
+    let (_dir, path, w, greg) = world();
+    let (written_tx, written_rx) = channel();
+    let writer = std::thread::spawn(move || {
+        let mut w = w;
+        on_log_hook(LogHook::BeforeSync, move || {
+            written_tx.send(()).unwrap();
+            std::thread::sleep(pause);
+        });
+        w.inject_log_fault(LogFault::FailNextSync);
+        assert!(w.assert(greg, "tag", s("lost"), Some(Tick(1))).is_err());
+    });
+    written_rx.recv().unwrap();
+    let opened = if read_only {
+        World::open_read_only(&path).unwrap()
+    } else {
+        World::open(&path).unwrap()
+    };
+    writer.join().unwrap();
+    std::mem::forget(_dir);
+    opened
+}
+
+#[test]
+fn an_open_during_a_commit_whose_fsync_fails_does_not_include_it() {
+    for read_only in [true, false] {
+        let mut opened =
+            open_during_a_failing_commit(read_only, std::time::Duration::from_millis(30));
+        assert_eq!(opened.latest_tx(), TxId(1), "read_only={read_only}");
+        assert_eq!(opened.catch_up(), Ok(0), "not diverged");
+        assert_eq!(opened.recovery(), &RecoveryReport::default());
+        assert_clean(&opened);
+    }
+}

@@ -4,7 +4,8 @@
 //! A world handle is a copy of a prefix of its log file. Other handles, in
 //! this process or others, may append to the file at any time; none may
 //! append or cut without the file's lock, and the lock is held only for
-//! the length of one commit (or one open, or the creation of the file).
+//! the length of one commit (or the last step of an open, or the creation of
+//! the file).
 //!
 //! **Catch-up** ([`World::catch_up`]) reads what follows the last
 //! transaction this handle applied and applies it as a replay would. It

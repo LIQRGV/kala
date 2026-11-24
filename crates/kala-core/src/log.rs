@@ -253,11 +253,15 @@ mod writer; // the append side: create, open + cut, append
 
 pub(crate) use encode::{EncodedTxn, NewEntry, encode_txn, revised_payload_len};
 #[cfg(feature = "test-hooks")]
+pub(crate) use fault::fire as fire_hook;
+#[cfg(feature = "test-hooks")]
 pub use fault::{LogFault, LogHook, on_log_hook};
 pub(crate) use file::read_log_file;
 pub(crate) use survey::{SurveyedTxn, TaggedFinding, survey};
 pub use writer::DEFAULT_BUSY_TIMEOUT;
-pub(crate) use writer::{LogWriter, Tail, WriterLock, file_len, read_tail_at};
+pub(crate) use writer::{
+    LogFile, LogWriter, READ_SETTLE_WAIT, Tail, WriterLock, file_len, read_tail_at,
+};
 
 /// First 8 bytes of every log file.
 pub const LOG_MAGIC: [u8; 8] = *b"KALALOG\0";
