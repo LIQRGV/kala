@@ -421,7 +421,6 @@ name = "kala-bolt"
 version = "0.1.0"
 dependencies = [
  "kala-core",
- "kala-datalog",
  "kala-fixture",
  "kala-lang",
  "kala-query",

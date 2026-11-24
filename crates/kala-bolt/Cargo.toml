@@ -9,7 +9,6 @@ workspace = true
 [dependencies]
 kala-core = { path = "../kala-core" }
 kala-query = { path = "../kala-query" }
-kala-datalog = { path = "../kala-datalog" }
 # The query front-ends behind one interface.
 kala-lang = { path = "../kala-lang" }
 # The `system` database: accounts, privileges and password verification.
