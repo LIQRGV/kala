@@ -434,6 +434,8 @@ fn read(txn: &Txn<'_>, names: &Names<'_>, op: ReadOp, base_tick: Tick) {
 fn handle(path: PathBuf, base: Vec<EntityId>, commands: Receiver<Cmd>, replies: Sender<Reply>) {
     let mut world = World::open(&path).unwrap();
     let send = |r: Reply| replies.send(r).unwrap();
+    // Opened: the driver waits for this before its first step (see `run`).
+    send(Reply::Done);
     while let Ok(cmd) = commands.recv() {
         match cmd {
             Cmd::CatchUp => {
@@ -1038,6 +1040,14 @@ fn run(steps: Vec<Step>) {
         }));
         commands.push(command_tx);
         replies.push(reply_rx);
+    }
+    // Every handle is open before the first step. An open takes the writer
+    // lock for a moment at its end, and a catch-up that finds the lock
+    // taken applies nothing ("not yet") instead of reading a tail that may
+    // not be durable (PR #20 review, item C): the driver, which compares
+    // each `begin` with the reference, must not race the opens.
+    for opened in &replies {
+        assert!(matches!(opened.recv().unwrap(), Reply::Done));
     }
     let mut driver = Driver {
         path,
