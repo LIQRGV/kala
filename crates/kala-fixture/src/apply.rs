@@ -130,54 +130,63 @@ impl Runner<'_> {
                 .map_err(|e| store(pos(), e))?;
                 Ok((res.changed, label.as_deref().map(|l| (l, vt))))
             }
-            POp::Correct { label, fix } => {
-                let (entry, vt) = match self.labels.get(label) {
-                    Some(Labelled::Stored(entry, vt)) => (*entry, *vt),
-                    Some(Labelled::Nothing) => {
-                        return Err(invalid(
-                            pos(),
-                            format!(
-                                "label `{}` names an op that stored nothing (0 changed)",
-                                Echo(label)
-                            ),
-                        ));
-                    }
-                    None if self.plan.labels.contains(label) => {
-                        return Err(invalid(
-                            pos(),
-                            format!(
-                                "label `{}` is corrected before its transaction committed",
-                                Echo(label)
-                            ),
-                        ));
-                    }
-                    None => {
-                        return Err(err(pos(), FixtureErrorKind::UnknownLabel(label.clone())));
-                    }
-                };
-                let c = match fix {
-                    PFix::Delete => Correction::Delete,
-                    PFix::Replace {
-                        value,
-                        tick,
-                        op,
-                        precision,
-                    } => Correction::Replace {
-                        value: match value {
-                            None => None,
-                            Some(item) => {
-                                Some(self.value(tx, at, "the replaced value", vt, item)?)
-                            }
-                        },
-                        tick: *tick,
-                        op: *op,
-                        precision: *precision,
-                    },
-                };
-                let res = tx.correct(entry, c).map_err(|e| store(pos(), e))?;
-                Ok((res.changed, None))
-            }
+            POp::Correct { label, fix } => self
+                .correct(tx, at, label, fix)
+                .map(|changed| (changed, None)),
         }
+    }
+
+    fn correct(
+        &self,
+        tx: &mut Txn<'_>,
+        at: &OpRef,
+        label: &str,
+        fix: &PFix,
+    ) -> Result<usize, FixtureError> {
+        let pos = || Some(at.clone());
+        let (entry, vt) = match self.labels.get(label) {
+            Some(Labelled::Stored(entry, vt)) => (*entry, *vt),
+            Some(Labelled::Nothing) => {
+                return Err(invalid(
+                    pos(),
+                    format!(
+                        "label `{}` names an op that stored nothing (0 changed)",
+                        Echo(label)
+                    ),
+                ));
+            }
+            None if self.plan.labels.contains(label) => {
+                return Err(invalid(
+                    pos(),
+                    format!(
+                        "label `{}` is corrected before its transaction committed",
+                        Echo(label)
+                    ),
+                ));
+            }
+            None => {
+                return Err(err(pos(), FixtureErrorKind::UnknownLabel(label.to_owned())));
+            }
+        };
+        let c = match fix {
+            PFix::Delete => Correction::Delete,
+            PFix::Replace {
+                value,
+                tick,
+                op,
+                precision,
+            } => Correction::Replace {
+                value: match value {
+                    None => None,
+                    Some(item) => Some(self.value(tx, at, "the replaced value", vt, item)?),
+                },
+                tick: *tick,
+                op: *op,
+                precision: *precision,
+            },
+        };
+        let res = tx.correct(entry, c).map_err(|e| store(pos(), e))?;
+        Ok(res.changed)
     }
 
     fn entity(&self, at: &OpRef, handle: &str) -> Result<EntityId, FixtureError> {

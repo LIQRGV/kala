@@ -120,36 +120,7 @@ pub(super) fn plan(yaml: &str) -> Result<Plan, FixtureError> {
     let mut labels = HashSet::new();
     let mut txns = Vec::with_capacity(raw_txns.len());
     for (ti, (tick, ops, _bare)) in raw_txns.into_iter().enumerate() {
-        if ops.len() > MAX_OPS_PER_TXN {
-            return Err(invalid(
-                Some(OpRef {
-                    txn: ti,
-                    op: MAX_OPS_PER_TXN,
-                    label: None,
-                }),
-                format!(
-                    "{} ops in one transaction; the limit is {MAX_OPS_PER_TXN}",
-                    ops.len()
-                ),
-            ));
-        }
-        let tick = match tick {
-            None => None,
-            Some(s) => Some(
-                to_tick(&s).map_err(|m| invalid(None, format!("transaction {ti}: `tick` {m}")))?,
-            ),
-        };
-        let mut planned = Vec::with_capacity(ops.len());
-        for (oi, raw) in ops.into_iter().enumerate() {
-            let (at, op) = plan_op(ti, oi, raw)?;
-            if let POp::Write { label: Some(l), .. } = &op
-                && !labels.insert(l.clone())
-            {
-                return Err(err(Some(at), FixtureErrorKind::DuplicateLabel(l.clone())));
-            }
-            planned.push((at, op));
-        }
-        txns.push(PTxn { tick, ops: planned });
+        txns.push(plan_txn(ti, tick, ops, &mut labels)?);
     }
     Ok(Plan {
         schema,
@@ -158,6 +129,44 @@ pub(super) fn plan(yaml: &str) -> Result<Plan, FixtureError> {
         txns,
         labels,
     })
+}
+
+fn plan_txn(
+    ti: usize,
+    tick: Option<Scalar>,
+    ops: Vec<RawOp>,
+    labels: &mut HashSet<String>,
+) -> Result<PTxn, FixtureError> {
+    if ops.len() > MAX_OPS_PER_TXN {
+        return Err(invalid(
+            Some(OpRef {
+                txn: ti,
+                op: MAX_OPS_PER_TXN,
+                label: None,
+            }),
+            format!(
+                "{} ops in one transaction; the limit is {MAX_OPS_PER_TXN}",
+                ops.len()
+            ),
+        ));
+    }
+    let tick = match tick {
+        None => None,
+        Some(s) => {
+            Some(to_tick(&s).map_err(|m| invalid(None, format!("transaction {ti}: `tick` {m}")))?)
+        }
+    };
+    let mut planned = Vec::with_capacity(ops.len());
+    for (oi, raw) in ops.into_iter().enumerate() {
+        let (at, op) = plan_op(ti, oi, raw)?;
+        if let POp::Write { label: Some(l), .. } = &op
+            && !labels.insert(l.clone())
+        {
+            return Err(err(Some(at), FixtureErrorKind::DuplicateLabel(l.clone())));
+        }
+        planned.push((at, op));
+    }
+    Ok(PTxn { tick, ops: planned })
 }
 
 /// A name (handle, label, node type) from a scalar: a string of at most
@@ -361,12 +370,33 @@ fn plan_entities(
         .collect())
 }
 
-fn plan_op(txn: usize, op: usize, raw: RawOp) -> Result<(OpRef, POp), FixtureError> {
-    let mut at = OpRef {
+fn plan_op(txn: usize, op: usize, mut raw: RawOp) -> Result<(OpRef, POp), FixtureError> {
+    let at = OpRef {
         txn,
         op,
         label: None,
     };
+    check_verb(&raw, &at)?;
+    if let Some((op, args)) = raw
+        .assert
+        .take()
+        .map(|a| (Op::Assert, a))
+        .or(raw.retract.take().map(|r| (Op::Retract, r)))
+    {
+        return plan_write(at, op, args, raw);
+    }
+    if let Some(args) = raw.create.take() {
+        return plan_create(at, args, raw);
+    }
+    let Some(target) = raw.correct.take() else {
+        // Unreachable: exactly one verb is present and it isn't any of the
+        // others. Reported, never a panic.
+        return Err(invalid(Some(at), "an op needs a verb"));
+    };
+    plan_correct(at, target, raw)
+}
+
+fn check_verb(raw: &RawOp, at: &OpRef) -> Result<(), FixtureError> {
     let verbs = [
         raw.assert.is_some(),
         raw.retract.is_some(),
@@ -375,127 +405,123 @@ fn plan_op(txn: usize, op: usize, raw: RawOp) -> Result<(OpRef, POp), FixtureErr
     ];
     if verbs.iter().filter(|v| **v).count() != 1 {
         return Err(invalid(
-            Some(at),
+            Some(at.clone()),
             "an op is exactly one of `assert`, `retract`, `create`, `correct`",
         ));
     }
-    let RawOp {
-        assert,
-        retract,
-        create,
-        correct,
-        delete,
-        replace,
-        tick,
-        precision,
-        label,
-    } = raw;
-    if let Some(args) = assert
-        .map(|a| (Op::Assert, a))
-        .or(retract.map(|r| (Op::Retract, r)))
-    {
-        // The op's own label names its position, once it is a valid label.
-        let label = match &label {
-            None => None,
-            Some(s) => Some(to_name(s, "`label`").map_err(|m| invalid(Some(at.clone()), m))?),
-        };
-        at.label.clone_from(&label);
-        let bad = |m: String| invalid(Some(at.clone()), m);
-        if delete.is_some() || replace.is_some() {
-            return Err(bad(
-                "`delete` and `replace` belong to a `correct`".to_owned()
-            ));
-        }
-        let (op, args) = args;
-        let Args::List(mut items) = args else {
-            return Err(bad(format!(
-                "`{}` takes a list [subject, attr, value]",
-                verb(op)
-            )));
-        };
-        if items.len() != 3 {
-            return Err(bad(format!(
-                "`{}` takes a list [subject, attr, value], not {} items",
-                verb(op),
-                items.len()
-            )));
-        }
-        let value = items.pop().ok_or_else(|| bad("missing value".to_owned()))?;
-        let attr = items.pop().ok_or_else(|| bad("missing attr".to_owned()))?;
-        let subject = items
-            .pop()
-            .ok_or_else(|| bad("missing subject".to_owned()))?;
-        let subject = to_subject(&subject).map_err(&bad)?;
-        let attr = match attr {
-            Item::Scalar(Scalar::Str(a)) => a,
-            Item::Scalar(s) => {
-                return Err(bad(format!(
-                    "the attribute must be a string, not {}",
-                    s.describe()
-                )));
-            }
-            Item::List(_) => return Err(bad("the attribute must be a string".to_owned())),
-        };
-        let tick = match &tick {
-            None => None,
-            Some(s) => Some(to_tick(s).map_err(|m| bad(format!("`tick` {m}")))?),
-        };
-        let precision = match &precision {
-            None => Precision::Exact,
-            Some(s) => to_precision(s).map_err(&bad)?,
-        };
-        return Ok((
-            at.clone(),
-            POp::Write {
-                op,
-                subject,
-                attr,
-                value,
-                tick,
-                precision,
-                label,
-            },
+    Ok(())
+}
+
+fn refuse_correction_fields(raw: &RawOp, at: &OpRef) -> Result<(), FixtureError> {
+    if raw.delete.is_some() || raw.replace.is_some() {
+        return Err(invalid(
+            Some(at.clone()),
+            "`delete` and `replace` belong to a `correct`",
         ));
     }
-    if let Some(args) = create {
-        let bad = |m: &str| invalid(Some(at.clone()), m.to_owned());
-        if label.is_some() {
-            return Err(bad("a `create` has no label"));
-        }
-        if tick.is_some() || precision.is_some() {
-            return Err(bad("`tick` and `precision` belong to an assert or retract"));
-        }
-        if delete.is_some() || replace.is_some() {
-            return Err(bad("`delete` and `replace` belong to a `correct`"));
-        }
-        let Args::List(items) = args else {
-            return Err(bad("`create` takes a list [NODE_TYPE, handle]"));
-        };
-        let [Item::Scalar(t), Item::Scalar(h)] = items.as_slice() else {
-            return Err(bad("`create` takes a list [NODE_TYPE, handle]"));
-        };
-        let node_type = to_name(t, "the node type").map_err(|m| invalid(Some(at.clone()), m))?;
-        let handle = to_name(h, "the handle").map_err(|m| invalid(Some(at.clone()), m))?;
-        return Ok((at, POp::Create { node_type, handle }));
-    }
-    let Some(target) = correct else {
-        // Unreachable: exactly one verb is present and it isn't any of the
-        // others. Reported, never a panic.
-        return Err(invalid(Some(at), "an op needs a verb"));
+    Ok(())
+}
+
+fn plan_write(mut at: OpRef, op: Op, args: Args, raw: RawOp) -> Result<(OpRef, POp), FixtureError> {
+    // The op's own label names its position, once it is a valid label.
+    let label = match &raw.label {
+        None => None,
+        Some(s) => Some(to_name(s, "`label`").map_err(|m| invalid(Some(at.clone()), m))?),
     };
+    at.label.clone_from(&label);
+    let bad = |m: String| invalid(Some(at.clone()), m);
+    refuse_correction_fields(&raw, &at)?;
+    let (subject, attr, value) = write_args(op, args, &at)?;
+    let tick = match &raw.tick {
+        None => None,
+        Some(s) => Some(to_tick(s).map_err(|m| bad(format!("`tick` {m}")))?),
+    };
+    let precision = match &raw.precision {
+        None => Precision::Exact,
+        Some(s) => to_precision(s).map_err(&bad)?,
+    };
+    Ok((
+        at.clone(),
+        POp::Write {
+            op,
+            subject,
+            attr,
+            value,
+            tick,
+            precision,
+            label,
+        },
+    ))
+}
+
+fn write_args(op: Op, args: Args, at: &OpRef) -> Result<(Subject, String, Item), FixtureError> {
+    let bad = |m: String| invalid(Some(at.clone()), m);
+    let Args::List(mut items) = args else {
+        return Err(bad(format!(
+            "`{}` takes a list [subject, attr, value]",
+            verb(op)
+        )));
+    };
+    if items.len() != 3 {
+        return Err(bad(format!(
+            "`{}` takes a list [subject, attr, value], not {} items",
+            verb(op),
+            items.len()
+        )));
+    }
+    let value = items.pop().ok_or_else(|| bad("missing value".to_owned()))?;
+    let attr = items.pop().ok_or_else(|| bad("missing attr".to_owned()))?;
+    let subject = items
+        .pop()
+        .ok_or_else(|| bad("missing subject".to_owned()))?;
+    let subject = to_subject(&subject).map_err(&bad)?;
+    let attr = match attr {
+        Item::Scalar(Scalar::Str(a)) => a,
+        Item::Scalar(s) => {
+            return Err(bad(format!(
+                "the attribute must be a string, not {}",
+                s.describe()
+            )));
+        }
+        Item::List(_) => return Err(bad("the attribute must be a string".to_owned())),
+    };
+    Ok((subject, attr, value))
+}
+
+fn plan_create(at: OpRef, args: Args, raw: RawOp) -> Result<(OpRef, POp), FixtureError> {
+    let bad = |m: &str| invalid(Some(at.clone()), m.to_owned());
+    if raw.label.is_some() {
+        return Err(bad("a `create` has no label"));
+    }
+    if raw.tick.is_some() || raw.precision.is_some() {
+        return Err(bad("`tick` and `precision` belong to an assert or retract"));
+    }
+    refuse_correction_fields(&raw, &at)?;
+    let Args::List(items) = args else {
+        return Err(bad("`create` takes a list [NODE_TYPE, handle]"));
+    };
+    let [Item::Scalar(t), Item::Scalar(h)] = items.as_slice() else {
+        return Err(bad("`create` takes a list [NODE_TYPE, handle]"));
+    };
+    let node_type = to_name(t, "the node type").map_err(|m| invalid(Some(at.clone()), m))?;
+    let handle = to_name(h, "the handle").map_err(|m| invalid(Some(at.clone()), m))?;
+    Ok((at, POp::Create { node_type, handle }))
+}
+
+fn plan_correct(mut at: OpRef, target: Scalar, raw: RawOp) -> Result<(OpRef, POp), FixtureError> {
     let target =
         to_name(&target, "the corrected label").map_err(|m| invalid(Some(at.clone()), m))?;
     at.label = Some(target.clone());
     let bad = |m: &str| invalid(Some(at.clone()), m.to_owned());
-    if label.is_some() {
+    if raw.label.is_some() {
         return Err(bad("a `correct` has no label of its own"));
     }
-    if tick.is_some() || precision.is_some() {
+    if raw.tick.is_some() || raw.precision.is_some() {
         return Err(bad(
             "`tick` and `precision` of a correction go inside `replace`",
         ));
     }
-    let fix = match (delete, replace) {
+    let fix = match (raw.delete, raw.replace) {
         (Some(Scalar::Bool(true)), None) => PFix::Delete,
         (Some(_), None) => return Err(bad("`delete` must be true")),
         (None, Some(r)) => {
