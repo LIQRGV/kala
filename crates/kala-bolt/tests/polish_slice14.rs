@@ -136,6 +136,64 @@ fn run_refuses_impersonation_without_accounts_too() {
 }
 
 #[test]
+fn route_on_system_works_for_a_non_admin_but_admits_no_system_read() {
+    let server = account_server();
+    let mut c = alice(&server);
+    send_route(&mut c, &[("db", string("system"))]);
+    let meta = c.success();
+    let Value::Map(rt) = &meta["rt"] else {
+        panic!("routing table")
+    };
+    assert_eq!(rt["db"], string("system"));
+    let Value::List(servers) = &rt["servers"] else {
+        panic!("servers")
+    };
+    assert_eq!(servers.len(), 3);
+    for entry in servers {
+        let Value::Map(entry) = entry else {
+            panic!("server")
+        };
+        assert_eq!(
+            entry["addresses"],
+            Value::List(vec![string(&server.addr.to_string())])
+        );
+    }
+    // The routing table is not a grant: RUN still guards the system world.
+    for query in [
+        "MATCH (a) RETURN a",
+        "MATCH (a:ACCOUNT) RETURN a.user",
+        "CALL db.labels()",
+        "CALL dbms.components()",
+    ] {
+        let message = run_fails(&mut c, query, "system", FORBIDDEN);
+        assert_eq!(message, "access to database \"system\" is forbidden");
+    }
+    send_run(
+        &mut c,
+        "SHOW DATABASES YIELD name",
+        &[("db", string("system"))],
+    );
+    c.success();
+    assert_eq!(c.pull(-1).0, vec![vec![string("varrow")]]);
+}
+
+#[test]
+fn route_on_system_works_without_accounts_as_show_databases_does() {
+    let server = Running::start();
+    let mut c = Client::ready(&server);
+    send_route(&mut c, &[("db", string("system"))]);
+    c.success();
+    run_fails(&mut c, "MATCH (a) RETURN a", "system", FORBIDDEN);
+    send_run(
+        &mut c,
+        "SHOW DATABASES YIELD name",
+        &[("db", string("system"))],
+    );
+    c.success();
+    assert_eq!(c.pull(-1).0, vec![vec![string("varrow")]]);
+}
+
+#[test]
 fn route_keeps_run_failures_for_unknown_and_forbidden_databases() {
     let server = account_server();
     // A non-admin cannot tell a hidden database from a missing one.

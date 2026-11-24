@@ -310,7 +310,8 @@ impl Session<'_> {
         self.state = State::Ready;
         success([])
     }
-    /// Shared authorization and existence checks; ROUTE reveals no more than RUN.
+    /// Shared authorization and existence checks; ROUTE reveals no more than
+    /// RUN (its one exception, `system`, is explained in `route`).
     fn database(&self, requested: Option<&str>) -> Result<String, Failure> {
         let name = self.registry.name(requested)?;
         if !self
@@ -330,7 +331,16 @@ impl Session<'_> {
         if impersonate {
             return Err(Failure::impersonation());
         }
-        let db = self.database(requested)?;
+        // Tools list databases on `system` through a routing URI, and RUN
+        // lets any identity do that there, so the table for `system` is not
+        // gated on reading it. It holds only the advertised address, which
+        // the caller already gets for its own databases; `system` is a
+        // reserved name, so nothing is learned from its existence; and RUN
+        // still checks read access. Every other name answers exactly as RUN.
+        let db = match self.registry.name(requested)? {
+            "system" => "system".to_owned(),
+            _ => self.database(requested)?,
+        };
         let servers = ["WRITE", "READ", "ROUTE"]
             .into_iter()
             .map(|role| {
