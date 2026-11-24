@@ -889,12 +889,43 @@ impl Driver {
         let mut made = Vec::new();
         // (the edge as the handle saw it, the edge the reference used)
         let mut edges = Vec::new();
+        // The revision each correctable chain has now, where a commit since
+        // the transaction began corrected it: a correction of such a chain
+        // is refused (weak mode gets here; optimistic has conflicted).
+        let corrected_since: Vec<Option<u32>> =
+            open.bases
+                .iter()
+                .map(|base| {
+                    let moved = since.iter().flatten().any(
+                        |entry| matches!(entry, Written::Fact { of: Some(of), .. } if of == base),
+                    );
+                    moved.then(|| {
+                        self.reference
+                            .entries()
+                            .filter_map(|e| e.revision())
+                            .filter(|(of, _)| of == base)
+                            .map(|(_, rev)| rev)
+                            .max()
+                            .expect("a corrected chain has a revision")
+                    })
+                })
+                .collect();
         let mut t = self.reference.begin();
         for (op, provisional_edge) in &open.ops {
             let names = Names {
                 base: &self.base,
                 made: &made,
             };
+            if let TxOp::Correct { pick, .. } = op
+                && let k = pick % open.facts.len()
+                && let Some(rev) = corrected_since[k]
+            {
+                expected = Err(Error::AlreadyCorrected {
+                    entry: open.facts[k],
+                    rev,
+                });
+                break;
+            }
             match make(&mut t, &names, *op, Some(open.base_tick), &open.facts) {
                 Reply::Failed(e) => {
                     expected = Err(e);

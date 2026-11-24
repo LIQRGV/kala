@@ -448,16 +448,6 @@ fn stage_form(
         fallback: tx.report_tick(form.at.or(default)),
         entry_offset: tx.staged_entry_count(),
         op_starts: Vec::with_capacity(form.ops.len()),
-        precisions: form
-            .ops
-            .iter()
-            .map(|op| match op {
-                WriteOp::Correct { entry, .. } => {
-                    tx.current_change(*entry).ok().map(|c| c.precision)
-                }
-                _ => None,
-            })
-            .collect(),
     };
     let mut state = state;
     let mut report = StagedWrite {
@@ -469,7 +459,7 @@ fn stage_form(
         let schema_before = tx.schema_changes().len();
         let first_operation = tx.operation_count();
         state.op_starts.push(tx.staged_entry_count());
-        let staged = stage_op(tx, op, index, &mut state).map_err(|cause| WriteError {
+        let staged = stage_op(tx, op, &mut state).map_err(|cause| WriteError {
             operation: Some((index + 1, kind(op))),
             cause,
         })?;
@@ -516,7 +506,6 @@ struct FormState {
     /// For each op begun so far, the transaction's staged entry count when
     /// it began: maps a staged entry back to the op that wrote it.
     op_starts: Vec<usize>,
-    precisions: Vec<Option<Precision>>,
 }
 impl FormState {
     /// The tick of a fact op: its own `:at`, else the form's, else the
@@ -562,12 +551,7 @@ impl Staged {
 }
 
 /// Stages one op in the native transaction.
-fn stage_op(
-    tx: &mut Txn<'_>,
-    op: &WriteOp,
-    index: usize,
-    state: &mut FormState,
-) -> Result<Staged, Failure> {
+fn stage_op(tx: &mut Txn<'_>, op: &WriteOp, state: &mut FormState) -> Result<Staged, Failure> {
     let fallback = state.fallback;
     match op {
         WriteOp::Attribute {
@@ -630,7 +614,7 @@ fn stage_op(
         } => stage_create(tx, node_type, handle.as_deref(), *if_missing, state),
         WriteOp::Set { .. } => stage_set(tx, op, state),
         WriteOp::Fact { .. } => stage_fact(tx, op, state),
-        WriteOp::Correct { .. } => stage_correct(tx, op, index, state),
+        WriteOp::Correct { .. } => stage_correct(tx, op),
     }
 }
 
@@ -702,12 +686,7 @@ fn stage_fact(tx: &mut Txn<'_>, op: &WriteOp, state: &FormState) -> Result<Stage
 }
 
 /// `[:correct ENTRY ...]`.
-fn stage_correct(
-    tx: &mut Txn<'_>,
-    op: &WriteOp,
-    index: usize,
-    state: &FormState,
-) -> Result<Staged, Failure> {
+fn stage_correct(tx: &mut Txn<'_>, op: &WriteOp) -> Result<Staged, Failure> {
     let WriteOp::Correct {
         entry, replacement, ..
     } = op
@@ -723,9 +702,13 @@ fn stage_correct(
             precision: r.precision,
         },
     };
+    // The chain's stored precision before the correction, so a no-op or a
+    // delete still reports the truth. Read here, as part of this op: the
+    // read of the chain is what an optimistic commit conflicts on, and it
+    // must be reported at the `:correct` that made it, not at the form's
+    // first op.
+    let stored = tx.current_change(*entry).ok().map(|c| c.precision);
     let r = tx.correct(*entry, c).map_err(Failure::Store)?;
-    // The chain's stored precision, so a no-op or delete
-    // still reports the truth.
     Ok(Staged {
         changed: r.changed,
         tick: r.tick,
@@ -733,7 +716,7 @@ fn stage_correct(
             replacement
                 .as_ref()
                 .and_then(|r| r.precision)
-                .or(state.precisions[index])
+                .or(stored)
                 .unwrap_or(Precision::Exact),
         ),
         entity: None,

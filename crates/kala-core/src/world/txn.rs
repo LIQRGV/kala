@@ -784,10 +784,17 @@ impl Txn<'_> {
     /// fact's new key.
     pub fn correct(&mut self, entry: EntryId, c: Correction) -> Result<WriteResult, Error> {
         let recorded = self.track.then(|| c.clone());
+        // The committed chain as this transaction sees it (staging changes
+        // nothing committed, so before or after the call is the same).
+        let chain = (self.track && !self.nested)
+            .then(|| self.world.correction_target(entry).ok())
+            .flatten()
+            .map(|target| (target.base, target.chain.rev));
         self.recorded(
             |_| Call::Correct {
                 entry,
                 correction: recorded.unwrap_or(Correction::Delete),
+                chain,
             },
             |txn| txn.correct_inner(entry, c),
         )
@@ -1038,9 +1045,11 @@ impl Txn<'_> {
     ///    that became redundant is "0 changed"
     ///    ([`CommitResult::finalized`] has the outcome of each operation);
     ///    an operation the store's rules now refuse (a duplicate handle,
-    ///    the opposite op at the same tick, an entry deleted meanwhile, a
-    ///    deprecated attribute, strict schema, a value's type) fails the
-    ///    commit with its ordinary error, nothing written;
+    ///    the opposite op at the same tick, an entry corrected meanwhile
+    ///    ([`Error::AlreadyCorrected`]: a correction is never stacked on
+    ///    another writer's), a deprecated attribute, strict schema, a
+    ///    value's type) fails the commit with its ordinary error, nothing
+    ///    written;
     /// 3. keeps the latest tick the transaction began with for its
     ///    tick-less writes, and says so if a newer commit moved it
     ///    ([`CommitResult::latest_tick_moved`]).

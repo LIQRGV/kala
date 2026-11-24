@@ -1145,6 +1145,110 @@ mod tests {
         }
     }
 
+    /// PR #20 review, item K: the chain read of a `:correct` belongs to
+    /// that op, wherever it stands in its form.
+    #[test]
+    fn a_conflict_on_a_later_correct_names_that_op() {
+        let (_dir, _path, mut a, mut b, entry) = seeded();
+        let mine =
+            format!("[[:assert :varrow :tag \"x\" :at 700] [:correct {entry} :replace :at 590]]");
+        let theirs = format!("[:correct {entry} :replace :at 595]");
+        let e = race(&mut a, &mut b, &mine, &theirs, Concurrency::Optimistic)
+            .err()
+            .expect("the corrections race");
+        assert_eq!(
+            e.message(),
+            format!(
+                "conflict: op 2 (:correct) read entry#{entry}, which another transaction \
+                 corrected; nothing was written; run it again"
+            )
+        );
+        assert_eq!(exit(&e), code(4));
+        let CliError::Conflict(conflict) = &e else {
+            panic!("{e:?}");
+        };
+        let doc: serde_json::Value = serde_json::from_str(&conflict_json(1, 0, conflict)).unwrap();
+        assert_eq!(
+            (&doc["op"], &doc["kind"], &doc["key"]),
+            (
+                &serde_json::json!(2),
+                &serde_json::json!("correct"),
+                &serde_json::json!("entry")
+            )
+        );
+    }
+
+    /// PR #20 review, item J: in weak mode a correction of an entry another
+    /// writer corrected meanwhile is refused with the store's own error.
+    #[test]
+    fn a_weak_correct_over_another_correction_is_a_store_error_not_a_stacked_revision() {
+        for theirs in [":replace :at 595", ":delete"] {
+            let (_dir, path, mut a, mut b, entry) = seeded();
+            let mine = format!("[:correct {entry} :replace :at 590]");
+            let theirs = format!("[:correct {entry} {theirs}]");
+            let before = a.latest_tx();
+            let e = race(&mut a, &mut b, &mine, &theirs, Concurrency::Weak)
+                .err()
+                .expect("refused");
+            assert_eq!(
+                e.message(),
+                format!(
+                    "log entry#{entry} was already corrected by a newer transaction (now \
+                     rev 1); nothing was written"
+                ),
+                "{theirs}"
+            );
+            let on_disk = World::open_read_only(&path).unwrap();
+            assert_eq!(on_disk.latest_tx().0, before.0 + 1, "{theirs}");
+        }
+    }
+
+    /// PR #20 review, item N: a conflict on an edge this form interned,
+    /// which a newer commit interned too, names the committed edge.
+    #[test]
+    fn a_conflict_on_an_edge_interned_meanwhile_names_the_committed_edge() {
+        let (_dir, _path, mut a, mut b) = pair();
+        execute(
+            &mut a,
+            &parse_write("[[:attribute :present :ref :many] [:attribute :disguised :bool :one]]")
+                .unwrap(),
+            None,
+            Concurrency::Optimistic,
+        )
+        .ok()
+        .unwrap();
+        // The other writer first interns another edge (which takes the
+        // number this form's edge has provisionally), then the same one.
+        let e = race(
+            &mut a,
+            &mut b,
+            "[[:assert :greg :present :carnath :at 1]
+              [:set [:greg :present :carnath] :disguised true :at 1]]",
+            "[[:assert :greg :present :ashford :at 1] [:assert :greg :present :carnath :at 1]
+              [:assert [:greg :present :carnath] :disguised false :at 1]]",
+            Concurrency::Optimistic,
+        )
+        .err()
+        .expect("the edge's properties were read as a new edge's");
+        let greg = a.entity_by_handle("greg").unwrap();
+        let carnath = a.entity_by_handle("carnath").unwrap();
+        let ashford = a.entity_by_handle("ashford").unwrap();
+        let merged = a.format_id(a.edge_id(greg, "present", carnath).unwrap().into());
+        let other = a.format_id(a.edge_id(greg, "present", ashford).unwrap().into());
+        assert_eq!(
+            e.message(),
+            format!(
+                "conflict: op 2 (:set) read {merged} :disguised, which another transaction \
+                 changed; nothing was written; run it again"
+            )
+        );
+        assert!(
+            !e.message().contains(&format!("{other} ")),
+            "{}",
+            e.message()
+        );
+    }
+
     #[test]
     fn a_lock_held_through_the_busy_timeout_is_exit_three() {
         let (_dir, path, _a, mut b) = pair();
@@ -1217,9 +1321,10 @@ mod tests {
         assert_eq!(exit(&e), code(3));
         assert_eq!(
             e.message(),
-            "w.kala: a damaged last transaction was cut from the world to a quarantine file \
-             and nobody has acknowledged it; nothing was written. Inspect it with \
-             `kala info`, then rerun with --acknowledge-recovery"
+            "w.kala: the world ends in a damaged last transaction that nobody has \
+             acknowledged (it is still in the file, and is left out of the world); nothing \
+             was written. Inspect it with `kala info`, then rerun with \
+             --acknowledge-recovery, which cuts it to a quarantine file"
         );
         // Through a form's op, the prefix is kept and the kind too.
         let e = write_err(WriteError {

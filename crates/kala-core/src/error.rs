@@ -160,6 +160,18 @@ pub enum Error {
     /// A correction names an entry whose revision chain is currently
     /// deleted: there is nothing left to correct. Holds the ID given.
     AlreadyDeleted(EntryId),
+    /// A transaction committing in weak mode corrected an entry whose
+    /// revision chain a newer transaction corrected meanwhile (replaced or
+    /// deleted): the correction was decided on a fact that is no longer
+    /// the current one, so it is refused instead of being stacked on top.
+    /// Nothing was written; look at the entry and correct it again. (In
+    /// optimistic mode the same race is an [`Error::Conflict`].)
+    AlreadyCorrected {
+        /// The entry as the caller named it.
+        entry: EntryId,
+        /// The chain's revision now.
+        rev: u32,
+    },
     /// The transaction already wrote an entry at this key `(entity,
     /// attribute, value, tick)`, and a transaction stores at most one entry
     /// per key (e.g. a correction of a chain it already corrected, or a
@@ -553,6 +565,12 @@ impl fmt::Display for Error {
             Error::AlreadyDeleted(id) => {
                 write!(f, "log entry#{} is already deleted by a correction", id.0)
             }
+            Error::AlreadyCorrected { entry, rev } => write!(
+                f,
+                "log entry#{} was already corrected by a newer transaction (now rev {rev}); \
+                 nothing was written",
+                entry.0
+            ),
             Error::TxnKeyConflict { entity, attr, tick } => write!(
                 f,
                 "the transaction already wrote an entry for {entity:?} {} at tick {}",

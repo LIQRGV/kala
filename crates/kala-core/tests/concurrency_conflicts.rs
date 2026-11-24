@@ -1154,7 +1154,9 @@ fn correcting_an_entry_the_other_handle_corrected() {
             .unwrap()
             .id
     }
-    // Weak: the ordinary error.
+    // Weak: an ordinary store error, saying the entry was corrected
+    // meanwhile (PR #20 review, item J: one error whether the other writer
+    // deleted or replaced; this was `AlreadyDeleted`).
     let mut p = pair();
     let entry = gregs_entry(&p.a, p.c);
     let mut tb = p.b.begin();
@@ -1162,7 +1164,10 @@ fn correcting_an_entry_the_other_handle_corrected() {
     tb.correct(entry, Correction::Delete).unwrap();
     p.a.correct(entry, Correction::Delete).unwrap();
     let before = bytes(&p.path);
-    assert_eq!(tb.commit().unwrap_err(), Error::AlreadyDeleted(entry));
+    assert_eq!(
+        tb.commit().unwrap_err(),
+        Error::AlreadyCorrected { entry, rev: 1 }
+    );
     assert_eq!(bytes(&p.path), before);
     clean(&mut p);
 
@@ -1183,8 +1188,11 @@ fn correcting_an_entry_the_other_handle_corrected() {
     drop(tb);
     clean(&mut p);
 
-    // Weak, a replace over the other's replace: the next revision of the
-    // chain, as one writer correcting twice.
+    // Weak, a replace over the other's replace. This used to commit as the
+    // next revision of the chain ("as one writer correcting twice"), which
+    // silently overrode the other writer's correction with one decided on
+    // the fact before it. Decided in the PR #20 review (item J): refused,
+    // like the delete above; the caller looks again and corrects again.
     let mut p = pair();
     let c = p.c;
     let entry = gregs_entry(&p.a, c);
@@ -1198,7 +1206,17 @@ fn correcting_an_entry_the_other_handle_corrected() {
     tb.set_concurrency(Concurrency::Weak);
     tb.correct(entry, at(590)).unwrap();
     p.a.correct(entry, at(580)).unwrap();
-    tb.commit().unwrap();
+    assert_eq!(
+        tb.commit().unwrap_err(),
+        Error::AlreadyCorrected { entry, rev: 1 }
+    );
+    // Only the other writer's correction is in the file; made again on the
+    // caught-up world, this one is its next revision.
+    let expected = serial(|w, _| {
+        w.correct(entry, at(580)).unwrap();
+    });
+    assert_eq!(bytes(&p.path), expected);
+    p.b.correct(entry, at(590)).unwrap();
     let expected = serial(|w, _| {
         w.correct(entry, at(580)).unwrap();
         w.correct(entry, at(590)).unwrap();

@@ -147,9 +147,10 @@ pub fn unwritable(e: &kala_core::Error) -> Option<String> {
              would cut it to a quarantine file; nothing was written. Inspect it with \
              `kala info`, then rerun with --acknowledge-recovery"
         ),
-        E::RecoveryUnacknowledged => "a damaged last transaction was cut from the world to \
-             a quarantine file and nobody has acknowledged it; nothing was written. \
-             Inspect it with `kala info`, then rerun with --acknowledge-recovery"
+        E::RecoveryUnacknowledged => "the world ends in a damaged last transaction that \
+             nobody has acknowledged (it is still in the file, and is left out of the \
+             world); nothing was written. Inspect it with `kala info`, then rerun with \
+             --acknowledge-recovery, which cuts it to a quarantine file"
             .to_string(),
         _ => return None,
     })

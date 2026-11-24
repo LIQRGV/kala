@@ -46,8 +46,9 @@ const MAX_VALUE_KEY_BYTES: usize = 256;
 ///
 /// Either way the commit takes the writer lock, catches up, re-applies the
 /// transaction's operations to the caught-up world under the store's own
-/// rules (duplicate handle, same-tick conflict, a deleted entry, deprecated
-/// attribute, strict schema, value type), assigns final IDs and reports the
+/// rules (duplicate handle, same-tick conflict, an entry corrected
+/// meanwhile, deprecated attribute, strict schema, value type), assigns
+/// final IDs and reports the
 /// ID mapping and a moved latest tick. The modes differ only in what the
 /// transaction's **reads** mean.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -208,6 +209,9 @@ pub(super) enum Call {
     Correct {
         entry: EntryId,
         correction: Correction,
+        /// The chain it corrected, by base entry, and the chain's
+        /// revision in the world the transaction began on.
+        chain: Option<(EntryId, u32)>,
     },
     InferWriteAttribute {
         name: String,
@@ -1212,7 +1216,26 @@ impl<'w> Txn<'w> {
                     )?;
                     outcome.precision = (written.changed > 0).then_some(*precision);
                 }
-                Call::Correct { entry, correction } => {
+                Call::Correct {
+                    entry,
+                    correction,
+                    chain,
+                } => {
+                    // The correction was decided on the chain's current
+                    // fact as the transaction saw it. If a newer commit
+                    // corrected the chain since (optimistic mode has
+                    // already conflicted on it), making it again would
+                    // stack a revision on a fact the caller never saw, or
+                    // override the other writer's correction: refused.
+                    if let Some((base, rev)) = chain {
+                        let now = fresh.world.journal.chain(*base).rev;
+                        if now != *rev {
+                            return Err(Error::AlreadyCorrected {
+                                entry: *entry,
+                                rev: now,
+                            });
+                        }
+                    }
                     let correction = match correction {
                         Correction::Replace {
                             value,
@@ -1308,8 +1331,11 @@ impl<'w> Txn<'w> {
                     && merged
                     && let Some((at, attr)) = reads.read_provisional(as_entity)
                 {
+                    // Named as the committed edge the triple turned out
+                    // to be: the provisional number means nothing any
+                    // more, or names another committed edge by now.
                     let key = ConflictKey::EntityAttribute {
-                        entity: as_entity,
+                        entity: EntityId::from(fin),
                         attr: attr.clone(),
                     };
                     return Err(conflict(key, *at));

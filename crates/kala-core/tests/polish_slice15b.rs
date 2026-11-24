@@ -725,3 +725,152 @@ fn a_file_is_locked_for_replacing_only_while_the_path_names_it() {
     let missing = dir.path().join("missing.kala");
     assert_eq!(with_file_lock(&missing, Duration::ZERO, || 1), Ok(None));
 }
+
+// ---- J: weak mode refuses a correction of an entry corrected meanwhile ----
+
+fn move_to(tick: i64) -> Correction {
+    Correction::Replace {
+        value: None,
+        tick: Some(Tick(tick)),
+        op: None,
+        precision: None,
+    }
+}
+
+#[test]
+fn a_weak_correction_of_an_entry_corrected_meanwhile_is_refused() {
+    for (theirs, what) in [
+        (move_to(580), "a replace over a replace"),
+        (Correction::Delete, "a replace over a delete"),
+    ] {
+        let (_dir, path, mut a, greg) = world();
+        let entry = a
+            .assert(greg, "tag", s("x"), Some(Tick(600)))
+            .unwrap()
+            .entries[0];
+        let mut b = World::open(&path).unwrap();
+        let mut tb = b.begin();
+        tb.set_concurrency(Concurrency::Weak);
+        tb.correct(entry, move_to(590)).unwrap();
+        a.correct(entry, theirs).unwrap();
+        let before = bytes(&path);
+        let err = tb.commit().unwrap_err();
+        assert_eq!(err, Error::AlreadyCorrected { entry, rev: 1 }, "{what}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "log entry#{} was already corrected by a newer transaction (now rev 1); \
+                 nothing was written",
+                entry.0
+            )
+        );
+        assert!(bytes(&path) == before, "{what}: nothing written");
+        // The handle is caught up and can decide again.
+        assert_eq!(state(&b, greg), state(&a, greg), "{what}");
+        assert_clean(&b);
+    }
+    // A delete over a delete, and a correction named by a revised entry.
+    let (_dir, path, mut a, greg) = world();
+    let entry = a
+        .assert(greg, "tag", s("x"), Some(Tick(600)))
+        .unwrap()
+        .entries[0];
+    let revised = a.correct(entry, move_to(595)).unwrap().entries[1];
+    let mut b = World::open(&path).unwrap();
+    let mut tb = b.begin();
+    tb.set_concurrency(Concurrency::Weak);
+    tb.correct(revised, Correction::Delete).unwrap();
+    a.correct(entry, Correction::Delete).unwrap();
+    assert_eq!(
+        tb.commit().unwrap_err(),
+        Error::AlreadyCorrected {
+            entry: revised,
+            rev: 2
+        }
+    );
+    // Not moved: a weak correction over unrelated commits goes through.
+    let (_dir, path, mut a, greg) = world();
+    let entry = a
+        .assert(greg, "tag", s("x"), Some(Tick(600)))
+        .unwrap()
+        .entries[0];
+    let mut b = World::open(&path).unwrap();
+    let mut tb = b.begin();
+    tb.set_concurrency(Concurrency::Weak);
+    tb.correct(entry, move_to(590)).unwrap();
+    a.assert(greg, "tag", s("y"), Some(Tick(601))).unwrap();
+    assert_eq!(tb.commit().unwrap().changed, 2);
+    assert_clean(&b);
+}
+
+// ---- N: a conflict on an edge names the committed edge, not a
+// provisional number ----
+
+#[test]
+fn a_conflict_on_a_merged_edge_names_the_edge_it_turned_out_to_be() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("world.kala");
+    let schema = schema()
+        .attribute(
+            AttrDef::new("present", ValueType::Ref, Kind::State, Cardinality::Many).directed(),
+        )
+        .attribute(AttrDef::new(
+            "disguised",
+            ValueType::Bool,
+            Kind::State,
+            Cardinality::One,
+        ));
+    let mut a = World::create(&path, schema).unwrap();
+    let greg = a.create_entity("CHARACTER", Some("greg")).unwrap();
+    let varrow = a.create_entity("PLACE", Some("varrow")).unwrap();
+    let ashford = a.create_entity("PLACE", Some("ashford")).unwrap();
+    let mut b = World::open(&path).unwrap();
+
+    let mut tb = b.begin();
+    tb.assert(greg, "present", Value::Ref(varrow), Some(Tick(1)))
+        .unwrap();
+    let provisional = tb.edge_id(greg, "present", varrow).unwrap();
+    // It reads the new edge's properties (none) and decides from that.
+    let meter = WorkMeter::bounded(1_000, None);
+    let held = tb
+        .values_at(provisional.into(), "disguised", Tick(1), 4, 1 << 10, &meter)
+        .unwrap();
+    assert!(held.values.is_empty());
+    tb.assert(
+        provisional.into(),
+        "disguised",
+        Value::Bool(true),
+        Some(Tick(1)),
+    )
+    .unwrap();
+
+    // Meanwhile: another edge takes the provisional number, and the same
+    // triple is interned (with a property) under the next one.
+    a.assert(greg, "present", Value::Ref(ashford), Some(Tick(1)))
+        .unwrap();
+    let other = a.edge_id(greg, "present", ashford).unwrap();
+    assert_eq!(other, provisional, "the number now names another edge");
+    a.assert(greg, "present", Value::Ref(varrow), Some(Tick(1)))
+        .unwrap();
+    let merged = a.edge_id(greg, "present", varrow).unwrap();
+    a.assert(
+        merged.into(),
+        "disguised",
+        Value::Bool(false),
+        Some(Tick(1)),
+    )
+    .unwrap();
+
+    let Err(Error::Conflict(conflict)) = tb.commit() else {
+        panic!("expected a conflict");
+    };
+    assert_eq!(
+        conflict.key,
+        ConflictKey::EntityAttribute {
+            entity: merged.into(),
+            attr: "disguised".into()
+        },
+        "the edge the transaction's triple is, not the number it had"
+    );
+    assert_eq!(conflict.operation, 1, "the read was made before op 2");
+}
