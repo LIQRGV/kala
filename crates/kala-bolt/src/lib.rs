@@ -15,3 +15,5 @@ pub use server::{Server, ServerConfig};
 
 // The `system` database lives in kala-system; `crate::system` names it here.
 use kala_system::system;
+
+mod metadata;

@@ -16,9 +16,9 @@ pub(crate) struct Token {
     pub end: usize,
 }
 /// Symbols in match order: every two-character symbol comes before its prefix.
-const SYMBOLS: [&str; 22] = [
-    "<>", "<=", ">=", "->", "<-", "(", ")", "[", "]", "{", "}", ":", ",", ".", ";", "=", "<", ">",
-    "-", "+", "*", "|",
+const SYMBOLS: [&str; 23] = [
+    "..", "<>", "<=", ">=", "->", "<-", "(", ")", "[", "]", "{", "}", ":", ",", ".", ";", "=", "<",
+    ">", "-", "+", "*", "|",
 ];
 /// Most tokens one query may hold.
 const MAX_TOKENS: usize = 8192;

@@ -10,6 +10,7 @@ pub struct Node {
 /// One relationship pattern.
 #[derive(Clone, Debug)]
 pub struct Edge {
+    pub bounds: Option<(usize, usize)>,
     pub name: Option<String>,
     pub kind: String,
     pub direction: Orientation,
@@ -18,12 +19,14 @@ pub struct Edge {
 /// A chain, with one more node than edges.
 #[derive(Clone, Debug)]
 pub struct Path {
+    pub name: Option<String>,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
 }
 /// A MATCH clause and its local tick.
 #[derive(Clone, Debug)]
 pub struct Match {
+    pub optional: bool,
     pub paths: Vec<Path>,
     pub tick: Option<Term>,
     pub canon: Option<Term>,
@@ -38,7 +41,8 @@ pub struct Item {
 /// A read query.
 #[derive(Clone, Debug)]
 pub struct Query {
-    pub matches: Vec<Match>,
+    pub include_all: bool,
+    pub clauses: Vec<Clause>,
     pub items: Vec<Item>,
     pub distinct: bool,
     pub order: Vec<(Expr<String>, bool)>,
@@ -49,7 +53,27 @@ impl Query {
     /// All referenced attributes, including maps and sort expressions.
     pub fn attributes(&self) -> Vec<&str> {
         let mut out = Vec::new();
-        for m in &self.matches {
+        for clause in &self.clauses {
+            let m = match clause {
+                Clause::Match(m) => m,
+                Clause::With(q, predicate) => {
+                    out.extend(q.attributes());
+                    if let Some(e) = predicate {
+                        e.attributes(&mut out);
+                    }
+                    continue;
+                }
+                Clause::Unwind(e, _) => {
+                    e.attributes(&mut out);
+                    continue;
+                }
+                Clause::Source(s) => {
+                    if let Some(e) = &s.predicate {
+                        e.attributes(&mut out);
+                    }
+                    continue;
+                }
+            };
             for p in &m.paths {
                 for n in &p.nodes {
                     for (k, e) in &n.props {
@@ -76,5 +100,36 @@ impl Query {
             e.attributes(&mut out);
         }
         out
+    }
+}
+
+/// A read pipeline clause. WITH's query contains only projection fields.
+#[derive(Clone, Debug)]
+pub enum Clause {
+    Match(Match),
+    With(Box<Query>, Option<Expr<String>>),
+    Unwind(Expr<String>, String),
+    Source(Source),
+}
+
+/// One catalogue or adapter row source and its projected bindings.
+#[derive(Clone, Debug)]
+pub struct Source {
+    pub source: kala_query::RowSource,
+    pub yields: Vec<(String, String)>,
+    pub predicate: Option<Expr<String>>,
+    pub tick: Option<Term>,
+    pub canon: Option<Term>,
+}
+impl Query {
+    /// Server metadata can be prepared without opening a world.
+    pub fn server_request(&self) -> Option<&kala_query::ServerRequest> {
+        self.clauses.iter().find_map(|c| match c {
+            Clause::Source(Source {
+                source: kala_query::RowSource::Server(request),
+                ..
+            }) => Some(request),
+            _ => None,
+        })
     }
 }

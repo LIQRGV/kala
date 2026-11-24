@@ -110,6 +110,123 @@ fn row_text(action: &crate::RowAction, world: &World, out: &mut String) {
     use crate::RowAction;
     out.push_str("Row ");
     match action {
+        RowAction::Source {
+            source,
+            columns,
+            tick,
+            ..
+        } => {
+            out.push_str("source ");
+            out.push_str(source.name());
+            if let crate::RowSource::Server(crate::ServerRequest::Databases(selection)) = source {
+                match selection {
+                    crate::DatabaseSelection::All => {}
+                    crate::DatabaseSelection::Named(n) => {
+                        out.push(' ');
+                        push_name(out, n);
+                    }
+                    crate::DatabaseSelection::Default => out.push_str(" default"),
+                    crate::DatabaseSelection::Home => out.push_str(" home"),
+                }
+            }
+            for v in columns {
+                out.push(' ');
+                out.push_str(&var_text(v));
+            }
+            out.push_str(" @");
+            out.push_str(&tick_text(tick));
+        }
+        RowAction::Values { rows, columns, .. } => {
+            out.push_str("values ");
+            expr_text(rows, world, 0, out);
+            for v in columns {
+                out.push(' ');
+                out.push_str(&var_text(v));
+            }
+        }
+        RowAction::CheckParameter { name, expected } => {
+            out.push_str("check ");
+            out.push_str(&param_text(name));
+            out.push_str(" :");
+            out.push_str(expected.name());
+        }
+        RowAction::Trail {
+            source,
+            target,
+            path,
+            attr,
+            direction,
+            tick,
+            min,
+            max,
+            excluded,
+            properties,
+        } => {
+            out.push_str("trail [");
+            out.push_str(&var_text(source));
+            out.push_str(" :");
+            push_name(out, attr);
+            out.push_str(&format!("*{min}..{max} "));
+            out.push_str(&var_text(target));
+            out.push_str("] as ");
+            out.push_str(&var_text(path));
+            out.push_str(match direction {
+                crate::Orientation::Out => " out @",
+                crate::Orientation::In => " in @",
+                crate::Orientation::Either => " either @",
+            });
+            out.push_str(&tick_text(tick));
+            for v in excluded {
+                out.push_str(" excluding ");
+                out.push_str(&var_text(v));
+            }
+            for (k, e) in properties {
+                out.push_str(" where ");
+                push_name(out, k);
+                out.push_str(" = ");
+                expr_text(e, world, 0, out);
+            }
+        }
+        RowAction::Unwind { expr, var, .. } => {
+            out.push_str("unwind ");
+            expr_text(expr, world, 0, out);
+            out.push_str(" as ");
+            out.push_str(&var_text(var));
+        }
+        RowAction::Project {
+            vars,
+            distinct,
+            order,
+            skip,
+            limit,
+            ..
+        } => {
+            out.push_str("project ");
+            output_text(
+                &crate::OutputSpec {
+                    vars: vars.clone(),
+                    distinct: *distinct,
+                    order: order.clone(),
+                    skip: skip.clone(),
+                    limit: limit.clone(),
+                },
+                world,
+                out,
+            );
+        }
+        RowAction::Group { keys, aggregates } => {
+            out.push_str("group");
+            for v in keys {
+                out.push(' ');
+                out.push_str(&var_text(v));
+            }
+            for a in aggregates {
+                out.push_str("  ");
+                out.push_str(&var_text(&a.output));
+                out.push_str(" = ");
+                bag_aggregate_text(a.function, a.distinct, a.argument.as_ref(), world, out);
+            }
+        }
         RowAction::Nodes { var, labels, tick } => {
             out.push_str("nodes ");
             out.push_str(&var_text(var));
@@ -214,6 +331,44 @@ fn expr_text(e: &crate::Expr, world: &World, depth: usize, out: &mut String) {
         Expr::Var(v) => out.push_str(&var_text(v)),
         Expr::Value(v) => out.push_str(&value_text(v, world)),
         Expr::Null => out.push_str("null"),
+        Expr::Function(f, e) => {
+            out.push_str(f.name());
+            out.push('(');
+            expr_text(e, world, depth + 1, out);
+            out.push(')');
+        }
+        Expr::Disjoint(a, b) => {
+            out.push_str("disjoint(");
+            expr_text(a, world, depth + 1, out);
+            out.push_str(", ");
+            expr_text(b, world, depth + 1, out);
+            out.push(')');
+        }
+        Expr::Path { start, segments } => {
+            out.push_str("path(");
+            out.push_str(&var_text(start));
+            for v in segments {
+                out.push_str(", ");
+                out.push_str(&var_text(v));
+            }
+            out.push(')');
+        }
+
+        Expr::List(xs) => {
+            out.push('[');
+            for (i, e) in xs.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                expr_text(e, world, depth + 1, out);
+            }
+            out.push(']');
+        }
+        Expr::Aggregate {
+            function,
+            distinct,
+            argument,
+        } => bag_aggregate_text(*function, *distinct, argument.as_deref(), world, out),
         Expr::Param(p) => out.push_str(&param_text(p)),
         Expr::Property { entity, key, tick } => {
             out.push_str(&var_text(entity));
@@ -375,6 +530,7 @@ fn op_line(op: &Op, world: &World, out: &mut String) {
         Op::Unit
         | Op::Join { .. }
         | Op::Union { .. }
+        | Op::Optional { .. }
         | Op::Not { .. }
         | Op::Difference { .. }
         | Op::Intersect { .. }
@@ -531,4 +687,24 @@ pub fn precision_text(p: kala_core::Precision) -> &'static str {
         kala_core::Precision::Decade => "decade",
         kala_core::Precision::Century => "century",
     }
+}
+
+fn bag_aggregate_text(
+    function: crate::BagFn,
+    distinct: bool,
+    argument: Option<&crate::Expr>,
+    world: &World,
+    out: &mut String,
+) {
+    out.push_str(function.name());
+    out.push('(');
+    if distinct {
+        out.push_str("DISTINCT ");
+    }
+    if let Some(e) = argument {
+        expr_text(e, world, 0, out);
+    } else {
+        out.push('*');
+    }
+    out.push(')');
 }

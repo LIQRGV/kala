@@ -39,6 +39,70 @@ pub(crate) fn run(
         prepared.params.len()
     );
     let params = parameters(world, &prepared.params, given, front_end.nullable_params())?;
+    execute(
+        world,
+        &prepared,
+        params,
+        stop,
+        max_message,
+        max_depth,
+        system,
+    )
+}
+/// Prepare adapter requests through the language seam; no query-text matching here.
+pub(crate) fn server_statement(
+    text: &str,
+    system: bool,
+) -> Result<Option<kala_lang::ServerStatement>, Failure> {
+    let source = crate::language::detect(text)?;
+    source
+        .front_end
+        .prepare_server(&source.text, &|name| system && name == "password_hash")
+        .map_err(Failure::from)
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_server(
+    statement: &kala_lang::ServerStatement,
+    rows: Vec<Datum>,
+    given: &Map,
+    stop: &AtomicBool,
+    max_message: usize,
+    max_depth: usize,
+    system: bool,
+) -> Result<Output, Failure> {
+    if system
+        && statement
+            .prepared
+            .plan
+            .attribute_names()
+            .into_iter()
+            .any(|name| name == "password_hash")
+    {
+        return Err(protected());
+    }
+    let world = World::in_memory(kala_core::Schema::new()).map_err(Failure::store)?;
+    let mut params = parameters(&world, &statement.prepared.params, given, true)?;
+    params.insert(kala_query::SERVER_ROWS_PARAMETER.into(), Datum::List(rows));
+    execute(
+        &world,
+        &statement.prepared,
+        params,
+        stop,
+        max_message,
+        max_depth,
+        system,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn execute(
+    world: &World,
+    prepared: &kala_query::Prepared,
+    params: QueryParams,
+    stop: &AtomicBool,
+    max_message: usize,
+    max_depth: usize,
+    system: bool,
+) -> Result<Output, Failure> {
     let limits = Limits::default();
     let result = kala_query::run_with(
         world,
@@ -246,6 +310,7 @@ fn datum_value(
     budget.charge(64)?;
     match d {
         Datum::Null => Ok(Value::Null),
+        Datum::Path(path) => path_value(&path, view, tick, meter, budget),
         Datum::List(values) => values
             .into_iter()
             .map(|v| datum_value(v, view, tick, meter, budget))
@@ -419,4 +484,69 @@ fn entity_value(
             ],
         ))
     }
+}
+
+/// Bolt 5 Path: deduplicated graph values and signed stored-direction indices.
+fn path_value(
+    path: &kala_query::PathValue,
+    view: &MeteredView<'_>,
+    tick: Tick,
+    meter: &WorkMeter<'_>,
+    budget: &mut Budget,
+) -> Result<Value, Failure> {
+    let mut node_indices = BTreeMap::new();
+    let mut nodes = Vec::new();
+    for id in path.nodes() {
+        budget.step(meter)?;
+        if !node_indices.contains_key(id) {
+            budget.charge(128)?;
+            node_indices.insert(*id, nodes.len() as i64);
+            nodes.push(entity_value(*id, view, tick, meter, budget)?);
+        }
+    }
+    let mut rel_indices = BTreeMap::new();
+    let mut rels = Vec::new();
+    let mut indices = Vec::new();
+    for (i, id) in path.edges().iter().enumerate() {
+        budget.step(meter)?;
+        let (source, kind, target) = view.edge(*id).ok_or_else(|| {
+            Failure::new(EXECUTION, "path relationship is not visible at this canon")
+        })?;
+        let from = path.nodes()[i];
+        let to = path.nodes()[i + 1];
+        let forward = path.forward()[i];
+        if (forward && (from != source || to != target))
+            || (!forward && (from != target || to != source))
+        {
+            return Err(Failure::new(
+                EXECUTION,
+                "path direction does not match stored endpoints",
+            ));
+        }
+        let index = if let Some(index) = rel_indices.get(id) {
+            *index
+        } else {
+            budget.charge(1024)?;
+            let index = rels.len() as i64 + 1;
+            rel_indices.insert(*id, index);
+            let entity: EntityId = (*id).into();
+            rels.push(Value::Structure(
+                0x72,
+                vec![
+                    Value::Integer(entity.raw() as i64),
+                    budget.string(kind)?,
+                    Value::Map(properties(entity, view, tick, meter, budget)?),
+                    budget.string(view.world().format_id(entity))?,
+                ],
+            ));
+            index
+        };
+        budget.charge(128)?;
+        indices.push(Value::Integer(if forward { index } else { -index }));
+        indices.push(Value::Integer(node_indices[&to]));
+    }
+    Ok(Value::Structure(
+        0x50,
+        vec![Value::List(nodes), Value::List(rels), Value::List(indices)],
+    ))
 }

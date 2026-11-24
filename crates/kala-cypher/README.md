@@ -32,12 +32,73 @@ Keywords ignore case; identifiers and labels match exact case. Backtick names,
 Cypher string escapes (including Unicode), `//` and `/* */` comments, and one
 trailing semicolon are accepted. Queries are at most 64 KiB, expression nesting
 at most 32, and pattern/expression elements at most 256. Errors include a line
-and column. OPTIONAL MATCH, WITH, functions/aggregates, variable-length paths,
-UNION, CALL, dynamic property access and writes are not supported yet.
+and column. UNION, dynamic property access, writes, arbitrary functions and
+unbounded traversal are not supported yet.
+
+## Pipelines, aggregates and paths
+
+`OPTIONAL MATCH pattern [AT TICK t] [WHERE predicate]` is a left outer match.
+Its WHERE filters the optional match; if all candidates fail, the original row
+survives with NULL for newly introduced names. OPTIONAL MATCH may start a query.
+Property access and path functions on NULL return NULL.
+
+`WITH [DISTINCT] item [AS alias], … [ORDER BY …] [SKIP n] [LIMIT n] [WHERE …]`
+projects a new scope. Only projected names survive; `WITH *` keeps all names.
+Non-variable expressions need aliases. Carried graph variables keep their
+binding tick; projected property values are not reread. WHERE sees the projected
+names. `UNWIND expr AS x` expands parameter, literal or variable lists in order,
+keeping duplicate elements; NULL and [] produce no rows, other scalars error.
+Lists can be nested to depth 32. Both retained memory and a list's expanded
+materialized size must fit the query byte limit, including lists built by WITH.
+
+RETURN and WITH support `count(*)`, `count(x)`, `count(DISTINCT x)`,
+`collect(x)`, `collect(DISTINCT x)`, `min`, `max`, `sum`, and `avg`.
+Non-aggregate items form implicit grouping keys. NULL operands are skipped;
+count(*) counts rows including NULL rows. Collect keeps duplicates and input
+row order (use WITH ORDER BY to select that order). Min/max require one value
+type; sum checks i64 overflow or uses f64; avg always returns f64.
+Without grouping keys, empty input produces one row: count=0, collect=[],
+sum=0, min/max/avg=NULL. With keys it produces no rows. Datalog's set aggregate
+and empty-input behavior are unchanged. Nested aggregates and aggregates in
+WHERE are errors.
+
+A relationship may specify `*min..max`, `*..max` (minimum 1), or `*n`.
+An upper bound is mandatory and at most **10** (`MAX_VAR_LENGTH` in kala-query).
+`*0..n` includes the start node and an empty relationship list. Every hop seeks
+from its frontier node and is covered by step, row, memory and cancellation
+limits; exceeding a limit fails, never truncates the answer.
+
+`MATCH p = (a)-[rs:ally_of*1..3]-(b) RETURN p` binds a Path and the ordered
+relationship list `rs`. Fixed multi-edge and zero-edge paths are also supported:
+`p = (a)-[:x]->(b)<-[:y]-(c)` and `p = (a)`. `length(p)`, `nodes(p)`,
+`relationships(p)`, and `size(list)` are the supported list/path functions.
+A path never repeats an edge; all relationship patterns in one MATCH also
+exclude edges used by its other patterns. Nodes may repeat; a bidirectional
+relationship is still one edge. Separate MATCH clauses may reuse an edge.
+Path equality and ordering compare node sequences, then edge sequences, then
+stored-direction flags, lexicographically. Properties in Bolt Path values are
+rendered at the plan's default tick, just like Node/Relationship values.
+
+## Catalogue and server metadata
+
+`CALL db.labels()`, `CALL db.relationshipTypes()` and `CALL db.propertyKeys()`
+work in the CLI and over Bolt. They return sorted schema names at the pinned
+canon; labels also include distinct active `label` values at the query tick,
+and property keys include `kala_handle`. Relationship types include inverse
+names and deprecated readable attributes. A catalogue CALL may carry
+`AT TICK t CANON c`. `YIELD col [AS alias], … [WHERE …]` flows through the
+ordinary WITH/RETURN pipeline. Arguments and YIELD * are unsupported.
+
+`CALL dbms.components()` and `SHOW DATABASES`, `SHOW DATABASE name`,
+`SHOW DEFAULT DATABASE`, `SHOW HOME DATABASE` require Bolt and likewise support
+YIELD/WHERE and projection. The adapter supplies a language-neutral metadata
+table; only a pure metadata source followed by WITH/RETURN is allowed. These
+statements cannot carry graph reads under their metadata authorization.
+See [driver metadata answers](../kala-bolt/README.md#neo4j-drivers-and-tools).
 
 ## Time and graph mapping
 
-The first MATCH's `AT TICK` sets the default; without it the default is the
+The first MATCH or catalogue CALL's `AT TICK` sets the default; without it the default is the
 latest tick at the pinned canon. Later MATCH clauses can read at another tick;
 clauses without AT TICK use the default. `CANON` may occur once, after AT TICK.
 Both accept integer literals or `$parameters`. A property's read tick is the
@@ -70,6 +131,10 @@ the latest name table, as elsewhere in Kala.
 | Boolean predicates | Three-valued; WHERE retains only true | Boolean; negation uses `not` |
 | NULL in output | One NULL cell; row retained | Not produced |
 | Duplicates | Bag unless RETURN DISTINCT | Set |
+| Unmatched OPTIONAL MATCH | Retain left row, new bindings NULL | Explicit set negation |
+| Aggregates on NULL | Skip NULL; count(*) still counts the row | No NULL |
+| Zero rows without grouping keys | One aggregate row | No aggregate row |
+| UNWIND NULL or [] | No rows | Not applicable |
 
 `<`, `<=`, `>` and `>=` compare only mutually comparable values: two numbers
 (integers and floats compare numerically), two strings, two booleans, or two
@@ -80,21 +145,21 @@ types are false and true, as in Neo4j.
 
 ORDER BY is stable, with NULL last ascending and first descending. Supported
 mixed types sort as nodes, relationships, lists, strings, booleans, numbers,
-NULL; strings use UTF-8 byte order and integers/floats compare numerically.
+paths, NULL; strings use UTF-8 byte order and integers/floats compare numerically.
 Without ORDER BY, execution order is deterministic. Projection/distinctness
 precede ordering and pagination. Budgets error rather than silently truncate.
 
 ## Known differences from Neo4j
 
 - One declared type per attribute; values cannot mix stored scalar types.
-- Lists represent sets: cardinality-many properties are sorted lists, without
+- Stored lists represent sets: cardinality-many properties are sorted lists, without
   duplicates. A missing property is NULL, including a missing many property.
 - A cardinality-one property with overlapping values is also a sorted list,
   preserving all asserted values and the store's cardinality warning.
 - One immutable node type plus active `label` values supplies labels.
 - A ref attribute read as a property returns a node/relationship reference,
   or a list for many, rather than requiring a relationship pattern.
-- Bolt Node and Relationship objects are enriched at the plan's **default**
+- Bolt Node, Relationship and Path objects are enriched at the plan's **default**
   tick even when bound in a later clause with a different tick. Explicit
   `RETURN v.key` reads at the variable's binding clause tick.
 - Native ref attributes can target edge entities. Both named and anonymous
@@ -118,3 +183,9 @@ Unprefixed Bolt RUN text selects Cypher, as does `// kala:cypher` on the first
 line. `// kala:datalog` selects Datalog. On the system world, all explicit
 `password_hash` reads are forbidden before evaluation, including comparisons,
 property maps and sort keys. Returning account nodes redacts that property.
+
+The upper bound of ten hops, collect's preserved input order, explicit path
+sequence ordering, and enrichment at the default tick are documented differences
+from Neo4j. Secret refusal covers every new expression position, including
+aggregates, WITH, UNWIND, optional maps and variable-length relationship maps;
+account nodes inside Paths use the same property redaction as Node results.

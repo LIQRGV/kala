@@ -913,9 +913,9 @@ fn cypher_cli_parameters_order_null_list_and_positioned_errors() {
         "MATCH (e {kala_handle: 'edwin'}) AT TICK -210 RETURN e.alias",
     ]);
     assert!(aliases.to_string().contains("the Lost Knight"));
-    let syntax = f.q(&["--lang", "cypher", "OPTIONAL MATCH (c) RETURN c"]);
+    let syntax = f.q(&["--lang", "cypher", "MATCH (c) RETURN properties(c)"]);
     assert_ne!(code(&syntax), 0);
-    assert!(stderr(&syntax).contains("OPTIONAL"));
+    assert!(stderr(&syntax).contains("properties"));
     assert!(stderr(&syntax).contains("line") && stderr(&syntax).contains("column"));
     let missing = f.q(&["--lang", "cypher", "MATCH (c) AT TICK $t RETURN c"]);
     assert_ne!(code(&missing), 0);

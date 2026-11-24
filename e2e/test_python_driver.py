@@ -3,8 +3,11 @@
 import concurrent.futures
 import os
 import select
+import shutil
+import signal
 import socket
 import subprocess
+import tempfile
 import threading
 import unittest
 from urllib.parse import urlparse
@@ -12,7 +15,7 @@ from urllib.parse import urlparse
 import neo4j
 from neo4j import GraphDatabase
 from neo4j.exceptions import AuthError, ClientError, CypherSyntaxError
-from neo4j.graph import Node, Relationship
+from neo4j.graph import Node, Relationship, Path
 
 URI = os.environ["KALA_BOLT_URI"]
 PREFIX = "// kala:datalog\n"
@@ -134,8 +137,8 @@ class DriverTests(unittest.TestCase):
             names = [r[0] for r in session.run("MATCH (c:CHARACTER) RETURN c.name ORDER BY c.name SKIP 2 LIMIT 2")]
             self.assertEqual(names, ["Hild", "Lisa"])
             with self.assertRaises(CypherSyntaxError) as error:
-                list(session.run("OPTIONAL MATCH (c) RETURN c"))
-            self.assertIn("OPTIONAL", error.exception.message)
+                list(session.run("MATCH (c) RETURN properties(c)"))
+            self.assertIn("properties", error.exception.message)
             self.assertIn("line", error.exception.message)
             self.assertEqual(len(list(session.run(ALLIES))), 2)
 
@@ -368,6 +371,130 @@ class DriverTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             after = [r[0] for r in session.run(query)]
             self.assertEqual(set(after), set(before) | {"Greg the Driver-Tested"})
+
+    def test_cypher_aggregates_optional_with_and_unwind(self):
+        with self.driver.session(database="varrow") as session:
+            row = session.run("MATCH (a)-[:ally_of]->(b) AT TICK -208 RETURN count(*), count(DISTINCT a)").single()
+            self.assertEqual(list(row), [30, 28])
+            row = session.run("MATCH (a)-[:ally_of]->(b) AT TICK -208 WITH a, count(b) AS n WHERE n > 1 RETURN a.name, n").single()
+            self.assertEqual(list(row), ["Edwin", 3])
+            row = session.run("MATCH (c {kala_handle: 'nobody'}) RETURN count(*), collect(c.name), min(c.name), sum(1), avg(1)").single()
+            self.assertEqual(list(row), [0, [], None, 0, None])
+            row = session.run("MATCH (c {kala_handle: 'kael'}) OPTIONAL MATCH (c)-[:ally_of]->(a) RETURN c.name, a").single()
+            self.assertEqual(list(row), ["Edwin", None])
+            rows = session.run("UNWIND $names AS n MATCH (c:CHARACTER {name:n}) RETURN c.kala_handle ORDER BY c.kala_handle", names=["Greg", "Hild", "Nobody"])
+            self.assertEqual([r[0] for r in rows], ["greg", "hild"])
+            row = session.run("UNWIND [3, null, 1, 3] AS x RETURN collect(x), count(*), count(x)").single()
+            self.assertEqual(list(row), [[3, 1, 3], 4, 3])
+
+    def test_path_hydration_and_bounded_relationship_errors(self):
+        with self.driver.session(database="varrow") as session:
+            rows = list(session.run("MATCH p = (e {kala_handle: 'edwin'})-[r:ally_of*1..2]->(x) AT TICK -208 RETURN p, length(p), nodes(p), relationships(p), r"))
+            self.assertEqual(len(rows), 3)
+            for row in rows:
+                path, length, nodes, rels, rel_list = row
+                self.assertIsInstance(path, Path)
+                self.assertEqual(length, 1)
+                self.assertEqual(path.start_node["kala_handle"], "edwin")
+                self.assertIn(path.end_node["kala_handle"], ["greg", "mara", "tomas"])
+                self.assertEqual(list(path.nodes), nodes)
+                self.assertEqual(list(path.relationships), rels)
+                self.assertEqual(rels, rel_list)
+                self.assertEqual(len(set(r.element_id for r in rels)), len(rels))
+                for rel in rels:
+                    self.assertEqual(rel.type, "ally_of")
+                    self.assertEqual({rel.start_node.element_id, rel.end_node.element_id}, {n.element_id for n in nodes})
+            # Every bidirectional edge is traversed in both directions. The
+            # driver's relationship objects must retain the same stored ends.
+            ends = {}
+            for row in session.run("MATCH p = (a)-[:ally_of]-(b) AT TICK -208 RETURN p"):
+                path = row[0]
+                rel = path.relationships[0]
+                pair = (rel.start_node.element_id, rel.end_node.element_id)
+                self.assertEqual(ends.setdefault(rel.element_id, pair), pair)
+            self.assertEqual(len(ends), 15)
+            path = session.run("MATCH p = (e {kala_handle: 'edwin'})-[:present]->(c) AT TICK -240 RETURN p").single()[0]
+            self.assertIsInstance(path, Path)
+            self.assertEqual(path.start_node["kala_handle"], "edwin")
+            self.assertEqual(path.end_node["kala_handle"], "carnath")
+            self.assertTrue(path.relationships[0]["disguised"])
+            zero = session.run("MATCH p = (a {kala_handle: 'edwin'}) RETURN p").single()[0]
+            self.assertIsInstance(zero, Path)
+            self.assertEqual(zero.start_node, zero.end_node)
+            self.assertEqual(len(zero.relationships), 0)
+            for bound in ["*", "*2..", "*1..11"]:
+                with self.assertRaises(CypherSyntaxError) as error:
+                    list(session.run("MATCH (a)-[:ally_of%s]-(b) RETURN b" % bound))
+                self.assertIn("10", error.exception.message)
+
+    def test_procedures_and_show_database_visibility(self):
+        with self.driver.session(database="varrow") as session:
+            row = session.run("CALL dbms.components()").single()
+            self.assertEqual(dict(row), {"name": "Kala", "versions": ["5.0.0"], "edition": "community"})
+            labels = [r[0] for r in session.run("CALL db.labels()")]
+            self.assertTrue({"CHARACTER", "PLACE", "City"}.issubset(labels))
+            rels = [r[0] for r in session.run("CALL db.relationshipTypes()")]
+            self.assertTrue({"ally_of", "located_in"}.issubset(rels))
+            props = [r[0] for r in session.run("CALL db.propertyKeys()")]
+            self.assertTrue({"name", "kala_handle"}.issubset(props))
+            self.assertNotIn("ally_of", props)
+            self.assertEqual([r[0] for r in session.run("CALL db.labels() YIELD label WHERE label = 'City' RETURN label")], ["City"])
+        with GraphDatabase.driver(URI, auth=("test-user", ""), connection_timeout=5) as driver:
+            for db in ["varrow", "system"]:
+                with driver.session(database=db) as session:
+                    rows = [dict(r) for r in session.run("SHOW DATABASES")]
+                    self.assertEqual([r["name"] for r in rows], ["varrow"])
+                    self.assertEqual(rows[0]["access"], "read-only")
+                    self.assertTrue(rows[0]["writer"])
+                    self.assertTrue(rows[0]["default"])
+        with self.driver.session(database="system") as session:
+            self.assertEqual([r[0] for r in session.run("SHOW DATABASES YIELD name")], ["hidden", "system", "varrow"])
+            with self.assertRaises(ClientError) as error:
+                list(session.run("MATCH (a:ACCOUNT) RETURN count(a.password_hash)"))
+            self.assertEqual(error.exception.code, "Neo.ClientError.Security.Forbidden")
+            for record in session.run("MATCH p = (a:ACCOUNT) RETURN p"):
+                for node in record[0].nodes:
+                    if "password_hash" in node:
+                        self.assertEqual(node["password_hash"], "<redacted>")
+
+    def test_routing_driver_verifies_and_runs_autocommit_with_and_without_db(self):
+        routing_uri = URI.replace("bolt://", "neo4j://", 1)
+        with GraphDatabase.driver(routing_uri, auth=("test-user", ""), connection_timeout=5) as driver:
+            driver.verify_connectivity()
+            for config in [{"database": "varrow"}, {}]:
+                with driver.session(**config) as session:
+                    self.assertEqual(session.run("MATCH (a)-[:ally_of]->(b) AT TICK -208 RETURN count(*)").single()[0], 30)
+                    self.assertEqual(len(list(session.run(ALLIES))), 2)
+
+    def test_routing_driver_uses_advertised_address(self):
+        # A resolver maps the advertised address to the server's ephemeral
+        # socket. This tests an advertised hostname without reserving a port.
+        with tempfile.TemporaryDirectory() as directory:
+            shutil.copyfile(os.environ["KALA_WORLD"], os.path.join(directory, "varrow.kala"))
+            process = subprocess.Popen([os.environ["KALA_BINARY"], "serve", directory, "--auth", "none", "--listen", "127.0.0.1:0", "--advertised-address", "localhost:7687"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                ready, _, _ = select.select([process.stdout], [], [], 20)
+                self.assertTrue(ready, "advertised-address server did not announce readiness")
+                line = process.stdout.readline().strip()
+                if not line.startswith("kala serve: listening on 127.0.0.1:"):
+                    _, errors = process.communicate(timeout=15)
+                    self.fail("advertised-address server did not start: " + line + errors)
+                endpoint = urlparse("bolt://" + line.split("listening on ", 1)[1])
+                seen = []
+                def resolver(address):
+                    seen.append(tuple(address))
+                    return [("127.0.0.1", endpoint.port)]
+                with GraphDatabase.driver("neo4j://127.0.0.1:%d" % endpoint.port, auth=None, resolver=resolver, connection_timeout=5) as driver:
+                    driver.verify_connectivity()
+                    with driver.session(database="varrow") as session:
+                        self.assertEqual(len(list(session.run(ALLIES))), 2)
+                        row = session.run("SHOW DATABASES YIELD address").single()
+                        self.assertEqual(row[0], "localhost:7687")
+                self.assertIn(("localhost", 7687), seen)
+            finally:
+                if process.poll() is None:
+                    process.send_signal(signal.SIGINT)
+                process.communicate(timeout=15)
 
 
 if __name__ == "__main__":

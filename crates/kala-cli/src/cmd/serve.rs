@@ -15,6 +15,7 @@ pub fn run(args: &ServeArgs) -> Result<String, CliError> {
     let addr = listen_addr(&args.listen)?;
     let config = ServerConfig {
         listen: addr,
+        advertised_address: args.advertised_address.clone(),
         default_db: args.default_db.clone(),
         insecure_allow_plaintext: args.insecure_allow_plaintext,
         max_connections: args.max_connections,

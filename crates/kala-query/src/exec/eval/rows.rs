@@ -4,7 +4,7 @@ use crate::exec::val::{cmp_real, result_row_bytes};
 use crate::{Expr, Orientation, RowAction, TickSource};
 use kala_core::{Cardinality, Direction, ValueType};
 
-fn tick(t: &TickSource) -> Tick {
+pub(super) fn tick(t: &TickSource) -> Tick {
     match t {
         TickSource::Const(t) => *t,
         _ => unreachable!("row ticks are resolved by compile"),
@@ -22,7 +22,7 @@ fn boolean(v: Val) -> Result<Option<bool>, QueryError> {
 fn bool_value(v: Option<bool>) -> Val {
     v.map_or(Val::Null, Val::Bool)
 }
-fn put(row: &mut Row, slot: usize, val: Val) -> bool {
+pub(super) fn put(row: &mut Row, slot: usize, val: Val) -> bool {
     match &row[slot] {
         Some(old) => *old == val,
         None => {
@@ -46,6 +46,7 @@ pub(in crate::exec) fn order(
                 0
             }
         }
+        Val::Path(..) => 6,
         Val::List(..) => 2,
         Val::Str(..) => 3,
         Val::Bool(_) => 4,
@@ -56,7 +57,10 @@ pub(in crate::exec) fn order(
     match (a, b) {
         (Val::I64(i), Val::F64(f)) => int_float(*i, *f),
         (Val::F64(f), Val::I64(i)) => int_float(*i, *f).reverse(),
-        (Val::List(_, xs), Val::List(_, ys)) => {
+        (Val::List(ix, xs), Val::List(iy, ys)) => {
+            if ix == iy {
+                return std::cmp::Ordering::Equal;
+            }
             for (x, y) in xs.iter().zip(ys.iter()) {
                 let o = order(x, y, work);
                 if !o.is_eq() {
@@ -139,10 +143,86 @@ impl Exec<'_, '_> {
         action: &RowAction<usize, Val>,
         rows: BTreeSet<Row>,
     ) -> Result<BTreeSet<Row>, QueryError> {
+        if let RowAction::Project {
+            vars,
+            distinct,
+            order,
+            skip,
+            limit,
+            ordinal,
+        } = action
+        {
+            return self.bag_project(rows, vars, *distinct, order, skip, limit, *ordinal);
+        }
+        if let RowAction::Group { keys, aggregates } = action {
+            return self.bag_group(rows, keys, aggregates);
+        }
         let mut out = BTreeSet::new();
         for row in rows {
             self.budget.step(1)?;
             match action {
+                RowAction::Source {
+                    source,
+                    columns,
+                    tick,
+                    ordinal,
+                } => {
+                    self.source_rows(source, columns, self::tick(tick), *ordinal, row, &mut out)?
+                }
+                RowAction::Values {
+                    rows,
+                    columns,
+                    ordinal,
+                } => {
+                    let value = self.expression(rows, &row)?;
+                    let Val::List(_, input) = value else {
+                        return Err(QueryError::TypeMismatch(
+                            "supplied rows must be a list".into(),
+                        ));
+                    };
+                    for values in input.iter() {
+                        let Val::List(_, values) = values else {
+                            return Err(QueryError::TypeMismatch(
+                                "supplied row must be a list".into(),
+                            ));
+                        };
+                        if values.len() != columns.len() {
+                            return Err(QueryError::TypeMismatch(
+                                "supplied row width does not match columns".into(),
+                            ));
+                        }
+                        let mut r = row.clone();
+                        for (s, v) in columns.iter().zip(values.iter()) {
+                            r[*s] = Some(v.clone());
+                        }
+                        r[*ordinal] = Some(Val::I64(out.len() as i64));
+                        self.budget.emit(&mut out, r)?;
+                    }
+                }
+                RowAction::CheckParameter { .. } => {
+                    self.budget.emit(&mut out, row)?;
+                }
+                RowAction::Trail { .. } => self.trail(action, row, &mut out)?,
+                RowAction::Group { .. } | RowAction::Project { .. } => {
+                    unreachable!("whole-input operation handled above")
+                }
+                RowAction::Unwind { expr, var, ordinal } => match self.expression(expr, &row)? {
+                    Val::Null => {}
+                    Val::List(_, values) => {
+                        for value in values.iter() {
+                            self.budget.step(1)?;
+                            let mut r = row.clone();
+                            r[*var] = Some(value.clone());
+                            r[*ordinal] = Some(Val::I64(out.len() as i64));
+                            self.budget.emit(&mut out, r)?;
+                        }
+                    }
+                    _ => {
+                        return Err(QueryError::TypeMismatch(
+                            "UNWIND needs a list or NULL".into(),
+                        ));
+                    }
+                },
                 RowAction::Bind { var, expr } => {
                     let value = self.expression(expr, &row)?;
                     let mut row = row;
@@ -404,7 +484,7 @@ impl Exec<'_, '_> {
         }
         Ok(true)
     }
-    fn property(&mut self, id: EntityId, key: &str, t: Tick) -> Result<Val, QueryError> {
+    pub(super) fn property(&mut self, id: EntityId, key: &str, t: Tick) -> Result<Val, QueryError> {
         self.budget.step(1)?;
         if let Some(value) = self.budget.memo(key).and_then(|m| m.property.get(&(id, t))) {
             return Ok(value.clone());
@@ -476,7 +556,7 @@ impl Exec<'_, '_> {
             .release_bytes(n.saturating_mul(64 + std::mem::size_of::<usize>()));
         let value = if many || sorted.len() > 1 {
             self.budget.step(sorted.len() as u64)?;
-            let (value, new) = self.interner.list(sorted)?;
+            let (value, new) = self.interner.list(sorted, self.budget.limits.max_bytes)?;
             if !new {
                 self.budget.release_bytes(list_bytes);
             }
@@ -493,7 +573,11 @@ impl Exec<'_, '_> {
         }
         Ok(value)
     }
-    fn expression(&mut self, e: &Expr<usize, Val>, row: &Row) -> Result<Val, QueryError> {
+    pub(super) fn expression(
+        &mut self,
+        e: &Expr<usize, Val>,
+        row: &Row,
+    ) -> Result<Val, QueryError> {
         self.budget.step(1)?;
         Ok(match e {
             Expr::Var(s) => row[*s]
@@ -501,6 +585,36 @@ impl Exec<'_, '_> {
                 .ok_or_else(|| QueryError::Plan("unbound expression".into()))?,
             Expr::Value(v) => v.clone(),
             Expr::Null => Val::Null,
+            Expr::Function(f, e) => {
+                let v = self.expression(e, row)?;
+                self.row_function(*f, v)?
+            }
+            Expr::Disjoint(a, b) => {
+                let a = self.expression(a, row)?;
+                let b = self.expression(b, row)?;
+                let a = self.edge_ids(&a)?;
+                let b = self.edge_ids(&b)?;
+                self.budget.step(a.len().saturating_mul(b.len()) as u64)?;
+                let disjoint = !a.iter().any(|e| b.contains(e));
+                self.budget
+                    .release_bytes((a.len() + b.len()).saturating_mul(8));
+                Val::Bool(disjoint)
+            }
+            Expr::Path { start, segments } => self.make_path(row, *start, segments)?,
+            Expr::List(xs) => {
+                let bytes = 64 + xs.len().saturating_mul(std::mem::size_of::<Val>());
+                self.budget.charge_bytes(bytes)?;
+                let values = xs
+                    .iter()
+                    .map(|e| self.expression(e, row))
+                    .collect::<Result<_, _>>()?;
+                let (value, new) = self.interner.list(values, self.budget.limits.max_bytes)?;
+                if !new {
+                    self.budget.release_bytes(bytes);
+                }
+                value
+            }
+            Expr::Aggregate { .. } => unreachable!("aggregate lowered before execution"),
             Expr::Param(_) => unreachable!("parameters resolved by compile"),
             Expr::Property {
                 entity,
@@ -567,7 +681,7 @@ impl Exec<'_, '_> {
 }
 
 /// A known differing list element decides false even if another element is NULL.
-fn equal(
+pub(super) fn equal(
     a: &Val,
     b: &Val,
     budget: &mut crate::exec::budget::Budget,

@@ -70,7 +70,7 @@ fn post_order(root: &Op) -> Vec<Visit<'_>> {
                 todo.push(Todo::Enter(input));
             }
             // The input, then the body seeded with the input's rows.
-            Op::Not { input, body } => {
+            Op::Not { input, body } | Op::Optional { input, body } => {
                 todo.push(Todo::Leave(Visit::Op(op)));
                 todo.push(Todo::Enter(body));
                 todo.push(Todo::Leave(Visit::NotBody));
@@ -450,7 +450,8 @@ impl Compiler<'_, '_> {
             Op::Output { .. } => {
                 return Err(QueryError::Plan("Output must be the plan root".into()));
             }
-            Op::Not { .. } => self.op_not()?,
+            Op::Not { .. } => self.op_not(false)?,
+            Op::Optional { .. } => self.op_not(true)?,
             Op::Difference { .. } => self.op_semi(|shared| Step::Difference { shared }),
             Op::Intersect { .. } => self.op_semi(|shared| Step::Intersect { shared }),
             Op::NodeScan { var, node_type, .. } => self.op_node_scan(var, node_type),
@@ -545,7 +546,7 @@ impl Compiler<'_, '_> {
     }
 
     /// Compiles the end of a `Not`: its body (on top) and its input.
-    fn op_not(&mut self) -> Result<(Step, BTreeSet<usize>), QueryError> {
+    fn op_not(&mut self, optional: bool) -> Result<(Step, BTreeSet<usize>), QueryError> {
         let slots = &mut *self.slots;
         let stack = &mut self.stack;
         let body = pop(stack);
@@ -564,7 +565,12 @@ impl Compiler<'_, '_> {
             )));
         }
         let key = input.iter().copied().collect();
-        Ok((Step::NotEnd { key }, input))
+        if optional {
+            let added = body.difference(&input).copied().collect();
+            Ok((Step::OptionalEnd { key, added }, body))
+        } else {
+            Ok((Step::NotEnd { key }, input))
+        }
     }
 
     /// Compiles a `NodeSeek`.

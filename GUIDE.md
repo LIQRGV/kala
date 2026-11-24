@@ -402,3 +402,22 @@ Missing properties return NULL; WHERE keeps only true, and duplicates remain
 unless RETURN DISTINCT is specified. Neo4j drivers use Cypher by default over
 Bolt; prefix Datalog text with `// kala:datalog` and a newline. See the
 [subset and known differences](crates/kala-cypher/README.md).
+
+### Count allies and follow bounded paths
+
+Cypher aggregates count matched rows, including duplicates. Edwin has three
+allies at tick -208:
+
+```sh
+kala query varrow.kala --lang cypher "MATCH (e {kala_handle: 'edwin'})-[:ally_of]->(a) AT TICK -208 RETURN count(*) AS allies"
+```
+
+A bounded path carries its traversal history. This returns greg, mara and tomas,
+each at length 1; a two-hop return to Edwin would reuse an edge and is excluded:
+
+```sh
+kala query varrow.kala --lang cypher "MATCH p = (e {kala_handle: 'edwin'})-[:ally_of*1..2]-(a) AT TICK -208 RETURN a.kala_handle, length(p) ORDER BY a.kala_handle"
+```
+
+Variable-length patterns require an upper bound of at most 10 hops. Exceeding a
+query resource limit reports an error rather than a partial result.

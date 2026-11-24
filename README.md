@@ -98,7 +98,7 @@ to manage per-database grants. Password accounts use Argon2id; non-loopback
 listeners require `--insecure-allow-plaintext` until TLS is available.
 `--auth none` remains a loopback-only development option. The server is read-only.
 Changes committed by `kala transact` become visible on the next query.
-Ctrl-C stops the server. Cypher reads are the default; explicit transactions, routing,
+Ctrl-C stops the server. Cypher reads and routing are supported; explicit transactions,
 Neo4j Browser and writes over Bolt are not supported yet. See the
 [Bolt support and limits](crates/kala-bolt/README.md) and the opt-in
 [driver E2E tests](e2e/README.md).
@@ -202,9 +202,11 @@ The native Rust API (`kala-core`) can also write directly. See
 - [x] Schema-on-write, schema revisions by canon, copy-forward migrations and `kala schema`
 - [x] `kala create`, replayable full-history dumps, private server backups and JSON snapshots
 - [x] `kala serve`: read-only Bolt 5 Datalog queries through Neo4j drivers
-- [ ] Neo4j Browser compatibility and routing/procedure stubs
 - [x] Cypher reads: MATCH/WHERE/RETURN, bags/NULL, ORDER BY/SKIP/LIMIT and time travel
-- [ ] Broader Cypher (optional matches, aggregates, paths and writes), then Gremlin
+- [x] Cypher breadth: OPTIONAL MATCH, WITH, aggregates, UNWIND, bounded paths and Bolt Path values
+- [x] Neo4j driver metadata and routing (CALL, SHOW DATABASES, ROUTE; TCP only)
+- [ ] Writes over Bolt and explicit transactions (slice 15), then transports and TLS
+- [ ] Web clients (WebSocket and remaining Browser stubs), then Gremlin when requested
 - [x] Accounts, host matching, Argon2id passwords and database privileges
 - [ ] TLS for encrypted Bolt connections
 - [ ] On-disk indexes with checkpoints

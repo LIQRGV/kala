@@ -127,6 +127,23 @@ impl Registry {
             .or(self.default.as_deref())
             .ok_or_else(|| Failure::new(DATABASE, "no default database; specify a database name"))
     }
+    /// Registry names only: does not open any world.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.databases.keys().map(String::as_str)
+    }
+    pub fn default_name(&self) -> Option<&str> {
+        self.default.as_deref()
+    }
+    pub fn require(&self, name: &str) -> Result<(), Failure> {
+        if self.databases.contains_key(name) {
+            Ok(())
+        } else {
+            Err(Failure::new(
+                DATABASE,
+                format!("database {name:?} was not found"),
+            ))
+        }
+    }
     pub fn get(&self, requested: Option<&str>) -> Result<(String, Arc<World>), Failure> {
         let name = self.name(requested)?;
         let db = self

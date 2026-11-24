@@ -45,6 +45,7 @@ struct Session<'a> {
     config: &'a ServerConfig,
     id: u64,
     peer: IpAddr,
+    advertised_address: String,
     output: Option<query::Output>,
     db: String,
     started: Instant,
@@ -75,6 +76,10 @@ pub(crate) fn serve(mut stream: TcpStream, id: u64, shared: &Shared<'_>) -> io::
         config,
         id,
         peer,
+        advertised_address: config
+            .advertised_address
+            .clone()
+            .unwrap_or(stream.local_addr()?.to_string()),
         output: None,
         db: String::new(),
         started: Instant::now(),
@@ -226,6 +231,9 @@ impl Session<'_> {
             }
             Message::Logoff if self.minor >= 1 && self.state == State::Ready => self.logoff(),
             Message::Reset if self.authenticated => self.reset(),
+            Message::Route { db, impersonate } if self.state == State::Ready => {
+                self.route(db.as_deref(), impersonate)?
+            }
             Message::Telemetry if self.minor >= 4 && self.state == State::Ready => success([]),
             Message::Unsupported if self.authenticated => {
                 return Err(Failure::new(INVALID, "not supported yet").into());
@@ -302,6 +310,60 @@ impl Session<'_> {
         self.state = State::Ready;
         success([])
     }
+    /// Shared authorization and existence checks; ROUTE reveals no more than RUN.
+    fn database(&self, requested: Option<&str>) -> Result<String, Failure> {
+        let name = self.registry.name(requested)?;
+        if !self
+            .identity
+            .as_ref()
+            .is_some_and(|id| id.permits_read(name))
+        {
+            return Err(Failure::new(
+                crate::error::FORBIDDEN,
+                format!("access to database {name:?} is forbidden"),
+            ));
+        }
+        self.registry.require(name)?;
+        Ok(name.to_owned())
+    }
+    fn route(&self, requested: Option<&str>, impersonate: bool) -> Result<Value, Failure> {
+        if impersonate {
+            return Err(Failure::new(
+                crate::error::FORBIDDEN,
+                "impersonation is not supported",
+            ));
+        }
+        let db = self.database(requested)?;
+        let servers = ["WRITE", "READ", "ROUTE"]
+            .into_iter()
+            .map(|role| {
+                Value::Map(
+                    [
+                        ("role".into(), Value::String(role.into())),
+                        (
+                            "addresses".into(),
+                            Value::List(vec![Value::String(self.advertised_address.clone())]),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )
+            })
+            .collect();
+        eprintln!("event=bolt_route connection_id={} db={db}", self.id);
+        Ok(success([(
+            "rt",
+            Value::Map(
+                [
+                    ("ttl".into(), Value::Integer(300)),
+                    ("db".into(), Value::String(db)),
+                    ("servers".into(), Value::List(servers)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        )]))
+    }
     /// RUN: checks access to the database, runs the whole query and keeps
     /// its encoded rows for PULL / DISCARD.
     fn run(
@@ -316,35 +378,55 @@ impl Session<'_> {
             Some(Value::String(s)) => Some(s.as_str()),
             _ => return Err(Failure::invalid()),
         };
-        let name = self.registry.name(requested)?;
-        if !self
-            .identity
+        let name = self.registry.name(requested)?.to_owned();
+        let statement = query::server_statement(text, name == "system")?;
+        let metadata_listing = statement
             .as_ref()
-            .is_some_and(|identity| identity.permits_read(name))
-        {
-            return Err(Failure::new(
-                crate::error::FORBIDDEN,
-                format!("access to database {name:?} is forbidden"),
-            ));
+            .is_some_and(|s| matches!(s.request, kala_lang::ServerRequest::Databases(_)));
+        if !(metadata_listing && name == "system") {
+            self.database(Some(&name))?;
         }
-        let (db, world) = self.registry.get(Some(name))?;
         self.started = Instant::now();
-        eprintln!("event=bolt_query_started connection_id={} db={db}", self.id);
-        let output = query::run(
-            &world,
-            text,
-            params,
-            stop,
-            self.config.max_message_bytes,
-            self.config.max_depth,
-        )?;
+        eprintln!(
+            "event=bolt_query_started connection_id={} db={name}",
+            self.id
+        );
+        let output = if let Some(statement) = statement {
+            let identity = self.identity.as_ref().ok_or_else(Failure::invalid)?;
+            let rows = crate::metadata::rows(
+                &statement.request,
+                self.registry,
+                identity,
+                &self.advertised_address,
+                stop,
+            )?;
+            query::run_server(
+                &statement,
+                rows,
+                params,
+                stop,
+                self.config.max_message_bytes,
+                self.config.max_depth,
+                name == "system",
+            )?
+        } else {
+            let (_, world) = self.registry.get(Some(&name))?;
+            query::run(
+                &world,
+                text,
+                params,
+                stop,
+                self.config.max_message_bytes,
+                self.config.max_depth,
+            )?
+        };
         let fields = Value::List(output.fields.iter().cloned().map(Value::String).collect());
         eprintln!(
             "event=bolt_query_completed connection_id={} rows={}",
             self.id,
             output.rows.len()
         );
-        self.db = db;
+        self.db = name;
         self.output = Some(output);
         self.state = State::Streaming;
         Ok(success([

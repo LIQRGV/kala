@@ -19,6 +19,8 @@ use std::time::Duration;
 pub struct ServerConfig {
     /// Listen endpoint; port zero asks the OS for a free port.
     pub listen: SocketAddr,
+    /// Public routing endpoint (HOST:PORT); otherwise the reached socket address.
+    pub advertised_address: Option<String>,
     /// Default world name; inferred when exactly one world is registered.
     pub default_db: Option<String>,
     /// Explicitly permit unencrypted account authentication on a non-loopback listener.
@@ -40,6 +42,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen: SocketAddr::from(([127, 0, 0, 1], 7687)),
+            advertised_address: None,
             default_db: None,
             insecure_allow_plaintext: false,
             max_connections: 64,
@@ -122,6 +125,16 @@ impl Server {
         auth: Arc<dyn Authenticator>,
         system: SystemDb,
     ) -> io::Result<Self> {
+        if config
+            .advertised_address
+            .as_deref()
+            .is_some_and(|s| !valid_advertised_address(s))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "advertised address must be HOST:PORT or [IPv6]:PORT",
+            ));
+        }
         if config.max_connections == 0
             || config.max_message_bytes == 0
             || config.max_depth == 0
@@ -370,6 +383,28 @@ impl LogLimit {
         self.last = Some(now);
         self.suppressed = 0;
     }
+}
+
+fn valid_advertised_address(address: &str) -> bool {
+    if address.len() > 1024 || address.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    let Some((host, port)) = address.rsplit_once(':') else {
+        return false;
+    };
+    if port.parse::<u16>().ok().is_none_or(|p| p == 0) {
+        return false;
+    }
+    if host.starts_with('[') {
+        return host
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .is_some_and(|s| s.parse::<std::net::Ipv6Addr>().is_ok());
+    }
+    !host.is_empty()
+        && host
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_'))
 }
 
 #[cfg(test)]

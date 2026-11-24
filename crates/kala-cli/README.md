@@ -524,3 +524,17 @@ containing typed cells. Output preserves ORDER BY and duplicate Cypher rows.
 kala query varrow.kala --lang cypher 'MATCH (c:CHARACTER) RETURN c.name ORDER BY c.name LIMIT 3'
 kala explain varrow.kala --lang cypher "MATCH (e {kala_handle: 'edwin'})-[:ally_of]->(a) AT TICK -210 RETURN DISTINCT a"
 ```
+
+Cypher list parameters also feed UNWIND, preserving order and duplicate values:
+
+```sh
+kala query varrow.kala --lang cypher \
+  'UNWIND $names AS n MATCH (c:CHARACTER {name: n}) RETURN c.kala_handle ORDER BY c.kala_handle' \
+  --param 'names=["Greg","Hild","Nobody"]'
+```
+
+The result contains greg and hild. List elements are validated against inferred
+attribute types before execution; nested lists have a depth limit of 32. The
+query/explain commands accept OPTIONAL MATCH, WITH, aggregates and bounded paths.
+`db.labels()`, `db.relationshipTypes()` and `db.propertyKeys()` work locally;
+server components and database listings report "only over Bolt".

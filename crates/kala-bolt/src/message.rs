@@ -17,6 +17,10 @@ pub(crate) enum Message {
         qid: i64,
         discard: bool,
     },
+    Route {
+        db: Option<String>,
+        impersonate: bool,
+    },
     Reset,
     Goodbye,
     Telemetry,
@@ -68,7 +72,31 @@ impl Message {
                 map(fields.next())?;
                 Self::Unsupported
             }
-            (0x12 | 0x13, 0) | (0x66, 3) => Self::Unsupported,
+            (0x66, 3) => {
+                let context = map(fields.next())?;
+                if context.values().any(|v| !matches!(v, Value::String(_))) {
+                    return Err(Failure::invalid());
+                }
+                let Some(Value::List(bookmarks)) = fields.next() else {
+                    return Err(Failure::invalid());
+                };
+                if bookmarks.iter().any(|v| !matches!(v, Value::String(_))) {
+                    return Err(Failure::invalid());
+                }
+                let extra = map(fields.next())?;
+                let db = match extra.get("db") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(s)) => Some(s.clone()),
+                    _ => return Err(Failure::invalid()),
+                };
+                let impersonate = match extra.get("imp_user") {
+                    None | Some(Value::Null) => false,
+                    Some(Value::String(_)) => true,
+                    _ => return Err(Failure::invalid()),
+                };
+                Self::Route { db, impersonate }
+            }
+            (0x12 | 0x13, 0) => Self::Unsupported,
             _ => return Err(Failure::invalid()),
         };
         Ok(msg)

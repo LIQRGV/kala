@@ -235,6 +235,9 @@ impl RelDef {
 /// recurses).
 #[derive(Debug)]
 pub enum Op {
+    /// Correlated left outer join. The body retains the input's bindings;
+    /// missing matches bind every body-only variable to NULL.
+    Optional { input: Box<Op>, body: Box<Op> },
     /// Nullable, row-preserving read or expression.
     Row {
         input: Box<Op>,
@@ -421,6 +424,7 @@ impl Op {
     /// by [`Plan::explain`] and named in errors.
     pub fn name(&self) -> &'static str {
         match self {
+            Op::Optional { .. } => "Optional",
             Op::Row { .. } => "Row",
             Op::Output { .. } => "Output",
             Op::Unit => "Unit",
@@ -463,6 +467,10 @@ impl Op {
             | Op::Aggregate { input, .. }
             | Op::Rel { input, .. } => out.push(input),
             Op::Join { left, right }
+            | Op::Optional {
+                input: left,
+                body: right,
+            }
             | Op::Not {
                 input: left,
                 body: right,
@@ -578,6 +586,10 @@ impl Op {
                 args: args.clone(),
                 out: out.clone(),
             },
+            Op::Optional { .. } => Op::Optional {
+                input: input(),
+                body: input(),
+            },
             Op::Not { .. } => Op::Not {
                 input: input(),
                 body: input(),
@@ -624,6 +636,7 @@ impl Op {
             (Op::Output { spec: a, .. }, Op::Output { spec: b, .. }) => a == b,
             (Op::Unit, Op::Unit)
             | (Op::Join { .. }, Op::Join { .. })
+            | (Op::Optional { .. }, Op::Optional { .. })
             | (Op::Not { .. }, Op::Not { .. })
             | (Op::Difference { .. }, Op::Difference { .. })
             | (Op::Intersect { .. }, Op::Intersect { .. }) => true,
@@ -856,6 +869,7 @@ impl Plan {
                 | Op::Project { .. }
                 | Op::Union { .. }
                 | Op::Apply { .. }
+                | Op::Optional { .. }
                 | Op::Not { .. }
                 | Op::Difference { .. }
                 | Op::Intersect { .. }
@@ -908,6 +922,10 @@ fn detach_children(op: &mut Op, todo: &mut Vec<Op>) {
         | Op::Aggregate { input, .. }
         | Op::Rel { input, .. } => take(input),
         Op::Join { left, right }
+        | Op::Optional {
+            input: left,
+            body: right,
+        }
         | Op::Not {
             input: left,
             body: right,

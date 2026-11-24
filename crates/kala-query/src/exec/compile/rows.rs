@@ -8,6 +8,167 @@ impl Compiler<'_, '_> {
     ) -> Result<(Step, BTreeSet<usize>), QueryError> {
         let mut bound = pop(&mut self.stack);
         let action = match action {
+            RowAction::Source {
+                source,
+                columns,
+                tick,
+                ordinal,
+            } => {
+                let columns: Vec<_> = columns.iter().map(|v| self.slots.slot(v)).collect();
+                let ordinal = self.slots.slot(ordinal);
+                bound.extend(columns.iter().copied().chain([ordinal]));
+                if matches!(source, crate::RowSource::Server(_)) {
+                    let rows = self.row_expr(
+                        &Expr::Param(crate::SERVER_ROWS_PARAMETER.into()),
+                        &bound,
+                        0,
+                    )?;
+                    RowAction::Values {
+                        rows,
+                        columns,
+                        ordinal,
+                    }
+                } else {
+                    RowAction::Source {
+                        source: source.clone(),
+                        columns,
+                        tick: self.row_tick(tick)?,
+                        ordinal,
+                    }
+                }
+            }
+            RowAction::Values {
+                rows,
+                columns,
+                ordinal,
+            } => {
+                let rows = self.row_expr(rows, &bound, 0)?;
+                let columns: Vec<_> = columns.iter().map(|v| self.slots.slot(v)).collect();
+                let ordinal = self.slots.slot(ordinal);
+                bound.extend(columns.iter().copied().chain([ordinal]));
+                RowAction::Values {
+                    rows,
+                    columns,
+                    ordinal,
+                }
+            }
+            RowAction::CheckParameter { name, expected } => {
+                let value = self.row_expr(&Expr::Param(name.clone()), &bound, 0)?;
+                if let Expr::Value(v) = value {
+                    self.check_parameter_value(&v, *expected)?;
+                }
+                RowAction::CheckParameter {
+                    name: name.clone(),
+                    expected: *expected,
+                }
+            }
+            RowAction::Trail {
+                source,
+                target,
+                path,
+                attr,
+                direction,
+                tick,
+                min,
+                max,
+                excluded,
+                properties,
+            } => {
+                if min > max || *max > crate::MAX_VAR_LENGTH {
+                    return Err(QueryError::Plan(
+                        "variable-length relationships need an upper bound of at most 10".into(),
+                    ));
+                }
+                let source = input_slot(self.slots, &bound, source, "trail start")?;
+                let excluded = excluded
+                    .iter()
+                    .map(|v| input_slot(self.slots, &bound, v, "trail exclusion"))
+                    .collect::<Result<_, _>>()?;
+                let properties = properties
+                    .iter()
+                    .map(|(k, e)| Ok((k.clone(), self.row_expr(e, &bound, 0)?)))
+                    .collect::<Result<_, QueryError>>()?;
+                let target = self.slots.slot(target);
+                let path = self.slots.slot(path);
+                bound.extend([target, path]);
+                RowAction::Trail {
+                    source,
+                    target,
+                    path,
+                    attr: attr.clone(),
+                    direction: *direction,
+                    tick: self.row_tick(tick)?,
+                    min: *min,
+                    max: *max,
+                    excluded,
+                    properties,
+                }
+            }
+            RowAction::Project {
+                vars,
+                distinct,
+                order,
+                skip,
+                limit,
+                ordinal,
+            } => {
+                let vars = vars
+                    .iter()
+                    .map(|v| input_slot(self.slots, &bound, v, "projection"))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let order = order
+                    .iter()
+                    .map(|(v, desc)| Ok((input_slot(self.slots, &bound, v, "order")?, *desc)))
+                    .collect::<Result<_, QueryError>>()?;
+                let skip = super::super::count_term(skip.as_ref(), self.params, 0)?;
+                let limit =
+                    super::super::count_term(limit.as_ref(), self.params, i64::MAX as usize)?;
+                let ordinal = self.slots.slot(ordinal);
+                bound = vars.iter().copied().chain([ordinal]).collect();
+                RowAction::Project {
+                    vars,
+                    distinct: *distinct,
+                    order,
+                    skip: Some(Term::Const(Value::I64(skip.min(i64::MAX as usize) as i64))),
+                    limit: Some(Term::Const(Value::I64(limit.min(i64::MAX as usize) as i64))),
+                    ordinal,
+                }
+            }
+            RowAction::Unwind { expr, var, ordinal } => {
+                let expr = self.row_expr(expr, &bound, 0)?;
+                let var = self.slots.slot(var);
+                let ordinal = self.slots.slot(ordinal);
+                bound.extend([var, ordinal]);
+                RowAction::Unwind { expr, var, ordinal }
+            }
+            RowAction::Group { keys, aggregates } => {
+                let keys = keys
+                    .iter()
+                    .map(|v| input_slot(self.slots, &bound, v, "group key"))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let aggregates = aggregates
+                    .iter()
+                    .map(|a| {
+                        let argument = a
+                            .argument
+                            .as_ref()
+                            .map(|e| self.row_expr(e, &bound, 0))
+                            .transpose()?;
+                        Ok(crate::BagAggregate {
+                            output: self.slots.slot(&a.output),
+                            function: a.function,
+                            distinct: a.distinct,
+                            argument,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, QueryError>>()?;
+                bound = keys
+                    .iter()
+                    .copied()
+                    .chain(aggregates.iter().map(|a| a.output))
+                    .collect();
+                RowAction::Group { keys, aggregates }
+            }
             RowAction::Nodes { var, labels, tick } => {
                 let tick = self.row_tick(tick)?;
                 let var = self.slots.slot(var);
@@ -84,6 +245,30 @@ impl Compiler<'_, '_> {
                 Expr::Value(self.row_constant(crate::ParameterValue::Scalar(v), depth)?)
             }
             Expr::Null => Expr::Null,
+            Expr::Function(f, e) => {
+                Expr::Function(*f, Box::new(self.row_expr(e, bound, depth + 1)?))
+            }
+            Expr::Disjoint(a, b) => Expr::Disjoint(
+                Box::new(self.row_expr(a, bound, depth + 1)?),
+                Box::new(self.row_expr(b, bound, depth + 1)?),
+            ),
+            Expr::Path { start, segments } => Expr::Path {
+                start: input_slot(self.slots, bound, start, "path start")?,
+                segments: segments
+                    .iter()
+                    .map(|v| input_slot(self.slots, bound, v, "path segment"))
+                    .collect::<Result<_, _>>()?,
+            },
+            Expr::List(xs) => Expr::List(
+                xs.iter()
+                    .map(|e| self.row_expr(e, bound, depth + 1))
+                    .collect::<Result<_, _>>()?,
+            ),
+            Expr::Aggregate { .. } => {
+                return Err(QueryError::Plan(
+                    "aggregate must be lowered to Group".into(),
+                ));
+            }
             Expr::Param(p) => {
                 let value = if let Some(v) = self.parameter_constants.get(p) {
                     v.clone()
@@ -125,6 +310,31 @@ impl Compiler<'_, '_> {
             Expr::IsNull(e) => Expr::IsNull(Box::new(self.row_expr(e, bound, depth + 1)?)),
         })
     }
+    fn check_parameter_value(
+        &mut self,
+        value: &Val,
+        expected: ValueType,
+    ) -> Result<(), QueryError> {
+        self.budget.step(1)?;
+        match value {
+            Val::Null => Ok(()),
+            Val::List(_, xs) => {
+                for x in xs.iter() {
+                    self.check_parameter_value(x, expected)?;
+                }
+                Ok(())
+            }
+            x if x.kind() == super::super::val::ValKind::Value(expected)
+                || (expected == ValueType::F64 && matches!(x, Val::I64(_))) =>
+            {
+                Ok(())
+            }
+            _ => Err(QueryError::TypeMismatch(format!(
+                "parameter list elements must be {}",
+                expected.name()
+            ))),
+        }
+    }
     fn row_constant(
         &mut self,
         value: crate::ParameterValue<'_>,
@@ -162,7 +372,7 @@ impl Compiler<'_, '_> {
                 for v in values {
                     out.push(self.row_constant(ParameterValue::Datum(v), depth + 1)?);
                 }
-                let (v, new) = self.interner.list(out)?;
+                let (v, new) = self.interner.list(out, self.budget.limits.max_bytes)?;
                 if !new {
                     self.budget.release_bytes(bytes);
                 }

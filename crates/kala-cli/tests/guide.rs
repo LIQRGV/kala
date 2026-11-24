@@ -346,3 +346,31 @@ fn guide_cypher_examples_match_the_fixture() {
         }
     }
 }
+
+#[test]
+fn guide_cypher_aggregate_and_bounded_path_examples_match_the_fixture() {
+    let text = normalized(&guide());
+    let f = fixture_through_cli();
+    let aggregate =
+        "MATCH (e {kala_handle: 'edwin'})-[:ally_of]->(a) AT TICK -208 RETURN count(*) AS allies";
+    let path = "MATCH p = (e {kala_handle: 'edwin'})-[:ally_of*1..2]-(a) AT TICK -208 RETURN a.kala_handle, length(p) ORDER BY a.kala_handle";
+    for query in [aggregate, path] {
+        assert!(
+            text.contains(&normalized(query)),
+            "missing checked Cypher example: {query}"
+        );
+    }
+    let aggregate = f.json("query", &["--lang", "cypher", aggregate]);
+    assert_eq!(aggregate["rows"][0][0]["value"], 3);
+    let paths = f.json("query", &["--lang", "cypher", path]);
+    assert_eq!(paths["rows"].as_array().unwrap().len(), 3);
+    for (row, name) in paths["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(["greg", "mara", "tomas"])
+    {
+        assert_eq!(row[0]["value"], name);
+        assert_eq!(row[1]["value"], 1);
+    }
+}

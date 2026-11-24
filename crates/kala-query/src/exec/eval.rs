@@ -19,9 +19,12 @@ use super::val::{
 pub(super) use fixpoint::Relation;
 use fixpoint::{Frame, Read};
 
+mod bags;
 mod fixpoint;
 mod read;
 mod rows;
+mod sources;
+mod trails;
 use read::Triple;
 pub(super) use rows::order;
 
@@ -232,6 +235,20 @@ impl Exec<'_, '_> {
                         self.budget.emit(&mut out, row.clone())?;
                     }
                     stack.push(out);
+                }
+                Step::OptionalEnd { key, added } => {
+                    let mut body = pop(&mut stack);
+                    let input = seeds.pop().expect("optional closes its seed");
+                    let unmatched = self.anti_semi(&input, &body, key, false)?;
+                    let n = unmatched.len();
+                    for mut row in unmatched {
+                        for s in added {
+                            row[*s] = Some(Val::Null);
+                        }
+                        self.budget.emit(&mut body, row)?;
+                    }
+                    self.budget.release_rows(input.len() + n);
+                    stack.push(body);
                 }
                 Step::NotEnd { key } => {
                     let body = pop(&mut stack);
@@ -474,6 +491,7 @@ impl Exec<'_, '_> {
             | Step::UnionEnd
             | Step::NotBegin
             | Step::Seed
+            | Step::OptionalEnd { .. }
             | Step::NotEnd { .. }
             | Step::Difference { .. }
             | Step::Intersect { .. }

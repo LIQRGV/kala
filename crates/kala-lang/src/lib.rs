@@ -17,6 +17,8 @@ use kala_query::Prepared;
 pub enum ErrorKind {
     /// The text could not be parsed or compiled (limits included).
     Syntax,
+    /// A named procedure does not exist.
+    Procedure,
     /// The query is well-formed but ill-typed.
     Type,
     /// The parsed query names an attribute the caller refused.
@@ -50,8 +52,29 @@ impl fmt::Display for LangError {
 
 impl std::error::Error for LangError {}
 
+/// A prepared metadata statement whose rows must come from the server adapter.
+#[derive(Clone, Debug)]
+pub struct ServerStatement {
+    /// Metadata table the adapter must supply.
+    pub request: kala_query::ServerRequest,
+    /// Shared plan that projects and filters the supplied table.
+    pub prepared: Prepared,
+}
+pub use kala_query::{DatabaseSelection, ServerRequest};
+
 /// A query language Kala parses: parse, refuse attributes in the AST, compile.
 pub trait FrontEnd: Sync {
+    /// Recognize and prepare a pure server-metadata pipeline without world I/O.
+    /// None means ordinary world preparation. The refusal hook still covers
+    /// every parsed expression, even when a projection would drop it.
+    fn prepare_server(
+        &self,
+        _text: &str,
+        _refuse: &dyn Fn(&str) -> bool,
+    ) -> Result<Option<ServerStatement>, LangError> {
+        Ok(None)
+    }
+
     /// The language's name (the `--lang` value; also used in logs).
     fn name(&self) -> &'static str;
     /// Whether parameters may be NULL or lists (Cypher), or must be scalars
@@ -107,6 +130,41 @@ impl FrontEnd for Datalog {
 pub struct Cypher;
 
 impl FrontEnd for Cypher {
+    fn prepare_server(
+        &self,
+        text: &str,
+        refuse: &dyn Fn(&str) -> bool,
+    ) -> Result<Option<ServerStatement>, LangError> {
+        use kala_cypher::ast::Clause;
+        let query = kala_cypher::parse(text).map_err(cypher_error)?;
+        let Some(request) = query.server_request().cloned() else {
+            return Ok(None);
+        };
+        if query.attributes().iter().any(|a| refuse(a)) {
+            return Err(LangError::refused());
+        }
+        // A metadata-only authorization exception must never admit world reads
+        // or reuse one supplied table for another source.
+        let pure = matches!(query.clauses.first(), Some(Clause::Source(s)) if matches!(s.source, kala_query::RowSource::Server(_)))
+            && query
+                .clauses
+                .iter()
+                .skip(1)
+                .all(|c| matches!(c, Clause::With(..)));
+        if !pure {
+            return Err(LangError {
+                kind: ErrorKind::Syntax,
+                message: "server metadata supports only YIELD, WHERE, WITH and RETURN".into(),
+            });
+        }
+        let empty = World::in_memory(kala_core::Schema::new()).map_err(|_| LangError {
+            kind: ErrorKind::Type,
+            message: "could not initialize metadata schema".into(),
+        })?;
+        let prepared = kala_cypher::prepare_parsed(&empty, text, &query).map_err(cypher_error)?;
+        Ok(Some(ServerStatement { request, prepared }))
+    }
+
     fn name(&self) -> &'static str {
         "cypher"
     }
@@ -119,22 +177,11 @@ impl FrontEnd for Cypher {
         text: &str,
         refuse: &dyn Fn(&str) -> bool,
     ) -> Result<Prepared, LangError> {
-        let error = |e: kala_cypher::CypherError| {
-            let kind = if e.kind == kala_cypher::ErrorKind::Type {
-                ErrorKind::Type
-            } else {
-                ErrorKind::Syntax
-            };
-            LangError {
-                kind,
-                message: e.to_string(),
-            }
-        };
-        let query = kala_cypher::parse(text).map_err(error)?;
+        let query = kala_cypher::parse(text).map_err(cypher_error)?;
         if query.attributes().iter().any(|a| refuse(a)) {
             return Err(LangError::refused());
         }
-        kala_cypher::prepare_parsed(world, text, &query).map_err(error)
+        kala_cypher::prepare_parsed(world, text, &query).map_err(cypher_error)
     }
 }
 
@@ -147,6 +194,18 @@ pub const NAMES: [&str; 2] = ["datalog", "cypher"];
 /// The front-end with this name, if any.
 pub fn front_end(name: &str) -> Option<&'static dyn FrontEnd> {
     LANGUAGES.into_iter().find(|l| l.name() == name)
+}
+
+fn cypher_error(e: kala_cypher::CypherError) -> LangError {
+    let kind = match e.kind {
+        kala_cypher::ErrorKind::Type => ErrorKind::Type,
+        kala_cypher::ErrorKind::Procedure => ErrorKind::Procedure,
+        _ => ErrorKind::Syntax,
+    };
+    LangError {
+        kind,
+        message: e.to_string(),
+    }
 }
 
 #[cfg(test)]

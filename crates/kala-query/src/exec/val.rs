@@ -34,6 +34,7 @@ use super::QueryError;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum ValKind {
     Null,
+    Path,
     List,
     Value(ValueType),
     Op,
@@ -45,6 +46,7 @@ impl ValKind {
     /// The kind's name in error messages.
     pub(super) fn name(self) -> &'static str {
         match self {
+            ValKind::Path => "path",
             ValKind::Null => "null",
             ValKind::List => "list",
             ValKind::Value(t) => t.name(),
@@ -73,7 +75,8 @@ pub(super) struct Id(u32);
 #[derive(Clone, Debug)]
 pub(super) enum Val {
     Null,
-    List(Id, Rc<Vec<Val>>),
+    List(Id, Rc<ListValue>),
+    Path(Id, Rc<crate::PathValue>),
     Bool(bool),
     I64(i64),
     F64(f64),
@@ -86,6 +89,20 @@ pub(super) enum Val {
     Intervals(Id, Rc<IntervalSet>),
 }
 
+/// Shared query list with bounded materialized size. Caching prevents a WITH
+/// chain from hiding exponential output work behind a small shared DAG.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(super) struct ListValue {
+    values: Vec<Val>,
+    pub(super) bytes: usize,
+    depth: usize,
+}
+impl std::ops::Deref for ListValue {
+    type Target = Vec<Val>;
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
 impl Val {
     /// The plain value (a string is copied), if this is a value.
     pub(super) fn to_value(&self) -> Option<Value> {
@@ -95,7 +112,12 @@ impl Val {
             Val::F64(x) => Value::F64(*x),
             Val::Str(_, s) => Value::Str(s.to_string()),
             Val::Ref(e) => Value::Ref(*e),
-            Val::Null | Val::List(..) | Val::Op(_) | Val::Precision(_) | Val::Intervals(..) => {
+            Val::Null
+            | Val::Path(..)
+            | Val::List(..)
+            | Val::Op(_)
+            | Val::Precision(_)
+            | Val::Intervals(..) => {
                 return None;
             }
         })
@@ -104,6 +126,7 @@ impl Val {
     /// The answer's datum (a string or interval set is copied).
     pub(super) fn to_datum(&self) -> Datum {
         match self {
+            Val::Path(_, p) => Datum::Path((**p).clone()),
             Val::Null => Datum::Null,
             Val::List(_, xs) => Datum::List(xs.iter().map(Val::to_datum).collect()),
             Val::Op(op) => Datum::Op(*op),
@@ -115,6 +138,7 @@ impl Val {
 
     pub(super) fn kind(&self) -> ValKind {
         match self {
+            Val::Path(..) => ValKind::Path,
             Val::Null => ValKind::Null,
             Val::List(..) => ValKind::List,
             Val::Bool(_) => ValKind::Value(ValueType::Bool),
@@ -135,6 +159,7 @@ impl Ord for Val {
     /// interval sets by [`Id`] (O(1), not their contents' order).
     fn cmp(&self, other: &Val) -> Ordering {
         match (self, other) {
+            (Val::Path(a, _), Val::Path(b, _)) => a.cmp(b),
             (Val::List(a, _), Val::List(b, _)) => a.cmp(b),
             (Val::Bool(a), Val::Bool(b)) => a.cmp(b),
             (Val::I64(a), Val::I64(b)) => a.cmp(b),
@@ -167,6 +192,7 @@ impl Hash for Val {
     /// Hashes what `cmp` compares, so equal values hash alike.
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
+            Val::Path(id, _) => (ValKind::Path, id).hash(state),
             Val::Null => ValKind::Null.hash(state),
             Val::List(id, _) => (ValKind::List, id).hash(state),
             Val::Str(id, _) => (ValueType::Str, id).hash(state),
@@ -226,6 +252,15 @@ fn common_prefix<T: PartialEq>(a: &[T], b: &[T], chunk: usize) -> usize {
 /// the prefix compared is added to `work`.
 pub(super) fn cmp_real(a: &Val, b: &Val, work: &mut CmpWork) -> Ordering {
     match (a, b) {
+        (Val::Path(x, a), Val::Path(y, b)) => {
+            if x == y {
+                return Ordering::Equal;
+            }
+            work.bytes = work
+                .bytes
+                .saturating_add(a.heap_bytes().min(b.heap_bytes()) as u64);
+            a.cmp(b)
+        }
         (Val::List(x, a), Val::List(y, b)) => {
             if x == y {
                 return Ordering::Equal;
@@ -276,7 +311,8 @@ pub(super) fn cmp_real_rows(a: &[Val], b: &[Val], work: &mut CmpWork) -> Orderin
 /// from then on rows share it and compare it by id.
 #[derive(Default)]
 pub(super) struct Interner {
-    lists: HashMap<Rc<Vec<Val>>, Id>,
+    paths: HashMap<Rc<crate::PathValue>, Id>,
+    lists: HashMap<Rc<ListValue>, Id>,
     /// Each string, its id, and whether it is charged to the byte budget
     /// (plan constants aren't: the front-end bounds the plan's size; a
     /// string read from the world is charged once, on first read).
@@ -286,7 +322,46 @@ pub(super) struct Interner {
 }
 
 impl Interner {
-    pub(super) fn list(&mut self, values: Vec<Val>) -> Result<(Val, bool), QueryError> {
+    pub(super) fn path(&mut self, value: crate::PathValue) -> Result<(Val, bool), QueryError> {
+        if let Some((p, id)) = self.paths.get_key_value(&value) {
+            return Ok((Val::Path(*id, p.clone()), false));
+        }
+        let id = Self::next_id(self.paths.len())?;
+        let value = Rc::new(value);
+        self.paths.insert(value.clone(), id);
+        Ok((Val::Path(id, value), true))
+    }
+
+    pub(super) fn list(
+        &mut self,
+        mut values: Vec<Val>,
+        max_bytes: usize,
+    ) -> Result<(Val, bool), QueryError> {
+        let depth = 1 + values
+            .iter()
+            .filter_map(|v| {
+                if let Val::List(_, xs) = v {
+                    Some(xs.depth)
+                } else {
+                    None
+                }
+            })
+            .max()
+            .unwrap_or(0);
+        if depth > 32 {
+            return Err(QueryError::Plan("list nesting limit exceeded".into()));
+        }
+        let bytes = result_row_bytes(&values);
+        if bytes > max_bytes {
+            return Err(QueryError::MemoryBudget { limit: max_bytes });
+        }
+        // A collect accumulator grows geometrically; retained charges describe len.
+        values.shrink_to_fit();
+        let values = ListValue {
+            values,
+            bytes,
+            depth,
+        };
         if let Some((v, id)) = self.lists.get_key_value(&values) {
             return Ok((Val::List(*id, v.clone()), false));
         }
@@ -418,11 +493,14 @@ pub(super) fn result_row_bytes(row: &[Val]) -> usize {
         .map(|v| match v {
             Val::Str(_, s) => s.len(),
             Val::Intervals(_, s) => s.len().saturating_mul(size_of::<Interval>()),
-            Val::List(_, xs) => result_row_bytes(xs),
+            Val::Path(_, p) => p.heap_bytes(),
+            Val::List(_, xs) => xs.bytes,
             _ => 0,
         })
-        .sum();
-    size_of::<Vec<Datum>>() + row.len() * size_of::<Datum>() + heap
+        .fold(0usize, usize::saturating_add);
+    size_of::<Vec<Datum>>()
+        .saturating_add(row.len().saturating_mul(size_of::<Datum>()))
+        .saturating_add(heap)
 }
 
 /// `l op r`. Equality across types is just false; ordering needs one type

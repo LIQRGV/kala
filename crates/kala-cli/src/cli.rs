@@ -170,6 +170,9 @@ pub struct ServeArgs {
     /// IP:port, [IPv6]:port, or localhost:port.
     #[arg(long, default_value = "127.0.0.1:7687")]
     pub listen: String,
+    /// Public HOST:PORT used by routing drivers; defaults to the reached address.
+    #[arg(long)]
+    pub advertised_address: Option<String>,
     /// Authentication policy (accounts by default; none is loopback-only).
     #[arg(long, default_value = "accounts", value_parser = ["accounts", "none"])]
     pub auth: String,

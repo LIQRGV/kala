@@ -32,12 +32,13 @@ trap cleanup EXIT
 export KALA_BINARY="$repo/target/debug/kala"
 export KALA_WORLD="$task_tmp/varrow.kala"
 "$KALA_BINARY" load crates/kala-core/tests/fixtures/varrow.yaml "$KALA_WORLD" > "$task_tmp/load.stdout"
+"$KALA_BINARY" load crates/kala-core/tests/fixtures/varrow.yaml "$task_tmp/hidden.kala" >> "$task_tmp/load.stdout"
 "$KALA_BINARY" user add "$task_tmp" test-user@localhost --trust > "$task_tmp/user.stdout"
 "$KALA_BINARY" user grant "$task_tmp" test-user@localhost read varrow >> "$task_tmp/user.stdout"
 export KALA_SERVER_STDOUT="$task_tmp/server.stdout"
 export KALA_SERVER_STDERR="$task_tmp/server.stderr"
 mkfifo "$task_tmp/ready"
-"$KALA_BINARY" serve "$task_tmp" --listen 127.0.0.1:0 > "$task_tmp/ready" 2> "$task_tmp/server.stderr" &
+"$KALA_BINARY" serve "$task_tmp" --listen 127.0.0.1:0 --default-db varrow > "$task_tmp/ready" 2> "$task_tmp/server.stderr" &
 server_pid=$!
 exec {ready_fd}<"$task_tmp/ready"
 if ! IFS= read -r -t 20 ready <&"$ready_fd"; then

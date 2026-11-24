@@ -69,7 +69,7 @@ fn cypher_syntax_type_missing_parameter_and_gremlin_errors() {
     let mut c = Client::ready(&server);
     for (text, params, suffix) in [
         ("MATCH (n RETURN n", map(&[]), "SyntaxError"),
-        ("OPTIONAL MATCH (n) RETURN n", map(&[]), "SyntaxError"),
+        ("MATCH (n) RETURN properties(n)", map(&[]), "SyntaxError"),
         (
             "MATCH (n) AT TICK $tick RETURN n",
             map(&[]),

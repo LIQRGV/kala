@@ -5,7 +5,7 @@ use crate::{
     lex::{self, Kind, Token},
 };
 use kala_core::Value;
-use kala_query::{CmpOp, Expr, Orientation, Term, TickSource};
+use kala_query::{BagFn, CmpOp, Expr, Orientation, Term, TickSource};
 pub(crate) fn parse(text: &str) -> Result<Query, CypherError> {
     let mut p = Parser {
         text,
@@ -103,18 +103,182 @@ impl Parser<'_> {
     }
     /// `MATCH … [MATCH …] RETURN … [ORDER BY …] [SKIP n] [LIMIT n] [;]`.
     fn query(&mut self) -> Result<Query, CypherError> {
-        let mut matches = Vec::new();
+        let mut clauses = Vec::new();
         let mut canon_seen = false;
-        self.need_kw("MATCH")?;
         loop {
-            matches.push(self.match_clause(&mut canon_seen)?);
-            if !self.kw("MATCH") {
+            self.element()?;
+            if self.kw("MATCH") {
+                clauses.push(Clause::Match(self.match_clause(&mut canon_seen, false)?));
+            } else if self.kw("OPTIONAL") {
+                self.need_kw("MATCH")?;
+                clauses.push(Clause::Match(self.match_clause(&mut canon_seen, true)?));
+            } else if self.kw("CALL") {
+                clauses.push(Clause::Source(self.source(false, &mut canon_seen)?));
+            } else if self.kw("SHOW") {
+                clauses.push(Clause::Source(self.source(true, &mut canon_seen)?));
+            } else if self.kw("UNWIND") {
+                let e = self.item()?;
+                self.need_kw("AS")?;
+                clauses.push(Clause::Unwind(e, self.name()?));
+            } else if self.kw("WITH") {
+                let q = self.projection(true)?;
+                let predicate = if self.kw("WHERE") {
+                    Some(self.expression(0, 0)?)
+                } else {
+                    None
+                };
+                clauses.push(Clause::With(Box::new(q), predicate));
+            } else {
                 break;
             }
         }
-        self.need_kw("RETURN")?;
+        if clauses.is_empty() {
+            return Err(self.unsupported("MATCH, OPTIONAL MATCH, WITH, UNWIND or a procedure"));
+        }
+        let mut q = if self.kw("RETURN") {
+            self.projection(false)?
+        } else if let Some(Clause::Source(source)) = clauses.last() {
+            Query {
+                include_all: false,
+                clauses: vec![],
+                items: source
+                    .yields
+                    .iter()
+                    .map(|(_, n)| Item {
+                        name: n.clone(),
+                        expr: Expr::Var(n.clone()),
+                    })
+                    .collect(),
+                distinct: false,
+                order: vec![],
+                skip: None,
+                limit: None,
+            }
+        } else {
+            return Err(self.unsupported("RETURN"));
+        };
+        q.clauses = clauses;
+        self.sym(";");
+        if !matches!(self.token().kind, Kind::End) {
+            return Err(self.unsupported("end of query"));
+        }
+        Ok(q)
+    }
+    fn source(&mut self, show: bool, canon_seen: &mut bool) -> Result<Source, CypherError> {
+        use kala_query::{DatabaseSelection, RowSource, ServerRequest};
+        let source = if show {
+            let selection = if self.kw("DATABASES") {
+                DatabaseSelection::All
+            } else if self.kw("DEFAULT") {
+                self.need_kw("DATABASE")?;
+                DatabaseSelection::Default
+            } else if self.kw("HOME") {
+                self.need_kw("DATABASE")?;
+                DatabaseSelection::Home
+            } else if self.kw("DATABASE") {
+                let name = match self.bump().kind {
+                    Kind::Ident(n, _) | Kind::String(n) => n,
+                    _ => return Err(self.err("database name expected")),
+                };
+                DatabaseSelection::Named(name)
+            } else {
+                return Err(self.unsupported("DATABASES"));
+            };
+            RowSource::Server(ServerRequest::Databases(selection))
+        } else {
+            let mut name = self.name()?;
+            while self.sym(".") {
+                name.push('.');
+                name.push_str(&self.name()?);
+            }
+            self.need("(")?;
+            if !self.sym(")") {
+                return Err(self.err("procedure arguments are not supported yet"));
+            }
+            match name.as_str() {
+                "db.labels" => RowSource::Labels,
+                "db.relationshipTypes" => RowSource::RelationshipTypes,
+                "db.propertyKeys" => RowSource::PropertyKeys,
+                "dbms.components" => RowSource::Server(ServerRequest::Components),
+                _ => {
+                    return Err(CypherError::new(
+                        self.text,
+                        self.token().start,
+                        ErrorKind::Procedure,
+                        format!(
+                            "procedure {} was not found",
+                            name.chars().take(80).collect::<String>()
+                        ),
+                    ));
+                }
+            }
+        };
+        let tick = if self.kw("AT") {
+            self.need_kw("TICK")?;
+            Some(self.integer(false)?)
+        } else {
+            None
+        };
+        let canon = if self.kw("CANON") {
+            if tick.is_none() || *canon_seen {
+                return Err(self.err("CANON requires AT TICK and may appear only once"));
+            }
+            *canon_seen = true;
+            Some(self.integer(true)?)
+        } else {
+            None
+        };
+        let yields = if self.kw("YIELD") {
+            let mut items: Vec<(String, String)> = Vec::new();
+            loop {
+                self.element()?;
+                let name = self.name()?;
+                let alias = if self.kw("AS") {
+                    self.name()?
+                } else {
+                    name.clone()
+                };
+                if items.iter().any(|(_, n)| n == &alias) {
+                    return Err(self.err("duplicate YIELD column"));
+                }
+                items.push((name, alias));
+                if !self.sym(",") {
+                    break;
+                }
+            }
+            items
+        } else {
+            source
+                .columns()
+                .iter()
+                .map(|n| (n.to_string(), n.to_string()))
+                .collect()
+        };
+        let predicate = if self.kw("WHERE") {
+            Some(self.expression(0, 0)?)
+        } else {
+            None
+        };
+        Ok(Source {
+            source,
+            yields,
+            predicate,
+            tick,
+            canon,
+        })
+    }
+    fn projection(&mut self, with: bool) -> Result<Query, CypherError> {
         let distinct = self.kw("DISTINCT");
-        let items = self.return_items()?;
+        let include_all = with && self.sym("*");
+        let items = if include_all {
+            if self.sym(",") {
+                self.return_items(with)?
+            } else {
+                vec![]
+            }
+        } else {
+            self.return_items(with)?
+        };
         let order = self.order_by()?;
         let skip = if self.kw("SKIP") {
             Some(self.integer(true)?)
@@ -126,12 +290,9 @@ impl Parser<'_> {
         } else {
             None
         };
-        self.sym(";");
-        if !matches!(self.token().kind, Kind::End) {
-            return Err(self.unsupported("end of query"));
-        }
         Ok(Query {
-            matches,
+            include_all,
+            clauses: vec![],
             items,
             distinct,
             order,
@@ -141,7 +302,11 @@ impl Parser<'_> {
     }
     /// One MATCH clause after its keyword: paths, then `AT TICK`, `CANON` and
     /// `WHERE`. `canon_seen` records that some clause already set the canon.
-    fn match_clause(&mut self, canon_seen: &mut bool) -> Result<Match, CypherError> {
+    fn match_clause(
+        &mut self,
+        canon_seen: &mut bool,
+        optional: bool,
+    ) -> Result<Match, CypherError> {
         let mut paths = vec![self.path()?];
         while self.sym(",") {
             paths.push(self.path()?);
@@ -171,6 +336,7 @@ impl Parser<'_> {
             None
         };
         Ok(Match {
+            optional,
             paths,
             tick,
             canon,
@@ -196,7 +362,7 @@ impl Parser<'_> {
         Ok(())
     }
     /// The comma-separated RETURN items, each with a distinct column name.
-    fn return_items(&mut self) -> Result<Vec<Item>, CypherError> {
+    fn return_items(&mut self, with: bool) -> Result<Vec<Item>, CypherError> {
         let mut items = Vec::new();
         loop {
             self.element()?;
@@ -206,6 +372,9 @@ impl Parser<'_> {
             let name = if self.kw("AS") {
                 self.name()?
             } else {
+                if with && !matches!(expr, Expr::Var(_)) {
+                    return Err(self.err("WITH expressions require an alias"));
+                }
                 match &expr {
                     Expr::Var(v) => v.clone(),
                     Expr::Property { entity, key, .. } => format!("{entity}.{key}"),
@@ -249,6 +418,13 @@ impl Parser<'_> {
         Ok(order)
     }
     fn path(&mut self) -> Result<Path, CypherError> {
+        let path_name = if matches!(self.token().kind, Kind::Ident(..)) {
+            let n = self.name()?;
+            self.need("=")?;
+            Some(n)
+        } else {
+            None
+        };
         let mut nodes = vec![self.node()?];
         let mut edges = Vec::new();
         while matches!(self.token().kind, Kind::Symbol("-") | Kind::Symbol("<-")) {
@@ -258,23 +434,26 @@ impl Parser<'_> {
                 self.need("-")?;
             }
             self.need("[")?;
-            if matches!(self.token().kind, Kind::Symbol("*")) {
-                return Err(self.err("variable-length relationships are not supported yet"));
-            }
             let name = if matches!(self.token().kind, Kind::Ident(..)) {
                 Some(self.name()?)
             } else {
                 None
             };
-            if !self.sym(":") {
-                return Err(self.err("exactly one relationship type is required"));
-            }
-            let kind = self.name()?;
+            let kind = if self.sym(":") {
+                self.name()?
+            } else {
+                String::new()
+            };
             if matches!(self.token().kind, Kind::Symbol("|")) {
                 return Err(self.err("multiple relationship types are not supported yet"));
             }
-            if matches!(self.token().kind, Kind::Symbol("*")) {
-                return Err(self.err("variable-length relationships are not supported yet"));
+            let bounds = if self.sym("*") {
+                Some(self.bounds()?)
+            } else {
+                None
+            };
+            if kind.is_empty() && bounds != Some((0, 0)) {
+                return Err(self.err("exactly one relationship type is required"));
             }
             let props = self.props()?;
             self.need("]")?;
@@ -288,6 +467,7 @@ impl Parser<'_> {
                 Orientation::Either
             };
             edges.push(Edge {
+                bounds,
                 name,
                 kind,
                 direction,
@@ -295,7 +475,40 @@ impl Parser<'_> {
             });
             nodes.push(self.node()?);
         }
-        Ok(Path { nodes, edges })
+        Ok(Path {
+            name: path_name,
+            nodes,
+            edges,
+        })
+    }
+    fn bounds(&mut self) -> Result<(usize, usize), CypherError> {
+        let message = "variable-length relationships need an upper bound of at most 10";
+        let number = |p: &mut Self| -> Result<Option<usize>, CypherError> {
+            if let Kind::Number(n) = &p.token().kind {
+                let n = n.parse::<usize>().map_err(|_| p.err(message))?;
+                p.bump();
+                Ok(Some(n))
+            } else {
+                Ok(None)
+            }
+        };
+        let first = number(self)?;
+        let (min, max) = if self.sym("..") {
+            (
+                first.unwrap_or(1),
+                number(self)?.ok_or_else(|| self.err(message))?,
+            )
+        } else {
+            let n = first.ok_or_else(|| self.err(message))?;
+            (n, n)
+        };
+        if max > kala_query::MAX_VAR_LENGTH {
+            return Err(self.err(message));
+        }
+        if min > max {
+            return Err(self.err("variable-length minimum exceeds maximum"));
+        }
+        Ok((min, max))
     }
     fn node(&mut self) -> Result<Node, CypherError> {
         self.element()?;
@@ -357,6 +570,26 @@ impl Parser<'_> {
         Ok(Term::Const(Value::I64(n)))
     }
     fn item(&mut self) -> Result<Expr<String>, CypherError> {
+        self.item_depth(0)
+    }
+    fn item_depth(&mut self, depth: usize) -> Result<Expr<String>, CypherError> {
+        if depth >= MAX_DEPTH {
+            return Err(self.err("expression nesting depth limit exceeded"));
+        }
+        self.element()?;
+        if self.sym("[") {
+            let mut xs = Vec::new();
+            if !self.sym("]") {
+                loop {
+                    xs.push(self.item_depth(depth + 1)?);
+                    if self.sym("]") {
+                        break;
+                    }
+                    self.need(",")?;
+                }
+            }
+            return Ok(Expr::List(xs));
+        }
         let negative = self.sym("-");
         let positive = if !negative { self.sym("+") } else { false };
         let t = self.bump();
@@ -389,8 +622,51 @@ impl Parser<'_> {
                 Expr::Value(Value::Bool(false))
             }
             Kind::Ident(s, _) => {
-                if matches!(self.token().kind, Kind::Symbol("(")) {
-                    return Err(self.err(format!("{s} functions/aggregates are not supported yet")));
+                if self.sym("(") {
+                    let name = s.to_ascii_lowercase();
+                    let row_fn = match name.as_str() {
+                        "length" => Some(kala_query::RowFn::Length),
+                        "nodes" => Some(kala_query::RowFn::Nodes),
+                        "relationships" => Some(kala_query::RowFn::Relationships),
+                        "size" => Some(kala_query::RowFn::Size),
+                        _ => None,
+                    };
+                    if let Some(f) = row_fn {
+                        let e = self.item_depth(depth + 1)?;
+                        self.need(")")?;
+                        return Ok(Expr::Function(f, Box::new(e)));
+                    }
+                    let function = match name.as_str() {
+                        "count" => BagFn::Count,
+                        "collect" => BagFn::Collect,
+                        "min" => BagFn::Min,
+                        "max" => BagFn::Max,
+                        "sum" => BagFn::Sum,
+                        "avg" => BagFn::Avg,
+                        _ => {
+                            return Err(
+                                self.err(format!("{s} functions/aggregates are not supported yet"))
+                            );
+                        }
+                    };
+                    let distinct = self.kw("DISTINCT");
+                    let argument = if self.sym("*") {
+                        if function != BagFn::Count || distinct {
+                            return Err(self.err("only count(*) accepts *"));
+                        }
+                        None
+                    } else {
+                        Some(Box::new(self.item_depth(depth + 1)?))
+                    };
+                    self.need(")")?;
+                    if argument.as_deref().is_some_and(has_aggregate) {
+                        return Err(self.err("nested aggregates are not supported"));
+                    }
+                    return Ok(Expr::Aggregate {
+                        function,
+                        distinct,
+                        argument,
+                    });
                 }
                 if self.sym(".") {
                     Expr::Property {
@@ -499,11 +775,26 @@ impl Parser<'_> {
                 Expr::Param(p) => p.len(),
                 Expr::Property { entity, key, .. } => entity.len() + key.len(),
                 Expr::Value(_) | Expr::Null => 0,
-                Expr::Not(e) | Expr::IsNull(e) => {
+                Expr::Path { start, segments } => {
+                    start.len() + segments.iter().map(String::len).sum::<usize>()
+                }
+                Expr::List(xs) => {
+                    stack.extend(xs);
+                    0
+                }
+                Expr::Aggregate { argument, .. } => {
+                    stack.extend(argument.as_deref());
+                    0
+                }
+                Expr::Not(e) | Expr::IsNull(e) | Expr::Function(_, e) => {
                     stack.push(e);
                     0
                 }
-                Expr::Compare(_, a, b) | Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+                Expr::Disjoint(a, b)
+                | Expr::Compare(_, a, b)
+                | Expr::And(a, b)
+                | Expr::Or(a, b)
+                | Expr::Xor(a, b) => {
                     stack.push(a);
                     stack.push(b);
                     0
@@ -544,8 +835,16 @@ impl Parser<'_> {
                 return Err(self.err("expression nesting depth limit exceeded"));
             }
             match e {
-                Expr::Not(e) | Expr::IsNull(e) => stack.push((e, d + 1)),
-                Expr::Compare(_, a, b) | Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+                Expr::Not(e) | Expr::IsNull(e) | Expr::Function(_, e) => stack.push((e, d + 1)),
+                Expr::List(xs) => stack.extend(xs.iter().map(|e| (e, d + 1))),
+                Expr::Aggregate { argument, .. } => {
+                    stack.extend(argument.as_deref().map(|e| (e, d + 1)))
+                }
+                Expr::Disjoint(a, b)
+                | Expr::Compare(_, a, b)
+                | Expr::And(a, b)
+                | Expr::Or(a, b)
+                | Expr::Xor(a, b) => {
                     stack.push((a, d + 1));
                     stack.push((b, d + 1));
                 }
@@ -553,5 +852,17 @@ impl Parser<'_> {
             }
         }
         Ok(())
+    }
+}
+
+pub(crate) fn has_aggregate(e: &Expr<String>) -> bool {
+    match e {
+        Expr::Aggregate { .. } => true,
+        Expr::List(xs) => xs.iter().any(has_aggregate),
+        Expr::Not(x) | Expr::IsNull(x) | Expr::Function(_, x) => has_aggregate(x),
+        Expr::Compare(_, a, b) | Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+            has_aggregate(a) || has_aggregate(b)
+        }
+        _ => false,
     }
 }

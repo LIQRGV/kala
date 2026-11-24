@@ -103,8 +103,8 @@ The plain handshake selects the highest offered version in 5.0–5.4, including
 minor-version ranges. Unsupported manifest proposals are skipped in favor of
 a supported plain proposal; a manifest-only or 4.x-only proposal is rejected.
 HELLO authenticates in 5.0; 5.1+ requires LOGON. LOGOFF returns to authentication.
-RUN, PULL, DISCARD, RESET, GOODBYE and 5.4 TELEMETRY are supported. BEGIN,
-COMMIT, ROLLBACK and ROUTE return `Neo.ClientError.Request.Invalid` with
+RUN, PULL, DISCARD, RESET, GOODBYE, ROUTE and 5.4 TELEMETRY are supported. BEGIN,
+COMMIT and ROLLBACK return `Neo.ClientError.Request.Invalid` with
 "not supported yet". Malformed PackStream closes after FAILURE when possible;
 pre-authentication failures close. Other failures enter FAILED, which answers
 IGNORED until RESET. RESET never grants authentication.
@@ -139,7 +139,8 @@ bookmark required.
 | Kala value | Bolt / Python driver |
 | --- | --- |
 | NULL | PackStream null / Python None |
-| Property list | Bolt List / Python list |
+| Property/query list (collect, nodes, relationships) | Bolt List / Python list, preserving query order |
+| Path | Bolt 5 Path / neo4j.graph.Path; deduplicated Nodes, UnboundRelationships, signed traversal indices |
 | i64, f64, bool, string | Integer, Float, Boolean, String |
 | Entity reference | Bolt 5 Node: raw integer ID, labels, properties, readable element_id |
 | Edge reference | Bolt 5 Relationship: negative tagged ID, endpoints, type, properties and all three element IDs |
@@ -147,7 +148,7 @@ bookmark required.
 | Precision | `"exact"`, `"day"`, `"month"`, `"year"`, `"decade"`, `"century"` |
 | Interval set | List of `[start, end]` lists, null for an open end |
 
-Nodes and relationships are enriched at the result's default tick and canon.
+Nodes, relationships and paths are enriched at the result's default tick and canon.
 Node labels include its immutable type and active string `label` values.
 Properties include every active non-ref attribute and the world handle (if present)
 under `kala_handle`. A user attribute named `handle` is an ordinary property and
@@ -214,14 +215,62 @@ Implementation references: [handshake](https://neo4j.com/docs/bolt/current/bolt/
 | Filtering | WHERE keeps only true | Boolean; negation via `not` |
 | NULL in RETURN | PackStream null | Not produced |
 
-Known differences from Neo4j: each attribute has one stored type; lists are
+Known differences from Neo4j: each attribute has one stored type; stored property lists are
 sorted sets (no order or duplicates); labels consist of one node type plus
 `label` values. Cardinality-one overlaps also return lists. Ref properties
-return graph references or lists of them. Node/Relationship enrichment always
+return graph references or lists of them. Node/Relationship/Path enrichment always
 uses the plan's default tick; explicit `v.key` uses its binding clause's tick.
 Cypher parameters support NULL and lists (with input order preserved). Native
 ref-to-edge targets remain edge references in unlabelled relationship endpoints;
 standalone node scans exclude edges.
 Every explicit system-world `password_hash` reference is refused before
 execution, including WHERE, maps, RETURN aliases, IS NULL and ORDER BY/LIMIT.
-Returning account nodes continues to redact hashes.
+Returning account nodes, including inside Paths, continues to redact hashes.
+
+## Neo4j drivers and tools
+
+The official Python driver is tested through `./e2e/run.sh` with both `bolt://`
+and routing `neo4j://` URIs, `verify_connectivity()` and auto-commit
+`session.run`, with explicit and default databases. Tests cover aggregates,
+OPTIONAL MATCH NULLs, UNWIND list parameters, Path hydration and stored edge
+directions, all four procedures below, database visibility and protected
+system attributes. Other official drivers and TCP tools such as `cypher-shell`
+and JDBC tools are expected to use these Bolt operations; they have not been
+run and compatibility is not claimed as tested. Explicit transactions remain
+unsupported: driver `execute_query`/`execute_read` still require slice 15.
+
+| Request | Answer |
+| --- | --- |
+| `CALL dbms.components()` | One row: name=`Kala`, versions=[`5.0.0`], edition=`community` |
+| `CALL db.labels()` | Sorted node types at the canon plus distinct active label values at the query tick |
+| `CALL db.relationshipTypes()` | Sorted ref-attribute names and inverse names, including deprecated readable definitions |
+| `CALL db.propertyKeys()` | Sorted non-ref attribute names plus `kala_handle`; names only, including on system |
+| `SHOW DATABASES` | Only databases on which the logged-in identity has any grant; system only for admins |
+| `SHOW DATABASE name`, `SHOW DEFAULT DATABASE`, `SHOW HOME DATABASE` | The corresponding filtered database rows |
+
+Each database row has columns in this order: `name, type, aliases, access,
+address, role, writer, requestedStatus, currentStatus, statusMessage, default,
+home, constituents`. Type is `standard` or `system`; aliases/constituents are
+empty lists, access=`read-only`, address=the advertised address, role=`primary`,
+writer=true, both statuses=`online`, statusMessage="", and default/home indicate
+the configured default database. Metadata listings on `system` work for a
+non-admin without opening that world; all filtering uses the shared executor.
+Unknown procedures return `Neo.ClientError.Procedure.ProcedureNotFound`.
+
+ROUTE is accepted only when authenticated and Ready. It returns a routing table
+with ttl=300, the resolved database name, and the single advertised address in
+WRITE, READ and ROUTE roles. Writer=true and the WRITE role keep driver routing
+usable; write queries still fail. Database authorization and unknown-database
+errors are shared with RUN. Impersonation is forbidden. Client routing-context
+addresses are never echoed.
+
+`kala serve --advertised-address HOST:PORT` sets the public endpoint; without
+it, the table uses the connection's local socket address (including its actual
+port when listening on port 0). The Python suite exercises both forms. HELLO's
+`Neo4j/5.0.0` and components' `5.0.0` are Bolt compatibility versions; HELLO's
+`kala_version` is Kala's actual version.
+
+**Neo4j Browser and other web-page clients are not supported yet.** They need
+Bolt over WebSocket, UNION ALL, `dbms.showCurrentUser()`, `dbms.clientConfig()`,
+and SHOW PROCEDURES/FUNCTIONS. Those belong to a later slice; this server remains
+TCP-only.
