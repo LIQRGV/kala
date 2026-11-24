@@ -529,10 +529,30 @@ pub struct Applied {
 }
 /// Apply one account change to `directory/system.kala` under its writer
 /// lock, creating the system world (never the directory) if it is absent.
+/// Waits for a lock another writer holds up to kala-core's default busy
+/// timeout (5 s); see [`apply_waiting`].
 pub fn apply(directory: impl AsRef<Path>, change: Change<'_>, recovery: Recovery) -> Applied {
+    apply_waiting(
+        directory,
+        change,
+        recovery,
+        kala_core::log::DEFAULT_BUSY_TIMEOUT,
+    )
+}
+/// [`apply`], waiting up to `busy_timeout` each time the system world's
+/// writer lock is held by another writer (opening it, and committing the
+/// change); zero means one attempt. Past it the result is
+/// [`SystemError::Busy`] and nothing was written.
+pub fn apply_waiting(
+    directory: impl AsRef<Path>,
+    change: Change<'_>,
+    recovery: Recovery,
+    busy_timeout: std::time::Duration,
+) -> Applied {
     let directory = directory.as_ref();
     let mut open = Open {
         recovery,
+        busy_timeout,
         recovered: None,
         conflicted: false,
     };
@@ -579,6 +599,8 @@ pub fn apply(directory: impl AsRef<Path>, change: Change<'_>, recovery: Recovery
 /// How [`writer`] may recover the log, and what it cut.
 struct Open {
     recovery: Recovery,
+    /// How long to wait for the writer lock (see [`apply_waiting`]).
+    busy_timeout: std::time::Duration,
     recovered: Option<kala_core::RecoveryReport>,
     /// The last attempt lost to another account change committed while it
     /// ran: nothing was written, and the change can be decided again.
@@ -612,13 +634,14 @@ fn commit(txn: Txn<'_>, open: &mut Open) -> Result<kala_core::CommitResult, Syst
 /// The open needs the writer lock, which another `kala user` command, or a
 /// process that just closed the world, may hold for a moment (a process
 /// spawning a child from another thread shares its open files with the
-/// child until the child execs). kala-core waits for it up to its busy
-/// timeout (5 s); a writer that holds it longer is reported as
+/// child until the child execs). kala-core waits for it up to the busy
+/// timeout (5 s unless the caller chose another), which the opened world's
+/// commits wait too; a writer that holds it longer is reported as
 /// [`SystemError::Busy`].
-fn open_writer(path: &Path, recovery: Recovery) -> Result<World, SystemError> {
-    match recovery {
-        Recovery::Refuse => World::open_refusing_damaged(path),
-        Recovery::Acknowledge => World::open(path),
+fn open_writer(path: &Path, open: &Open) -> Result<World, SystemError> {
+    match open.recovery {
+        Recovery::Refuse => World::open_refusing_damaged_waiting(path, open.busy_timeout),
+        Recovery::Acknowledge => World::open_waiting(path, open.busy_timeout),
     }
     .map_err(store)
 }
@@ -627,7 +650,7 @@ fn writer(directory: &Path, open: &mut Open) -> Result<World, SystemError> {
     // not a system world is refused before any recovery can cut its tail.
     ensure(directory)?;
     let path = directory.join("system.kala");
-    let mut world = open_writer(&path, open.recovery)?;
+    let mut world = open_writer(&path, open)?;
     let damaged = world.recovery().cause == Some(kala_core::CutCause::Damaged);
     if damaged {
         // Reachable only with `Recovery::Acknowledge`: the refusing open
