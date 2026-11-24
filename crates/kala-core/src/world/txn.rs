@@ -528,6 +528,14 @@ impl Txn<'_> {
             self.base_tick
         })
     }
+    /// The tick [`Txn::write_tick`] resolves `tick` to, without counting as
+    /// a write that landed on the latest tick the transaction began with:
+    /// for reporting an operation that stores no tick (a create, a schema
+    /// operation), which must not raise the commit's
+    /// [`TickMoved`](crate::TickMoved) warning.
+    pub fn report_tick(&self, tick: Option<Tick>) -> Tick {
+        tick.or(self.default_tick).unwrap_or(self.base_tick)
+    }
     /// Number of primitive entries staged so far, for language report offsets.
     pub fn staged_entry_count(&self) -> usize {
         self.entries.len()

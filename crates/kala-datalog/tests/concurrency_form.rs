@@ -265,3 +265,49 @@ fn a_conflict_is_reported_at_the_op_that_read() {
     );
     assert_eq!(std::fs::read(&path).unwrap(), before, "nothing written");
 }
+
+/// The "latest tick moved" warning is about writes that landed on the
+/// latest tick the transaction began with. A form whose facts all carry a
+/// tick (their own, or the form's `:at`), or that only creates and
+/// declares, used no such tick: creates and schema ops are merely reported
+/// at it.
+#[test]
+fn only_a_fact_on_the_starting_latest_tick_raises_the_tick_warning() {
+    for (text, warns) in [
+        ("[:assert :greg :located_in :carnath]", true),
+        ("[:set :carnath :located_in :varrow]", true),
+        (
+            "[[:create :CHARACTER :kael] [:assert :kael :located_in :varrow]]",
+            true,
+        ),
+        // A form that stores nothing has nothing to warn about.
+        ("[:retract :greg :located_in :carnath]", false),
+        ("[:assert :greg :located_in :carnath :at 601]", false),
+        ("[:at 601 [:assert :greg :located_in :carnath]]", false),
+        ("[:set :carnath :located_in :varrow :at 605]", false),
+        ("[:create :CHARACTER :kael]", false),
+        ("[[:attribute :age :i64] [:create :CHARACTER :kael]]", false),
+        (
+            "[[:create :CHARACTER :kael] [:assert :kael :located_in :varrow :at 3]]",
+            false,
+        ),
+    ] {
+        let (_dir, _path, mut a, mut b) = pair();
+        let form = parse_write(text).unwrap();
+        let mut tb = b.begin();
+        let staged = stage(&mut tb, &form, None).unwrap();
+        // The other handle moves the latest tick from 601 to 650.
+        execute(
+            &mut a,
+            &parse_write("[:assert :ashford :located_in :carnath :at 650]").unwrap(),
+            None,
+        )
+        .unwrap();
+        let report = commit(tb, staged).unwrap_or_else(|e| panic!("{text}: {e}"));
+        assert_eq!(
+            report.latest_tick_moved.map(|m| (m.from, m.to)),
+            warns.then_some((Tick(601), Tick(650))),
+            "{text}"
+        );
+    }
+}

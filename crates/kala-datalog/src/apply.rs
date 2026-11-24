@@ -441,7 +441,8 @@ fn stage_form(
         remaining: crate::MAX_WRITE_OPS,
         remaining_bytes: kala_core::MAX_ENTRY_BYTES,
         read_meter: kala_core::WorkMeter::bounded(MAX_SET_READ_KEYS, None),
-        fallback: tx.write_tick(form.at.or(default)),
+        form_tick: form.at.or(default),
+        fallback: tx.report_tick(form.at.or(default)),
         entry_offset: tx.staged_entry_count(),
         op_starts: Vec::with_capacity(form.ops.len()),
         precisions: form
@@ -501,6 +502,11 @@ struct FormState {
     remaining: usize,
     remaining_bytes: usize,
     read_meter: kala_core::WorkMeter<'static>,
+    /// The form's `:at`, else the caller's default tick.
+    form_tick: Option<Tick>,
+    /// The tick an op with no `:at` is reported at: `form_tick`, else the
+    /// transaction's own default (its starting latest tick). Ops that store
+    /// a tick resolve it with [`FormState::fact_tick`] instead.
     fallback: Tick,
     /// Staged entries of the transaction before this form.
     entry_offset: usize,
@@ -510,6 +516,15 @@ struct FormState {
     precisions: Vec<Option<Precision>>,
 }
 impl FormState {
+    /// The tick of a fact op: its own `:at`, else the form's, else the
+    /// transaction's default. Resolved through the transaction, so a fact
+    /// that lands on the latest tick the transaction began with is known
+    /// to it (a commit over a newer latest tick then warns); creates and
+    /// schema ops, which store no tick, are only *reported* at
+    /// `fallback` and never raise that warning.
+    fn fact_tick(&self, tx: &Txn<'_>, at: Option<Tick>) -> Tick {
+        at.unwrap_or_else(|| tx.write_tick(self.form_tick))
+    }
     /// Who staged the transaction's entry at `position`.
     fn staged_by(&self, position: usize) -> OccupiedBy {
         if position < self.entry_offset {
@@ -659,30 +674,19 @@ fn stage_fact(tx: &mut Txn<'_>, op: &WriteOp, state: &FormState) -> Result<Stage
     };
     let e = subject(tx, s)?;
     let v = value(tx, v)?;
+    let tick = state.fact_tick(tx, *at);
     if !tx
         .infer_write_attribute(&attr.name, &v, *op)
         .map_err(Failure::Store)?
     {
         return Ok(Staged {
-            tick: at.unwrap_or(state.fallback),
+            tick,
             ..Staged::schema(state.fallback)
         });
     }
     let r = match op {
-        Op::Assert => tx.assert_with_precision(
-            e,
-            &attr.name,
-            v,
-            Some(at.unwrap_or(state.fallback)),
-            *precision,
-        ),
-        Op::Retract => tx.retract_with_precision(
-            e,
-            &attr.name,
-            v,
-            Some(at.unwrap_or(state.fallback)),
-            *precision,
-        ),
+        Op::Assert => tx.assert_with_precision(e, &attr.name, v, Some(tick), *precision),
+        Op::Retract => tx.retract_with_precision(e, &attr.name, v, Some(tick), *precision),
     }
     .map_err(|error| fact_failure(tx, e, error))?;
     // A no-op stores nothing, so it reports no precision (changing a
@@ -753,7 +757,7 @@ fn stage_set(tx: &mut Txn<'_>, op: &WriteOp, state: &mut FormState) -> Result<St
         return Err(Failure::Limit);
     }
     let entity = subject(tx, s)?;
-    let tick = at.unwrap_or(state.fallback);
+    let tick = state.fact_tick(tx, *at);
     let mut wanted = std::collections::BTreeMap::new();
     for v in values {
         // Caller-built ASTs bypass the text parser: bound strings before cloning
