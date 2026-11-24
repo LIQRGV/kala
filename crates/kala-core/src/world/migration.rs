@@ -1,4 +1,5 @@
 //! Copy-forward migrations use a logged marker and exact, replay-verified copies.
+use super::concurrency::Call;
 use super::schema_ops::OrderedEntry;
 use super::*;
 use crate::error::{ErrorEntity, UnconvertibleValue};
@@ -244,6 +245,25 @@ impl Txn<'_> {
         name: &str,
         options: MigrationOptions,
     ) -> Result<MigrationReport, Error> {
+        let recorded = self.track.then(|| options.clone());
+        self.recorded(
+            |_| Call::Migrate {
+                name: name.to_owned(),
+                options: recorded.expect("recorded only when tracking"),
+            },
+            |txn| txn.migrate_attribute_op(name, options),
+        )
+    }
+
+    fn migrate_attribute_op(
+        &mut self,
+        name: &str,
+        options: MigrationOptions,
+    ) -> Result<MigrationReport, Error> {
+        // A migration copies the attribute's whole history, and its edges'
+        // properties under every attribute: it read everything. A commit
+        // that lands first would be missing from the copy.
+        self.note_read_all();
         self.guard(|txn| {
             let source = txn.attr_id(name)?;
             let old = txn.world.catalog.attributes[source.0 as usize].clone();

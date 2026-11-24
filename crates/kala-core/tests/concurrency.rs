@@ -358,14 +358,16 @@ fn a_single_writer_reads_one_transaction_per_commit() {
     );
 }
 
-// ------------------------------------------------------------ stale Txn
+// ------------------------------------------------------------ a Txn begun before another commit
 
 #[test]
-fn a_txn_begun_before_another_commit_is_stale_and_writes_nothing() {
+fn a_txn_that_read_what_another_commit_changed_conflicts_and_writes_nothing() {
     let (_d, path, mut first, greg) = world();
     let mut second = World::open(&path).unwrap();
 
     let mut txn = second.begin();
+    // It read Greg's tags, and writes from that.
+    txn.note_read(greg, "tag").unwrap();
     txn.assert(greg, "tag", tag("mine"), Some(Tick(1))).unwrap();
     // A schema edit too: its provisional state must not leak either.
     txn.declare_node_type("FACTION").unwrap();
@@ -374,10 +376,20 @@ fn a_txn_begun_before_another_commit_is_stale_and_writes_nothing() {
         .unwrap();
     let before = bytes(&path);
     let err = txn.commit().unwrap_err();
-    assert_eq!(err, Error::SnapshotStale { applied: 1 });
-    assert_eq!(bytes(&path), before, "a stale commit writes nothing");
+    assert_eq!(
+        err,
+        Error::Conflict(Conflict {
+            key: ConflictKey::EntityAttribute {
+                entity: greg,
+                attr: "tag".into()
+            },
+            operation: 0,
+            applied: 1
+        })
+    );
+    assert_eq!(bytes(&path), before, "a refused commit writes nothing");
 
-    // The handle is caught up and holds none of the stale transaction.
+    // The handle is caught up and holds none of the refused transaction.
     assert_eq!(second.latest_tx(), first.latest_tx());
     assert_eq!(tags(&second, greg), vec![tag("theirs")]);
     assert!(second.node_types().all(|t| t != "FACTION"));
@@ -386,6 +398,7 @@ fn a_txn_begun_before_another_commit_is_stale_and_writes_nothing() {
 
     // A new transaction, begun afterwards, commits.
     let mut txn = second.begin();
+    txn.note_read(greg, "tag").unwrap();
     txn.assert(greg, "tag", tag("mine"), Some(Tick(1))).unwrap();
     let res = txn.commit().unwrap();
     assert!(res.committed);
@@ -393,6 +406,33 @@ fn a_txn_begun_before_another_commit_is_stale_and_writes_nothing() {
     assert_eq!(first.catch_up().unwrap(), 1);
     assert_eq!(tags(&first, greg), vec![tag("mine"), tag("theirs")]);
     assert_clean(&first);
+}
+
+#[test]
+fn a_txn_begun_before_another_commit_commits_over_it() {
+    let (_d, path, mut first, greg) = world();
+    let mut second = World::open(&path).unwrap();
+
+    // Blind writes and a schema edit, staged on tx 1.
+    let mut txn = second.begin();
+    txn.assert(greg, "tag", tag("mine"), Some(Tick(1))).unwrap();
+    txn.declare_node_type("FACTION").unwrap();
+    first
+        .assert(greg, "tag", tag("theirs"), Some(Tick(2)))
+        .unwrap();
+    let res = txn.commit().unwrap();
+    assert!(res.committed);
+    assert_eq!(res.tx, TxId(3), "after the other handle's tx 2");
+    assert_eq!((res.changed, res.declared), (1, 1));
+    assert_eq!(res.finalized.as_ref().map(|f| f.applied), Some(1));
+    assert_eq!(tags(&second, greg), vec![tag("mine"), tag("theirs")]);
+    assert!(second.node_types().any(|t| t == "FACTION"));
+    assert_eq!(first.catch_up().unwrap(), 1);
+    assert_eq!(state(&second), state(&first));
+    assert_clean(&second);
+    assert_clean(&first);
+    let txs: Vec<u64> = spans(&bytes(&path)).iter().map(|s| s.tx).collect();
+    assert_eq!(txs, vec![0, 1, 2, 3]);
 }
 
 #[test]
@@ -1077,22 +1117,17 @@ fn two_threads_committing_on_two_handles_always_finish() {
             let done = done_tx.clone();
             std::thread::spawn(move || {
                 for i in 0..ROUNDS {
-                    // Auto-committed writes, and explicit transactions
-                    // retried when another commit landed first.
+                    // Auto-committed writes, and explicit transactions:
+                    // blind writes, so each commits whether or not the
+                    // other thread's commit landed first.
                     w.assert(greg, "tag", tag(&format!("{name}-auto-{i}")), Some(Tick(i)))
                         .unwrap();
-                    loop {
-                        let mut txn = w.begin();
-                        txn.assert(greg, "tag", tag(&format!("{name}-txn-{i}")), Some(Tick(i)))
-                            .unwrap();
-                        match txn.commit() {
-                            Ok(res) => {
-                                assert!(res.committed);
-                                break;
-                            }
-                            Err(Error::SnapshotStale { .. }) => continue,
-                            Err(e) => panic!("{name}: {e:?}"),
-                        }
+                    let mut txn = w.begin();
+                    txn.assert(greg, "tag", tag(&format!("{name}-txn-{i}")), Some(Tick(i)))
+                        .unwrap();
+                    match txn.commit() {
+                        Ok(res) => assert!(res.committed),
+                        Err(e) => panic!("{name}: {e:?}"),
                     }
                 }
                 done.send(()).unwrap();

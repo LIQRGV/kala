@@ -98,6 +98,11 @@ impl StagedIds {
             .and_then(|i| self.defs[*i].handle.as_deref())
     }
 
+    /// Whether this transaction created entity `id`.
+    pub(super) fn created(&self, id: EntityId) -> bool {
+        self.positions.contains_key(&id)
+    }
+
     pub(super) fn push_edge(&mut self, def: EdgeDef) {
         self.edge_by_triple.insert(def.triple(), def.id);
         self.edges.push(def);

@@ -57,6 +57,7 @@
 //! `test_hooks` submodule.
 
 mod catalog;
+mod concurrency;
 mod ids;
 mod index;
 mod journal;
@@ -90,6 +91,7 @@ use crate::store::{OrderedKv, OrderedMap};
 use crate::tick::{Precision, Tick};
 use crate::value::{Value, ValueType, fold_for_search};
 use crate::value_table::{ContentHash, ValueTable, fnv1a64};
+pub use concurrency::{Concurrency, Finalized, FinalizedOp, IdMap, MAX_READ_KEYS, TickMoved};
 pub use index::IndexDump;
 pub(crate) use index::{Index, decode_e_row, decode_v_row, decode_vfold_row};
 pub use meter::{MeteredView, WorkMeter};

@@ -100,10 +100,10 @@ impl std::error::Error for SystemError {}
 fn store(error: kala_core::Error) -> SystemError {
     match error {
         kala_core::Error::WorldLocked => SystemError::Busy,
-        // Another account change was committed between this one's read of
-        // the accounts and its commit; nothing was written. Running the
-        // command again applies it to the accounts as they are now.
-        kala_core::Error::SnapshotStale { .. } => SystemError::Busy,
+        // A commit refused because another account change was committed
+        // first; nothing was written. Running the command again applies it
+        // to the accounts as they are now.
+        kala_core::Error::Conflict(_) => SystemError::Busy,
         kala_core::Error::RecoveryRequired { bytes } => SystemError::RecoveryRequired { bytes },
         // Only the version number: nothing of the file's content.
         kala_core::Error::UnsupportedVersion(version)

@@ -411,9 +411,11 @@ fn stage_form(
     let mut report = StagedWrite {
         ops: Vec::new(),
         entry_offset: tx.staged_entry_count(),
+        spans: Vec::with_capacity(form.ops.len()),
     };
     for (index, op) in form.ops.iter().enumerate() {
         let schema_before = tx.schema_changes().len();
+        let first_operation = tx.operation_count();
         state.op_starts.push(tx.staged_entry_count());
         let staged = stage_op(tx, op, index, &mut state).map_err(|cause| WriteError {
             operation: Some((index + 1, kind(op))),
@@ -440,6 +442,7 @@ fn stage_form(
             entity: staged.entity,
             created: staged.created,
         });
+        report.spans.push(first_operation..tx.operation_count());
     }
     Ok(report)
 }

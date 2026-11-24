@@ -118,25 +118,14 @@ fn user(s: impl Into<String>) -> CliError {
 /// check comes first so its message names `kala user`.
 ///
 /// Another process may commit to the world between this form's start and
-/// its commit; kala-core then refuses the commit, having written nothing
-/// and caught the world up ([`kala_core::Error::SnapshotStale`]). The form
-/// is applied again from scratch on the caught-up world, as if it had been
-/// submitted a moment later, a bounded number of times. (Stage 2 of slice
-/// 15b: the conflict check that lets a form commit over commits it doesn't
-/// conflict with replaces this loop.)
+/// its commit. kala-core then commits the form over those transactions
+/// (final IDs, the form's own latest tick) unless one of them wrote
+/// something the form read (a `:set`, a conditional create): that is a
+/// conflict ([`kala_core::Error::Conflict`]), nothing is written, and the
+/// error says to run the form again.
 pub fn execute(w: &mut World, form: &WriteTxn, default: Option<Tick>) -> Result<Report, CliError> {
-    const STALE_RETRIES: usize = 32;
     refuse_system(w)?;
-    let mut attempt = 0;
-    let report = loop {
-        match kala_lang::write::execute(w, form, default) {
-            Err(kala_lang::write::WriteError {
-                cause: kala_lang::write::Failure::Store(kala_core::Error::SnapshotStale { .. }),
-                ..
-            }) if attempt < STALE_RETRIES => attempt += 1,
-            other => break other.map_err(write_err)?,
-        }
-    };
+    let report = kala_lang::write::execute(w, form, default).map_err(write_err)?;
     Ok(committed_report(w, report))
 }
 /// Create-mode restores own a private file. `system` says the genesis of the

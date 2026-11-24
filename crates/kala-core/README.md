@@ -192,8 +192,10 @@ assert_eq!(world.format_id(greg), "CHARACTER#3");
   committed since (it reads only the new transactions, takes no lock and
   never changes the file); `World::begin` and the auto-committed writes do
   it first. A commit that finds newer transactions than its transaction
-  began on fails with `Error::SnapshotStale` and writes nothing (run it
-  again). Only a commit, under the lock, cuts a torn tail; a damaged one
+  began on commits over them (final IDs in `CommitResult::ids`), unless
+  they wrote something it read: then it fails with `Error::Conflict` and
+  writes nothing (run it again; `Concurrency::Weak` skips that check).
+  Only a commit, under the lock, cuts a torn tail; a damaged one
   fails it with `Error::RecoveryRequired` until
   `World::acknowledge_recovery`. A handle whose file was cut below what it
   applied, rewritten or replaced gets `Error::LogDiverged` and must be

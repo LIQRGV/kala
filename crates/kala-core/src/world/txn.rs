@@ -1,7 +1,9 @@
 //! The write path: validating a fact into a definition, judging it against
 //! what holds at its tick, and [`Txn`], which stages and commits writes.
 
+use super::concurrency::{Call, ReadSet, Recorded, Snapshot};
 use super::*;
+use std::cell::{Cell, RefCell};
 
 /// One entry a transaction staged, in write order: the order of its log
 /// entries.
@@ -49,7 +51,7 @@ impl Staged {
 #[derive(Debug)]
 pub(super) struct Target {
     /// The chain's base entry.
-    base: EntryId,
+    pub(super) base: EntryId,
     chain: Chain,
     /// The chain's current fact, as stored.
     pub(super) fact: FactDef,
@@ -121,6 +123,22 @@ pub struct CommitResult {
     /// transaction isn't reported (see [`Warnings`]). Empty if nothing was
     /// appended.
     pub warnings: Warnings,
+    /// The IDs this transaction allocated that the commit changed, because
+    /// other transactions were committed since it began: provisional to
+    /// final (see [`IdMap`]). Translate any entity or edge ID the
+    /// transaction returned before the commit through it. Empty when
+    /// nothing moved.
+    pub ids: IdMap,
+    /// Set when the transaction made a write with no tick (it landed on
+    /// the latest tick the transaction began with) and a newer commit had
+    /// moved the world's latest tick by the time it committed. A warning,
+    /// never a refusal: the write stays where it is.
+    pub latest_tick_moved: Option<TickMoved>,
+    /// Set when other transactions were committed since this one began:
+    /// what the commit made of each operation on the caught-up world
+    /// (counts may differ from what the operations returned when they were
+    /// staged). `None` when the staged entries were committed as they were.
+    pub finalized: Option<Finalized>,
 }
 
 /// The values [`Txn::values_at`] read.
@@ -169,12 +187,17 @@ pub enum TickOccupant {
 /// transaction: every later write returns [`Error::TransactionAborted`], and
 /// so does [`Txn::commit`], which then applies nothing. A no-op is not a
 /// failure.
+///
+/// A transaction works on the world as it was when it began. Other handles
+/// on the same log file may commit while it runs; [`Txn::commit`] says what
+/// happens then ("Committing over newer transactions"): by default it
+/// conflicts only if they wrote something this transaction read.
 #[derive(Debug)]
 pub struct Txn<'w> {
     pub(super) world: &'w mut World,
     /// The world's latest tick when the transaction began: the tick of a
     /// write with no tick of its own and no transaction default.
-    base_tick: Tick,
+    pub(super) base_tick: Tick,
     default_tick: Option<Tick>,
     /// The tx this transaction commits as. Fixed at begin: the `Txn` holds
     /// the world mutably, so no other commit can take it first.
@@ -196,7 +219,25 @@ pub struct Txn<'w> {
     /// auto-committed writes, see [`World::begin_locked`]): then the world
     /// was caught up under it and nothing can have been appended since.
     /// Released when the transaction commits or is dropped.
-    held: Option<WriterLock>,
+    pub(super) held: Option<WriterLock>,
+    /// Whether another handle can commit while this transaction runs (a
+    /// file-backed world, the lock not taken at begin): only then are
+    /// operations and reads recorded.
+    pub(super) track: bool,
+    /// Inside a recorded operation: operations it makes aren't recorded.
+    pub(super) nested: bool,
+    /// The operations made so far, as the caller made them (see
+    /// [`Txn::finalize`]).
+    pub(super) ops: Vec<Recorded>,
+    /// What the transaction read (optimistic mode). Interior, because reads
+    /// take `&self`.
+    pub(super) reads: RefCell<ReadSet>,
+    pub(super) concurrency: Concurrency,
+    pub(super) ids_exposed: bool,
+    /// The ID tables' sizes when the transaction began.
+    pub(super) snapshot: Snapshot,
+    /// Whether a write fell back to `base_tick`.
+    pub(super) used_base_tick: Cell<bool>,
 }
 
 impl Txn<'_> {
@@ -208,27 +249,39 @@ impl Txn<'_> {
         node_type: &str,
         handle: &str,
     ) -> Result<(EntityId, bool), Error> {
-        self.guard(|tx| {
-            let expected = *tx
-                .world
-                .catalog
-                .node_type_by_name
-                .get(node_type)
-                .ok_or_else(|| Error::UnknownNodeType(node_type.to_owned()))?;
-            if let Some(id) = tx.entity_by_handle(handle) {
-                if id.node_type() != expected {
-                    return Err(Error::HandleTypeMismatch {
-                        handle: handle.to_owned(),
-                        node_type: tx.world.catalog.node_types[usize::from(id.node_type().0)]
-                            .name
-                            .clone(),
-                    });
-                }
-                return Ok((id, false));
-            }
-            tx.create_entity(node_type, Some(handle))
-                .map(|id| (id, true))
-        })
+        self.recorded(
+            |(id, created)| Call::FindOrCreate {
+                node_type: node_type.to_owned(),
+                handle: handle.to_owned(),
+                id: *id,
+                created: *created,
+            },
+            |tx| {
+                tx.guard(|tx| {
+                    let expected = *tx
+                        .world
+                        .catalog
+                        .node_type_by_name
+                        .get(node_type)
+                        .ok_or_else(|| Error::UnknownNodeType(node_type.to_owned()))?;
+                    // A free handle is a read: `entity_by_handle` records it.
+                    if let Some(id) = tx.entity_by_handle(handle) {
+                        if id.node_type() != expected {
+                            return Err(Error::HandleTypeMismatch {
+                                handle: handle.to_owned(),
+                                node_type: tx.world.catalog.node_types
+                                    [usize::from(id.node_type().0)]
+                                .name
+                                .clone(),
+                            });
+                        }
+                        return Ok((id, false));
+                    }
+                    tx.create_entity(node_type, Some(handle))
+                        .map(|id| (id, true))
+                })
+            },
+        )
     }
 
     /// Values held at a tick, including earlier staged operations. This is a
@@ -250,6 +303,9 @@ impl Txn<'_> {
             return Err(Error::TransactionAborted);
         }
         let (attr_id, def) = self.world.catalog.resolve(&self.ids, entity, attr)?;
+        // The read `[:set …]` decides from: a newer entry on this entity
+        // and attribute invalidates it.
+        self.note_key(entity, attr_id, attr, true);
         let work = Work(Some(meter));
         let layers = [&self.world.indexes.e_index, &self.staged];
         let mut values = BTreeMap::new();
@@ -467,7 +523,10 @@ impl Txn<'_> {
 
     /// Resolve an optional tick using the transaction's stable defaults.
     pub fn write_tick(&self, tick: Option<Tick>) -> Tick {
-        tick.or(self.default_tick).unwrap_or(self.base_tick)
+        tick.or(self.default_tick).unwrap_or_else(|| {
+            self.note_base_tick();
+            self.base_tick
+        })
     }
     /// Number of primitive entries staged so far, for language report offsets.
     pub fn staged_entry_count(&self) -> usize {
@@ -478,8 +537,17 @@ impl Txn<'_> {
         self.poisoned = true;
     }
     /// Current committed correction target (staged corrections of it are refused).
+    /// A read of the entry's chain: under optimistic concurrency a newer
+    /// correction of it conflicts with this transaction's commit.
     pub fn current_change(&self, entry: EntryId) -> Result<Change, Error> {
-        self.world.current_change(entry)
+        let target = self.world.correction_target(entry)?;
+        self.note_chain(target.base, entry, target.fact.attr);
+        Ok(Change {
+            tick: target.fact.tick,
+            op: target.fact.op,
+            precision: target.fact.precision,
+            value: target.value,
+        })
     }
 
     /// Sets the tick for this transaction's writes that don't give their
@@ -505,16 +573,25 @@ impl Txn<'_> {
         node_type: &str,
         handle: Option<&str>,
     ) -> Result<EntityId, Error> {
-        self.guard(|txn| {
-            let def = txn
-                .world
-                .catalog
-                .prepare_entity(&txn.ids, node_type, handle)?;
-            let id = def.id;
-            txn.order.push(OrderedEntry::Entity(txn.ids.defs.len()));
-            txn.ids.push(def);
-            Ok(id)
-        })
+        self.recorded(
+            |id| Call::Create {
+                node_type: node_type.to_owned(),
+                handle: handle.map(str::to_owned),
+                id: *id,
+            },
+            |txn| {
+                txn.guard(|txn| {
+                    let def = txn
+                        .world
+                        .catalog
+                        .prepare_entity(&txn.ids, node_type, handle)?;
+                    let id = def.id;
+                    txn.order.push(OrderedEntry::Entity(txn.ids.defs.len()));
+                    txn.ids.push(def);
+                    Ok(id)
+                })
+            },
+        )
     }
 
     /// Runs one write: refused if the transaction is already poisoned or
@@ -600,7 +677,7 @@ impl Txn<'_> {
 
     /// Resolves the tick, validates, judges against committed + staged
     /// facts, and stages the fact unless it is a no-op.
-    fn write(
+    pub(super) fn write(
         &mut self,
         entity: EntityId,
         attr: &str,
@@ -609,8 +686,31 @@ impl Txn<'_> {
         op: Op,
         precision: Precision,
     ) -> Result<WriteResult, Error> {
+        let tick = self.write_tick(tick);
+        self.recorded(
+            |_| Call::Write {
+                entity,
+                attr: attr.to_owned(),
+                value: v.clone(),
+                tick,
+                op,
+                precision,
+            },
+            |txn| txn.write_at(entity, attr, v, tick, op, precision),
+        )
+    }
+
+    /// [`Txn::write`] at a resolved tick.
+    fn write_at(
+        &mut self,
+        entity: EntityId,
+        attr: &str,
+        v: &Value,
+        tick: Tick,
+        op: Op,
+        precision: Precision,
+    ) -> Result<WriteResult, Error> {
         self.guard(|txn| {
-            let tick = tick.or(txn.default_tick).unwrap_or(txn.base_tick);
             let fact = txn.world.prepare_fact(
                 &txn.ids,
                 FactRequest {
@@ -664,8 +764,21 @@ impl Txn<'_> {
     /// before, even if this correction would be a no-op) or at a replaced
     /// fact's new key.
     pub fn correct(&mut self, entry: EntryId, c: Correction) -> Result<WriteResult, Error> {
+        let recorded = self.track.then(|| c.clone());
+        self.recorded(
+            |_| Call::Correct {
+                entry,
+                correction: recorded.unwrap_or(Correction::Delete),
+            },
+            |txn| txn.correct_inner(entry, c),
+        )
+    }
+
+    fn correct_inner(&mut self, entry: EntryId, c: Correction) -> Result<WriteResult, Error> {
         self.guard(|txn| {
             let target = txn.world.correction_target(entry)?;
+            // A correction acts on the chain's current fact: it read it.
+            txn.note_chain(target.base, entry, target.fact.attr);
             let attr = txn.world.catalog.attributes[target.fact.attr.0 as usize]
                 .name
                 .clone();
@@ -872,8 +985,7 @@ impl Txn<'_> {
     /// - transactions other handles appended since this handle last looked
     ///   are applied to the world (as [`World::catch_up`] does). If there
     ///   are any, this transaction was staged on a world that is no longer
-    ///   the latest: the commit fails with [`Error::SnapshotStale`], writes
-    ///   nothing, and a transaction begun now sees them;
+    ///   the latest, and it is committed **over** them (below);
     /// - a torn last transaction (a writer died mid-append) is cut off, as
     ///   [`World::open`] cuts it: saved to a quarantine file first and
     ///   reported by [`World::recovery`]. The commit then goes ahead;
@@ -887,10 +999,41 @@ impl Txn<'_> {
     ///   is [`Error::Corrupt`] (see [`World::catch_up`]); nothing is
     ///   written.
     ///
+    /// **Committing over newer transactions.** Everything a transaction
+    /// allocates is provisional until it commits: entity and edge IDs,
+    /// entry IDs, its tx. If other transactions were appended since it
+    /// began, the commit, still under the lock:
+    ///
+    /// 1. under [`Concurrency::Optimistic`] (the default), checks what the
+    ///    transaction **read** ([`Txn::values_at`], find-or-create, a
+    ///    correction's entry, the `note_*` methods) against the entries
+    ///    those transactions appended. If one of them wrote through a key
+    ///    it read, the commit fails with [`Error::Conflict`] and writes
+    ///    nothing; run the transaction again. Blind writes never conflict.
+    ///    [`Concurrency::Weak`] skips this step;
+    /// 2. makes the transaction's operations again, in order, on the
+    ///    caught-up world: what one writer making them now would store.
+    ///    Entities and edges get their final IDs
+    ///    ([`CommitResult::ids`] maps the provisional ones); an edge a
+    ///    newer commit interned for the same triple is reused; a write
+    ///    that became redundant is "0 changed"
+    ///    ([`CommitResult::finalized`] has the outcome of each operation);
+    ///    an operation the store's rules now refuse (a duplicate handle,
+    ///    the opposite op at the same tick, an entry deleted meanwhile, a
+    ///    deprecated attribute, strict schema, a value's type) fails the
+    ///    commit with its ordinary error, nothing written;
+    /// 3. keeps the latest tick the transaction began with for its
+    ///    tick-less writes, and says so if a newer commit moved it
+    ///    ([`CommitResult::latest_tick_moved`]).
+    ///
+    /// A transaction that staged nothing (every write was a no-op where it
+    /// began) is a read: it returns without taking the lock, as if it had
+    /// committed when it began.
+    ///
     /// The auto-committed writes ([`World::assert`], [`World::retract`],
     /// [`World::correct`], [`World::create_entity`]) take the lock before
     /// they stage their one write, so they are judged on the latest state
-    /// and never fail with [`Error::SnapshotStale`].
+    /// and never conflict.
     pub fn commit(self) -> Result<CommitResult, Error> {
         self.commit_with(true)
     }
@@ -909,7 +1052,7 @@ impl Txn<'_> {
 
     /// The body of [`Txn::commit`]; `warn` selects whether the overlap
     /// warnings diff is computed. Nothing else depends on it.
-    fn commit_with(mut self, warn: bool) -> Result<CommitResult, Error> {
+    pub(super) fn commit_with(mut self, warn: bool) -> Result<CommitResult, Error> {
         if self.poisoned {
             return Err(Error::TransactionAborted);
         }
@@ -924,6 +1067,9 @@ impl Txn<'_> {
                 edges: Vec::new(),
                 warnings: Warnings::default(),
                 schema: Vec::new(),
+                ids: IdMap::default(),
+                latest_tick_moved: None,
+                finalized: None,
             });
         }
         // The writer lock, from here until the log has the transaction (or
@@ -935,7 +1081,7 @@ impl Txn<'_> {
                 Some(held) => {
                     let applied = self.catch_up_under_lock(&held)?;
                     if applied > 0 {
-                        return self.commit_after_catch_up(held, applied, warn);
+                        return self.finalize(held, applied, warn);
                     }
                     Some(held)
                 }
@@ -967,6 +1113,9 @@ impl Txn<'_> {
             edges: self.ids.edges.iter().map(|d| d.id).collect(),
             warnings,
             schema: std::mem::take(&mut self.schema_changes),
+            ids: IdMap::default(),
+            latest_tick_moved: None,
+            finalized: None,
         })
     }
 
@@ -987,30 +1136,6 @@ impl Txn<'_> {
             before.restore(&mut self.world.catalog);
         }
         self.world.apply_tail(tail, Some(held))
-    }
-
-    /// What a commit does when `applied` (> 0) transactions were appended
-    /// to the log since this transaction began. It is handed the writer
-    /// lock `held` (taken for this commit; whatever it appends, it appends
-    /// under it), with the world caught up with those transactions and the
-    /// committed schema restored; everything the transaction staged
-    /// (`order`, `entries`, `ids`, `tx`, its judgements) is still relative
-    /// to the world it began on.
-    ///
-    /// This is where the optimistic commit plugs in (slice 15b, stage 3):
-    /// finalize the staged operations against the caught-up world, check
-    /// what the transaction read against the new entries, and append. Until
-    /// then a transaction never commits over a world it didn't see: it
-    /// fails with [`Error::SnapshotStale`] and writes nothing, and the
-    /// caller runs it again on the caught-up world.
-    fn commit_after_catch_up(
-        self,
-        held: WriterLock,
-        applied: usize,
-        _warn: bool,
-    ) -> Result<CommitResult, Error> {
-        drop(held);
-        Err(Error::SnapshotStale { applied })
     }
 
     /// Which overlap checks this commit's warnings compare before and
@@ -1597,6 +1722,10 @@ impl World {
     pub(super) fn begin_without_catch_up(&mut self) -> Txn<'_> {
         let base_tick = self.latest_tick();
         let tx = self.next_tx();
+        // Only a file other handles can append to can change under a
+        // transaction.
+        let track = self.journal.log.is_some();
+        let snapshot = Snapshot::of(&self.catalog);
         Txn {
             world: self,
             base_tick,
@@ -1610,6 +1739,14 @@ impl World {
             schema_changes: Vec::new(),
             order: Vec::new(),
             held: None,
+            track,
+            nested: false,
+            ops: Vec::new(),
+            reads: RefCell::new(ReadSet::default()),
+            concurrency: Concurrency::Optimistic,
+            ids_exposed: false,
+            snapshot,
+            used_base_tick: Cell::new(false),
         }
     }
 
@@ -1627,6 +1764,8 @@ impl World {
     pub(super) fn begin_locked(&mut self) -> Result<Txn<'_>, Error> {
         let held = self.lock_and_catch_up()?;
         let mut txn = self.begin_without_catch_up();
+        // Under the lock nothing can be appended before the commit.
+        txn.track = held.is_none() && txn.track;
         txn.held = held;
         Ok(txn)
     }

@@ -1,5 +1,6 @@
 //! Transactional schema definitions. The mutable borrow hides provisional names;
 //! dropping or failing a transaction restores only its schema metadata.
+use super::concurrency::Call;
 use super::*;
 
 #[derive(Debug)]
@@ -519,10 +520,27 @@ impl Txn<'_> {
         value: &Value,
         op: Op,
     ) -> Result<bool, Error> {
+        self.recorded(
+            |_| Call::InferWriteAttribute {
+                name: name.to_owned(),
+                value: value.clone(),
+                op,
+            },
+            |txn| txn.infer_write_attribute_op(name, value, op),
+        )
+    }
+    fn infer_write_attribute_op(
+        &mut self,
+        name: &str,
+        value: &Value,
+        op: Op,
+    ) -> Result<bool, Error> {
         if op == Op::Retract
             && self.world.attribute(name).is_none()
             && self.world.world_setting("schema") != Some("strict")
         {
+            // The write is dropped because the name is undeclared: a read.
+            self.note_undeclared_attr(name);
             return self.guard(|_| Ok(false));
         }
         self.infer_attribute(name, value)?;
@@ -535,17 +553,30 @@ impl Txn<'_> {
     }
     /// The current staged definition, including earlier operations in this transaction.
     pub fn attribute(&self, name: &str) -> Option<&AttrDef> {
-        self.world.attribute(name)
+        let def = self.world.attribute(name);
+        if def.is_none() {
+            self.note_undeclared_attr(name);
+        }
+        def
     }
     /// Whether the transaction writes a system world ([`World::is_system`]).
     pub fn is_system(&self) -> bool {
         self.world.is_system()
     }
     /// Resolves a handle including entities created earlier in this transaction.
+    ///
+    /// Finding no entity is a read the caller may decide from (find-or-
+    /// create): under optimistic concurrency a newer commit that creates
+    /// the handle conflicts with this transaction's commit.
     pub fn entity_by_handle(&self, name: &str) -> Option<EntityId> {
-        self.ids
+        let found = self
+            .ids
             .entity_by_handle(name)
-            .or_else(|| self.world.entity_by_handle(name))
+            .or_else(|| self.world.entity_by_handle(name));
+        if found.is_none() {
+            self.note_free_handle(name);
+        }
+        found
     }
     /// The entity's handle, including entities created earlier in this
     /// transaction (the reverse of [`Txn::entity_by_handle`]).
@@ -563,6 +594,15 @@ impl Txn<'_> {
     }
     /// Infers a definition from a first value unless the world is strict.
     pub fn infer_attribute(&mut self, name: &str, value: &Value) -> Result<(), Error> {
+        self.recorded(
+            |_| Call::InferAttribute {
+                name: name.to_owned(),
+                value: value.clone(),
+            },
+            |txn| txn.infer_attribute_op(name, value),
+        )
+    }
+    fn infer_attribute_op(&mut self, name: &str, value: &Value) -> Result<(), Error> {
         self.guard(|txn| {
             if txn.world.attribute(name).is_some() { return Ok(()); }
             check_new_name(name)?;
@@ -578,6 +618,21 @@ impl Txn<'_> {
     /// Only the defaults that live inference can produce are accepted, and
     /// strict mode and reserved-name checks remain in force.
     pub fn infer_attribute_with(
+        &mut self,
+        name: &str,
+        ty: ValueType,
+        options: &AttributeOptions,
+    ) -> Result<(), Error> {
+        self.recorded(
+            |_| Call::InferAttributeWith {
+                name: name.to_owned(),
+                value_type: ty,
+                options: options.clone(),
+            },
+            |txn| txn.infer_attribute_with_op(name, ty, options),
+        )
+    }
+    fn infer_attribute_with_op(
         &mut self,
         name: &str,
         ty: ValueType,
@@ -616,6 +671,12 @@ impl Txn<'_> {
 
     /// Infers a node type unless the world is strict.
     pub fn infer_node_type(&mut self, name: &str) -> Result<(), Error> {
+        self.recorded(
+            |_| Call::InferNodeType(name.to_owned()),
+            |txn| txn.infer_node_type_op(name),
+        )
+    }
+    fn infer_node_type_op(&mut self, name: &str) -> Result<(), Error> {
         self.guard(|txn| {
             if txn.world.catalog.node_type_by_name.contains_key(name) {
                 return Ok(());
@@ -631,7 +692,14 @@ impl Txn<'_> {
         })
     }
     /// Declares or revises an attribute. Origin and deprecation are managed by the store.
-    pub fn declare_attribute(&mut self, mut def: AttrDef) -> Result<(), Error> {
+    pub fn declare_attribute(&mut self, def: AttrDef) -> Result<(), Error> {
+        let recorded = self.track.then(|| def.clone());
+        self.recorded(
+            |_| Call::DeclareAttribute(recorded.expect("recorded only when tracking")),
+            |txn| txn.declare_attribute_op(def),
+        )
+    }
+    fn declare_attribute_op(&mut self, mut def: AttrDef) -> Result<(), Error> {
         self.guard(|txn| {
             if def.deprecated {
                 return Err(Error::Schema(
@@ -650,6 +718,21 @@ impl Txn<'_> {
     /// no facts), starts from the [`AttrDef::new`] defaults. The result is
     /// validated like [`Txn::declare_attribute`].
     pub fn declare_attribute_with(
+        &mut self,
+        name: &str,
+        value_type: ValueType,
+        options: &AttributeOptions,
+    ) -> Result<(), Error> {
+        self.recorded(
+            |_| Call::DeclareAttributeWith {
+                name: name.to_owned(),
+                value_type,
+                options: options.clone(),
+            },
+            |txn| txn.declare_attribute_with_op(name, value_type, options),
+        )
+    }
+    fn declare_attribute_with_op(
         &mut self,
         name: &str,
         value_type: ValueType,
@@ -765,7 +848,10 @@ impl Txn<'_> {
     }
     /// Declares a node type, or confirms an inferred one.
     pub fn declare_node_type(&mut self, name: &str) -> Result<(), Error> {
-        self.guard(|txn| txn.node_type_inner(name, false))
+        self.recorded(
+            |_| Call::DeclareNodeType(name.to_owned()),
+            |txn| txn.guard(|txn| txn.node_type_inner(name, false)),
+        )
     }
     fn node_type_inner(&mut self, name: &str, inferred: bool) -> Result<(), Error> {
         let id = if let Some(id) = self.world.catalog.node_type_by_name.get(name) {
@@ -799,6 +885,15 @@ impl Txn<'_> {
     }
     /// Changes the name at every canon, preserving the attribute ID.
     pub fn rename_attribute(&mut self, old: &str, new: &str) -> Result<(), Error> {
+        self.recorded(
+            |_| Call::Rename {
+                old: old.to_owned(),
+                new: new.to_owned(),
+            },
+            |txn| txn.rename_attribute_op(old, new),
+        )
+    }
+    fn rename_attribute_op(&mut self, old: &str, new: &str) -> Result<(), Error> {
         self.guard(|txn| {
             check_new_name(new)?;
             let id = txn.attr_id(old)?;
@@ -827,6 +922,12 @@ impl Txn<'_> {
     }
     /// Refuses subsequent writes while preserving reads.
     pub fn deprecate_attribute(&mut self, name: &str) -> Result<(), Error> {
+        self.recorded(
+            |_| Call::Deprecate(name.to_owned()),
+            |txn| txn.deprecate_attribute_op(name),
+        )
+    }
+    fn deprecate_attribute_op(&mut self, name: &str) -> Result<(), Error> {
         self.guard(|txn| {
             let id = txn.attr_id(name)?;
             let mut def = txn.world.catalog.attributes[id.0 as usize].clone();
@@ -843,6 +944,15 @@ impl Txn<'_> {
     }
     /// Revises the cardinality label, with overlap warnings at commit.
     pub fn set_cardinality(&mut self, name: &str, cardinality: Cardinality) -> Result<(), Error> {
+        self.recorded(
+            |_| Call::SetCardinality {
+                name: name.to_owned(),
+                cardinality,
+            },
+            |txn| txn.set_cardinality_op(name, cardinality),
+        )
+    }
+    fn set_cardinality_op(&mut self, name: &str, cardinality: Cardinality) -> Result<(), Error> {
         self.guard(|txn| {
             let id = txn.attr_id(name)?;
             let mut def = txn.world.catalog.attributes[id.0 as usize].clone();
@@ -864,6 +974,15 @@ impl Txn<'_> {
     }
     /// Changes a generic world setting, effective for the next operation.
     pub fn world_setting(&mut self, key: &str, value: &str) -> Result<(), Error> {
+        self.recorded(
+            |_| Call::WorldSetting {
+                key: key.to_owned(),
+                value: value.to_owned(),
+            },
+            |txn| txn.world_setting_op(key, value),
+        )
+    }
+    fn world_setting_op(&mut self, key: &str, value: &str) -> Result<(), Error> {
         self.guard(|txn| {
             if txn.world.world_setting(key) == Some(value) {
                 return Ok(());

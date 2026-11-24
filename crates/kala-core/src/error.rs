@@ -240,18 +240,195 @@ pub enum Error {
     /// (its reads keep answering from what it had applied, which the file
     /// no longer backs). Reopen the world.
     LogDiverged,
-    /// A commit found that other transactions were appended to the log
-    /// since this transaction began (`applied` of them; this handle has now
-    /// applied them). Nothing was written. Begin a new transaction on the
-    /// caught-up world and run the writes again.
-    ///
-    /// A placeholder of the per-transaction lock (slice 15b, stage 2): the
-    /// conflict check that lets a transaction commit over newer commits it
-    /// doesn't conflict with replaces it.
-    SnapshotStale {
-        /// How many transactions were appended since this one began.
-        applied: usize,
+    /// An optimistic commit found that a transaction committed after this
+    /// one began wrote something this one had read (or, for a transaction
+    /// marked [`Txn::set_ids_exposed`](crate::Txn::set_ids_exposed), that an
+    /// ID it handed out would change). Nothing was written and the handle
+    /// is caught up: begin a new transaction and run the same reads and
+    /// writes again; they then see the newer state. See [`Conflict`].
+    Conflict(Conflict),
+}
+
+/// Why an optimistic commit was refused ([`Error::Conflict`]): which read a
+/// newer commit invalidated. It names the key as the transaction recorded
+/// it, never what the newer commit wrote there.
+///
+/// A conflict is transient: nothing was written, and the same transaction
+/// run again on the caught-up world reads the new state. Match on
+/// [`Conflict::key`] (or [`ConflictKey::kind`] for a stable label).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Conflict {
+    /// The read that no longer holds.
+    pub key: ConflictKey,
+    /// Where in the transaction the read was made: the number of write
+    /// operations ([`Txn::operation_count`](crate::Txn::operation_count))
+    /// the transaction had made before it, so the read fed the operation
+    /// with this 0-based index (or a later one). For
+    /// [`ConflictKey::ExposedId`], the index of the operation that
+    /// allocated the ID.
+    pub operation: usize,
+    /// How many transactions were committed since this one began.
+    pub applied: usize,
+}
+
+/// The kind of read a [`Conflict`] names, with the key as the transaction
+/// gave it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConflictKey {
+    /// A read of an entity's attribute (`[:set …]`, `Txn::values_at`,
+    /// `Txn::note_read`): a newer entry is on that entity and attribute.
+    EntityAttribute {
+        /// The entity read.
+        entity: EntityId,
+        /// The attribute read, by its name now.
+        attr: String,
     },
+    /// A reverse read ("who is in Varrow", `Txn::note_reverse_read`): a
+    /// newer entry has that target as its value under the attribute.
+    Reverse {
+        /// The target read.
+        target: EntityId,
+        /// The attribute read, by its name now.
+        attr: String,
+    },
+    /// A value lookup (`Txn::note_value_read`): a newer entry has that
+    /// attribute and value. The value isn't repeated here.
+    Value {
+        /// The attribute looked up, by its name now.
+        attr: String,
+    },
+    /// A read of a whole attribute (`Txn::note_read_attribute`, or a read
+    /// set past [`MAX_READ_KEYS`](crate::MAX_READ_KEYS) keys, which is kept
+    /// per attribute): a newer entry or schema change is on that attribute.
+    Attribute {
+        /// The attribute read, by its name now.
+        attr: String,
+    },
+    /// A scan of every entity of a node type (`Txn::note_type_scan`): a
+    /// newer commit created an entity of that type.
+    TypeScan {
+        /// The node type scanned.
+        node_type: String,
+    },
+    /// Type scans or handle reads of a read set past its bound: a newer
+    /// commit created an entity.
+    AnyDefine,
+    /// A handle that was free when read (find-or-create,
+    /// `Txn::entity_by_handle`): a newer commit created an entity with it.
+    Handle {
+        /// The handle read.
+        handle: String,
+    },
+    /// The entry (its revision chain) a correction read: a newer commit
+    /// corrected it.
+    Entry {
+        /// The entry named in the correction or read.
+        entry: EntryId,
+    },
+    /// A name that was undeclared when the transaction looked it up (an
+    /// attribute or node type): a newer commit declared it.
+    Undeclared {
+        /// The name looked up.
+        name: String,
+    },
+    /// `Txn::note_read_all`: any newer commit conflicts.
+    All,
+    /// The transaction was marked as having shown its provisional IDs
+    /// (`Txn::set_ids_exposed`), and this entity or edge ID would be
+    /// renumbered, or merged into one a newer commit defined.
+    ExposedId {
+        /// The provisional ID, as the transaction handed it out.
+        id: EntityId,
+    },
+}
+
+impl ConflictKey {
+    /// A stable label for the kind of key, for adapters that map conflicts
+    /// to their own codes.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ConflictKey::EntityAttribute { .. } => "entity-attribute",
+            ConflictKey::Reverse { .. } => "reverse",
+            ConflictKey::Value { .. } => "value",
+            ConflictKey::Attribute { .. } => "attribute",
+            ConflictKey::TypeScan { .. } => "type-scan",
+            ConflictKey::AnyDefine => "any-define",
+            ConflictKey::Handle { .. } => "handle",
+            ConflictKey::Entry { .. } => "entry",
+            ConflictKey::Undeclared { .. } => "undeclared",
+            ConflictKey::All => "all",
+            ConflictKey::ExposedId { .. } => "exposed-id",
+        }
+    }
+}
+
+impl fmt::Display for Conflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("conflict: ")?;
+        match &self.key {
+            ConflictKey::EntityAttribute { attr, .. } => write!(
+                f,
+                "another transaction wrote {} of an entity this transaction read",
+                Quoted(attr)
+            )?,
+            ConflictKey::Reverse { attr, .. } => write!(
+                f,
+                "another transaction wrote {} pointing at an entity this transaction read \
+                 the incoming relationships of",
+                Quoted(attr)
+            )?,
+            ConflictKey::Value { attr } => write!(
+                f,
+                "another transaction wrote a value of {} this transaction looked up",
+                Quoted(attr)
+            )?,
+            ConflictKey::Attribute { attr } => write!(
+                f,
+                "another transaction changed {}, which this transaction read",
+                Quoted(attr)
+            )?,
+            ConflictKey::TypeScan { node_type } => write!(
+                f,
+                "another transaction created a {} entity after this transaction scanned them",
+                Echo(node_type)
+            )?,
+            ConflictKey::AnyDefine => f.write_str(
+                "another transaction created an entity after this transaction scanned them",
+            )?,
+            ConflictKey::Handle { handle } => write!(
+                f,
+                "another transaction created the handle {}, which this transaction found free",
+                Quoted(handle)
+            )?,
+            ConflictKey::Entry { entry } => write!(
+                f,
+                "another transaction corrected entry#{}, which this transaction read",
+                entry.0
+            )?,
+            ConflictKey::Undeclared { name } => write!(
+                f,
+                "another transaction declared {}, which this transaction found undeclared",
+                Quoted(name)
+            )?,
+            ConflictKey::All => {
+                f.write_str("another transaction committed after this one read the world")?
+            }
+            ConflictKey::ExposedId { .. } => f.write_str(
+                "another transaction took an ID this transaction had already handed out",
+            )?,
+        }
+        let what = match self.key {
+            ConflictKey::ExposedId { .. } => "allocated by",
+            _ => "read before",
+        };
+        write!(
+            f,
+            " ({} newer transaction(s), {what} operation {}); nothing was written, \
+             run the transaction again",
+            self.applied,
+            self.operation.saturating_add(1)
+        )
+    }
 }
 
 impl fmt::Display for Error {
@@ -418,11 +595,7 @@ impl fmt::Display for Error {
                 "the log file is no longer the log this world applied (it was cut, rewritten \
                  or replaced by another process); reopen the world",
             ),
-            Error::SnapshotStale { applied } => write!(
-                f,
-                "the world changed since this transaction began ({applied} newer \
-                 transaction(s)); nothing was written, run the transaction again"
-            ),
+            Error::Conflict(conflict) => conflict.fmt(f),
         }
     }
 }
