@@ -24,5 +24,5 @@ proptest = "1.12.0"
 rustix = { version = "1.1.6", features = ["fs", "net", "process"] }
 # Platform sockaddr_un layout only; no unsafe calls.
 libc = "0.2"
-# Private staging directory, created with mode 0700 before publishing a socket.
+# Private staging directory (asked for mode 0700 at mkdir) for publishing a socket.
 tempfile = "3.27.0"

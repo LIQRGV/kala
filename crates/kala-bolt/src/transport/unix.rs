@@ -75,19 +75,26 @@ fn require_trusted_ancestry(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// A new private directory. mkdir gets mode 0700 itself, so the directory
+/// never exists with wider permissions, whatever the umask (tempfile's
+/// default is 0777 minus the umask).
+fn private_directory(prefix: &str, parent: &Path) -> io::Result<tempfile::TempDir> {
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in(parent)
+}
+
 fn staging_directory(parent: &Path, parent_stat: &Stat) -> io::Result<tempfile::TempDir> {
     #[cfg(target_os = "linux")]
     {
         let _ = parent_stat;
-        tempfile::Builder::new()
-            .prefix(".kala-")
-            .tempdir_in(parent)
-            .map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!("Unix socket staging through /proc/self/fd: {e}"),
-                )
-            })
+        private_directory(".kala-", parent).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("Unix socket staging through /proc/self/fd: {e}"),
+            )
+        })
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -101,7 +108,7 @@ fn staging_directory(parent: &Path, parent_stat: &Stat) -> io::Result<tempfile::
             if std::fs::metadata(candidate)?.dev() != parent_dev {
                 break;
             }
-            match tempfile::Builder::new().prefix(".k-").tempdir_in(candidate) {
+            match private_directory(".k-", candidate) {
                 Ok(stage) if validate_path(&stage.path().join("s")).is_ok() => return Ok(stage),
                 Ok(_) => (),
                 Err(e) if e.kind() == io::ErrorKind::PermissionDenied => (),
@@ -226,8 +233,9 @@ impl BoundUnix {
         let locked = DirectoryLock::take(&parent)?;
         let parent_alias = directory_path(&parent, parent_path);
         let stage = staging_directory(&parent_alias, &parent_stat)?;
-        // tempfile creates with 0700; restore owner bits even with a restrictive
-        // caller umask. No other user ever gains access to the staged socket.
+        // Created 0700 minus the umask: never wider, but a restrictive caller
+        // umask can strip owner bits, so restore them. No other user ever
+        // gains access to the staged socket.
         std::fs::set_permissions(stage.path(), std::fs::Permissions::from_mode(0o700))?;
         let stage_dir = File::open(stage.path())?;
         let staged_path = directory_path(&stage_dir, stage.path()).join("s");
