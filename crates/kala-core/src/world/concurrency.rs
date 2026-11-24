@@ -726,21 +726,18 @@ impl Txn<'_> {
     /// [`Concurrency::Optimistic`]). Choose before the transaction reads:
     /// under [`Concurrency::Weak`] reads aren't recorded, so going back to
     /// optimistic after a read was made that way counts as having read
-    /// everything (any newer commit then conflicts). A transaction that
-    /// has read nothing yet changes mode freely.
+    /// everything (any newer commit then conflicts). Reads recorded under
+    /// optimistic mode are kept across a switch to weak (a weak commit
+    /// doesn't check them) and count again, exactly, after a switch back.
+    /// A transaction that has read nothing yet changes mode freely.
     pub fn set_concurrency(&mut self, mode: Concurrency) {
-        match (self.concurrency, mode) {
-            (Concurrency::Optimistic, Concurrency::Weak) => {
-                *self.reads.borrow_mut() = ReadSet::default();
-            }
-            (Concurrency::Weak, Concurrency::Optimistic) => {
-                // Only reads that went unrecorded can't be vouched for.
-                if self.unrecorded_reads.get() {
-                    let at = self.ops.len();
-                    self.reads.borrow_mut().read_all(at);
-                }
-            }
-            _ => {}
+        // Only reads that went unrecorded can't be vouched for.
+        if self.concurrency == Concurrency::Weak
+            && mode == Concurrency::Optimistic
+            && self.unrecorded_reads.get()
+        {
+            let at = self.ops.len();
+            self.reads.borrow_mut().read_all(at);
         }
         self.concurrency = mode;
     }

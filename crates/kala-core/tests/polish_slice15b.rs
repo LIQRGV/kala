@@ -963,3 +963,55 @@ fn a_read_of_an_undeclared_name_conflicts_once_a_newer_commit_declares_it() {
         assert_clean(&b);
     }
 }
+
+// ---- P (round 2): reads made before a switch to weak mode are kept ----
+
+#[test]
+fn reads_recorded_before_a_switch_to_weak_count_again_after_switching_back() {
+    for (theirs, conflicts) in [("age", true), ("tag", false)] {
+        let (_dir, path, mut a, greg) = world();
+        let mut b = World::open(&path).unwrap();
+        let mut tb = b.begin();
+        // Read under optimistic mode, then weak and back with no read in
+        // between: the read still counts.
+        tb.note_read(greg, "age").unwrap();
+        tb.set_concurrency(Concurrency::Weak);
+        tb.set_concurrency(Concurrency::Optimistic);
+        tb.assert(greg, "age", Value::I64(30), Some(Tick(5)))
+            .unwrap();
+        let value = if theirs == "age" {
+            Value::I64(29)
+        } else {
+            s("unrelated")
+        };
+        a.assert(greg, theirs, value, Some(Tick(5))).unwrap();
+        let outcome = tb.commit();
+        if conflicts {
+            let Err(Error::Conflict(conflict)) = outcome else {
+                panic!("expected a conflict, got {outcome:?}");
+            };
+            assert_eq!(
+                conflict.key,
+                ConflictKey::EntityAttribute {
+                    entity: greg,
+                    attr: "age".into()
+                }
+            );
+        } else {
+            // Exactly what was read, not "everything".
+            assert_eq!(outcome.unwrap().changed, 1);
+            assert_clean(&b);
+        }
+    }
+    // Committed while weak, the earlier read is not checked.
+    let (_dir, path, mut a, greg) = world();
+    let mut b = World::open(&path).unwrap();
+    let mut tb = b.begin();
+    tb.note_read(greg, "age").unwrap();
+    tb.set_concurrency(Concurrency::Weak);
+    tb.assert(greg, "age", Value::I64(30), Some(Tick(5)))
+        .unwrap();
+    a.assert(greg, "age", Value::I64(29), Some(Tick(5)))
+        .unwrap();
+    assert_eq!(tb.commit().unwrap().changed, 1);
+}
