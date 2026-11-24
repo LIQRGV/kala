@@ -8,7 +8,7 @@ mod common;
 #[path = "common/damage.rs"]
 mod damage;
 
-use common::{VARROW, code, kala, stderr, stdout};
+use common::{VARROW, code, feed, kala, stderr, stdout};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -733,7 +733,6 @@ fn user_password_flag_before_subcommand_is_diagnosed_without_echoing_the_value()
 
 /// Runs `kala repl --write world [extra]` with `input` on stdin.
 fn repl_write(world: &Path, extra: &[&str], input: &str) -> Output {
-    use std::io::Write;
     let mut child = Command::new(env!("CARGO_BIN_EXE_kala"))
         .args(["repl", "--write"])
         .arg(world)
@@ -743,12 +742,7 @@ fn repl_write(world: &Path, extra: &[&str], input: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
+    feed(&mut child, input.as_bytes());
     child.wait_with_output().unwrap()
 }
 
@@ -873,7 +867,6 @@ fn recovery_and_write_report_outputs_never_contain_hashes_or_passwords() {
 
 /// `kala user <args>` with `input` piped to stdin.
 fn user_stdin(args: &[&str], input: &str) -> Output {
-    use std::io::Write;
     let mut child = Command::new(env!("CARGO_BIN_EXE_kala"))
         .arg("user")
         .args(args)
@@ -882,12 +875,7 @@ fn user_stdin(args: &[&str], input: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
+    feed(&mut child, input.as_bytes());
     child.wait_with_output().unwrap()
 }
 

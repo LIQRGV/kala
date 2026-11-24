@@ -5,7 +5,6 @@ use common::*;
 use kala_core::{Tick, TxId, Value, World};
 use serde_json::Value as Json;
 use std::fs;
-use std::io::Write;
 use std::process::{Command, Output, Stdio};
 
 fn loaded_varrow() -> Fx {
@@ -543,12 +542,8 @@ fn repl(path: &std::path::Path, source: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(source.as_bytes())
-        .unwrap();
+    // A refused world (the system world) exits before reading its input.
+    feed(&mut child, source.as_bytes());
     child.wait_with_output().unwrap()
 }
 

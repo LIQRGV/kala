@@ -29,12 +29,7 @@ fn repl(f: &Fx, text: &str, flags: &[&str]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(text.as_bytes())
-        .unwrap();
+    feed(&mut child, text.as_bytes());
     child.wait_with_output().unwrap()
 }
 
