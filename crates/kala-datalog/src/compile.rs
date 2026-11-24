@@ -192,6 +192,8 @@ struct Compiler<'w> {
     param_order: Vec<String>,
     /// The type of every parameter used so far.
     types: HashMap<String, ValueType>,
+    /// Recursive rule seed passes may see head positions before propagation.
+    inferring_rule_types: bool,
 }
 
 impl<'w> Compiler<'w> {
@@ -202,6 +204,7 @@ impl<'w> Compiler<'w> {
             params: HashMap::new(),
             param_order: Vec::new(),
             types: HashMap::new(),
+            inferring_rule_types: false,
         }
     }
 
@@ -346,9 +349,11 @@ impl<'w> Compiler<'w> {
             // validations and final IR. Rotating a large recursive head must
             // not recompile its whole body once per position.
             let mut out = Vec::new();
+            self.inferring_rule_types = comp.recursive;
             for &ri in &comp.rules {
                 self.rule_defs(ri, rules, by_name, &mut out)?;
             }
+            self.inferring_rule_types = false;
             if comp.recursive {
                 propagate_head_types(comp, rules, by_name);
                 out.clear();
@@ -762,7 +767,21 @@ impl<'w> Compiler<'w> {
                 match ty {
                     Some(Ty::Val(ty)) => self.use_param(s, ty, param_kind(ty))?,
                     Some(t) => return Err(param_not_a_value(s, t)),
-                    None => {}
+                    // Captured parameters can occur in recursive bodies before
+                    // their callees' head types have been propagated.
+                    None if self.inferring_rule_types => {}
+                    None => {
+                        return Err(mismatch(
+                            s.span,
+                            format!(
+                                "argument {} of `{}` can't be typed: the rule never binds it \
+                                 to a fact, so ?{} has no type here",
+                                i + 1,
+                                show(&c.name),
+                                show(&s.name)
+                            ),
+                        ));
+                    }
                 }
                 Term::Param(s.name.clone())
             }
