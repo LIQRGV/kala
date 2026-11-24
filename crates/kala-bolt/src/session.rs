@@ -232,11 +232,16 @@ impl Session<'_> {
                     "authentication failed",
                 )
             })?;
+        // A Unix peer has no IP; `-` rather than a host name that could be
+        // mistaken for a loopback TCP client.
+        let (client_ip, transport) = match self.peer {
+            Peer::Ip(ip) => (ip.to_string(), "tcp"),
+            Peer::Local => ("-".to_owned(), "unix"),
+        };
         eprintln!(
-            "event=bolt_authenticated connection_id={} user={:?} client_ip={}",
+            "event=bolt_authenticated connection_id={} user={:?} client_ip={client_ip} peer={transport}",
             self.id,
             crate::error::escape(&identity.principal),
-            self.peer
         );
         self.identity = Some(identity);
         Ok(())
