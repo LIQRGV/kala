@@ -97,7 +97,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering as AtomicOrdering};
-pub use txn::{CommitResult, TickOccupant, Txn};
+pub use txn::{CommitResult, HeldValues, TickOccupant, Txn};
 pub use view::View;
 use {catalog::*, ids::*, index::*, journal::*, meter::*, open::*, txn::*, write_gate::*};
 

@@ -179,12 +179,16 @@ A form containing `:set` has a budget of 256 expanded primitive writes/operation
 (no-op operations count once). Requested and held sets each have at most 256
 members; all sets in one form share a 16 MiB budget for their combined encoded
 requested/held values and a 65,536-key read budget (conflict diagnostics included). A limit error aborts the entire transaction.
+When the attribute itself holds more than 256 values at the tick, the error says
+so (`cannot set :alias: it holds more than 256 values at tick 10 (the :set
+limit); use :retract/:assert`): change such a set member by member.
 
 Each commit retains the first 100 introduced and 100 resolved overlap warnings,
 in their existing deterministic order, with exact omitted counts. A longer list
-ends with `… and N more overlap warnings (run kala doctor to list them)` (or
-`more resolved overlap warnings`). Doctor continues to inspect the full world;
-resolved warnings describe past issues and are no longer current doctor findings.
+ends with `… and N more overlap warnings (run kala doctor to list them)`, or
+for resolved ones `… and N more resolved overlap warnings` (no doctor hint:
+doctor inspects the full world as it is now, and resolved overlaps no longer
+exist).
 JSON includes `introduced_omitted` and `resolved_omitted` only when nonzero.
 
 `--json` prints one document per successful form, with fields `form`, `dry_run`,

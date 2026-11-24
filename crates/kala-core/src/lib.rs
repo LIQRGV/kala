@@ -40,6 +40,7 @@ pub use schema::{
 pub use tick::{Precision, Tick};
 pub use value::{MAX_INDEXED_STRING_BYTES, Value, ValueError, ValueType, fold_for_search};
 pub use world::{
-    AttrStats, Change, CommitResult, Correction, CutCause, Direction, EntryInfo, IndexDump, Mark,
-    MeteredView, Op, RecoveryReport, TickOccupant, TxId, Txn, View, WorkMeter, World, WriteResult,
+    AttrStats, Change, CommitResult, Correction, CutCause, Direction, EntryInfo, HeldValues,
+    IndexDump, Mark, MeteredView, Op, RecoveryReport, TickOccupant, TxId, Txn, View, WorkMeter,
+    World, WriteResult,
 };

@@ -123,6 +123,17 @@ pub struct CommitResult {
     pub warnings: Warnings,
 }
 
+/// The values [`Txn::values_at`] read.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HeldValues {
+    /// The values held, in encoding order: all of them, or the first `limit`
+    /// found when `more` is set.
+    pub values: Vec<Value>,
+    /// The attribute holds more than `limit` values at the tick; the read
+    /// stopped retaining at `limit`.
+    pub more: bool,
+}
+
 /// What holds a value's exact tick, from [`Txn::entry_at_tick`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TickOccupant {
@@ -217,8 +228,10 @@ impl Txn<'_> {
 
     /// Values held at a tick, including earlier staged operations. This is a
     /// read only: language-level replacement still writes explicit primitives.
-    /// Distinct-value walks and seeks charge `meter`; stop before retaining more
-    /// than `limit` values or `max_bytes` encoded bytes (at most 16 MiB).
+    /// Distinct-value walks and seeks charge `meter`. At most `limit` values are
+    /// retained: when more are held, [`HeldValues::more`] is set (not an
+    /// error, so a caller can say exactly that). Exceeding `max_bytes` encoded
+    /// bytes (at most 16 MiB) or the meter is [`Error::WorkInterrupted`].
     pub fn values_at(
         &self,
         entity: EntityId,
@@ -227,7 +240,7 @@ impl Txn<'_> {
         limit: usize,
         max_bytes: usize,
         meter: &WorkMeter<'_>,
-    ) -> Result<Vec<Value>, Error> {
+    ) -> Result<HeldValues, Error> {
         if self.poisoned {
             return Err(Error::TransactionAborted);
         }
@@ -237,13 +250,16 @@ impl Txn<'_> {
         let mut values = BTreeMap::new();
         let mut bytes = 0usize;
         let mut error = None;
+        let mut more = false;
         let mut keep = |encoding: &[u8]| {
-            if error.is_some() || values.contains_key(encoding) {
+            if error.is_some() || more || values.contains_key(encoding) {
                 return;
             }
-            if values.len() >= limit
-                || bytes.saturating_add(encoding.len()) > max_bytes.min(crate::MAX_ENTRY_BYTES)
-            {
+            if values.len() >= limit {
+                more = true;
+                return;
+            }
+            if bytes.saturating_add(encoding.len()) > max_bytes.min(crate::MAX_ENTRY_BYTES) {
                 error = Some(Error::WorkInterrupted {
                     reason: WorkInterruptReason::Limit,
                 });
@@ -324,7 +340,10 @@ impl Txn<'_> {
         if let Some(error) = error {
             return Err(error);
         }
-        Ok(values.into_values().collect())
+        Ok(HeldValues {
+            values: values.into_values().collect(),
+            more,
+        })
     }
 
     /// The entry currently occupying a value's exact tick: one this transaction

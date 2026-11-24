@@ -35,6 +35,11 @@ pub enum Failure {
     SetEvent(String),
     /// Replacement work exceeded the documented per-form budget.
     Limit,
+    /// The attribute holds more values at the tick than one `:set` reads.
+    SetTooManyHeld {
+        attr: String,
+        tick: Tick,
+    },
     /// The store's same-tick conflict: the opposite op is already stored for
     /// this value at this tick.
     SameTick(Box<SameTick>),
@@ -102,6 +107,13 @@ impl std::fmt::Display for WriteError {
                 ":set exceeds the {}-operation/value limit, 16 MiB per-form value budget, or {}-key read budget",
                 crate::MAX_WRITE_OPS,
                 MAX_SET_READ_KEYS
+            ),
+            Failure::SetTooManyHeld { attr, tick } => write!(
+                f,
+                "cannot set :{}: it holds more than {} values at tick {} (the :set limit); use :retract/:assert",
+                Echo(attr),
+                crate::MAX_WRITE_OPS,
+                tick.0
             ),
             Failure::SameTick(conflict) => {
                 let SameTick {
@@ -757,12 +769,24 @@ fn stage_set(tx: &mut Txn<'_>, op: &WriteOp, state: &mut FormState) -> Result<St
                 Failure::Store(e)
             }
         })?;
+    if held.more {
+        return Err(Failure::SetTooManyHeld {
+            attr: attr.name.clone(),
+            tick,
+        });
+    }
     let mut removed = Vec::new();
-    for value in held {
+    for value in held.values {
         let key = value
             .encode()
             .map_err(|e| Failure::Store(kala_core::Error::Value(e)))?;
-        state.remaining_bytes -= key.len();
+        // `values_at` already kept the held values within the remaining
+        // budget; a checked subtraction keeps that an error, never a wrap,
+        // if the two ever disagree.
+        state.remaining_bytes = state
+            .remaining_bytes
+            .checked_sub(key.len())
+            .ok_or(Failure::Limit)?;
         if wanted.remove(&key).is_none() {
             removed.push(value);
         }

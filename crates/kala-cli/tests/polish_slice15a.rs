@@ -246,3 +246,66 @@ fn set_member_lists_take_tagged_values_and_wrapped_edge_triples() {
     assert_eq!(j["changed"], 1);
     assert_eq!(values(&f, "greg", "friend", 302).len(), 3);
 }
+
+// --- F: limits say what they are ---------------------------------------------
+
+/// `:set` reads at most 256 held values. Past that the error names the
+/// attribute, the tick and the way out, not the generic budget text.
+#[test]
+fn set_on_an_attribute_holding_more_than_256_values_says_so() {
+    for held in [257, 400] {
+        let f = build(EMPTY);
+        let mut w = World::open(&f.path).unwrap();
+        let edwin = w.entity_by_handle("edwin").unwrap();
+        let mut tx = w.begin();
+        for i in 0..held {
+            tx.assert(edwin, "alias", Value::Str(format!("a{i}")), Some(Tick(0)))
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        drop(w);
+        for source in [
+            "[:set :edwin :alias [] :at 10]",
+            "[:set :edwin :alias [\"a1\" \"new\"] :at 10]",
+        ] {
+            assert_eq!(
+                refused(&f, source),
+                format!(
+                    "{PREFIX}op 1 (:set): cannot set :alias: it holds more than 256 values at tick 10 (the :set limit); use :retract/:assert"
+                ),
+                "{held} held, {source}"
+            );
+        }
+        // At a tick where it holds nothing, the same form is fine.
+        assert_eq!(
+            apply(&f, "[:set :edwin :alias [\"x\"] :at -5]")["changed"],
+            1
+        );
+    }
+}
+
+// --- G: the capped resolved-warnings line ------------------------------------
+
+/// Doctor lists current overlaps; resolved ones no longer exist, so only the
+/// introduced line points at it.
+#[test]
+fn capped_resolved_warnings_do_not_point_at_doctor() {
+    let f = build(EMPTY);
+    let members = (0..17)
+        .map(|n| format!("\"n{n:02}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    apply(&f, &format!("[:set :edwin :name [{members}] :at 0]"));
+    let output = transact(&f, "[:set :edwin :name [] :at 10]", false);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let out = stdout(&output);
+    let lines: Vec<&str> = out.lines().filter(|l| l.starts_with('…')).collect();
+    assert_eq!(
+        lines,
+        [
+            "… and 36 more overlap warnings (run kala doctor to list them)",
+            "… and 36 more resolved overlap warnings",
+        ],
+        "{out}"
+    );
+}

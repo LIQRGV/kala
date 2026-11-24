@@ -275,10 +275,12 @@ pub fn render(report: &Report, json: bool) -> String {
     for o in &report.warnings.resolved {
         let _ = writeln!(s, "resolved warning: {o}");
     }
+    // Doctor lists current overlaps only; resolved ones no longer exist, so
+    // this line has no doctor hint.
     if report.warnings.resolved_omitted > 0 {
         let _ = writeln!(
             s,
-            "… and {} more resolved overlap warnings (run kala doctor to list them)",
+            "… and {} more resolved overlap warnings",
             report.warnings.resolved_omitted
         );
     }
