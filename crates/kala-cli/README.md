@@ -144,9 +144,21 @@ Plain creates keep rejecting duplicate handles.
 
 `[:set :greg :located_in :ashford :at 225]` replaces what Greg holds **at tick
 225** by explicitly retracting removed members and asserting new members.
-A scalar is a singleton; `[:set :edwin :alias ["the Grey King" "Ned"] :at 800]`
+A single value is a singleton; `[:set :edwin :alias ["the Grey King" "Ned"] :at 800]`
 replaces the whole set, and `[]` clears it. Duplicate members count once; held
 members keep their original entries and precision. The fixture defines `alias`.
+
+The value position takes every single value `:assert` takes, including the
+tagged scalars: `[:set :greg :score [:f64 :inf]]` and
+`[:set :greg :friend [:id "CHARACTER#2"]]` each set ONE value. Any other vector
+is the member list, and each member is written like an `:assert` value, so
+`[:set :greg :scores [1.5 [:f64 :-inf]]]` and
+`[:set :greg :friend [:mara [:id "CHARACTER#2"]]]` work. One consequence: an
+edge triple as the single value must be wrapped,
+`[:set :note :about [[:edwin :ally_of :mara]]]`, because a bare
+`[:edwin :ally_of :mara]` is a list of three members (and fails with
+``unknown entity `:ally_of` `` unless all three are handles).
+
 `:at` and `:precision` work as on assertions; edge triples can be subjects.
 A set with several values on a `one` attribute is accepted with overlap warnings.
 Events, deprecated attributes and unknown attributes with `[]` are refused.

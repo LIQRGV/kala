@@ -416,7 +416,7 @@ fn operation(items: Vec<Form>, span: Span, restore: bool) -> Result<WriteOp, Dat
         _ => Err(DatalogError::syntax(
             ks,
             format!(
-                "unknown write op :{}; expected :create, :assert, :retract or :correct",
+                "unknown write op :{}; expected :create, :assert, :retract, :set or :correct",
                 show(&kind)
             ),
         )),
@@ -542,7 +542,20 @@ fn create_op(mut args: Args, restore: bool) -> Result<WriteOp, DatalogError> {
         span: args.span,
     })
 }
-/// A scalar means a singleton; a vector is the complete set (including empty).
+/// `[:set subject attribute value-or-members option…]`.
+///
+/// The value position takes every single value `:assert` takes, or a member
+/// list:
+/// - a literal, a handle, or a vector that is a tagged scalar (`[:id "…"]`,
+///   `[:f64 :inf]`, exactly what [`tagged_scalar`] recognises) is ONE value:
+///   the one-member set;
+/// - any other vector is the complete set of members (`[]` = none), each
+///   parsed like an `:assert` value, so tagged scalars and edge triples work
+///   as members.
+///
+/// So an edge triple as the single value must be wrapped
+/// (`[[:edwin :ally_of :mara]]`): a bare `[:edwin :ally_of :mara]` is three
+/// members.
 fn set_op(mut args: Args) -> Result<WriteOp, DatalogError> {
     let span = args.span;
     let subject = value(args.required()?)?;
@@ -561,7 +574,7 @@ fn set_op(mut args: Args) -> Result<WriteOp, DatalogError> {
             items,
             bracket: Bracket::Square,
             ..
-        } => {
+        } if tagged_scalar(&items).is_none() => {
             if items.len() > MAX_WRITE_OPS {
                 return Err(DatalogError::limit(
                     Some(span),

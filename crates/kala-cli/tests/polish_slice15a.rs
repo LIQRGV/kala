@@ -178,3 +178,71 @@ fn same_tick_messages_label_entities_and_values() {
     );
     assert!(!err.contains("EntityId("), "{err}");
 }
+
+// --- E: :set takes every single value :assert takes --------------------------
+
+#[test]
+fn set_accepts_tagged_scalars_as_single_values_like_assert() {
+    let f = build(EMPTY);
+    let inf = Value::f64(f64::INFINITY).unwrap();
+    let j = apply(&f, "[:set :greg :score [:f64 :inf] :at 300]");
+    assert_eq!(j["changed"], 1);
+    assert_eq!(values(&f, "greg", "score", 300), [inf]);
+    // The same value through :assert is already held: 0 changed.
+    assert_eq!(
+        apply(&f, "[:assert :greg :score [:f64 :inf] :at 300]")["changed"],
+        0
+    );
+
+    let edwin = f.id("edwin");
+    assert_eq!(
+        World::open_read_only(&f.path).unwrap().format_id(edwin),
+        "CHARACTER#2"
+    );
+    let j = apply(&f, "[:set :greg :friend [:id \"CHARACTER#2\"] :at 300]");
+    assert_eq!(j["changed"], 1);
+    assert_eq!(values(&f, "greg", "friend", 300), [Value::Ref(edwin)]);
+}
+
+#[test]
+fn set_member_lists_take_tagged_values_and_wrapped_edge_triples() {
+    let f = build(EMPTY);
+    let j = apply(&f, "[:set :greg :scores [1.5 [:f64 :-inf]] :at 300]");
+    assert_eq!(j["changed"], 2);
+    assert_eq!(
+        values(&f, "greg", "scores", 300),
+        [
+            Value::f64(f64::NEG_INFINITY).unwrap(),
+            Value::f64(1.5).unwrap()
+        ]
+    );
+    let j = apply(
+        &f,
+        "[:set :greg :friend [:mara [:id \"CHARACTER#2\"]] :at 300]",
+    );
+    assert_eq!(j["changed"], 2);
+    assert_eq!(
+        values(&f, "greg", "friend", 300),
+        [Value::Ref(f.id("edwin")), Value::Ref(f.id("mara"))]
+    );
+
+    // One edge as the single value is wrapped in a member list.
+    apply(&f, "[:assert :edwin :ally_of :mara :at 1]");
+    let j = apply(&f, "[:set :greg :about [[:edwin :ally_of :mara]] :at 300]");
+    assert_eq!(j["changed"], 1);
+    let w = World::open_read_only(&f.path).unwrap();
+    let edge = w.edge_id(f.id("edwin"), "ally_of", f.id("mara")).unwrap();
+    assert_eq!(values(&f, "greg", "about", 300), [Value::Ref(edge.into())]);
+    drop(w);
+
+    // A bare triple is three members, so its middle element is read as a
+    // handle (documented): wrap the triple instead.
+    let err = refused(&f, "[:set :greg :about [:edwin :ally_of :mara] :at 301]");
+    assert_eq!(
+        err,
+        format!("{PREFIX}op 1 (:set): unknown entity `:ally_of`")
+    );
+    let j = apply(&f, "[:set :greg :friend [:edwin :mara :greg] :at 302]");
+    assert_eq!(j["changed"], 1);
+    assert_eq!(values(&f, "greg", "friend", 302).len(), 3);
+}
