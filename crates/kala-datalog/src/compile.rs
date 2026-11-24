@@ -98,6 +98,9 @@ struct Param {
     span: Span,
     kind: Option<ParamKind>,
     used: bool,
+    /// Set when the parameter was passed to a rule position that has no
+    /// type: the error to report if nothing else gives the parameter one.
+    untyped_call: Option<DatalogError>,
 }
 
 /// One variable scope: `:where`, one rule definition, or one `(not ..)`
@@ -296,6 +299,7 @@ impl<'w> Compiler<'w> {
                         span: s.span,
                         kind: None,
                         used: false,
+                        untyped_call: None,
                     },
                 );
                 self.param_order.push(s.name.clone());
@@ -409,13 +413,15 @@ impl<'w> Compiler<'w> {
     }
 
     /// The declared parameters with their kinds, in `:in` order; one the
-    /// query never uses is an error.
+    /// query never uses is an error, and so is one whose only use is a rule
+    /// position that gives it no type.
     fn used_params(&self) -> Result<Vec<(String, ParamKind)>, DatalogError> {
         let mut params = Vec::with_capacity(self.param_order.len());
         for name in &self.param_order {
             let p = &self.params[name];
-            match (&p.kind, p.used) {
-                (Some(kind), true) => params.push((name.clone(), kind.clone())),
+            match (&p.kind, p.used, &p.untyped_call) {
+                (Some(kind), true, _) => params.push((name.clone(), kind.clone())),
+                (_, _, Some(untyped)) => return Err(untyped.clone()),
                 _ => {
                     return Err(unbound(
                         p.span,
@@ -762,7 +768,24 @@ impl<'w> Compiler<'w> {
                 match ty {
                     Some(Ty::Val(ty)) => self.use_param(s, ty, param_kind(ty))?,
                     Some(t) => return Err(param_not_a_value(s, t)),
-                    None => {}
+                    // Not an error yet: another clause may type the parameter,
+                    // and a recursive rule's head types may still be seeding.
+                    // `used_params` reports it if the parameter stays untyped.
+                    None => {
+                        let error = mismatch(
+                            s.span,
+                            format!(
+                                "argument {} of `{}` can't be typed: the rule never binds it \
+                                 to a fact, so ?{} has no type here",
+                                i + 1,
+                                show(&c.name),
+                                show(&s.name)
+                            ),
+                        );
+                        if let Some(p) = self.params.get_mut(&s.name) {
+                            p.untyped_call.get_or_insert(error);
+                        }
+                    }
                 }
                 Term::Param(s.name.clone())
             }

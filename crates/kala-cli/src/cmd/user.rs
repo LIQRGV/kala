@@ -5,7 +5,7 @@ use crate::{
     escape,
 };
 use kala_system::{
-    auth::Credentials,
+    auth::{AccountName, Credentials},
     system::{self, Applied, Change, Recovery, SystemError},
 };
 use std::io::{self, BufRead, IsTerminal, Read, Write};
@@ -158,6 +158,7 @@ fn add(
     credentials: &UserCredentials,
     write: &UserWrite,
 ) -> Result<String, CliError> {
+    AccountName::parse(account).map_err(|e| system_error(dir, e))?;
     let report = {
         let password = password(credentials)?;
         let password = password.as_ref().map(Credentials::expose);
@@ -172,6 +173,7 @@ fn set(
     credentials: &UserCredentials,
     write: &UserWrite,
 ) -> Result<String, CliError> {
+    AccountName::parse(account).map_err(|e| system_error(dir, e))?;
     let report = {
         let password = password(credentials)?;
         let password = password.as_ref().map(Credentials::expose);
