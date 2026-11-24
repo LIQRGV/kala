@@ -741,80 +741,89 @@ impl<'w> Compiler<'w> {
         let mut args = Vec::with_capacity(c.args.len());
         for (i, a) in c.args.iter().enumerate() {
             let ty = rule.types.get(i).copied().flatten();
-            args.push(match (a, ty) {
-                (Item::Var(s), ty) if self.is_param(scope, &s.name) => {
-                    match ty {
-                        Some(Ty::Val(ty)) => self.use_param(s, ty, param_kind(ty))?,
-                        Some(t) => return Err(param_not_a_value(s, t)),
-                        None => {}
-                    }
-                    Term::Param(s.name.clone())
+            args.push(self.call_arg(c, i, a, ty, scope)?);
+        }
+        Ok(plan::Call {
+            name: c.name.clone(),
+            args,
+        })
+    }
+
+    fn call_arg(
+        &mut self,
+        c: &Call,
+        i: usize,
+        a: &Item,
+        ty: Option<Ty>,
+        scope: &mut Scope,
+    ) -> Result<Term, DatalogError> {
+        Ok(match (a, ty) {
+            (Item::Var(s), ty) if self.is_param(scope, &s.name) => {
+                match ty {
+                    Some(Ty::Val(ty)) => self.use_param(s, ty, param_kind(ty))?,
+                    Some(t) => return Err(param_not_a_value(s, t)),
+                    None => {}
                 }
-                (Item::Var(s), ty) => {
-                    if let Some(ty) = ty {
-                        unify_var(scope, &s.name, ty, s.span)?;
-                    }
-                    scope.bound.insert(s.name.clone());
-                    Term::Var(scope.var(&s.name))
+                Term::Param(s.name.clone())
+            }
+            (Item::Var(s), ty) => {
+                if let Some(ty) = ty {
+                    unify_var(scope, &s.name, ty, s.span)?;
                 }
-                (Item::Any(_), _) => Term::Any,
-                (other, None) => Term::Const(self.constant(other)?.0),
-                (other, Some(Ty::Precision)) => Term::Precision(
-                    precision_constant(other)
-                        .ok_or_else(|| mismatch(other.span(), "expected a precision keyword"))?,
-                ),
-                (other, Some(Ty::Op)) => match op_constant(other) {
-                    Some(o) => Term::Op(o),
-                    None => {
-                        return Err(mismatch(
-                            other.span(),
-                            format!(
-                                "argument {} of `{}` is an op (`:assert` or `:retract`)",
-                                i + 1,
-                                show(&c.name)
-                            ),
-                        ));
-                    }
-                },
-                (other, Some(Ty::Intervals)) => {
+                scope.bound.insert(s.name.clone());
+                Term::Var(scope.var(&s.name))
+            }
+            (Item::Any(_), _) => Term::Any,
+            (other, None) => Term::Const(self.constant(other)?.0),
+            (other, Some(Ty::Precision)) => Term::Precision(
+                precision_constant(other)
+                    .ok_or_else(|| mismatch(other.span(), "expected a precision keyword"))?,
+            ),
+            (other, Some(Ty::Op)) => match op_constant(other) {
+                Some(o) => Term::Op(o),
+                None => {
                     return Err(mismatch(
                         other.span(),
                         format!(
-                            "argument {} of `{}` is an interval set, which can't be a constant",
+                            "argument {} of `{}` is an op (`:assert` or `:retract`)",
                             i + 1,
                             show(&c.name)
                         ),
                     ));
                 }
-                (other, Some(Ty::Val(ty))) => {
-                    let (v, got) = self.constant(other)?;
-                    match (ty, v) {
-                        (t, v) if v.value_type() == t => Term::Const(v),
-                        (ValueType::F64, Value::I64(n)) => {
-                            Term::Const(int_as_f64(n, other.span())?)
-                        }
-                        _ => {
-                            let want = if ty == ValueType::Ref {
-                                "an entity (`:edwin`, `TYPE#n` or `edge#n`)".to_string()
-                            } else {
-                                format!("a {}", ty.name())
-                            };
-                            return Err(mismatch(
-                                other.span(),
-                                format!(
-                                    "argument {} of `{}` needs {want}, not {got}",
-                                    i + 1,
-                                    show(&c.name)
-                                ),
-                            ));
-                        }
+            },
+            (other, Some(Ty::Intervals)) => {
+                return Err(mismatch(
+                    other.span(),
+                    format!(
+                        "argument {} of `{}` is an interval set, which can't be a constant",
+                        i + 1,
+                        show(&c.name)
+                    ),
+                ));
+            }
+            (other, Some(Ty::Val(ty))) => {
+                let (v, got) = self.constant(other)?;
+                match (ty, v) {
+                    (t, v) if v.value_type() == t => Term::Const(v),
+                    (ValueType::F64, Value::I64(n)) => Term::Const(int_as_f64(n, other.span())?),
+                    _ => {
+                        let want = if ty == ValueType::Ref {
+                            "an entity (`:edwin`, `TYPE#n` or `edge#n`)".to_string()
+                        } else {
+                            format!("a {}", ty.name())
+                        };
+                        return Err(mismatch(
+                            other.span(),
+                            format!(
+                                "argument {} of `{}` needs {want}, not {got}",
+                                i + 1,
+                                show(&c.name)
+                            ),
+                        ));
                     }
                 }
-            });
-        }
-        Ok(plan::Call {
-            name: c.name.clone(),
-            args,
+            }
         })
     }
 
