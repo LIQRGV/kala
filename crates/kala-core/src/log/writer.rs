@@ -103,6 +103,42 @@ fn try_read_lock(file: &File) -> Result<Option<ReadLock<'_>>, Error> {
     }
 }
 
+/// Runs `f` while the file at `path` is locked as a log file is for a
+/// commit (its exclusive advisory lock, waited for up to `busy_timeout`):
+/// for replacing or removing a file that may be a world another process is
+/// writing, when it can't be opened as a world (`World::with_writer_lock`
+/// is for one that can). Returns `f`'s result, or `None`, `f` not run, if
+/// there is nothing to lock: no file at `path`, or not a regular file.
+///
+/// Once the lock is held the path is checked to still name the locked
+/// file; if it doesn't (it was replaced meanwhile), `f` isn't run and this
+/// is [`Error::LogDiverged`]. [`Error::WorldLocked`] if the lock stays
+/// held; [`Error::Io`] if the file can't be opened for reading. The lock
+/// is released when `f` returns or panics.
+pub fn with_file_lock<T>(
+    path: &Path,
+    busy_timeout: Duration,
+    f: impl FnOnce() -> T,
+) -> Result<Option<T>, Error> {
+    let file = match open_regular(path, OpenOptions::new().read(true)) {
+        Ok(file) => Arc::new(file),
+        Err(Error::Io { kind, .. })
+            if matches!(
+                kind,
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    let _held = lock(&file, busy_timeout)?;
+    if !names_file(path, &file)? {
+        return Err(Error::LogDiverged);
+    }
+    Ok(Some(f()))
+}
+
 /// Whether `path` names the open `file` (by device and inode, on Unix; one
 /// `stat` and one `fstat`). Elsewhere always `true`.
 fn names_file(path: &Path, file: &File) -> Result<bool, Error> {

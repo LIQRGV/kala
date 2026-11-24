@@ -258,7 +258,7 @@ pub(crate) use fault::fire as fire_hook;
 pub use fault::{LogFault, LogHook, on_log_hook};
 pub(crate) use file::read_log_file;
 pub(crate) use survey::{SurveyedTxn, TaggedFinding, survey};
-pub use writer::DEFAULT_BUSY_TIMEOUT;
+pub use writer::{DEFAULT_BUSY_TIMEOUT, with_file_lock};
 pub(crate) use writer::{
     LogFile, LogWriter, READ_SETTLE_WAIT, Tail, WriterLock, file_len, read_tail_at,
 };

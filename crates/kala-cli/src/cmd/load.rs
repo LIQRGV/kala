@@ -6,7 +6,10 @@
 //!
 //! `--force` replaces a world only while holding its writer lock: the old
 //! world is opened right before the rename and its lock held across it, so
-//! it is never replaced in the middle of another process's commit. A
+//! it is never replaced in the middle of another process's commit. The
+//! same goes for an old file that doesn't open as a world, and the lock is
+//! checked to be the lock of the file the path still names (see
+//! [`replace`]). A
 //! process that merely has the old world open holds no lock (the lock is
 //! per transaction); its next write or catch-up finds its log gone
 //! (`LogDiverged`) and writes nothing. A directory is never replaced.
@@ -59,20 +62,12 @@ pub fn run(args: &LoadArgs) -> Result<String, CliError> {
     let summary = summary(&loaded, fixture, world);
     drop(loaded);
 
-    // The old world's writer lock is held across the rename, so no commit
-    // to it is in progress while it is replaced.
-    let old = if force {
-        lock_old(world, args.busy_timeout)
+    let placed = if force {
+        replace(&tmp, world, args.busy_timeout)
     } else {
-        Ok(None)
+        place(&tmp, world, false)
     };
-    old.and_then(|old| match old {
-        Some(mut old) => old
-            .with_writer_lock(|| place(&tmp, world, force))
-            .map_err(|e| locked_or(world, &e))?,
-        None => place(&tmp, world, force),
-    })
-    .inspect_err(|_| remove_quietly(&tmp))?;
+    placed.inspect_err(|_| remove_quietly(&tmp))?;
     // Make the rename durable; best effort (the log itself is already
     // fsynced by kala-core).
     if let Ok(d) = File::open(&dir) {
@@ -115,14 +110,61 @@ fn refuse_dir(world: &Path) -> CliError {
     ))
 }
 
+/// How often `--force` looks again because the file at the world's path
+/// was replaced by another process while it waited for its lock.
+const REPLACE_ATTEMPTS: usize = 4;
+
+/// `--force`: moves the loaded file `tmp` over `world` while holding the
+/// writer lock of the file that is there, so no commit to it is in
+/// progress while it is replaced:
+///
+/// - an old file that opens as a world is locked through that world
+///   ([`World::with_writer_lock`]);
+/// - one that doesn't (corrupt, not a Kala log) may still be a log that a
+///   process opened earlier and is committing to, so it is locked as a
+///   file ([`kala_core::log::with_file_lock`]), waiting as long;
+/// - with nothing there (or nothing that can be locked: not a regular
+///   file, or unreadable by this user), the file is moved into place.
+///
+/// Either lock is the lock of one file. If the path names another file
+/// once the lock is held (another `load --force` got there first), nothing
+/// is replaced under the wrong lock: the file now at the path is looked at
+/// and locked instead, a few times over.
+fn replace(
+    tmp: &Path,
+    world: &Path,
+    busy_timeout: Option<std::time::Duration>,
+) -> Result<(), CliError> {
+    let wait = busy_timeout.unwrap_or(kala_core::log::DEFAULT_BUSY_TIMEOUT);
+    for _ in 0..REPLACE_ATTEMPTS {
+        let placed = match lock_old(world, busy_timeout)? {
+            Some(mut old) => old.with_writer_lock(|| place(tmp, world, true)),
+            None => match kala_core::log::with_file_lock(world, wait, || place(tmp, world, true)) {
+                Ok(Some(placed)) => Ok(placed),
+                // Nothing a lock can be taken on.
+                Ok(None) | Err(kala_core::Error::Io { .. }) => Ok(place(tmp, world, true)),
+                Err(e) => Err(e),
+            },
+        };
+        match placed {
+            Ok(placed) => return placed,
+            Err(kala_core::Error::LogDiverged) => {}
+            Err(e) => return Err(locked_or(world, &e)),
+        }
+    }
+    Err(CliError::Store(format!(
+        "{}: another process keeps replacing it; nothing was written",
+        escape::path(world)
+    )))
+}
+
 /// Before `--force` replaces `world`: opens the old world for writing (so
 /// the caller can take its writer lock for the rename; the open itself
 /// waits for a commit in progress in another process, up to `busy_timeout`
 /// (`--busy-timeout`; `None` is kala-core's default, 5 s), and is refused
 /// if the lock stays held). Nothing there (or gone meanwhile): `None`. An old file
-/// that doesn't open as a world (corrupt, not a Kala log, unreadable) has
-/// no lock to respect and is replaced as asked: `None` too. A directory is
-/// refused.
+/// that doesn't open as a world (corrupt, not a Kala log, unreadable) is
+/// `None` too: the caller locks it as a file. A directory is refused.
 ///
 /// A process that merely has the old world open, without a commit in
 /// progress, holds no lock (the lock is per transaction): the world is

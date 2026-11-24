@@ -132,6 +132,14 @@ impl Journal {
         self.log.as_ref().map(LogWriter::lock).transpose()
     }
 
+    /// Whether the log writer's path still names the file it has open (and
+    /// locks): `true` for a world with no log writer.
+    pub(super) fn path_is_log_file(&self) -> Result<bool, Error> {
+        self.log
+            .as_ref()
+            .map_or(Ok(true), LogWriter::path_is_this_file)
+    }
+
     /// How long [`Journal::lock`] waits (the default for a world with no
     /// log writer, which never locks).
     pub(super) fn busy_timeout(&self) -> std::time::Duration {

@@ -674,3 +674,54 @@ fn an_open_during_a_commit_whose_fsync_fails_does_not_include_it() {
         assert_clean(&opened);
     }
 }
+
+// ---- E: the writer lock is the lock of the file the path names ----
+
+#[test]
+fn with_writer_lock_refuses_when_the_path_names_another_file() {
+    let (dir, path, mut w, greg) = world();
+    w.assert(greg, "tag", s("a"), Some(Tick(1))).unwrap();
+    // Another process replaced the world (a forced load renames a new log
+    // over the path): this handle's lock is the old, unlinked file's.
+    let other = dir.path().join("other.kala");
+    drop(World::create(&other, schema()).unwrap());
+    std::fs::rename(&other, &path).unwrap();
+    let replaced = bytes(&path);
+    let mut ran = false;
+    let res = w.with_writer_lock(|| ran = true);
+    assert_eq!(res, Err(Error::LogDiverged));
+    assert!(!ran, "nothing runs under the lock of a file the path left");
+    assert!(bytes(&path) == replaced);
+    // The lock was released: the new world is free to write.
+    let mut new = World::open(&path).unwrap();
+    new.create_entity("CHARACTER", Some("x")).unwrap();
+}
+
+#[test]
+fn a_file_is_locked_for_replacing_only_while_the_path_names_it() {
+    use kala_core::log::with_file_lock;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("not-a-world.kala");
+    std::fs::write(&path, b"not a kala log").unwrap();
+    // Free: runs under the lock.
+    assert_eq!(with_file_lock(&path, Duration::ZERO, || 7), Ok(Some(7)));
+    // Held by someone else: refused after the wait, nothing run.
+    let held = hold_lock(&path);
+    let mut ran = false;
+    assert_eq!(
+        with_file_lock(&path, Duration::from_millis(50), || ran = true),
+        Err(Error::WorldLocked)
+    );
+    assert!(!ran);
+    drop(held);
+    // While it runs, a writer of that file is kept out.
+    let inside = with_file_lock(&path, Duration::ZERO, || {
+        let f = OpenOptions::new().read(true).open(&path).unwrap();
+        f.try_lock().is_err()
+    });
+    assert_eq!(inside, Ok(Some(true)));
+    // Nothing there: nothing to lock.
+    let missing = dir.path().join("missing.kala");
+    assert_eq!(with_file_lock(&missing, Duration::ZERO, || 1), Ok(None));
+}

@@ -111,10 +111,21 @@ impl World {
     /// `f` (it is borrowed), and nothing is read or caught up here. A world
     /// with no log writer (in memory, read-only) runs `f` without a lock.
     ///
+    /// The lock is the lock of the file this handle has open. If the path
+    /// no longer names that file once the lock is held (another process
+    /// renamed a new log over it meanwhile), holding it keeps nobody out of
+    /// the file that is there now: `f` isn't run, the handle stops
+    /// following its file and this fails with [`Error::LogDiverged`]. Open
+    /// the world again and retry.
+    ///
     /// A handle whose file was replaced under the lock finds out at its next
     /// commit or catch-up ([`Error::LogDiverged`]).
     pub fn with_writer_lock<T>(&mut self, f: impl FnOnce() -> T) -> Result<T, Error> {
         let _held = self.journal.lock()?;
+        if !self.journal.path_is_log_file()? {
+            self.gate.stop_following(Error::LogDiverged);
+            return Err(Error::LogDiverged);
+        }
         Ok(f())
     }
 
