@@ -1,7 +1,8 @@
 //! Byte transports for one shared Bolt session. Wrappers retain the absolute
 //! deadline and delegate cancellation to the underlying connection.
+pub use kala_system::auth::Peer;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::time::Instant;
 
 /// Cancellation handle owned by the accept loop, independent of blocked I/O.
@@ -21,9 +22,9 @@ pub trait Transport: Send {
     /// Obtain an independent handle that interrupts blocked I/O.
     fn shutdown_handle(&self) -> io::Result<Box<dyn ShutdownHandle>>;
     /// The peer identity used for account matching.
-    fn peer(&self) -> io::Result<IpAddr>;
+    fn peer(&self) -> io::Result<Peer>;
     /// The reached endpoint, used when no advertised address is configured.
-    fn local_addr(&self) -> io::Result<SocketAddr>;
+    fn local_addr(&self) -> io::Result<ListenAddr>;
 }
 
 fn remaining(deadline: Instant) -> io::Result<std::time::Duration> {
@@ -51,29 +52,135 @@ impl Transport for Tcp {
     fn shutdown_handle(&self) -> io::Result<Box<dyn ShutdownHandle>> {
         Ok(Box::new(self.0.try_clone()?))
     }
-    fn peer(&self) -> io::Result<IpAddr> {
-        Ok(self.0.peer_addr()?.ip())
+    fn peer(&self) -> io::Result<Peer> {
+        Ok(Peer::Ip(self.0.peer_addr()?.ip()))
     }
-    fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.0.local_addr()
+    fn local_addr(&self) -> io::Result<ListenAddr> {
+        Ok(ListenAddr::Tcp(self.0.local_addr()?))
     }
 }
 
-pub(crate) struct Listener(TcpListener);
+pub(crate) enum Listener {
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    Unix(unix::BoundUnix),
+}
 impl Listener {
-    pub(crate) fn bind(addr: SocketAddr) -> io::Result<Self> {
-        let listener = TcpListener::bind(addr)?;
-        listener.set_nonblocking(true)?;
-        Ok(Self(listener))
+    pub(crate) fn bind(addr: &ListenAddr, mode: u32) -> io::Result<Self> {
+        match addr {
+            ListenAddr::Tcp(addr) => {
+                let listener = TcpListener::bind(addr)?;
+                listener.set_nonblocking(true)?;
+                Ok(Self::Tcp(listener))
+            }
+            ListenAddr::Unix(path) => {
+                #[cfg(unix)]
+                {
+                    unix::BoundUnix::bind(path, mode).map(Self::Unix)
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = (path, mode);
+                    Err(invalid("unix:// is not supported on this platform"))
+                }
+            }
+        }
     }
-    pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.0.local_addr()
+    pub(crate) fn local_addr(&self) -> io::Result<ListenAddr> {
+        match self {
+            Self::Tcp(listener) => Ok(ListenAddr::Tcp(listener.local_addr()?)),
+            #[cfg(unix)]
+            Self::Unix(listener) => Ok(ListenAddr::Unix(listener.path.clone())),
+        }
     }
     pub(crate) fn accept(&self) -> io::Result<Box<dyn Transport>> {
-        let (stream, _) = self.0.accept()?;
-        // Some platforms inherit nonblocking mode from the listener.
-        stream.set_nonblocking(false)?;
-        stream.set_nodelay(true)?;
-        Ok(Box::new(Tcp(stream)))
+        match self {
+            Self::Tcp(listener) => {
+                let (stream, _) = listener.accept()?;
+                // Some platforms inherit nonblocking mode from the listener.
+                stream.set_nonblocking(false)?;
+                stream.set_nodelay(true)?;
+                Ok(Box::new(Tcp(stream)))
+            }
+            #[cfg(unix)]
+            Self::Unix(listener) => listener.accept(),
+        }
+    }
+}
+
+#[cfg(unix)]
+mod unix;
+
+/// A configured or bound Bolt endpoint.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ListenAddr {
+    /// Bolt over TCP.
+    Tcp(SocketAddr),
+    /// Bolt over a filesystem Unix socket.
+    Unix(std::path::PathBuf),
+}
+impl std::fmt::Display for ListenAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tcp(a) => a.fmt(f),
+            Self::Unix(p) => write!(f, "unix://{}", p.display()),
+        }
+    }
+}
+impl ListenAddr {
+    /// Whether the listener is restricted to the local machine.
+    pub fn is_loopback(&self) -> bool {
+        match self {
+            Self::Tcp(a) => a.ip().is_loopback(),
+            Self::Unix(_) => true,
+        }
+    }
+}
+impl std::str::FromStr for ListenAddr {
+    type Err = io::Error;
+    fn from_str(value: &str) -> io::Result<Self> {
+        let value = match value.split_once("://") {
+            Some(("bolt", address)) => address,
+            Some(("unix", path)) => {
+                let addr = Self::Unix(path.into());
+                addr.validate()?;
+                return Ok(addr);
+            }
+            Some(("neo4j", _)) => return Err(invalid("neo4j:// is not a listen address")),
+            Some((scheme, _)) => return Err(invalid(format!("{scheme}:// is not supported yet"))),
+            None => value,
+        };
+        let addr = if let Some(port) = value.strip_prefix("localhost:") {
+            SocketAddr::from((
+                [127, 0, 0, 1],
+                port.parse::<u16>()
+                    .map_err(|_| invalid("invalid listen port"))?,
+            ))
+        } else {
+            value.parse().map_err(|_| {
+                invalid("listen address must be IP:PORT, [IPv6]:PORT or localhost:PORT (no DNS)")
+            })?
+        };
+        Ok(Self::Tcp(addr))
+    }
+}
+
+fn invalid(message: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+impl ListenAddr {
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        if let Self::Unix(path) = self {
+            #[cfg(unix)]
+            {
+                unix::validate_path(path)?;
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = path;
+                return Err(invalid("unix:// is not supported on this platform"));
+            }
+        }
+        Ok(())
     }
 }

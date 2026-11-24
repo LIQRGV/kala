@@ -14,6 +14,32 @@ use std::{
     sync::{Condvar, Mutex},
 };
 
+/// Authenticated transport origin; a local socket is not an IP loopback alias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Peer {
+    /// A TCP peer address.
+    Ip(IpAddr),
+    /// A filesystem socket peer, matched only by `localhost`.
+    Local,
+}
+impl Peer {
+    /// Whether trust authentication may be considered for this origin.
+    pub fn is_loopback(self) -> bool {
+        match self {
+            Self::Ip(ip) => normalize_ip(ip).is_loopback(),
+            Self::Local => true,
+        }
+    }
+}
+impl fmt::Display for Peer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ip(ip) => ip.fmt(f),
+            Self::Local => f.write_str("localhost"),
+        }
+    }
+}
+
 /// Credentials are accessible to authenticators but always redacted when formatted.
 #[derive(Clone)]
 pub struct Credentials(String);
@@ -211,7 +237,14 @@ impl HostPattern {
     }
     /// Whether this selector includes a peer; IPv4-mapped IPv6 is normalized.
     pub fn matches(&self, peer: IpAddr) -> bool {
-        let peer = normalize_ip(peer);
+        self.matches_peer(Peer::Ip(peer))
+    }
+    /// Match an origin without treating Unix sockets as an invented IP address.
+    pub fn matches_peer(&self, peer: Peer) -> bool {
+        let peer = match peer {
+            Peer::Local => return matches!(self.kind, HostKind::Localhost),
+            Peer::Ip(ip) => normalize_ip(ip),
+        };
         match (&self.kind, peer) {
             (HostKind::Any, _) => true,
             (HostKind::Localhost, ip) => {
@@ -372,6 +405,15 @@ impl AccountVerifier {
         peer: IpAddr,
         system_world: impl FnOnce() -> Result<W, AuthFailure>,
     ) -> Result<Identity, AuthFailure> {
+        self.authenticate_peer(token, Peer::Ip(peer), system_world)
+    }
+    /// Authenticate an IP or local-socket origin against a committed snapshot.
+    pub fn authenticate_peer<W: AsRef<World>>(
+        &self,
+        token: &AuthToken,
+        peer: Peer,
+        system_world: impl FnOnce() -> Result<W, AuthFailure>,
+    ) -> Result<Identity, AuthFailure> {
         let user = match token.scheme.as_str() {
             "none" => "root",
             "basic" => &token.principal,
@@ -381,12 +423,12 @@ impl AccountVerifier {
         let accounts = system::read_accounts(world.as_ref()).map_err(|_| AuthFailure)?;
         let account = accounts
             .iter()
-            .filter(|a| a.summary.user == user && a.host.matches(peer))
+            .filter(|a| a.summary.user == user && a.host.matches_peer(peer))
             .max_by_key(|a| a.host.specificity());
         if let Some(account) = account
             && account.summary.plugin == Plugin::Trust
             && account.host.permits_trust()
-            && normalize_ip(peer).is_loopback()
+            && peer.is_loopback()
         {
             return Ok(account.identity());
         }

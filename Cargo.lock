@@ -425,7 +425,9 @@ dependencies = [
  "kala-lang",
  "kala-query",
  "kala-system",
+ "libc",
  "proptest",
+ "rustix",
  "tempfile",
 ]
 

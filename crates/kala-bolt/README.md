@@ -17,12 +17,12 @@ kala serve worlds --listen 127.0.0.1:7687 --auth accounts \
   --default-db varrow --max-connections 64 --idle-timeout 600
 ```
 
-Port 0 selects a free port, reported by the single stdout startup line
+Port 0 selects a free port, reported by a stdout startup line for each listener
 `kala serve: listening on <address>`. Other diagnostics use structured stderr
 lines; neither queries, parameters nor credentials are logged. `localhost`
 resolves to `127.0.0.1`; `127.0.0.0/8` and `::1` are accepted. Other listen
 addresses require accounts and `--insecure-allow-plaintext`; `--auth none`
-always requires loopback. SIGINT closes the listener and client sockets,
+always requires loopback. SIGINT closes every listener and client socket,
 cancels queries and joins connection threads.
 
 A single discovered user database is the implicit default (`system` is excluded). With multiple databases,
@@ -33,7 +33,7 @@ set `--default-db` or supply the driver's session database. The library exports
 creates, opens or reads `system.kala` (skipping it with one stderr line) and never
 serves the `system` database;
 `Server::bind_with_auth` accepts a custom authenticator but still restricts
-binding to loopback. Authenticators receive the peer IP and return an identity
+binding to loopback. Authenticators receive an IP or explicit local peer and return an identity
 with a matched host and grants. `NoAuth` accepts all well-formed tokens with a `read:*` identity (a
 development mode, not an administrator). Credentials format as
 `<redacted>` and are dropped after the authentication callback.
@@ -42,6 +42,76 @@ Unprefixed query text is Cypher; an explicit first line `// kala:cypher` also
 selects Cypher. `// kala:datalog` followed by a newline selects Datalog; trailing
 ASCII spaces on that line are allowed. `// kala:gremlin` reports that Gremlin is
 not supported yet. See the [Cypher subset](../kala-cypher/README.md).
+
+## Transports and multiple listeners
+
+A transport carries the same Bolt bytes with absolute read/write deadlines,
+peer identity, a reached address, and an independent shutdown handle. TCP and
+Unix streams use one session implementation, including authentication, message
+size/depth bounds and failure/RESET behavior. TLS and WebSocket are planned as
+wrappers of this seam. `Transport` requires no raw descriptor, and
+`Server::with_transport_wrapper` can decorate accepted streams; conformance
+also runs through a wrapper that splits every read and write into single bytes.
+
+`ServerConfig::listen` is a list of `ListenAddr` values; `Server::local_addrs()`
+returns every actual bound endpoint in order. `--listen` accepts bare
+`IP:PORT`, `[IPv6]:PORT`, `localhost:PORT`, the same forms after `bolt://`, and
+(on Unix) `unix:///absolute/path`. DNS is never used. The default remains
+`127.0.0.1:7687`. Up to 16 distinct listeners share one `--max-connections` cap.
+All listeners bind before any startup line is printed; a failed bind closes
+previous listeners and removes newly created Unix sockets. Unsupported schemes
+are errors; `neo4j://` is a client routing URI, not a listen address.
+
+```sh
+kala serve worlds --listen bolt://127.0.0.1:7687 \
+  --listen unix:///run/kala/bolt.sock --unix.mode 0660
+```
+
+Unix paths must be absolute and fit the platform's `sun_path` limit (107 bytes
+on Linux, excluding the trailing NUL). Socket permissions default to `0600`;
+`--unix.mode` accepts octal permission bits through `0777`. Other users gain
+write permission only if it is explicitly requested, for example `0666`.
+Creation binds in a private `0700` staging directory, sets the requested mode,
+then publishes with a no-clobber hard link on the same filesystem. There is no
+public permission window and no process-global umask change. The filesystem
+must support hard links to socket inodes.
+
+The parent directory must belong to the server user or root and must not be
+group/other writable unless sticky. Prefer a private directory restricted to
+intended clients. Linux uses pinned directory descriptors through
+`/proc/self/fd` (procfs must be available), including for staging, and
+no-follow descriptor-relative metadata, publication and cleanup. Other Unix
+platforms additionally require trusted owners/permissions throughout the
+canonical directory ancestry; staging may use a shorter writable ancestor on
+the same filesystem to fit `sun_path`. Processes with the same UID and root
+share filesystem authority and are outside this boundary.
+
+An existing socket is replaced only when a nonblocking connect is refused;
+a live socket, including a full backlog, reports `already in use`. Regular
+files and symlinks are refused without deletion. Clean shutdown removes only
+the socket inode this listener created. Lifecycle operations use nonblocking
+directory locks: lock contention fails closed, and cleanup logs a diagnostic
+and leaves a stale socket if it cannot safely take the lock. A subsequent start
+can reclaim that stale socket. A private directory also prevents unrelated
+users from taking its directory lock.
+
+A Unix peer matches **only `localhost`**, so `root@localhost` trust and password
+accounts work; IP patterns and `%` do not match it. Socket and directory
+permissions are the access boundary, not peer-credential authentication. Some
+Unix systems do not enforce socket write permissions, so restrict the directory
+as well. IP-only custom authenticators retain their existing API and refuse
+local peers unless they implement `authenticate_peer`. Unix listeners count as
+local for `--auth none` and need no plaintext opt-in; every non-loopback TCP
+listener still requires accounts and `--insecure-allow-plaintext`.
+
+With no `--advertised-address`, Unix `SHOW DATABASES` reports `unix:///path`,
+and `ROUTE` fails with `routing over a Unix socket needs --advertised-address`.
+An explicit advertised address is used for both. TCP continues to advertise the
+connection's local address by default, with a warning per non-loopback listener.
+
+Official Neo4j drivers cannot dial Unix sockets. The Unix conformance tests use
+the Rust socket client; the Python driver E2E suite continues to use TCP. On
+non-Unix systems, `unix://` reports `not supported on this platform`.
 
 ## Accounts and privileges
 
@@ -61,7 +131,7 @@ Hosts are matched without DNS, in this order:
 3. CIDR, longest prefix first, e.g. `10.0.0.0/8` or `fd00::/8`.
 4. IPv4 patterns with whole trailing wildcard octets, most literal octets first,
    e.g. `192.168.1.%` or `10.%`.
-5. `%` (any peer).
+5. `%` (any IP peer).
 
 IPv4-mapped IPv6 peers match IPv4 patterns. The most specific account is selected
 before checking credentials; a failed password never falls back to a broader

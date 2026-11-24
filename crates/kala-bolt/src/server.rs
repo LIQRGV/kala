@@ -3,7 +3,7 @@ use crate::{
     auth::{Accounts, Authenticator, NoAuth, Plugin},
     registry::{Registry, SystemDb},
     session,
-    transport::{Listener, ShutdownHandle, Transport},
+    transport::{ListenAddr, Listener, ShutdownHandle, Transport},
 };
 use std::io;
 use std::net::SocketAddr;
@@ -18,8 +18,10 @@ use std::time::Duration;
 /// Listener settings. All durations and bounds must be nonzero.
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
-    /// Listen endpoint; port zero asks the OS for a free port.
-    pub listen: SocketAddr,
+    /// Ordered listen endpoints; TCP port zero asks the OS for a free port.
+    pub listen: Vec<ListenAddr>,
+    /// Filesystem permissions for Unix sockets.
+    pub unix_mode: u32,
     /// Public routing endpoint (HOST:PORT); otherwise the reached socket address.
     pub advertised_address: Option<String>,
     /// Default world name; inferred when exactly one world is registered.
@@ -42,7 +44,8 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            listen: SocketAddr::from(([127, 0, 0, 1], 7687)),
+            listen: vec![ListenAddr::Tcp(SocketAddr::from(([127, 0, 0, 1], 7687)))],
+            unix_mode: 0o600,
             advertised_address: None,
             default_db: None,
             insecure_allow_plaintext: false,
@@ -57,11 +60,14 @@ impl Default for ServerConfig {
 }
 /// A bound server; account authentication bootstraps the system world if absent.
 pub struct Server {
-    listener: Listener,
+    listeners: Vec<Listener>,
+    wrapper: Option<Arc<TransportWrapper>>,
     config: ServerConfig,
     registry: Arc<Registry>,
     auth: Arc<dyn Authenticator>,
 }
+type TransportWrapper = dyn Fn(Box<dyn Transport>) -> Box<dyn Transport> + Send + Sync;
+
 struct Client {
     socket: Box<dyn ShutdownHandle>,
     thread: JoinHandle<()>,
@@ -69,14 +75,16 @@ struct Client {
 impl Server {
     /// Bind a loopback-only, no-auth server and discover its databases.
     /// Never creates, opens or reads `system.kala`, and never serves the
-    /// `system` database; writes nothing to `directory`.
+    /// `system` database; writes no database files.
     pub fn bind(directory: impl AsRef<Path>, config: ServerConfig) -> io::Result<Self> {
+        Self::validate_listeners(&config)?;
         Self::require_loopback(&config)?;
         Self::bind_inner(directory.as_ref(), config, Arc::new(NoAuth), SystemDb::Skip)
     }
     /// Bind with persisted accounts, bootstrapping root@localhost when needed.
     pub fn bind_accounts(directory: impl AsRef<Path>, config: ServerConfig) -> io::Result<Self> {
-        if !config.listen.ip().is_loopback() && !config.insecure_allow_plaintext {
+        Self::validate_listeners(&config)?;
+        if config.listen.iter().any(|a| !a.is_loopback()) && !config.insecure_allow_plaintext {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "accounts require a loopback listen address unless --insecure-allow-plaintext is given",
@@ -108,11 +116,38 @@ impl Server {
         config: ServerConfig,
         auth: Arc<dyn Authenticator>,
     ) -> io::Result<Self> {
+        Self::validate_listeners(&config)?;
         Self::require_loopback(&config)?;
         Self::bind_inner(directory.as_ref(), config, auth, SystemDb::Serve)
     }
+    fn validate_listeners(config: &ServerConfig) -> io::Result<()> {
+        if config.listen.is_empty() || config.listen.len() > 16 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected 1 to 16 listeners",
+            ));
+        }
+        if config.unix_mode > 0o777 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Unix mode must be octal permissions 0000 through 0777",
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for addr in &config.listen {
+            addr.validate()
+                .map_err(|e| io::Error::new(e.kind(), format!("listener {addr}: {e}")))?;
+            if !seen.insert(addr) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("duplicate listen address: {addr}"),
+                ));
+            }
+        }
+        Ok(())
+    }
     fn require_loopback(config: &ServerConfig) -> io::Result<()> {
-        if !config.listen.ip().is_loopback() {
+        if config.listen.iter().any(|a| !a.is_loopback()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "no-auth server requires a loopback listen address",
@@ -162,45 +197,68 @@ impl Server {
             config.default_db.clone(),
             system,
         )?);
-        let listener = Listener::bind(config.listen)?;
+        let mut listeners = Vec::new();
+        for addr in &config.listen {
+            listeners.push(
+                Listener::bind(addr, config.unix_mode)
+                    .map_err(|e| io::Error::new(e.kind(), format!("listener {addr}: {e}")))?,
+            );
+        }
         Ok(Self {
-            listener,
+            listeners,
+            wrapper: None,
             config,
             registry,
             auth,
         })
     }
-    /// The actual endpoint, after resolving port zero.
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.listener.local_addr()
+    /// Actual bound endpoints, in configuration order.
+    pub fn local_addrs(&self) -> io::Result<Vec<ListenAddr>> {
+        self.listeners.iter().map(Listener::local_addr).collect()
+    }
+    /// Wrap every accepted byte transport before running the shared session.
+    /// Wrappers must preserve peer metadata, deadlines and cancellation.
+    pub fn with_transport_wrapper(
+        mut self,
+        wrapper: impl Fn(Box<dyn Transport>) -> Box<dyn Transport> + Send + Sync + 'static,
+    ) -> Self {
+        self.wrapper = Some(Arc::new(wrapper));
+        self
     }
     /// Accept until `shutdown` is set, then close sockets, cancel queries and
     /// join the bounded client threads. No detached connections survive return.
     pub fn run(self, shutdown: Arc<AtomicBool>) -> io::Result<()> {
         let mut clients = Clients::new();
         let mut accept_failed = LogLimit::new();
-        let result = loop {
+        let result = 'accept: loop {
             clients.reap();
             if shutdown.load(Ordering::Relaxed) {
                 break Ok(());
             }
-            match self.listener.accept() {
-                Ok(stream) => self.admit(stream, &mut clients, &shutdown),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(5))
+            let mut accepted = false;
+            for listener in &self.listeners {
+                match listener.accept() {
+                    Ok(stream) => {
+                        accepted = true;
+                        self.admit(stream, &mut clients, &shutdown);
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(e) if accept_error_is_fatal(&e) => break 'accept Err(e),
+                    Err(e) => {
+                        accept_failed.log(format_args!(
+                            "event=bolt_accept_failed error={:?}",
+                            e.kind()
+                        ));
+                        thread::sleep(Duration::from_millis(50));
+                    }
                 }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
-                Err(e) if accept_error_is_fatal(&e) => break Err(e),
-                Err(e) => {
-                    // A connection aborted before accept, EMFILE/ENFILE, a
-                    // network blip: drop it and keep serving (with a short
-                    // pause so fd exhaustion can't spin the loop).
-                    accept_failed.log(format_args!(
-                        "event=bolt_accept_failed error={:?}",
-                        e.kind()
-                    ));
-                    thread::sleep(Duration::from_millis(50));
-                }
+            }
+            if !accepted {
+                thread::sleep(Duration::from_millis(5));
             }
         };
         shutdown.store(true, Ordering::Relaxed);
@@ -219,6 +277,10 @@ impl Server {
             ));
             return;
         }
+        let stream = match &self.wrapper {
+            Some(wrap) => wrap(stream),
+            None => stream,
+        };
         let prepared = stream.shutdown_handle();
         let socket = match prepared {
             Ok(s) => s,

@@ -28,7 +28,7 @@ fn account_server() -> Running {
     system::add(dir.path(), "alice@localhost", None).unwrap();
     system::grant(dir.path(), "alice@localhost", "read", "varrow").unwrap();
     let config = ServerConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
+        listen: vec!["127.0.0.1:0".parse().unwrap()],
         default_db: Some("varrow".into()),
         ..ServerConfig::default()
     };
@@ -341,7 +341,7 @@ fn a_path_ending_on_an_edge_entity_is_refused_not_sent_malformed() {
     let server = Running::in_dir(
         dir,
         ServerConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: vec!["127.0.0.1:0".parse().unwrap()],
             ..ServerConfig::default()
         },
     );

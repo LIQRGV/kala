@@ -283,11 +283,49 @@ See [Bolt accounts and listen rules](../kala-bolt/README.md) for host precedence
 database authorization and the explicit plaintext opt-in needed for a
 non-loopback listener. `--auth none` remains loopback-only.
 
+`--listen` is repeatable (at most 16 distinct addresses), with no DNS lookup:
+
+- `IP:PORT`, `[IPv6]:PORT`, or `localhost:PORT` (`localhost` means `127.0.0.1`).
+- `bolt://HOST:PORT`, using those same host forms.
+- `unix:///absolute/path` on Unix platforms; the path must fit `sun_path`.
+
+No `--listen` still binds `127.0.0.1:7687`. Unsupported URI schemes fail rather
+than selecting another transport. `neo4j://` is a client routing URI and cannot
+be a listener. All listeners share `--max-connections` and stop on Ctrl-C.
+
+```sh
+kala serve worlds --listen bolt://127.0.0.1:7687 \
+  --listen unix:///run/kala/bolt.sock --unix.mode 0660
+```
+
+`--unix.mode` sets octal socket permissions (default `0600`, permitted values
+`0000` through `0777`; special mode bits are refused). Granting other-write
+requires an explicit mode such as `0666`. Use a private directory; a shared
+writable parent must be sticky, and the parent must belong to this user or root.
+See [transport lifecycle and platform rules](../kala-bolt/README.md#transports-and-multiple-listeners).
+Unix peers match only `localhost` accounts. They count as local for auth and
+plaintext rules; adding a non-loopback TCP listener still requires the usual
+opt-in. Official Neo4j drivers cannot connect to the Unix socket.
+
+Startup prints one line per bound listener in the requested order, only after
+all binds succeed (port zero is replaced by its actual port):
+
+```text
+kala serve: listening on 127.0.0.1:7687
+kala serve: listening on unix:///run/kala/bolt.sock
+```
+
+A failed start serves nothing, prints no startup lines, and cleans up sockets
+created by earlier binds. Unix sockets are also removed on clean shutdown,
+provided the path still names this server's inode.
+
 `--advertised-address HOST:PORT` is the address routing drivers (`neo4j://`)
 and `SHOW DATABASES` are given. Without it they get the local address of each
 connection, which is fine on loopback. Set it for every non-loopback listen
 (`--listen 0.0.0.0:7687` behind NAT or in a container would otherwise hand out
-an internal address); `kala serve` warns on stderr when it is missing.
+an internal address); `kala serve` warns on stderr for each such listener when
+it is missing. Over a Unix socket, `SHOW DATABASES` instead reports `unix:///path`
+and `ROUTE` requires `--advertised-address`; an explicit address is used by both.
 
 
 ## Changing and inspecting the schema

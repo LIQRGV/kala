@@ -93,7 +93,7 @@ transactions:
     let server = Running::in_dir(
         dir,
         ServerConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: vec!["127.0.0.1:0".parse().unwrap()],
             ..ServerConfig::default()
         },
     );
@@ -199,7 +199,7 @@ transactions:
     let server = Running::in_dir(
         dir,
         ServerConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: vec!["127.0.0.1:0".parse().unwrap()],
             ..ServerConfig::default()
         },
     );
@@ -313,7 +313,7 @@ fn ambiguous_default_is_refused_and_explicit_default_is_honored() {
             );
         }
         let config = ServerConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: vec!["127.0.0.1:0".parse().unwrap()],
             default_db: default.clone(),
             ..ServerConfig::default()
         };
@@ -363,7 +363,7 @@ fn unreadable_world_is_a_generic_store_error_without_paths() {
     let server = Running::in_dir(
         dir,
         ServerConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: vec!["127.0.0.1:0".parse().unwrap()],
             ..ServerConfig::default()
         },
     );
@@ -384,7 +384,7 @@ fn node_property_larger_than_wire_budget_fails_before_streaming_and_reset_recove
     let server = Running::in_dir(
         dir,
         ServerConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: vec!["127.0.0.1:0".parse().unwrap()],
             ..ServerConfig::default()
         },
     );

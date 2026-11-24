@@ -167,9 +167,12 @@ pub struct SchemaArgs {
 pub struct ServeArgs {
     /// Directory containing <database>.kala world files.
     pub dir: PathBuf,
-    /// IP:port, [IPv6]:port, or localhost:port.
+    /// Repeatable: IP:port, bolt://HOST:port, or unix:///absolute/path (no DNS).
     #[arg(long, default_value = "127.0.0.1:7687")]
-    pub listen: String,
+    pub listen: Vec<String>,
+    /// Unix socket permissions in octal; other-write requires an explicit mode.
+    #[arg(long = "unix.mode", default_value = "0600", value_parser = crate::cmd::serve::unix_mode)]
+    pub unix_mode: u32,
     /// Public HOST:PORT used by routing drivers; defaults to the reached address.
     #[arg(long)]
     pub advertised_address: Option<String>,

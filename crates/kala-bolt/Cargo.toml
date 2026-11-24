@@ -18,3 +18,11 @@ kala-system = { path = "../kala-system" }
 kala-fixture = { path = "../kala-fixture" }
 tempfile = "3.27.0"
 proptest = "1.12.0"
+
+[target.'cfg(unix)'.dependencies]
+# Safe descriptor-relative filesystem operations and nonblocking stale probes.
+rustix = { version = "1.1.6", features = ["fs", "net", "process"] }
+# Platform sockaddr_un layout only; no unsafe calls.
+libc = "0.2"
+# Private staging directory, created with mode 0700 before publishing a socket.
+tempfile = "3.27.0"

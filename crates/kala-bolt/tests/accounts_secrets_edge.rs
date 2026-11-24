@@ -26,7 +26,7 @@ fn server_with(extra: &[(&str, &str)]) -> Running {
     )
     .unwrap();
     let config = ServerConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
+        listen: vec!["127.0.0.1:0".parse().unwrap()],
         ..ServerConfig::default()
     };
     let auth = Arc::new(Accounts::open(dir.path()).unwrap());

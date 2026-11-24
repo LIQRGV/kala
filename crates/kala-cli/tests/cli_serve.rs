@@ -244,3 +244,27 @@ fn no_auth_rejects_non_loopback_even_with_plaintext_opt_in() {
         assert!(String::from_utf8_lossy(&output.stderr).contains("loopback"));
     }
 }
+
+#[test]
+#[cfg(unix)]
+fn two_listeners_print_two_lines() {
+    let server = Process::with_options(
+        "127.0.0.1:0",
+        &["--listen", "bolt://127.0.0.2:0", "--auth", "none"],
+        false,
+    );
+    let (stdout, _) = server.stop();
+    let addresses: Vec<SocketAddr> = stdout
+        .lines()
+        .map(|line| {
+            line.strip_prefix("kala serve: listening on ")
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(addresses.len(), 2, "{stdout}");
+    assert_eq!(addresses[0].ip().to_string(), "127.0.0.1");
+    assert_eq!(addresses[1].ip().to_string(), "127.0.0.2");
+    assert!(addresses.iter().all(|address| address.port() != 0));
+}

@@ -1,4 +1,5 @@
 //! One connection's Bolt state. Authentication failures are terminal.
+use crate::transport::Peer;
 use crate::{
     auth::{AuthToken, Authenticator, Credentials, Identity},
     chunk,
@@ -12,7 +13,6 @@ use crate::{
     transport::Transport,
 };
 use std::io;
-use std::net::IpAddr;
 use std::ops::ControlFlow;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
@@ -45,7 +45,7 @@ struct Session<'a> {
     auth: &'a dyn Authenticator,
     config: &'a ServerConfig,
     id: u64,
-    peer: IpAddr,
+    peer: Peer,
     advertised_address: String,
     output: Option<query::Output>,
     db: String,
@@ -214,12 +214,15 @@ impl Session<'_> {
             principal: field(&mut map, "principal")?,
             credentials: Credentials::new(field(&mut map, "credentials")?),
         };
-        let identity = self.auth.authenticate(&token, self.peer).map_err(|_| {
-            Failure::new(
-                "Neo.ClientError.Security.Unauthorized",
-                "authentication failed",
-            )
-        })?;
+        let identity = self
+            .auth
+            .authenticate_peer(&token, self.peer)
+            .map_err(|_| {
+                Failure::new(
+                    "Neo.ClientError.Security.Unauthorized",
+                    "authentication failed",
+                )
+            })?;
         eprintln!(
             "event=bolt_authenticated connection_id={} user={:?} client_ip={}",
             self.id,
@@ -343,6 +346,12 @@ impl Session<'_> {
     fn route(&self, requested: Option<&str>, impersonate: bool) -> Result<Value, Failure> {
         if impersonate {
             return Err(Failure::impersonation());
+        }
+        if self.peer == Peer::Local && self.config.advertised_address.is_none() {
+            return Err(Failure::new(
+                INVALID,
+                "routing over a Unix socket needs --advertised-address",
+            ));
         }
         // Tools list databases on `system` through a routing URI, and RUN
         // lets any identity do that there, so the table for `system` is not

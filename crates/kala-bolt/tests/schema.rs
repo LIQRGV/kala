@@ -38,7 +38,7 @@ fn renamed_properties_and_relationships_use_new_names_at_old_canon() {
     let server = Running::in_dir(
         dir,
         ServerConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: vec!["127.0.0.1:0".parse().unwrap()],
             ..ServerConfig::default()
         },
     );

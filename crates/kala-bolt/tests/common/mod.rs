@@ -26,7 +26,7 @@ impl Running {
     }
 
     pub fn with_config(mut config: ServerConfig) -> Self {
-        config.listen = "127.0.0.1:0".parse().unwrap();
+        config.listen = vec!["127.0.0.1:0".parse().unwrap()];
         let dir = tempfile::tempdir().unwrap();
         drop(kala_fixture::load_fixture_to(VARROW, &dir.path().join("varrow.kala")).unwrap());
         Self::in_dir(dir, config)
@@ -41,7 +41,7 @@ impl Running {
         let dir = tempfile::tempdir().unwrap();
         drop(kala_fixture::load_fixture_to(VARROW, &dir.path().join("varrow.kala")).unwrap());
         let config = ServerConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: vec!["127.0.0.1:0".parse().unwrap()],
             ..ServerConfig::default()
         };
         let server = Server::bind_with_auth(dir.path(), config, auth).unwrap();
@@ -49,7 +49,9 @@ impl Running {
     }
 
     pub fn from_server(dir: tempfile::TempDir, server: Server) -> Self {
-        let addr = server.local_addr().unwrap();
+        let kala_bolt::transport::ListenAddr::Tcp(addr) = server.local_addrs().unwrap()[0] else {
+            panic!("TCP test helper needs a TCP listener")
+        };
         let shutdown = Arc::new(AtomicBool::new(false));
         let stop = shutdown.clone();
         let thread = thread::spawn(move || server.run(stop).unwrap());
@@ -84,7 +86,7 @@ impl Drop for Running {
     }
 }
 
-pub fn handshake(stream: &mut TcpStream, minor: u8) {
+pub fn handshake(stream: &mut (impl Read + Write), minor: u8) {
     let mut bytes = [0_u8; 20];
     bytes[..4].copy_from_slice(&[0x60, 0x60, 0xb0, 0x17]);
     bytes[6] = minor;
@@ -95,7 +97,7 @@ pub fn handshake(stream: &mut TcpStream, minor: u8) {
     assert_eq!(response, [0, 0, minor, 5]);
 }
 
-pub fn assert_closed(stream: &mut TcpStream) {
+pub fn assert_closed(stream: &mut impl Read) {
     let mut byte = [0];
     match stream.read(&mut byte) {
         Ok(0) => (),
