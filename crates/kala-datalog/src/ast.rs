@@ -319,6 +319,10 @@ pub struct Pred {
 pub struct WriteTxn {
     /// True only for a top-level restore-mode `[:genesis ...]`.
     pub genesis: bool,
+    /// The mode a leading `[:concurrency :weak]` / `[:concurrency
+    /// :optimistic]` op names for this transaction; `None` if the form
+    /// doesn't say (the caller's default applies). Never written by a dump.
+    pub concurrency: Option<kala_core::Concurrency>,
     pub at: Option<kala_core::Tick>,
     pub ops: Vec<WriteOp>,
     pub span: Span,

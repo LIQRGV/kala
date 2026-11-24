@@ -54,6 +54,26 @@ pub struct StagedWrite {
     pub spans: Vec<std::ops::Range<usize>>,
 }
 impl StagedWrite {
+    /// The op a [`Conflict`](crate::Conflict)'s `operation` belongs to:
+    /// the one that made the read a newer commit invalidated. `native` is
+    /// the number of native operations the transaction had made when it
+    /// read, so the reader is the op that began there (an op reads before
+    /// it writes), else the op whose native operations include that index
+    /// (a read made between two of its writes). `None` if the stager kept
+    /// no spans or the read wasn't made by one of this form's ops (an
+    /// earlier form of a caller-owned transaction, or the caller itself).
+    pub fn operation_of(&self, native: usize) -> Option<&WriteOperation> {
+        if self.spans.len() != self.ops.len() {
+            return None;
+        }
+        let at = |found: usize| self.ops.get(found);
+        self.spans
+            .iter()
+            .position(|span| span.start == native)
+            .or_else(|| self.spans.iter().position(|span| span.contains(&native)))
+            .and_then(at)
+    }
+
     /// Attach committed entry IDs to this form's operations. Transaction totals
     /// describe the entire commit, including other forms staged by the caller.
     ///

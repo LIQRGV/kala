@@ -2,7 +2,8 @@
 use crate::ast::{Item, WriteOp, WriteTxn, WriteValue};
 use kala_core::write::{StagedWrite, WriteOperation, WriteReport};
 use kala_core::{
-    Correction, Echo, EntityId, EntryId, Op, Precision, Tick, TickOccupant, Txn, Value, World,
+    Concurrency, Correction, Echo, EntityId, EntryId, Op, Precision, Tick, TickOccupant, Txn,
+    Value, World,
 };
 use std::collections::HashMap;
 
@@ -312,7 +313,9 @@ pub struct WritePolicy {
 }
 
 /// Stage and commit one form under the default [`WritePolicy`] (a system
-/// world is refused). Authorization and file recovery belong to the caller.
+/// world is refused) and the default concurrency mode (optimistic, unless
+/// the form names its own). Authorization and file recovery belong to the
+/// caller.
 pub fn execute(
     w: &mut World,
     form: &WriteTxn,
@@ -328,17 +331,59 @@ pub fn execute_with(
     default: Option<Tick>,
     policy: WritePolicy,
 ) -> Result<WriteReport, WriteError> {
+    execute_in(w, form, default, policy, Concurrency::default())
+}
+
+/// [`execute_with`] for a caller with its own default concurrency mode:
+/// the transaction commits in `mode` unless the form begins with
+/// `[:concurrency …]`, which wins.
+pub fn execute_in(
+    w: &mut World,
+    form: &WriteTxn,
+    default: Option<Tick>,
+    policy: WritePolicy,
+    mode: Concurrency,
+) -> Result<WriteReport, WriteError> {
     let mut tx = w.begin();
+    tx.set_concurrency(mode);
     let staged = stage_with(&mut tx, form, default, policy)?;
-    let result = tx.commit().map_err(|e| WriteError {
-        operation: None,
-        cause: Failure::Store(e),
-    })?;
-    Ok(staged.complete(&result))
+    commit(tx, staged)
+}
+
+/// Commit a transaction holding one staged form and report it.
+///
+/// A commit refused because a newer transaction wrote something this one
+/// read ([`kala_core::Error::Conflict`]) is reported at the op that made
+/// the read, when the form made it ([`StagedWrite::operation_of`]):
+/// `op 2 (:set): conflict: …`. Nothing was written; the caller may stage
+/// and commit the same form again on the caught-up world.
+pub fn commit(tx: Txn<'_>, staged: StagedWrite) -> Result<WriteReport, WriteError> {
+    match tx.commit() {
+        Ok(result) => Ok(staged.complete(&result)),
+        Err(error) => {
+            let operation = match &error {
+                kala_core::Error::Conflict(conflict) => staged
+                    .operation_of(conflict.operation)
+                    .map(|op| (op.position, op.kind)),
+                _ => None,
+            };
+            Err(WriteError {
+                operation,
+                cause: Failure::Store(error),
+            })
+        }
+    }
 }
 
 /// Stage into a caller-owned transaction without committing. Every error poisons
 /// it, including name-resolution errors, so no partial form can be committed.
+///
+/// A form that begins with `[:concurrency …]` sets the transaction's mode
+/// ([`Txn::set_concurrency`]) before anything is staged; a form that
+/// doesn't leaves the mode the caller chose. The mode belongs to the whole
+/// transaction: a caller staging several forms into one should let only
+/// the first name it (going weak drops the reads recorded so far; going
+/// back to optimistic counts as having read everything).
 ///
 /// Uses the default [`WritePolicy`]: a system world is refused.
 pub fn stage(
@@ -364,6 +409,9 @@ pub fn stage_with(
             cause: Failure::SystemWorld,
         })
     } else {
+        if let Some(mode) = form.concurrency {
+            tx.set_concurrency(mode);
+        }
         stage_form(tx, form, default)
     };
     if result.is_err() {

@@ -245,11 +245,18 @@ mod tests {
 }
 
 /// Shared write entry point; server adapters need no language-crate dependency.
+///
+/// A form's concurrency mode: [`execute_in`](write::execute_in) takes the
+/// caller's default, [`stage`](write::stage) leaves a caller-owned
+/// transaction's mode alone, and in both a form that begins with
+/// `[:concurrency :weak]` (or `:optimistic`) sets its own.
+/// [`commit`](write::commit) reports a conflict at the op that read.
 pub mod write {
+    pub use kala_core::Concurrency;
     pub use kala_core::write::{StagedWrite, WriteOperation, WriteReport};
     pub use kala_datalog::apply::{
-        Failure, Occupant, OccupiedBy, SameTick, WriteError, WritePolicy, execute, execute_with,
-        stage, stage_with,
+        Failure, Occupant, OccupiedBy, SameTick, WriteError, WritePolicy, commit, execute,
+        execute_in, execute_with, stage, stage_with,
     };
     pub use kala_datalog::ast::WriteTxn;
     pub use kala_datalog::{parse_write, parse_writes, write_forms};
