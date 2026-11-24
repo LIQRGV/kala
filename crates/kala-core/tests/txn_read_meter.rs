@@ -30,7 +30,13 @@ fn conflict_entry_lookup_skips_a_large_unrelated_later_transaction() {
     let found = tx
         .entry_at_tick(e, "v", &Value::I64(0), Tick(0), &meter)
         .unwrap();
-    assert_eq!(found, Some((original, Op::Assert)));
+    assert_eq!(
+        found,
+        Some(TickOccupant::Committed {
+            entry: original,
+            op: Op::Assert
+        })
+    );
     assert!(
         meter.keys() > 0 && meter.keys() <= 128,
         "diagnostic lookup must charge its bounded work: {}",

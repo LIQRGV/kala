@@ -123,6 +123,29 @@ pub struct CommitResult {
     pub warnings: Warnings,
 }
 
+/// What holds a value's exact tick, from [`Txn::entry_at_tick`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TickOccupant {
+    /// A committed log entry. Its ID is permanent, so it may be named in a
+    /// `correct`.
+    Committed {
+        /// The entry (a base fact or its current revision).
+        entry: EntryId,
+        /// What it says at that tick.
+        op: Op,
+    },
+    /// An entry this transaction staged and has not committed. It has no
+    /// entry ID yet: if the transaction aborts, the ID it would have got goes
+    /// to an unrelated later entry, so nothing may name it.
+    Staged {
+        /// Its position among the transaction's staged entries: the count
+        /// [`Txn::staged_entry_count`] returned just before it was staged.
+        position: usize,
+        /// What it says at that tick.
+        op: Op,
+    },
+}
+
 /// A write transaction on a [`World`], started with [`World::begin`].
 ///
 /// Writes are judged as they are made, against the committed facts *and*
@@ -304,9 +327,9 @@ impl Txn<'_> {
         Ok(values.into_values().collect())
     }
 
-    /// The entry currently occupying a value's exact tick, including provisional
-    /// IDs of this transaction's earlier writes. Used to explain same-tick errors;
-    /// callers must not persist provisional IDs when the transaction is aborted.
+    /// The entry currently occupying a value's exact tick: one this transaction
+    /// staged earlier, else a committed one. Used to explain same-tick errors.
+    /// A staged entry is reported by position, never by a provisional entry ID.
     pub fn entry_at_tick(
         &self,
         entity: EntityId,
@@ -314,7 +337,7 @@ impl Txn<'_> {
         value: &Value,
         tick: Tick,
         meter: &WorkMeter<'_>,
-    ) -> Result<Option<(EntryId, Op)>, Error> {
+    ) -> Result<Option<TickOccupant>, Error> {
         let fact = self.world.prepare_fact(
             &self.ids,
             FactRequest {
@@ -339,23 +362,15 @@ impl Txn<'_> {
             .next()
             .is_some_and(|(k, _)| k.starts_with(&prefix))
         {
-            for (position, ordered) in self.order.iter().enumerate().rev() {
+            for (position, entry) in self.entries.iter().enumerate().rev() {
                 if !work.add(1) {
                     meter.check()?;
                 }
-                let OrderedEntry::Fact(i) = ordered else {
-                    continue;
-                };
-                let (f, mark) = self.entries[*i].key_and_mark();
+                let (f, mark) = entry.key_and_mark();
                 if (f.entity, f.attr, &f.value, f.tick)
                     == (fact.entity, fact.attr, &fact.value, tick)
                 {
-                    return Ok(mark.op().map(|op| {
-                        (
-                            EntryId(self.world.journal.next_entry().0 + position as u64),
-                            op,
-                        )
-                    }));
+                    return Ok(mark.op().map(|op| TickOccupant::Staged { position, op }));
                 }
             }
         }
@@ -417,7 +432,10 @@ impl Txn<'_> {
                 None => v == value,
             };
             if e == fact.entity && a == fact.attr && t == tick && matches_value {
-                return Ok(op.map(|op| (entry.id, op)));
+                return Ok(op.map(|op| TickOccupant::Committed {
+                    entry: entry.id,
+                    op,
+                }));
             }
         }
         Ok(None)

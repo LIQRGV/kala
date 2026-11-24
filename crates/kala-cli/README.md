@@ -150,8 +150,17 @@ members keep their original entries and precision. The fixture defines `alias`.
 `:at` and `:precision` work as on assertions; edge triples can be subjects.
 A set with several values on a `one` attribute is accepted with overlap warnings.
 Events, deprecated attributes and unknown attributes with `[]` are refused.
-A same-tick conflict names the entry and suggests `[:correct ...]` for changing
-canon. A set with no tick uses the transaction's stable default/latest tick.
+A set with no tick uses the transaction's stable default/latest tick.
+
+A same-tick conflict (the set would retract a value asserted at that very tick,
+or assert one retracted at it) is refused, and the message says what holds the
+tick. For a committed entry it names the entry and the correction that fixes
+it: `[:correct N :delete]` removes that assert or retract, and for an assert
+`[:correct N :replace :value …]` changes its value instead. When the conflict
+is with an earlier operation of the same transaction, the message names that
+operation (`op 1 of this transaction`) and no entry ID: nothing was committed,
+so there is nothing to correct; change the earlier operation. Entities are
+shown by handle, else as `TYPE#n`.
 Dumps contain only the stored assert/retract primitives, never `:set`.
 
 A form containing `:set` has a budget of 256 expanded primitive writes/operations

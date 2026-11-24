@@ -1,7 +1,9 @@
 //! Datalog writes lowered to native primitives, with no adapter or I/O policy.
 use crate::ast::{Item, WriteOp, WriteTxn, WriteValue};
 use kala_core::write::{StagedWrite, WriteOperation, WriteReport};
-use kala_core::{Correction, EntityId, Op, Precision, Tick, Txn, Value, World};
+use kala_core::{
+    Correction, Echo, EntityId, EntryId, Op, Precision, Tick, TickOccupant, Txn, Value, World,
+};
 use std::collections::HashMap;
 
 /// A failure's position and typed cause. Adapters choose formatting and exit codes.
@@ -33,11 +35,42 @@ pub enum Failure {
     SetEvent(String),
     /// Replacement work exceeded the documented per-form budget.
     Limit,
-    /// Native same-tick conflict, enriched with the occupying entry.
-    SameTick {
-        error: Box<kala_core::Error>,
-        entry: Option<(kala_core::EntryId, Op)>,
-    },
+    /// The store's same-tick conflict: the opposite op is already stored for
+    /// this value at this tick.
+    SameTick(Box<SameTick>),
+}
+/// A same-tick conflict as an author can read it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SameTick {
+    /// The subject as an author names it: its handle, else `TYPE#n` /
+    /// `edge#n`. Safe to print.
+    pub subject: String,
+    pub attr: String,
+    pub tick: Tick,
+    /// What holds the tick, when `:set` could find it within its read
+    /// budget. `None` for plain `:assert` / `:retract`.
+    pub occupant: Option<Occupant>,
+}
+/// The stored op a `:set` collided with at its tick.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Occupant {
+    /// The value, as text safe to print (strings quoted, refs by label).
+    pub value: String,
+    /// What is stored for it at the tick.
+    pub op: Op,
+    pub by: OccupiedBy,
+}
+/// Who wrote the op a `:set` collided with. Only a committed entry has an ID
+/// that may be named in a `[:correct …]`: a staged one has none yet, and the
+/// ID it would get is reused by an unrelated entry when the form aborts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OccupiedBy {
+    /// A committed log entry.
+    Entry(EntryId),
+    /// An earlier operation of this form (1-based position).
+    Operation(usize),
+    /// A form staged earlier into the same caller-owned transaction.
+    EarlierForm,
 }
 impl std::fmt::Display for WriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -70,22 +103,54 @@ impl std::fmt::Display for WriteError {
                 crate::MAX_WRITE_OPS,
                 MAX_SET_READ_KEYS
             ),
-            Failure::SameTick { error, entry } => {
-                write!(f, "same-tick conflict: {error}")?;
-                if let Some((id, op)) = entry {
-                    write!(
-                        f,
-                        "; value was {} by entry#{}; to change that tick use [:correct {} :replace :value …] (for an uncommitted entry, change the earlier operation instead)",
+            Failure::SameTick(conflict) => {
+                let SameTick {
+                    subject,
+                    attr,
+                    tick,
+                    occupant,
+                } = conflict.as_ref();
+                write!(
+                    f,
+                    "same-tick conflict: the opposite op is already stored for {subject} \"{}\" at tick {}",
+                    Echo(attr),
+                    tick.0
+                )?;
+                let Some(Occupant { value, op, by }) = occupant else {
+                    return Ok(());
+                };
+                let (did, noun) = match op {
+                    Op::Assert => ("asserted", "assert"),
+                    Op::Retract => ("retracted", "retract"),
+                };
+                write!(f, "; {value} was {did} at that tick by ")?;
+                match by {
+                    // Deleting the entry always resolves the conflict: the
+                    // value then keeps the state it had before that tick.
+                    // Replacing the value only helps for an assert (it was a
+                    // different value that started at that tick).
+                    OccupiedBy::Entry(id) => {
+                        let id = id.0;
+                        write!(
+                            f,
+                            "entry#{id}: use [:correct {id} :delete] to remove that {noun}"
+                        )?;
                         if *op == Op::Assert {
-                            "asserted"
-                        } else {
-                            "retracted"
-                        },
-                        id.0,
-                        id.0
-                    )?;
+                            write!(
+                                f,
+                                ", or [:correct {id} :replace :value …] to change its value"
+                            )?;
+                        }
+                        Ok(())
+                    }
+                    OccupiedBy::Operation(n) => write!(
+                        f,
+                        "op {n} of this transaction: change that operation instead"
+                    ),
+                    OccupiedBy::EarlierForm => f.write_str(
+                        "an earlier operation of this transaction: change that operation instead",
+                    ),
                 }
-                Ok(())
             }
             Failure::SystemWorld => {
                 f.write_str("the system database is written only through account management")
@@ -125,6 +190,43 @@ fn migration_failure(tx: &Txn<'_>, error: kala_core::Error) -> Failure {
     Failure::Migration {
         error: Box::new(error),
         labels,
+    }
+}
+
+/// An entity as an author names it: its handle, else `TYPE#n` / `edge#n`.
+fn label(tx: &Txn<'_>, id: EntityId) -> String {
+    match tx.handle_of(id) {
+        Some(handle) => Echo(handle).to_string(),
+        None => tx.format_id(id),
+    }
+}
+/// A value for a one-line message: strings quoted and escaped (long ones
+/// cut), refs by label.
+fn value_text(tx: &Txn<'_>, value: &Value) -> String {
+    match value {
+        Value::Str(s) => format!(
+            "\"{}\"",
+            Echo(&s.replace('\\', "\\\\").replace('"', "\\\""))
+        ),
+        Value::Ref(id) => label(tx, *id),
+        Value::I64(n) => n.to_string(),
+        Value::F64(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+    }
+}
+/// The store's same-tick conflict as the applier reports it, with the subject
+/// the author wrote. Other errors pass through.
+fn fact_failure(tx: &Txn<'_>, subject: EntityId, error: kala_core::Error) -> Failure {
+    match error {
+        kala_core::Error::SameTickConflict { attr, tick, .. } => {
+            Failure::SameTick(Box::new(SameTick {
+                subject: label(tx, subject),
+                attr,
+                tick,
+                occupant: None,
+            }))
+        }
+        error => Failure::Store(error),
     }
 }
 
@@ -280,6 +382,8 @@ fn stage_form(
         remaining_bytes: kala_core::MAX_ENTRY_BYTES,
         read_meter: kala_core::WorkMeter::bounded(MAX_SET_READ_KEYS, None),
         fallback: tx.write_tick(form.at.or(default)),
+        entry_offset: tx.staged_entry_count(),
+        op_starts: Vec::with_capacity(form.ops.len()),
         precisions: form
             .ops
             .iter()
@@ -298,6 +402,7 @@ fn stage_form(
     };
     for (index, op) in form.ops.iter().enumerate() {
         let schema_before = tx.schema_changes().len();
+        state.op_starts.push(tx.staged_entry_count());
         let staged = stage_op(tx, op, index, &mut state).map_err(|cause| WriteError {
             operation: Some((index + 1, kind(op))),
             cause,
@@ -334,7 +439,22 @@ struct FormState {
     remaining_bytes: usize,
     read_meter: kala_core::WorkMeter<'static>,
     fallback: Tick,
+    /// Staged entries of the transaction before this form.
+    entry_offset: usize,
+    /// For each op begun so far, the transaction's staged entry count when
+    /// it began: maps a staged entry back to the op that wrote it.
+    op_starts: Vec<usize>,
     precisions: Vec<Option<Precision>>,
+}
+impl FormState {
+    /// Who staged the transaction's entry at `position`.
+    fn staged_by(&self, position: usize) -> OccupiedBy {
+        if position < self.entry_offset {
+            return OccupiedBy::EarlierForm;
+        }
+        // 1-based: the last op that began at or before the entry.
+        OccupiedBy::Operation(self.op_starts.partition_point(|start| *start <= position))
+    }
 }
 
 /// What staging one op did.
@@ -501,7 +621,7 @@ fn stage_fact(tx: &mut Txn<'_>, op: &WriteOp, state: &FormState) -> Result<Stage
             *precision,
         ),
     }
-    .map_err(Failure::Store)?;
+    .map_err(|error| fact_failure(tx, e, error))?;
     // A no-op stores nothing, so it reports no precision (changing a
     // held fact's precision needs `:correct`).
     Ok(Staged {
@@ -667,20 +787,35 @@ fn stage_set(tx: &mut Txn<'_>, op: &WriteOp, state: &mut FormState) -> Result<St
         };
         match result {
             Ok(r) => changed += r.changed,
-            Err(error) if matches!(error, kala_core::Error::SameTickConflict { .. }) => {
-                let entry = tx
-                    .entry_at_tick(entity, &attr.name, &value, tick, &state.read_meter)
-                    .map_err(|e| {
-                        if matches!(e, kala_core::Error::WorkInterrupted { .. }) {
-                            Failure::Limit
-                        } else {
-                            Failure::Store(e)
-                        }
-                    })?;
-                return Err(Failure::SameTick {
-                    error: Box::new(error),
-                    entry,
+            Err(kala_core::Error::SameTickConflict { .. }) => {
+                // The lookup only explains the conflict. If it runs out of
+                // the form's read budget (the entry sits in a very large
+                // transaction), the conflict is still the error to report,
+                // without the entry detail: a generic limit error would hide
+                // the real cause.
+                let found =
+                    match tx.entry_at_tick(entity, &attr.name, &value, tick, &state.read_meter) {
+                        Ok(found) => found,
+                        Err(kala_core::Error::WorkInterrupted { .. }) => None,
+                        Err(e) => return Err(Failure::Store(e)),
+                    };
+                let occupant = found.map(|found| {
+                    let (op, by) = match found {
+                        TickOccupant::Committed { entry, op } => (op, OccupiedBy::Entry(entry)),
+                        TickOccupant::Staged { position, op } => (op, state.staged_by(position)),
+                    };
+                    Occupant {
+                        value: value_text(tx, &value),
+                        op,
+                        by,
+                    }
                 });
+                return Err(Failure::SameTick(Box::new(SameTick {
+                    subject: label(tx, entity),
+                    attr: attr.name.clone(),
+                    tick,
+                    occupant,
+                })));
             }
             Err(error) => return Err(Failure::Store(error)),
         }
