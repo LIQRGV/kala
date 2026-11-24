@@ -227,6 +227,42 @@ for "at the same time", use `during` and `intersect` as in the last example.
 clauses inside a branch. A sixth history position binds precision as a keyword:
 `[?e :name ?v ?t ?op ?prec]`. `:exact` is the default precision.
 
+## Replace a value and rerun a script
+
+Start on a fresh copy of the sample world. Greg is in Varrow from tick 200
+until tick 250, so moving him at 225 replaces one held location with another.
+Put this in `move.edn`:
+
+```clojure
+[:set :greg :located_in :ashford :at 225]
+```
+
+```sh
+kala transact varrow.kala move.edn
+kala history varrow.kala greg located_in
+```
+
+The write reports `2 changed` with no overlap warning: one explicit Varrow
+retraction and one Ashford assertion, both at 225. History keeps the existing
+change points too, including the later Varrow retraction at 250. Running the
+same set again reports `0 changed`. Reads at 224 still put Greg in Varrow.
+
+For a script you can rerun, put this in `rerunnable.edn`:
+
+```clojure
+[:at 800 [:create :CHARACTER :kael2 :if-missing] [:assert :kael2 :name "Kael"] [:assert :kael2 :located_in :varrow]]
+```
+
+```sh
+kala transact varrow.kala rerunnable.edn
+kala transact varrow.kala rerunnable.edn
+```
+
+The first run creates Kael. The second reports `exists`, `0 changed` and
+`nothing committed`; it appends no log entries. A handle belonging to another
+node type is an error. For several aliases, use a vector with `:set`; `[]`
+clears the set. Use `:assert` when you only want to add one member.
+
 ## Correct a mistake and read the older draft
 
 Save `leave.edn`:

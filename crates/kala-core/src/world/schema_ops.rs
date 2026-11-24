@@ -967,14 +967,6 @@ impl<'w> View<'w> {
     }
 }
 
-impl World {
-    pub(super) fn all_overlaps(&self) -> Vec<Overlap> {
-        self.at_canon(self.latest_tx())
-            .attributes()
-            .flat_map(|def| self.overlaps(&def.name).unwrap_or_default())
-            .collect()
-    }
-}
 impl Txn<'_> {
     pub(super) fn encode_ordered(&self) -> Result<EncodedTxn, Error> {
         let items = self.order.iter().map(|entry| match entry {
@@ -1043,34 +1035,4 @@ impl World {
     pub(crate) fn schema_matches(&self, other: &Self) -> bool {
         self.catalog.schema_matches(&other.catalog)
     }
-}
-
-pub(super) fn schema_warnings(before: Vec<Vec<Overlap>>, after: Vec<Vec<Overlap>>) -> Warnings {
-    // The ordinary write diff receives one list per touched side. Schema edits
-    // can add/remove entire sides, so align those lists before using that diff.
-    let group = |lists: Vec<Vec<Overlap>>| {
-        let mut groups: BTreeMap<(EntityId, String, u8), Vec<Overlap>> = BTreeMap::new();
-        for overlap in lists.into_iter().flatten() {
-            let key = (
-                overlap.entity,
-                overlap.attr.clone(),
-                if overlap.side == Side::Forward { 0 } else { 1 },
-            );
-            groups.entry(key).or_default().push(overlap);
-        }
-        groups
-    };
-    let mut old = group(before);
-    let mut new = group(after);
-    let keys: std::collections::BTreeSet<_> = old.keys().chain(new.keys()).cloned().collect();
-    let (before, after) = keys
-        .into_iter()
-        .map(|key| {
-            (
-                old.remove(&key).unwrap_or_default(),
-                new.remove(&key).unwrap_or_default(),
-            )
-        })
-        .unzip();
-    overlap_diff(before, after)
 }

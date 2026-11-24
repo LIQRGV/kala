@@ -49,6 +49,7 @@ pub fn form_kind(text: &str) -> Result<FormKind, DatalogError> {
                     k.as_str(),
                     "genesis"
                         | "create"
+                        | "set"
                         | "assert"
                         | "retract"
                         | "correct"
@@ -306,7 +307,7 @@ fn transaction(f: Form, restore: bool) -> Result<WriteTxn, DatalogError> {
         return Ok(WriteTxn {
             genesis: false,
             at: None,
-            ops: vec![operation(items, span)?],
+            ops: vec![operation(items, span, restore)?],
             span,
         });
     }
@@ -347,7 +348,7 @@ fn transaction_ops(
                 })?)?);
         } else {
             let (items, s) = vector(first)?;
-            ops.push(operation(items, s)?);
+            ops.push(operation(items, s, restore)?);
         }
     }
     for f in it {
@@ -358,7 +359,7 @@ fn transaction_ops(
             ));
         }
         let (items, s) = vector(f)?;
-        ops.push(operation(items, s)?);
+        ops.push(operation(items, s, restore)?);
     }
     Ok((at, ops))
 }
@@ -391,7 +392,7 @@ impl Args {
     }
 }
 /// One write operation `[:keyword …]`: the keyword selects the form.
-fn operation(items: Vec<Form>, span: Span) -> Result<WriteOp, DatalogError> {
+fn operation(items: Vec<Form>, span: Span, restore: bool) -> Result<WriteOp, DatalogError> {
     let mut args = Args {
         it: items.into_iter(),
         span,
@@ -407,7 +408,8 @@ fn operation(items: Vec<Form>, span: Span) -> Result<WriteOp, DatalogError> {
             span,
             ":genesis must be the first top-level form of kala transact --create",
         )),
-        "create" => create_op(args),
+        "create" => create_op(args, restore),
+        "set" => set_op(args),
         "assert" => fact_op(Op::Assert, args),
         "retract" => fact_op(Op::Retract, args),
         "correct" => correct_op(args),
@@ -500,19 +502,87 @@ fn schema_op(kind: &str, mut args: Args) -> Result<WriteOp, DatalogError> {
     Ok(op)
 }
 /// `[:create TYPE]` or `[:create TYPE handle]`.
-fn create_op(mut args: Args) -> Result<WriteOp, DatalogError> {
+fn create_op(mut args: Args, restore: bool) -> Result<WriteOp, DatalogError> {
     let (node_type, _) = named(args.required()?)?;
-    let handle = args.it.next().map(named).transpose()?.map(|(name, _)| name);
+    let handle_form = args.it.next();
+    // Restore preserves the historic plain-create spelling of a handle named
+    // `if-missing`. In ordinary input that keyword alone is the missing option
+    // argument; a quoted handle remains an unambiguous literal.
+    if !restore
+        && matches!(&handle_form, Some(Form::Atom { tok: Tok::Keyword(k), .. }) if k == "if-missing")
+    {
+        return Err(DatalogError::syntax(
+            args.span,
+            ":if-missing requires a handle",
+        ));
+    }
+    let handle = handle_form.map(named).transpose()?.map(|(name, _)| name);
+    let if_missing = if let Some(f) = args.it.next() {
+        let (option, span) = keyword(f)?;
+        if option != "if-missing" {
+            return Err(DatalogError::syntax(
+                span,
+                ":create takes only a type and handle (optionally :if-missing)",
+            ));
+        }
+        true
+    } else {
+        false
+    };
     if let Some(f) = args.it.next() {
         return Err(DatalogError::syntax(
             f.span(),
-            ":create takes only a type and handle",
+            ":create takes only a type and handle (optionally :if-missing)",
         ));
     }
     Ok(WriteOp::Create {
         node_type,
         handle,
+        if_missing,
         span: args.span,
+    })
+}
+/// A scalar means a singleton; a vector is the complete set (including empty).
+fn set_op(mut args: Args) -> Result<WriteOp, DatalogError> {
+    let span = args.span;
+    let subject = value(args.required()?)?;
+    if let WriteValue::Scalar(i) = &subject
+        && !matches!(i, Item::Keyword(..) | Item::Id(..))
+    {
+        return Err(DatalogError::syntax(
+            i.span(),
+            "subject must be a handle, ID or edge triple",
+        ));
+    }
+    let (name, aspan) = named(args.required()?)?;
+    let members = args.required()?;
+    let values = match members {
+        Form::Seq {
+            items,
+            bracket: Bracket::Square,
+            ..
+        } => {
+            if items.len() > MAX_WRITE_OPS {
+                return Err(DatalogError::limit(
+                    Some(span),
+                    format!(":set exceeds {MAX_WRITE_OPS} values"),
+                ));
+            }
+            items
+                .into_iter()
+                .map(value)
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        scalar => vec![value(scalar)?],
+    };
+    let options = options(args.it, false, span)?;
+    Ok(WriteOp::Set {
+        subject,
+        attr: Attr { name, span: aspan },
+        values,
+        at: options.at,
+        precision: options.precision.unwrap_or(Precision::Exact),
+        span,
     })
 }
 /// `[:assert subject attribute value option…]`, or the same with `:retract`.

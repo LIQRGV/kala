@@ -21,11 +21,19 @@ struct Operation {
     declared: usize,
     entries: Vec<u64>,
     entity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created: Option<bool>,
+    #[serde(skip)]
+    handle: Option<String>,
 }
 #[derive(Serialize)]
 struct Warnings {
     introduced: Vec<String>,
     resolved: Vec<String>,
+    #[serde(skip_serializing_if = "is_zero")]
+    introduced_omitted: u128,
+    #[serde(skip_serializing_if = "is_zero")]
+    resolved_omitted: u128,
 }
 #[derive(Serialize)]
 pub struct Report {
@@ -83,6 +91,9 @@ pub(crate) fn refuse_system(world: &World) -> Result<(), CliError> {
     }
     Ok(())
 }
+fn is_zero(n: &u128) -> bool {
+    *n == 0
+}
 fn user(s: impl Into<String>) -> CliError {
     CliError::User(s.into())
 }
@@ -104,7 +115,7 @@ fn write_err(e: kala_lang::write::WriteError) -> CliError {
     use kala_lang::write::Failure;
     let error = match e.cause {
         Failure::Store(e) => core_err(e),
-        Failure::Migration { error, labels } => migrate_err(&labels, error),
+        Failure::Migration { error, labels } => migrate_err(&labels, *error),
         Failure::UnknownEntity(s) => user(format!("unknown entity `{}`", escape::value(&s))),
         cause => user(
             kala_lang::write::WriteError {
@@ -139,6 +150,10 @@ fn committed_report(w: &World, result: kala_core::write::WriteReport) -> Report 
             declared: op.declared,
             entries: op.entries.iter().map(|e| e.0).collect(),
             entity: op.entity.map(|e| w.format_id(e)),
+            created: op.created,
+            handle: op
+                .created
+                .and_then(|_| op.entity.and_then(|e| w.handle_of(e).map(str::to_owned))),
         })
         .collect();
     let overlap_lines = |overlaps: &[_]| -> Vec<String> {
@@ -170,6 +185,8 @@ fn committed_report(w: &World, result: kala_core::write::WriteReport) -> Report 
         warnings: Warnings {
             introduced: overlap_lines(&result.warnings.introduced),
             resolved: overlap_lines(&result.warnings.resolved),
+            introduced_omitted: result.warnings.introduced_omitted,
+            resolved_omitted: result.warnings.resolved_omitted,
         },
     }
 }
@@ -217,7 +234,15 @@ pub fn render(report: &Report, json: bool) -> String {
         }
         let _ = write!(s, ", {}", counts(op.changed, op.declared));
         if let Some(e) = &op.entity {
-            let _ = write!(s, ", created {e}");
+            let verb = if op.created == Some(false) {
+                "exists"
+            } else {
+                "created"
+            };
+            let _ = write!(s, ", {verb} {e}");
+            if let Some(handle) = &op.handle {
+                let _ = write!(s, " {}", escape::label(handle));
+            }
         }
         for id in &op.entries {
             let _ = write!(s, ", entry#{id}");
@@ -230,8 +255,22 @@ pub fn render(report: &Report, json: bool) -> String {
     for o in &report.warnings.introduced {
         let _ = writeln!(s, "warning: {o}");
     }
+    if report.warnings.introduced_omitted > 0 {
+        let _ = writeln!(
+            s,
+            "… and {} more overlap warnings (run kala doctor to list them)",
+            report.warnings.introduced_omitted
+        );
+    }
     for o in &report.warnings.resolved {
         let _ = writeln!(s, "resolved warning: {o}");
+    }
+    if report.warnings.resolved_omitted > 0 {
+        let _ = writeln!(
+            s,
+            "… and {} more resolved overlap warnings (run kala doctor to list them)",
+            report.warnings.resolved_omitted
+        );
     }
     s
 }

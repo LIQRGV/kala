@@ -14,6 +14,8 @@ pub struct WriteOperation {
     pub declared: usize,
     pub entries: Vec<EntryId>,
     pub entity: Option<EntityId>,
+    /// For conditional creates: whether this operation created the entity.
+    pub created: Option<bool>,
 }
 /// A committed transaction, independent of any language or output format.
 #[derive(Clone, Debug, PartialEq)]

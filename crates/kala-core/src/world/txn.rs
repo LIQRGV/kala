@@ -161,6 +161,268 @@ pub struct Txn<'w> {
 }
 
 impl Txn<'_> {
+    /// Find a handle of the requested type, or stage a new entity. The returned
+    /// boolean says whether a definition was staged. Type mismatches poison the
+    /// transaction just like ordinary duplicate-handle errors.
+    pub fn find_or_create_entity(
+        &mut self,
+        node_type: &str,
+        handle: &str,
+    ) -> Result<(EntityId, bool), Error> {
+        self.guard(|tx| {
+            let expected = *tx
+                .world
+                .catalog
+                .node_type_by_name
+                .get(node_type)
+                .ok_or_else(|| Error::UnknownNodeType(node_type.to_owned()))?;
+            if let Some(id) = tx.entity_by_handle(handle) {
+                if id.node_type() != expected {
+                    return Err(Error::HandleTypeMismatch {
+                        handle: handle.to_owned(),
+                        node_type: tx.world.catalog.node_types[usize::from(id.node_type().0)]
+                            .name
+                            .clone(),
+                    });
+                }
+                return Ok((id, false));
+            }
+            tx.create_entity(node_type, Some(handle))
+                .map(|id| (id, true))
+        })
+    }
+
+    /// Values held at a tick, including earlier staged operations. This is a
+    /// read only: language-level replacement still writes explicit primitives.
+    /// Distinct-value walks and seeks charge `meter`; stop before retaining more
+    /// than `limit` values or `max_bytes` encoded bytes (at most 16 MiB).
+    pub fn values_at(
+        &self,
+        entity: EntityId,
+        attr: &str,
+        tick: Tick,
+        limit: usize,
+        max_bytes: usize,
+        meter: &WorkMeter<'_>,
+    ) -> Result<Vec<Value>, Error> {
+        if self.poisoned {
+            return Err(Error::TransactionAborted);
+        }
+        let (attr_id, def) = self.world.catalog.resolve(&self.ids, entity, attr)?;
+        let work = Work(Some(meter));
+        let layers = [&self.world.indexes.e_index, &self.staged];
+        let mut values = BTreeMap::new();
+        let mut bytes = 0usize;
+        let mut error = None;
+        let mut keep = |encoding: &[u8]| {
+            if error.is_some() || values.contains_key(encoding) {
+                return;
+            }
+            if values.len() >= limit
+                || bytes.saturating_add(encoding.len()) > max_bytes.min(crate::MAX_ENTRY_BYTES)
+            {
+                error = Some(Error::WorkInterrupted {
+                    reason: WorkInterruptReason::Limit,
+                });
+                return;
+            }
+            match Value::decode(encoding) {
+                Ok(value) => {
+                    bytes += encoding.len();
+                    values.insert(encoding.to_vec(), value);
+                }
+                Err(e) => error = Some(Error::Value(e)),
+            }
+        };
+        let mut read = |prefix: &mut Vec<u8>| {
+            if !holds(&layers, prefix, tick, TxId(u64::MAX), work) {
+                return;
+            }
+            let part = &prefix[key::E_ATTR_PREFIX_LEN..];
+            let encoding = if def.value_type == ValueType::Str && !def.indexed {
+                key::ValueRef::from_key_bytes(part).and_then(|r| {
+                    self.ids
+                        .values
+                        .resolve(r)
+                        .or_else(|| self.world.indexes.values.resolve(r))
+                })
+            } else {
+                Some(part)
+            };
+            if let Some(encoding) = encoding {
+                keep(encoding);
+            }
+        };
+        let prefix = key::e_attr_prefix(entity, attr_id);
+        for index in layers {
+            index::for_each_history(
+                index,
+                &prefix,
+                |k| key::E_ATTR_PREFIX_LEN + key::e_value_bytes(k).map_or(0, |v| v.len()),
+                work,
+                &mut read,
+            );
+        }
+        if self.world.catalog.is_bidirectional(attr_id) {
+            // Committed reverse histories identify partners. Judge their E keys
+            // against both layers so staged retracts/corrections are visible.
+            let mut reverse = |source: EntityId| {
+                let mut prefix = key::e_value_prefix(
+                    source,
+                    attr_id,
+                    &Value::Ref(entity).encode().expect("ref encoding"),
+                );
+                if holds(&layers, &mut prefix, tick, TxId(u64::MAX), work) {
+                    keep(&Value::Ref(source).encode().expect("ref encoding"));
+                }
+            };
+            index::for_each_history(
+                &self.world.indexes.r_index,
+                &key::r_attr_prefix(entity, attr_id),
+                |_| key::R_SOURCE_PREFIX_LEN,
+                work,
+                |p| {
+                    if let Some(source) = key::r_source(p) {
+                        reverse(source);
+                    }
+                },
+            );
+            for entry in &self.entries {
+                if !work.add(1) {
+                    break;
+                }
+                let (fact, _) = entry.key_and_mark();
+                if fact.attr == attr_id && fact.target == Some(entity) {
+                    reverse(fact.entity);
+                }
+            }
+        }
+        meter.check()?;
+        if let Some(error) = error {
+            return Err(error);
+        }
+        Ok(values.into_values().collect())
+    }
+
+    /// The entry currently occupying a value's exact tick, including provisional
+    /// IDs of this transaction's earlier writes. Used to explain same-tick errors;
+    /// callers must not persist provisional IDs when the transaction is aborted.
+    pub fn entry_at_tick(
+        &self,
+        entity: EntityId,
+        attr: &str,
+        value: &Value,
+        tick: Tick,
+        meter: &WorkMeter<'_>,
+    ) -> Result<Option<(EntryId, Op)>, Error> {
+        let fact = self.world.prepare_fact(
+            &self.ids,
+            FactRequest {
+                entity,
+                attr,
+                value,
+                tick,
+                op: Op::Assert,
+                precision: Precision::Exact,
+                deprecated: DeprecatedWrites::Correction,
+            },
+        )?;
+        let work = Work(Some(meter));
+        let mut prefix = key::e_value_prefix(fact.entity, fact.attr, fact.key_value());
+        key::push_seek_tick(&mut prefix, tick);
+        if !work.add(1) {
+            meter.check()?;
+        }
+        if self
+            .staged
+            .scan_from(&prefix)
+            .next()
+            .is_some_and(|(k, _)| k.starts_with(&prefix))
+        {
+            for (position, ordered) in self.order.iter().enumerate().rev() {
+                if !work.add(1) {
+                    meter.check()?;
+                }
+                let OrderedEntry::Fact(i) = ordered else {
+                    continue;
+                };
+                let (f, mark) = self.entries[*i].key_and_mark();
+                if (f.entity, f.attr, &f.value, f.tick)
+                    == (fact.entity, fact.attr, &fact.value, tick)
+                {
+                    return Ok(mark.op().map(|op| {
+                        (
+                            EntryId(self.world.journal.next_entry().0 + position as u64),
+                            op,
+                        )
+                    }));
+                }
+            }
+        }
+        if !work.add(1) {
+            meter.check()?;
+        }
+        let Some((key, mark)) = self
+            .world
+            .indexes
+            .e_index
+            .scan_from(&prefix)
+            .next()
+            .filter(|(k, _)| k.starts_with(&prefix))
+        else {
+            return Ok(None);
+        };
+        if mark.op().is_none() {
+            return Ok(None);
+        }
+        let Some(tx) = key::e_key_tx(key) else {
+            return Ok(None);
+        };
+        let entries = self.world.journal.entries();
+        // Locate the owning transaction without walking unrelated later history.
+        let start = entries.partition_point(|e| e.tx < tx);
+        let end = entries.partition_point(|e| e.tx <= tx);
+        for entry in entries[start..end].iter().rev() {
+            if !work.add(1) {
+                meter.check()?;
+            }
+            let (e, a, v, t, op) = match &entry.body {
+                EntryBody::Fact {
+                    entity,
+                    attr,
+                    value,
+                    tick,
+                    op,
+                    ..
+                }
+                | EntryBody::Revised {
+                    entity,
+                    attr,
+                    value,
+                    tick,
+                    op,
+                    ..
+                } => (*entity, *attr, value, *tick, Some(*op)),
+                EntryBody::Deleted {
+                    entity,
+                    attr,
+                    value,
+                    tick,
+                    ..
+                } => (*entity, *attr, value, *tick, None),
+                _ => continue,
+            };
+            let matches_value = match fact.target {
+                Some(target) => v == &Value::Ref(target),
+                None => v == value,
+            };
+            if e == fact.entity && a == fact.attr && t == tick && matches_value {
+                return Ok(op.map(|op| (entry.id, op)));
+            }
+        }
+        Ok(None)
+    }
+
     /// Resolve an optional tick using the transaction's stable defaults.
     pub fn write_tick(&self, tick: Option<Tick>) -> Tick {
         tick.or(self.default_tick).unwrap_or(self.base_tick)
@@ -712,108 +974,110 @@ enum WarningScope {
     World,
 }
 
+type WarningKey = (EntityId, AttrId, u8);
+type WarningIntervals = Vec<(Value, Vec<Interval>)>;
+type WarningSnapshot = BTreeMap<WarningKey, WarningIntervals>;
 impl WarningScope {
-    /// The overlaps in scope at `world`'s latest canon: one list per
-    /// touched side, or one list for the whole world.
-    fn overlaps(&self, world: &World) -> Vec<Vec<Overlap>> {
+    fn intervals(&self, world: &World) -> WarningSnapshot {
+        let view = world.at_canon(world.latest_tx());
+        let mut snapshot = BTreeMap::new();
+        let mut capture = |entity, attr, side| {
+            let intervals = view.warning_intervals(entity, attr, side);
+            if !intervals.is_empty() {
+                snapshot.insert((entity, attr, u8::from(side == Side::Reverse)), intervals);
+            }
+        };
         match self {
-            WarningScope::Off => Vec::new(),
-            WarningScope::Sides(sides) => world.overlaps_of_sides(sides),
-            WarningScope::World => vec![world.all_overlaps()],
+            Self::Off => {}
+            Self::Sides(sides) => {
+                for touched in sides {
+                    let (e, a, s) = touched.side;
+                    capture(e, a, s);
+                }
+            }
+            Self::World => {
+                for entity in world.catalog.defined_ids() {
+                    for (i, def) in world.catalog.attributes.iter().enumerate() {
+                        if def.kind != Kind::State {
+                            continue;
+                        }
+                        let attr = AttrId(i as u32);
+                        if def.cardinality == Cardinality::One {
+                            capture(entity, attr, Side::Forward);
+                        }
+                        if def.reverse_cardinality == Some(Cardinality::One) {
+                            capture(entity, attr, Side::Reverse);
+                        }
+                    }
+                }
+            }
         }
+        snapshot
     }
 }
 
-/// The overlaps in a commit's [`WarningScope`] before the transaction is
-/// applied, to compare with the ones after.
-#[derive(Debug)]
+/// Keep value intervals, never overlap pairs. Snapshot memory is linear in
+/// history; the only overlap allocations are the capped result lists.
 struct OverlapsBefore {
     scope: WarningScope,
-    overlaps: Vec<Vec<Overlap>>,
-    /// For [`WarningScope::World`]: the attribute names before the commit,
-    /// so an overlap of a renamed attribute compares under its new name.
-    old_names: HashMap<String, AttrId>,
+    intervals: WarningSnapshot,
 }
-
 impl OverlapsBefore {
-    /// Reads the overlaps in `scope` from `world`, which holds the
-    /// committed state (no transaction's provisional schema).
-    fn capture(scope: WarningScope, world: &World) -> OverlapsBefore {
-        let old_names = match scope {
-            WarningScope::World => world.catalog.attr_by_name.clone(),
-            WarningScope::Off | WarningScope::Sides(_) => HashMap::new(),
-        };
-        OverlapsBefore {
-            overlaps: scope.overlaps(world),
+    fn capture(scope: WarningScope, world: &World) -> Self {
+        Self {
+            intervals: scope.intervals(world),
             scope,
-            old_names,
         }
     }
-
-    /// The warnings of the commit now applied to `world`: the overlaps it
-    /// introduced and resolved within the scope.
-    fn warnings(mut self, world: &World) -> Warnings {
-        let after = self.scope.overlaps(world);
-        match self.scope {
-            WarningScope::Off => Warnings::default(),
-            WarningScope::Sides(_) => overlap_diff(self.overlaps, after),
-            WarningScope::World => {
-                for overlap in self.overlaps.iter_mut().flatten() {
-                    if let Some(id) = self.old_names.get(&overlap.attr) {
-                        overlap.attr = world.attr_name(*id).unwrap_or(&overlap.attr).to_owned();
-                    }
-                }
-                schema_ops::schema_warnings(self.overlaps, after)
-            }
+    fn warnings(self, world: &World) -> Warnings {
+        let after = self.scope.intervals(world);
+        let touched: BTreeMap<_, _> = match &self.scope {
+            WarningScope::Sides(sides) => sides
+                .iter()
+                .map(|t| {
+                    let (e, a, s) = t.side;
+                    ((e, a, u8::from(s == Side::Reverse)), t.values.as_slice())
+                })
+                .collect(),
+            _ => BTreeMap::new(),
+        };
+        let mut keys: Vec<_> = self.intervals.keys().chain(after.keys()).copied().collect();
+        keys.sort_unstable();
+        keys.dedup();
+        // Names are the latest namespace even for resolved warnings after rename.
+        keys.sort_by(|a, b| {
+            (a.0, world.attr_name(a.1), a.2).cmp(&(b.0, world.attr_name(b.1), b.2))
+        });
+        let mut warnings = Warnings::default();
+        for key @ (entity, attr, side) in keys {
+            let old = self
+                .intervals
+                .get(&key)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let new = after.get(&key).map(Vec::as_slice).unwrap_or_default();
+            crate::overlap::diff_intervals(
+                old,
+                new,
+                touched.get(&key).copied(),
+                |introduced, a, b, during| {
+                    warnings.push(introduced, || Overlap {
+                        entity,
+                        attr: world.attr_name(attr).unwrap_or_default().to_owned(),
+                        side: if side == 0 {
+                            Side::Forward
+                        } else {
+                            Side::Reverse
+                        },
+                        a: a.clone(),
+                        b: b.clone(),
+                        during,
+                    });
+                },
+            );
         }
+        warnings
     }
-}
-
-/// The result of a [`Txn`] write that stored `changed` entries at `tick`
-/// (entry IDs and edges are only known at commit).
-/// The write warnings from the overlaps of the same checks before and after
-/// a commit (lists in the same order, as [`World::overlaps_of_sides`]
-/// returns them): `introduced` = after − before, `resolved` = before −
-/// after, by exact equality. The order of the checks and of each list is
-/// kept, which gives the reported sort order.
-///
-/// Each list is sorted by `(a, b, during.from)` (value encodings), and that
-/// key is unique within a list (one pair's maximal stretches are
-/// disjoint), so the two lists are compared in one sort-merge: an overlap
-/// at the same key with another `until` is the old one resolved and the
-/// new one introduced.
-pub(super) fn overlap_diff(before: Vec<Vec<Overlap>>, after: Vec<Vec<Overlap>>) -> Warnings {
-    fn sort_key(o: &Overlap) -> (Option<Vec<u8>>, Option<Vec<u8>>, Tick) {
-        (o.a.encode().ok(), o.b.encode().ok(), o.during.from)
-    }
-    let mut w = Warnings::default();
-    for (old, new) in before.into_iter().zip(after) {
-        let mut old = old.into_iter().map(|o| (sort_key(&o), o)).peekable();
-        let mut new = new.into_iter().map(|o| (sort_key(&o), o)).peekable();
-        loop {
-            let order = match (old.peek(), new.peek()) {
-                (None, None) => break,
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (Some((ko, _)), Some((kn, _))) => ko.cmp(kn),
-            };
-            match order {
-                Ordering::Less => w.resolved.extend(old.next().map(|(_, o)| o)),
-                Ordering::Greater => w.introduced.extend(new.next().map(|(_, o)| o)),
-                Ordering::Equal => {
-                    let (o, n) = match (old.next(), new.next()) {
-                        (Some((_, o)), Some((_, n))) => (o, n),
-                        _ => unreachable!("invariant: both lists were peeked non-empty"),
-                    };
-                    if o != n {
-                        w.resolved.push(o);
-                        w.introduced.push(n);
-                    }
-                }
-            }
-        }
-    }
-    w
 }
 
 /// Refuses a live write of `fact` with [`Error::EntryTooLarge`] if a
@@ -1156,20 +1420,6 @@ impl Catalog {
 }
 
 impl World {
-    /// The overlaps at the latest canon of each touched side in `sides`
-    /// that involve one of its touched values, one list per entry (see
-    /// [`View::overlaps_of_touching`]).
-    fn overlaps_of_sides(&self, sides: &[TouchedSide]) -> Vec<Vec<Overlap>> {
-        let view = self.at_canon(self.latest_tx());
-        sides
-            .iter()
-            .map(|t| {
-                let (entity, attr, side) = t.side;
-                view.overlaps_of_touching(entity, attr, side, Some(&t.values))
-            })
-            .collect()
-    }
-
     /// The current fact in an entry's correction chain, at the latest canon.
     /// Accepts the same entry IDs as [`World::correct`] and returns the same
     /// target errors (including a chain already deleted). This is a read only;

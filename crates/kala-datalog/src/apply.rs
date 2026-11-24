@@ -15,7 +15,7 @@ pub struct WriteError {
 pub enum Failure {
     Store(kala_core::Error),
     Migration {
-        error: kala_core::Error,
+        error: Box<kala_core::Error>,
         labels: HashMap<EntityId, String>,
     },
     UnknownEntity(String),
@@ -24,6 +24,17 @@ pub enum Failure {
     ExpectedFact,
     ExpectedCorrection,
     Genesis,
+    /// Empty replacements cannot infer an attribute's type.
+    EmptyUnknownAttribute(String),
+    /// Events can only be removed from canon through a correction.
+    SetEvent(String),
+    /// Replacement work exceeded the documented per-form budget.
+    Limit,
+    /// Native same-tick conflict, enriched with the occupying entry.
+    SameTick {
+        error: Box<kala_core::Error>,
+        entry: Option<(kala_core::EntryId, Op)>,
+    },
 }
 impl std::fmt::Display for WriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -31,7 +42,8 @@ impl std::fmt::Display for WriteError {
             write!(f, "op {index} (:{verb}): ")?;
         }
         match &self.cause {
-            Failure::Store(e) | Failure::Migration { error: e, .. } => write!(f, "{e}"),
+            Failure::Store(e) => write!(f, "{e}"),
+            Failure::Migration { error, .. } => write!(f, "{error}"),
             Failure::UnknownEntity(s) => write!(f, "unknown entity `{}`", kala_core::Echo(s)),
             Failure::UnknownEdge => {
                 f.write_str("unknown edge triple (the edge must already exist)")
@@ -39,6 +51,39 @@ impl std::fmt::Display for WriteError {
             Failure::ExpectedReference => f.write_str("expected a reference"),
             Failure::ExpectedFact => f.write_str("expected a fact"),
             Failure::ExpectedCorrection => f.write_str("expected a correction"),
+            Failure::EmptyUnknownAttribute(name) => write!(
+                f,
+                "cannot set unknown attribute :{} to []; declare it first",
+                kala_core::Echo(name)
+            ),
+            Failure::SetEvent(name) => write!(
+                f,
+                "cannot set event :{}: events are never retracted; use [:correct …]",
+                kala_core::Echo(name)
+            ),
+            Failure::Limit => write!(
+                f,
+                ":set exceeds the {}-operation/value limit, 16 MiB per-form value budget, or {}-key read budget",
+                crate::MAX_WRITE_OPS,
+                MAX_SET_READ_KEYS
+            ),
+            Failure::SameTick { error, entry } => {
+                write!(f, "same-tick conflict: {error}")?;
+                if let Some((id, op)) = entry {
+                    write!(
+                        f,
+                        "; value was {} by entry#{}; to change that tick use [:correct {} :replace :value …] (for an uncommitted entry, change the earlier operation instead)",
+                        if *op == Op::Assert {
+                            "asserted"
+                        } else {
+                            "retracted"
+                        },
+                        id.0,
+                        id.0
+                    )?;
+                }
+                Ok(())
+            }
             Failure::Genesis => f.write_str(":genesis must be first; use kala transact --create"),
         }
     }
@@ -71,7 +116,10 @@ fn migration_failure(tx: &Txn<'_>, error: kala_core::Error) -> Failure {
         }
         _ => return Failure::Store(error),
     }
-    Failure::Migration { error, labels }
+    Failure::Migration {
+        error: Box::new(error),
+        labels,
+    }
 }
 
 fn kind(op: &WriteOp) -> &'static str {
@@ -89,6 +137,7 @@ fn kind(op: &WriteOp) -> &'static str {
             op: Op::Retract, ..
         } => "retract",
         WriteOp::Correct { .. } => "correct",
+        WriteOp::Set { .. } => "set",
     }
 }
 fn reference(tx: &Txn<'_>, i: &Item) -> Result<EntityId, Failure> {
@@ -115,7 +164,7 @@ fn subject(tx: &Txn<'_>, v: &WriteValue) -> Result<EntityId, Failure> {
         } => tx
             .edge_id(reference(tx, source)?, &attr.name, reference(tx, target)?)
             .map(EntityId::from)
-            .ok_or_else(|| Failure::UnknownEdge),
+            .ok_or(Failure::UnknownEdge),
     }
 }
 fn value(tx: &Txn<'_>, v: &WriteValue) -> Result<Value, Failure> {
@@ -169,7 +218,17 @@ fn stage_form(
             cause: Failure::Genesis,
         });
     }
+    let has_set = form.ops.iter().any(|op| matches!(op, WriteOp::Set { .. }));
+    if has_set && form.ops.len() > crate::MAX_WRITE_OPS {
+        return Err(WriteError {
+            operation: None,
+            cause: Failure::Limit,
+        });
+    }
     let state = FormState {
+        remaining: crate::MAX_WRITE_OPS,
+        remaining_bytes: kala_core::MAX_ENTRY_BYTES,
+        read_meter: kala_core::WorkMeter::bounded(MAX_SET_READ_KEYS, None),
         fallback: tx.write_tick(form.at.or(default)),
         precisions: form
             .ops
@@ -193,6 +252,16 @@ fn stage_form(
             operation: Some((index + 1, kind(op))),
             cause,
         })?;
+        if has_set {
+            let cost = staged.changed.max(1);
+            if cost > state.remaining {
+                return Err(WriteError {
+                    operation: Some((index + 1, kind(op))),
+                    cause: Failure::Limit,
+                });
+            }
+            state.remaining -= cost;
+        }
         report.ops.push(WriteOperation {
             position: index + 1,
             kind: kind(op),
@@ -202,11 +271,18 @@ fn stage_form(
             declared: tx.schema_changes().len() - schema_before,
             entries: Vec::new(),
             entity: staged.entity,
+            created: staged.created,
         });
     }
     Ok(report)
 }
+/// A form's replacements share a key-work budget, including historical values
+/// and staged reverse edges. The write/value limit is MAX_WRITE_OPS (256).
+pub const MAX_SET_READ_KEYS: u64 = crate::MAX_WRITE_OPS as u64 * 256;
 struct FormState {
+    remaining: usize,
+    remaining_bytes: usize,
+    read_meter: kala_core::WorkMeter<'static>,
     fallback: Tick,
     precisions: Vec<Option<Precision>>,
 }
@@ -218,6 +294,7 @@ struct Staged {
     precision: Option<Precision>,
     /// The entity a `:create` staged.
     entity: Option<EntityId>,
+    created: Option<bool>,
 }
 
 impl Staged {
@@ -228,6 +305,7 @@ impl Staged {
             tick: fallback,
             precision: None,
             entity: None,
+            created: None,
         }
     }
 }
@@ -294,8 +372,12 @@ fn stage_op(
             })
         }
         WriteOp::Create {
-            node_type, handle, ..
-        } => stage_create(tx, node_type, handle.as_deref(), state),
+            node_type,
+            handle,
+            if_missing,
+            ..
+        } => stage_create(tx, node_type, handle.as_deref(), *if_missing, state),
+        WriteOp::Set { .. } => stage_set(tx, op, state),
         WriteOp::Fact { .. } => stage_fact(tx, op, state),
         WriteOp::Correct { .. } => stage_correct(tx, op, index, state),
     }
@@ -306,14 +388,24 @@ fn stage_create(
     tx: &mut Txn<'_>,
     node_type: &str,
     handle: Option<&str>,
+    if_missing: bool,
     state: &mut FormState,
 ) -> Result<Staged, Failure> {
     tx.infer_node_type(node_type).map_err(Failure::Store)?;
-    let id = tx
-        .create_entity(node_type, handle)
-        .map_err(Failure::Store)?;
+    let (id, created) = if if_missing {
+        let handle = handle.ok_or(Failure::ExpectedReference)?;
+        tx.find_or_create_entity(node_type, handle)
+            .map_err(Failure::Store)?
+    } else {
+        (
+            tx.create_entity(node_type, handle)
+                .map_err(Failure::Store)?,
+            true,
+        )
+    };
     Ok(Staged {
         entity: Some(id),
+        created: if_missing.then_some(created),
         ..Staged::schema(state.fallback)
     })
 }
@@ -367,6 +459,7 @@ fn stage_fact(tx: &mut Txn<'_>, op: &WriteOp, state: &FormState) -> Result<Stage
         tick: r.tick,
         precision: (r.changed > 0).then_some(*precision),
         entity: None,
+        created: None,
     })
 }
 
@@ -406,5 +499,147 @@ fn stage_correct(
                 .unwrap_or(Precision::Exact),
         ),
         entity: None,
+        created: None,
+    })
+}
+
+/// Replace by difference, retaining existing members and their precision.
+fn stage_set(tx: &mut Txn<'_>, op: &WriteOp, state: &mut FormState) -> Result<Staged, Failure> {
+    let WriteOp::Set {
+        subject: s,
+        attr,
+        values,
+        at,
+        precision,
+        ..
+    } = op
+    else {
+        return Err(Failure::ExpectedFact);
+    };
+    if values.len() > crate::MAX_WRITE_OPS {
+        return Err(Failure::Limit);
+    }
+    let entity = subject(tx, s)?;
+    let tick = at.unwrap_or(state.fallback);
+    let mut wanted = std::collections::BTreeMap::new();
+    for v in values {
+        // Caller-built ASTs bypass the text parser: bound strings before cloning
+        // or encoding them. Account for NUL escaping in the stored encoding.
+        let size = match v {
+            WriteValue::Scalar(Item::Str(s, _)) => {
+                if s.len() > state.remaining_bytes {
+                    return Err(Failure::Limit);
+                }
+                s.len()
+                    .saturating_add(s.bytes().filter(|b| *b == 0).count())
+                    .saturating_add(3)
+            }
+            WriteValue::Scalar(Item::Bool(..)) => 2,
+            _ => 9,
+        };
+        if size > state.remaining_bytes {
+            return Err(Failure::Limit);
+        }
+        state.remaining_bytes -= size;
+        let v = value(tx, v)?;
+        let key = v
+            .encode()
+            .map_err(|e| Failure::Store(kala_core::Error::Value(e)))?;
+        wanted.insert(key, v);
+    }
+    if let Some(v) = wanted.values().next() {
+        tx.infer_write_attribute(&attr.name, v, Op::Assert)
+            .map_err(Failure::Store)?;
+    }
+    let def = tx
+        .attribute(&attr.name)
+        .ok_or_else(|| Failure::EmptyUnknownAttribute(attr.name.clone()))?;
+    if def.deprecated {
+        return Err(Failure::Store(kala_core::Error::DeprecatedAttribute(
+            attr.name.clone(),
+        )));
+    }
+    if def.kind == kala_core::Kind::Event {
+        return Err(Failure::SetEvent(attr.name.clone()));
+    }
+    for v in wanted.values() {
+        if v.value_type() != def.value_type {
+            return Err(Failure::Store(kala_core::Error::WrongValueType {
+                attr: attr.name.clone(),
+                expected: def.value_type,
+                got: v.value_type(),
+            }));
+        }
+    }
+    let held = tx
+        .values_at(
+            entity,
+            &attr.name,
+            tick,
+            crate::MAX_WRITE_OPS,
+            state.remaining_bytes,
+            &state.read_meter,
+        )
+        .map_err(|e| {
+            if matches!(e, kala_core::Error::WorkInterrupted { .. }) {
+                Failure::Limit
+            } else {
+                Failure::Store(e)
+            }
+        })?;
+    let mut removed = Vec::new();
+    for value in held {
+        let key = value
+            .encode()
+            .map_err(|e| Failure::Store(kala_core::Error::Value(e)))?;
+        state.remaining_bytes -= key.len();
+        if wanted.remove(&key).is_none() {
+            removed.push(value);
+        }
+    }
+    let changes = removed.len().saturating_add(wanted.len());
+    if changes > state.remaining {
+        return Err(Failure::Limit);
+    }
+    let mut changed = 0;
+    for (op, value) in removed
+        .into_iter()
+        .map(|v| (Op::Retract, v))
+        .chain(wanted.into_values().map(|v| (Op::Assert, v)))
+    {
+        let result = match op {
+            Op::Assert => {
+                tx.assert_with_precision(entity, &attr.name, value.clone(), Some(tick), *precision)
+            }
+            Op::Retract => {
+                tx.retract_with_precision(entity, &attr.name, value.clone(), Some(tick), *precision)
+            }
+        };
+        match result {
+            Ok(r) => changed += r.changed,
+            Err(error) if matches!(error, kala_core::Error::SameTickConflict { .. }) => {
+                let entry = tx
+                    .entry_at_tick(entity, &attr.name, &value, tick, &state.read_meter)
+                    .map_err(|e| {
+                        if matches!(e, kala_core::Error::WorkInterrupted { .. }) {
+                            Failure::Limit
+                        } else {
+                            Failure::Store(e)
+                        }
+                    })?;
+                return Err(Failure::SameTick {
+                    error: Box::new(error),
+                    entry,
+                });
+            }
+            Err(error) => return Err(Failure::Store(error)),
+        }
+    }
+    Ok(Staged {
+        changed,
+        tick,
+        precision: (changed > 0).then_some(*precision),
+        entity: None,
+        created: None,
     })
 }

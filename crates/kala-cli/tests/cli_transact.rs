@@ -50,6 +50,22 @@ fn locations(f: &Fx, tick: i64) -> Vec<String> {
 }
 
 #[test]
+fn set_moves_greg_without_an_overlap_warning() {
+    let f = varrow();
+    // Verify the fixture through the real binary before pinning the replacement.
+    assert_eq!(locations(&f, 224), ["varrow"]);
+    let output = ok(&f, "[:set :greg :located_in :ashford :at 225]");
+    assert!(output.contains("2 changed"), "{output}");
+    assert!(warning_lines(&output).is_empty(), "{output}");
+    assert_eq!(locations(&f, 224), ["varrow"]);
+    assert_eq!(locations(&f, 225), ["ashford"]);
+    let before = fs::read(&f.path).unwrap();
+    let output = ok(&f, "[:set :greg :located_in :ashford :at 225]");
+    assert!(output.contains("nothing committed: 0 changed"), "{output}");
+    assert_eq!(fs::read(&f.path).unwrap(), before);
+}
+
+#[test]
 fn greg_overlap_warning_appears_and_resolves() {
     let f = build(EMPTY);
     let first = ok(&f, "[:assert :greg :located_in :varrow :at 200]");

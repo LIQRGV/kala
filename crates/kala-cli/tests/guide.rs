@@ -374,3 +374,41 @@ fn guide_cypher_aggregate_and_bounded_path_examples_match_the_fixture() {
         assert_eq!(row[1]["value"], 1);
     }
 }
+
+#[test]
+fn guide_set_move_and_if_missing_script_are_rerunnable() {
+    const MOVE: &str = "[:set :greg :located_in :ashford :at 225]";
+    const SCRIPT: &str = "[:at 800 [:create :CHARACTER :kael2 :if-missing] [:assert :kael2 :name \"Kael\"] [:assert :kael2 :located_in :varrow]]";
+    let f = fixture_through_cli();
+    let move_file = f.dir.path().join("move.edn");
+    fs::write(&move_file, MOVE).unwrap();
+    let result = f.json("transact", &[move_file.to_str().unwrap()]);
+    assert_eq!(result["changed"], 2);
+    assert!(
+        result["warnings"]["introduced"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let script_file = f.dir.path().join("rerunnable.edn");
+    fs::write(&script_file, SCRIPT).unwrap();
+    let first = f.json("transact", &[script_file.to_str().unwrap()]);
+    assert_eq!(first["changed"], 2);
+    let before = fs::read(&f.path).unwrap();
+    let second = f.json("transact", &[script_file.to_str().unwrap()]);
+    assert_eq!(second["changed"], 0);
+    assert_eq!(fs::read(&f.path).unwrap(), before);
+    let prose = normalized(&guide());
+    for source in [MOVE, SCRIPT] {
+        assert!(
+            prose.contains(&normalized(source)),
+            "guide form missing: {source}"
+        );
+    }
+    for command in [
+        "kala transact varrow.kala move.edn",
+        "kala transact varrow.kala rerunnable.edn",
+    ] {
+        assert!(prose.contains(command), "guide command missing: {command}");
+    }
+}

@@ -135,6 +135,37 @@ creation reports its entity ID and 0 fact entries changed. Use printed entry IDs
 with `[:correct N :delete]` or `[:correct N :replace :at 830]`. Replacement also
 accepts `:value`, `:op` and `:precision`. A no-op prints 0 changed.
 
+`[:create :CHARACTER :kael2 :if-missing]` creates a free handle, or reports
+`exists CHARACTER#N kael2` if it already belongs to that type. Another type is
+an error. It requires a handle and sees earlier creates in the transaction.
+Existing entities write no entry; a form containing only that no-op reports
+`nothing committed`. JSON adds `created: true` or `false` for conditional creates.
+Plain creates keep rejecting duplicate handles.
+
+`[:set :greg :located_in :ashford :at 225]` replaces what Greg holds **at tick
+225** by explicitly retracting removed members and asserting new members.
+A scalar is a singleton; `[:set :edwin :alias ["the Grey King" "Ned"] :at 800]`
+replaces the whole set, and `[]` clears it. Duplicate members count once; held
+members keep their original entries and precision. The fixture defines `alias`.
+`:at` and `:precision` work as on assertions; edge triples can be subjects.
+A set with several values on a `one` attribute is accepted with overlap warnings.
+Events, deprecated attributes and unknown attributes with `[]` are refused.
+A same-tick conflict names the entry and suggests `[:correct ...]` for changing
+canon. A set with no tick uses the transaction's stable default/latest tick.
+Dumps contain only the stored assert/retract primitives, never `:set`.
+
+A form containing `:set` has a budget of 256 expanded primitive writes/operations
+(no-op operations count once). Requested and held sets each have at most 256
+members; all sets in one form share a 16 MiB budget for their combined encoded
+requested/held values and a 65,536-key read budget (conflict diagnostics included). A limit error aborts the entire transaction.
+
+Each commit retains the first 100 introduced and 100 resolved overlap warnings,
+in their existing deterministic order, with exact omitted counts. A longer list
+ends with `… and N more overlap warnings (run kala doctor to list them)` (or
+`more resolved overlap warnings`). Doctor continues to inspect the full world;
+resolved warnings describe past issues and are no longer current doctor findings.
+JSON includes `introduced_omitted` and `resolved_omitted` only when nonzero.
+
 `--json` prints one document per successful form, with fields `form`, `dry_run`,
 `tx`, `changed`, `declared`, `entries`, `edges`, `ops`, `schema` and `warnings`. Each op has `position`,
 `kind`, `tick`, `precision`, `changed`, `declared`, `entries` and `entity` (null unless created).

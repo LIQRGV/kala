@@ -380,6 +380,7 @@ pub enum WriteOp {
     Create {
         node_type: String,
         handle: Option<String>,
+        if_missing: bool,
         span: Span,
     },
     Fact {
@@ -387,6 +388,15 @@ pub enum WriteOp {
         subject: WriteValue,
         attr: Attr,
         value: WriteValue,
+        at: Option<kala_core::Tick>,
+        precision: kala_core::Precision,
+        span: Span,
+    },
+    /// Replace the whole value set at a tick, lowered to retract/assert differences.
+    Set {
+        subject: WriteValue,
+        attr: Attr,
+        values: Vec<WriteValue>,
         at: Option<kala_core::Tick>,
         precision: kala_core::Precision,
         span: Span,

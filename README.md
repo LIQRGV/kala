@@ -205,7 +205,8 @@ The native Rust API (`kala-core`) can also write directly. See
 - [x] Cypher reads: MATCH/WHERE/RETURN, bags/NULL, ORDER BY/SKIP/LIMIT and time travel
 - [x] Cypher breadth: OPTIONAL MATCH, WITH, aggregates, UNWIND, bounded paths and Bolt Path values
 - [x] Neo4j driver metadata and routing (CALL, SHOW DATABASES, ROUTE; TCP only)
-- [ ] Writes over Bolt and explicit transactions (slice 15), then transports and TLS
+- [x] Shared write applier, Datalog `:set` / `:if-missing`, bounded commit warnings and write-privilege groundwork (slice 15a)
+- [ ] Writes over Bolt and explicit transactions (slices 15b–15d), then transports and TLS
 - [ ] Web clients (WebSocket and remaining Browser stubs), then Gremlin when requested
 - [x] Accounts, host matching, Argon2id passwords and database privileges
 - [ ] TLS for encrypted Bolt connections

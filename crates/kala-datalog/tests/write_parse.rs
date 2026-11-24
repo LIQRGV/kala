@@ -5,6 +5,35 @@ use kala_datalog::{ErrorKind, FormKind, form_kind, parse_write, parse_writes};
 use proptest::prelude::*;
 
 #[test]
+fn set_form_parses() {
+    let text = "[:set :greg :located_in :ashford :at 601]";
+    let tx = parse_write(text).unwrap_or_else(|e| panic!("set form must parse: {e}"));
+    assert_eq!(tx.ops.len(), 1);
+    match &tx.ops[0] {
+        WriteOp::Set {
+            subject,
+            attr,
+            values,
+            at,
+            precision,
+            ..
+        } => {
+            assert!(
+                matches!(subject, WriteValue::Scalar(kala_datalog::ast::Item::Keyword(s, _)) if s == "greg")
+            );
+            assert_eq!(attr.name, "located_in");
+            assert_eq!(values.len(), 1);
+            assert!(
+                matches!(&values[0], WriteValue::Scalar(kala_datalog::ast::Item::Keyword(s, _)) if s == "ashford")
+            );
+            assert_eq!(*at, Some(Tick(601)));
+            assert_eq!(*precision, Precision::Exact);
+        }
+        other => panic!("expected parsed set, got {other:?}"),
+    }
+}
+
+#[test]
 fn every_operation_and_option_order() {
     for text in [
         "[:create :CHARACTER :kael]",
@@ -201,4 +230,108 @@ fn eight_digit_unicode_escapes_accept_scalars_and_reject_invalid_codepoints() {
             "accepted invalid Unicode escape: {source}"
         );
     }
+}
+
+#[test]
+fn if_missing_forms_parse_and_require_a_handle() {
+    for source in [
+        "[:create :CHARACTER :kael :if-missing]",
+        "[:create \"CHARACTER\" \"kael\" :if-missing]",
+    ] {
+        let tx = parse_write(source).unwrap_or_else(|e| panic!("{source}: {e}"));
+        assert_eq!(tx.ops.len(), 1);
+        assert!(matches!(
+            &tx.ops[0],
+            WriteOp::Create {
+                if_missing: true,
+                ..
+            }
+        ));
+    }
+    let source = "[:create :CHARACTER :if-missing]";
+    let error = parse_write(source).expect_err(source).to_string();
+    assert!(error.contains("handle"), "{error}");
+    assert!(parse_write("[:create :CHARACTER :kael :if-missing :if-missing]").is_err());
+}
+
+#[test]
+fn set_parses_empty_many_edge_subject_and_tick_extremes() {
+    for source in [
+        "[:set :greg :alias []]",
+        "[:set :greg :alias [\"one\" \"two\" \"two\"] :precision :year]",
+        "[:set [:greg :located_in :varrow] :disguised true :at 1]",
+        "[:set :greg :related_to [[:edwin :located_in :varrow]]]",
+    ] {
+        let tx = parse_write(source).unwrap_or_else(|e| panic!("{source}: {e}"));
+        assert_eq!(tx.ops.len(), 1);
+        assert_eq!(form_kind(source).unwrap(), FormKind::Write);
+    }
+    for tick in [i64::MIN, -1, 0, i64::MAX] {
+        parse_write(&format!("[:set :greg :age 1 :at {tick}]")).unwrap();
+    }
+    for source in [
+        "[:set :greg :alias]",
+        "[:set :greg :age ?age]",
+        "[:set :greg :age [1 ?age]]",
+        "[:set :greg :age 1 :at 0 :at 1]",
+        "[:set :greg :age 1 :precision :week]",
+    ] {
+        assert!(parse_write(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn set_vectors_and_new_forms_keep_the_parser_resource_limits() {
+    let many = format!(
+        "[:set :greg :age [{}]]",
+        (0..257)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    assert_eq!(parse_write(&many).unwrap_err().kind, ErrorKind::Limit);
+    let ops = format!("[{}]", "[:create :CHARACTER :greg :if-missing]".repeat(257));
+    assert_eq!(parse_write(&ops).unwrap_err().kind, ErrorKind::Limit);
+    let deep = format!(
+        "[:set :greg :age {}0{}]",
+        "[".repeat(kala_datalog::MAX_DEPTH),
+        "]".repeat(kala_datalog::MAX_DEPTH)
+    );
+    assert_eq!(parse_write(&deep).unwrap_err().kind, ErrorKind::Limit);
+    let oversized = format!(
+        "[:set :greg :alias \"{}\"]",
+        "a".repeat(kala_datalog::MAX_QUERY_BYTES)
+    );
+    assert_eq!(parse_write(&oversized).unwrap_err().kind, ErrorKind::Limit);
+}
+
+#[test]
+fn quoted_if_missing_handle_stays_literal() {
+    for source in [
+        r#"[:create :CHARACTER "if-missing"]"#,
+        r#"[:create :CHARACTER "if-missing" :if-missing]"#,
+    ] {
+        let parsed = parse_write(source).unwrap_or_else(|e| panic!("{source}: {e}"));
+        assert!(
+            matches!(&parsed.ops[0], WriteOp::Create { handle: Some(handle), .. } if handle == "if-missing")
+        );
+    }
+    assert!(
+        parse_write("[:create :CHARACTER :if-missing]")
+            .unwrap_err()
+            .to_string()
+            .contains("handle")
+    );
+}
+
+#[test]
+fn restore_accepts_legacy_plain_create_for_an_if_missing_handle() {
+    let source = "[:genesis [:node-type :CHARACTER]]\n[:create :CHARACTER :if-missing]";
+    let forms = kala_datalog::restore_forms(source)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(forms.len(), 2);
+    assert!(
+        matches!(&forms[1].ops[0], WriteOp::Create { handle: Some(handle), if_missing: false, .. } if handle == "if-missing")
+    );
 }

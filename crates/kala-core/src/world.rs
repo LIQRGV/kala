@@ -77,7 +77,7 @@ use crate::log::{
     self, EncodedTxn, EntryBody, EntryId, LogEntry, LogWriter, NewEntry, SurveyedTxn,
 };
 use crate::overlap::{
-    Overlap, Side, Warnings, find_overlaps, find_overlaps_touching, value_intervals,
+    Interval, Overlap, Side, Warnings, find_overlaps, find_overlaps_touching, value_intervals,
 };
 use crate::schema::{AttrDef, Cardinality, Kind, RefDirection, Schema};
 use crate::schema::{
@@ -93,7 +93,6 @@ pub use meter::{MeteredView, WorkMeter};
 pub(crate) use open::ReplayFault;
 use schema_ops::{OrderedEntry, SchemaSnapshot};
 use std::borrow::Cow;
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};

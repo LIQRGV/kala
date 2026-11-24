@@ -58,6 +58,16 @@ pub struct Identity {
     pub grants: Vec<String>,
 }
 impl Identity {
+    /// Whether this identity may write the named database (separate from read).
+    pub fn permits_write(&self, db: &str) -> bool {
+        self.grants.iter().any(|grant| {
+            grant.split_once(':').is_some_and(|(privilege, target)| {
+                (target == "*" || target == db)
+                    && (privilege == "admin" || (db != "system" && privilege == "write"))
+            })
+        })
+    }
+
     /// Whether this identity has the stored backup privilege. Local file
     /// backups use filesystem permissions; a future server dump will call this.
     /// Like reads, the accounts database (password hashes) is covered only by

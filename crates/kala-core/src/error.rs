@@ -58,6 +58,8 @@ pub enum Error {
     UnknownNodeType(String),
     /// The handle is already used by another entity in this world.
     DuplicateHandle(String),
+    /// Find-or-create found the handle on a different, permanent node type.
+    HandleTypeMismatch { handle: String, node_type: String },
     /// A name is declared twice in the schema.
     DuplicateName(String),
     /// The handle isn't a valid handle (e.g. empty).
@@ -245,6 +247,12 @@ impl fmt::Display for Error {
             }
             Error::WorkInterrupted { reason } => write!(f, "read interrupted: {reason:?}"),
             Error::UnknownNodeType(name) => write!(f, "unknown node type {}", Quoted(name)),
+            Error::HandleTypeMismatch { handle, node_type } => write!(
+                f,
+                "handle {} is already in use by a {}",
+                Quoted(handle),
+                Echo(node_type)
+            ),
             Error::DuplicateHandle(h) => write!(f, "handle {} is already in use", Quoted(h)),
             Error::DuplicateName(name) => {
                 write!(f, "name {} is declared twice in the schema", Quoted(name))

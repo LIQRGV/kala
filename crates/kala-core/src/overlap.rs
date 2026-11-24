@@ -266,8 +266,126 @@ fn sweep(
 /// `(entity, attr, side, a, b, during.from)`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Warnings {
+    /// Introduced overlaps omitted after the first [`MAX_COMMIT_WARNINGS`].
+    /// A u128 counts pairs exactly even if their count exceeds usize; the
+    /// interval snapshots themselves must fit in addressable Vec allocations.
+    pub introduced_omitted: u128,
+    /// Resolved overlaps omitted after the first [`MAX_COMMIT_WARNINGS`].
+    pub resolved_omitted: u128,
     /// Overlaps that hold after the commit and didn't before.
     pub introduced: Vec<Overlap>,
     /// Overlaps that held before the commit and don't after.
     pub resolved: Vec<Overlap>,
+}
+
+/// Maximum overlaps retained per introduced/resolved list in a commit result.
+/// Counting continues after the cap; no per-pair objects are allocated then.
+pub const MAX_COMMIT_WARNINGS: usize = 100;
+
+impl Warnings {
+    pub(crate) fn push(&mut self, introduced: bool, make: impl FnOnce() -> Overlap) {
+        let (list, omitted) = if introduced {
+            (&mut self.introduced, &mut self.introduced_omitted)
+        } else {
+            (&mut self.resolved, &mut self.resolved_omitted)
+        };
+        if list.len() < MAX_COMMIT_WARNINGS {
+            list.push(make());
+        } else {
+            *omitted += 1;
+        }
+    }
+}
+
+/// Lazily sweep two interval lists. Memory is constant even when every pair
+/// overlaps; values are cloned only for warnings retained by the report.
+fn intersections<'a>(a: &'a [Interval], b: &'a [Interval]) -> impl Iterator<Item = Interval> + 'a {
+    let (mut x, mut y) = (0, 0);
+    std::iter::from_fn(move || {
+        while x < a.len() && y < b.len() {
+            let intersection = a[x].intersect(&b[y]);
+            if a[x].ends_before(&b[y]) {
+                x += 1;
+            } else {
+                y += 1;
+            }
+            if intersection.is_some() {
+                return intersection;
+            }
+        }
+        None
+    })
+}
+
+/// Compare before/after interval snapshots without ever materializing pair
+/// overlaps. Preserve the historical (a, b, from) ordering, including changed
+/// endpoints (one resolution and one introduction).
+pub(crate) fn diff_intervals(
+    before: &[(Value, Vec<Interval>)],
+    after: &[(Value, Vec<Interval>)],
+    touched: Option<&[Vec<u8>]>,
+    mut emit: impl FnMut(bool, &Value, &Value, Interval),
+) {
+    let mut aligned = std::collections::BTreeMap::new();
+    for (value, intervals) in before {
+        aligned.insert(value.encode().ok(), (value, intervals.as_slice(), &[][..]));
+    }
+    for (value, intervals) in after {
+        aligned
+            .entry(value.encode().ok())
+            .or_insert((value, &[][..], &[][..]))
+            .2 = intervals.as_slice();
+    }
+    let values: Vec<_> = aligned
+        .into_iter()
+        .map(|(key, (value, old, new))| {
+            let changed =
+                touched.is_none_or(|t| key.as_ref().is_some_and(|k| t.binary_search(k).is_ok()));
+            (value, old, new, changed)
+        })
+        .collect();
+    let positions: Vec<_> = (0..values.len()).filter(|&i| values[i].3).collect();
+    for (i, (a, ao, an, changed)) in values.iter().enumerate() {
+        // Untouched pairs cannot differ; avoid quadratic iteration for one edit.
+        let from = positions.partition_point(|&j| j <= i);
+        let candidates: Box<dyn Iterator<Item = usize>> = if *changed {
+            Box::new(i + 1..values.len())
+        } else {
+            Box::new(positions[from..].iter().copied())
+        };
+        for j in candidates {
+            let (b, bo, bn, _) = &values[j];
+            let mut old = intersections(ao, bo).peekable();
+            let mut new = intersections(an, bn).peekable();
+            loop {
+                use std::cmp::Ordering::*;
+                let order = match (old.peek(), new.peek()) {
+                    (None, None) => break,
+                    (Some(_), None) => Less,
+                    (None, Some(_)) => Greater,
+                    (Some(o), Some(n)) => o.from.cmp(&n.from),
+                };
+                match order {
+                    Less => {
+                        if let Some(o) = old.next() {
+                            emit(false, a, b, o);
+                        }
+                    }
+                    Greater => {
+                        if let Some(n) = new.next() {
+                            emit(true, a, b, n);
+                        }
+                    }
+                    Equal => {
+                        if let (Some(o), Some(n)) = (old.next(), new.next())
+                            && o != n
+                        {
+                            emit(false, a, b, o);
+                            emit(true, a, b, n);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

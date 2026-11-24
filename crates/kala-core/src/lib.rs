@@ -30,7 +30,9 @@ pub use interval::IntervalSet;
 #[doc(hidden)]
 pub use log::LogFault;
 pub use log::{EntryId, MAX_ENTRY_BYTES};
-pub use overlap::{Interval, Overlap, Side, Warnings, find_overlaps, value_intervals};
+pub use overlap::{
+    Interval, MAX_COMMIT_WARNINGS, Overlap, Side, Warnings, find_overlaps, value_intervals,
+};
 pub use schema::{
     AttrDef, AttributeOptions, BUILTIN_NAME_PREFIX, Cardinality, Kind, MigrationOptions,
     MigrationReport, RESERVED_NAME_PREFIX, RefDirection, Schema, SchemaChange,

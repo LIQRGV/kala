@@ -122,3 +122,180 @@ fn entity_only_commit_reports_the_same_tx_for_each_staged_form() {
     assert_eq!(first.complete(&commit).tx, Some(commit.tx));
     assert_eq!(second.complete(&commit).tx, Some(commit.tx));
 }
+
+#[test]
+fn set_and_if_missing_see_prior_forms_in_the_same_transaction() {
+    let mut w = empty();
+    let mut tx = w.begin();
+    let first = stage(
+        &mut tx,
+        &parse_write(
+            "[:at -10 [:create :CHARACTER :kael :if-missing] [:assert :kael :name \"old\"]]",
+        )
+        .unwrap(),
+        None,
+    )
+    .unwrap();
+    let second = stage(
+        &mut tx,
+        &parse_write("[:at -5 [:create :CHARACTER :kael :if-missing] [:set :kael :name \"new\"]]")
+            .unwrap(),
+        None,
+    )
+    .unwrap();
+    let commit = tx.commit().unwrap();
+    assert_eq!(commit.changed, 3);
+    let first = first.complete(&commit);
+    let second = second.complete(&commit);
+    assert_eq!(first.tx, second.tx);
+    assert_eq!(second.ops[1].entries, commit.entries[1..]);
+    let kael = w.entity_by_handle("kael").unwrap();
+    assert_eq!(
+        w.as_of(kael, "name", Tick(-10)).unwrap(),
+        [Value::Str("old".into())]
+    );
+    assert_eq!(
+        w.as_of(kael, "name", Tick(-5)).unwrap(),
+        [Value::Str("new".into())]
+    );
+}
+
+#[test]
+fn failed_set_forms_poison_a_caller_owned_transaction_and_rollback_schema_and_handles() {
+    for bad in [
+        "[:set :missing :age 1]",
+        "[:set :kael :age \"not a number\"]",
+        "[:set :kael :bought :kael]",
+        "[:set :kael :missing []]",
+    ] {
+        let mut w = empty();
+        execute(
+            &mut w,
+            &parse_write("[[:attribute :age :i64] [:attribute :bought :ref :event]]").unwrap(),
+            None,
+        )
+        .unwrap();
+        let before = w.latest_tx();
+        let mut tx = w.begin();
+        stage(
+            &mut tx,
+            &parse_write("[:create :CHARACTER :kael]").unwrap(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            stage(&mut tx, &parse_write(bad).unwrap(), None).is_err(),
+            "{bad}"
+        );
+        assert!(
+            matches!(tx.commit(), Err(Error::TransactionAborted)),
+            "{bad}"
+        );
+        assert!(w.entity_by_handle("kael").is_none());
+        assert_eq!(w.latest_tx(), before);
+        assert!(w.attribute("missing").is_none());
+    }
+}
+
+#[test]
+fn set_reads_the_fact_revived_by_an_earlier_staged_correction() {
+    let mut w = empty();
+    let initial = execute(&mut w, &parse_write("[[:create :CHARACTER :kael] [:assert :kael :name \"old\" :at 0] [:retract :kael :name \"old\" :at 10] [:assert :kael :name \"middle\" :at 10]]").unwrap(), None).unwrap();
+    let retraction = initial.ops[2].entries[0];
+    let mut tx = w.begin();
+    stage(
+        &mut tx,
+        &parse_write(&format!("[:correct {} :delete]", retraction.0)).unwrap(),
+        None,
+    )
+    .unwrap();
+    let set = stage(
+        &mut tx,
+        &parse_write("[:set :kael :name \"new\" :at 20]").unwrap(),
+        None,
+    )
+    .unwrap();
+    let commit = tx.commit().unwrap();
+    let report = set.complete(&commit);
+    assert_eq!(
+        report.ops[0].changed, 3,
+        "old and middle must both be retracted"
+    );
+    let kael = w.entity_by_handle("kael").unwrap();
+    assert_eq!(
+        w.as_of(kael, "name", Tick(20)).unwrap(),
+        [Value::Str("new".into())]
+    );
+    assert_eq!(
+        w.as_of(kael, "name", Tick(19)).unwrap(),
+        [Value::Str("middle".into()), Value::Str("old".into())]
+    );
+    assert!(
+        kala_core::doctor(&w, &kala_core::DoctorOptions::default())
+            .errors()
+            .is_empty()
+    );
+}
+
+#[test]
+fn set_read_limit_poisoning_rolls_back_earlier_staged_forms() {
+    let mut w = empty();
+    execute(
+        &mut w,
+        &parse_write("[[:create :CHARACTER :kael] [:attribute :alias :string :many]]").unwrap(),
+        None,
+    )
+    .unwrap();
+    let kael = w.entity_by_handle("kael").unwrap();
+    let mut tx = w.begin();
+    for i in 0..257 {
+        tx.assert(kael, "alias", Value::Str(format!("a{i}")), Some(Tick(0)))
+            .unwrap();
+    }
+    tx.commit().unwrap();
+    let before = w.latest_tx();
+    let mut tx = w.begin();
+    stage(
+        &mut tx,
+        &parse_write("[:create :CHARACTER :uncommitted]").unwrap(),
+        None,
+    )
+    .unwrap();
+    let failure = stage(
+        &mut tx,
+        &parse_write("[:set :kael :alias [] :at 10]").unwrap(),
+        None,
+    )
+    .unwrap_err();
+    assert!(failure.to_string().contains("limit"), "{failure}");
+    assert!(matches!(tx.commit(), Err(Error::TransactionAborted)));
+    assert!(w.entity_by_handle("uncommitted").is_none());
+    assert_eq!(w.latest_tx(), before);
+    assert_eq!(w.as_of(kael, "alias", Tick(10)).unwrap().len(), 257);
+}
+
+#[test]
+fn descending_sets_share_a_value_byte_budget_and_poison_the_transaction() {
+    use kala_core::{AttrDef, Cardinality, Kind, ValueType};
+    let schema = Schema::new()
+        .node_type("CHARACTER")
+        .attribute(AttrDef::new("bio", ValueType::Str, Kind::State, Cardinality::Many).unindexed());
+    let mut w = World::in_memory(schema).unwrap();
+    let e = w.create_entity("CHARACTER", Some("e")).unwrap();
+    w.assert(
+        e,
+        "bio",
+        Value::Str("x".repeat(9 * 1024 * 1024)),
+        Some(Tick(0)),
+    )
+    .unwrap();
+    let before = w.latest_tx();
+    let mut tx = w.begin();
+    let form = parse_write("[[:set :e :bio [] :at 2] [:set :e :bio [] :at 1]]").unwrap();
+    let failure = stage(&mut tx, &form, None)
+        .expect_err("re-reading a long held value must charge the cumulative form byte budget");
+    assert!(failure.to_string().contains("budget"), "{failure}");
+    assert!(matches!(tx.commit(), Err(Error::TransactionAborted)));
+    assert_eq!(w.latest_tx(), before);
+    assert_eq!(w.history(e, "bio").unwrap().len(), 1);
+}
