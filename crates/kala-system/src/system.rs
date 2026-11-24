@@ -100,9 +100,8 @@ impl std::error::Error for SystemError {}
 fn store(error: kala_core::Error) -> SystemError {
     match error {
         kala_core::Error::WorldLocked => SystemError::Busy,
-        // A commit refused because another account change was committed
-        // first; nothing was written. Running the command again applies it
-        // to the accounts as they are now.
+        // Another account change was committed after this one read the
+        // accounts; nothing was written. `apply` runs the change again.
         kala_core::Error::Conflict(_) => SystemError::Busy,
         kala_core::Error::RecoveryRequired { bytes } => SystemError::RecoveryRequired { bytes },
         // Only the version number: nothing of the file's content.
@@ -535,21 +534,42 @@ pub fn apply(directory: impl AsRef<Path>, change: Change<'_>, recovery: Recovery
     let mut open = Open {
         recovery,
         recovered: None,
+        conflicted: false,
     };
-    let result = match change {
-        Change::Add { account, password } => add_inner(directory, account, password, &mut open),
-        Change::Set { account, password } => set_inner(directory, account, password, &mut open),
-        Change::Grant {
-            account,
-            privilege,
-            db,
-        } => change_grant(directory, account, privilege, db, true, &mut open),
-        Change::Revoke {
-            account,
-            privilege,
-            db,
-        } => change_grant(directory, account, privilege, db, false, &mut open),
-        Change::Drop { account } => drop_inner(directory, account, &mut open),
+    // Every change is decided from the accounts as read (does the account
+    // exist, is this the last admin, the next audit tick), so its
+    // transaction counts as having read all of them: if another change is
+    // committed first, kala-core refuses this one, having written nothing,
+    // and it is decided again from the accounts as they are now. Bounded:
+    // past it the caller sees `Busy` ("retry the command").
+    const CONFLICT_RETRIES: usize = 16;
+    let mut attempt = 0;
+    let result = loop {
+        open.conflicted = false;
+        let result = match &change {
+            Change::Add { account, password } => {
+                add_inner(directory, account, *password, &mut open)
+            }
+            Change::Set { account, password } => {
+                set_inner(directory, account, *password, &mut open)
+            }
+            Change::Grant {
+                account,
+                privilege,
+                db,
+            } => change_grant(directory, account, privilege, db, true, &mut open),
+            Change::Revoke {
+                account,
+                privilege,
+                db,
+            } => change_grant(directory, account, privilege, db, false, &mut open),
+            Change::Drop { account } => drop_inner(directory, account, &mut open),
+        };
+        if open.conflicted && attempt < CONFLICT_RETRIES {
+            attempt += 1;
+            continue;
+        }
+        break result;
     };
     Applied {
         recovered: open.recovered,
@@ -560,6 +580,32 @@ pub fn apply(directory: impl AsRef<Path>, change: Change<'_>, recovery: Recovery
 struct Open {
     recovery: Recovery,
     recovered: Option<kala_core::RecoveryReport>,
+    /// The last attempt lost to another account change committed while it
+    /// ran: nothing was written, and the change can be decided again.
+    conflicted: bool,
+}
+/// Begins the transaction of an account change that was decided from
+/// `world` as the caller just read it, writing at `tick`. The transaction
+/// counts as having read every account, so a change committed by another
+/// process before this one's commit is a conflict; and one that `begin`
+/// itself caught up with (after the caller's reads) is one too.
+fn begin<'w>(world: &'w mut World, tick: Tick, open: &mut Open) -> Result<Txn<'w>, SystemError> {
+    let read_at = world.latest_tx();
+    let mut txn = world.begin();
+    if txn.snapshot_tx() != read_at {
+        open.conflicted = true;
+        return Err(SystemError::Busy);
+    }
+    txn.note_read_all();
+    txn.set_default_tick(tick);
+    Ok(txn)
+}
+/// Commits an account change begun with [`begin`].
+fn commit(txn: Txn<'_>, open: &mut Open) -> Result<kala_core::CommitResult, SystemError> {
+    txn.commit().map_err(|e| {
+        open.conflicted = matches!(e, kala_core::Error::Conflict(_));
+        store(e)
+    })
 }
 /// Opens the system world for writing.
 ///
@@ -652,8 +698,7 @@ fn add_inner(
     let key = name.key();
     let previous = world.entity_by_handle(&key);
     let tick = next_tick(&world)?;
-    let mut txn = world.begin();
-    txn.set_default_tick(tick);
+    let mut txn = begin(&mut world, tick, open)?;
     // Reuse a dropped account's permanent handle, retaining its full history.
     let id = match previous {
         Some(id) => id,
@@ -671,7 +716,7 @@ fn add_inner(
         txn.assert(id, "password_hash", Value::Str(hash.expose().into()), None)
             .map_err(store)?;
     }
-    let committed = txn.commit().map_err(store)?;
+    let committed = commit(txn, open)?;
     eprintln!(
         "event=account_added user={} host={} plugin={plugin}",
         name.user, name.host
@@ -727,8 +772,7 @@ fn set_inner(
     let accounts = read_accounts(&world)?;
     let old = find(&accounts, &name).ok_or(SystemError::AccountNotFound)?;
     let tick = next_tick(&world)?;
-    let mut txn = world.begin();
-    txn.set_default_tick(tick);
+    let mut txn = begin(&mut world, tick, open)?;
     replace(
         &mut txn,
         old.id,
@@ -743,7 +787,7 @@ fn set_inner(
         old.password.as_ref().map(Credentials::expose),
         password.as_ref().map(Credentials::expose),
     )?;
-    let committed = txn.commit().map_err(store)?;
+    let committed = commit(txn, open)?;
     eprintln!(
         "event=account_auth_changed user={} host={} plugin={plugin} changed={}",
         name.user, name.host, committed.changed
@@ -839,8 +883,7 @@ fn change_grant(
     if !add && grant == "admin:*" {
         guard_last_admin(&accounts, target)?;
     }
-    let mut txn = world.begin();
-    txn.set_default_tick(tick);
+    let mut txn = begin(&mut world, tick, open)?;
     if add {
         txn.assert(target.id, "grant", Value::Str(grant), None)
             .map_err(store)?;
@@ -848,7 +891,7 @@ fn change_grant(
         txn.retract(target.id, "grant", Value::Str(grant), None)
             .map_err(store)?;
     }
-    let committed = txn.commit().map_err(store)?;
+    let committed = commit(txn, open)?;
     eprintln!(
         "event=account_grant_changed user={} host={} privilege={privilege} db={db} granted={add}",
         name.user, name.host
@@ -881,15 +924,14 @@ fn drop_inner(
         .map(|attr| strings(&world, target.id, attr).map(|v| (attr, v)))
         .collect::<Result<Vec<_>, _>>()?;
     let tick = next_tick(&world)?;
-    let mut txn = world.begin();
-    txn.set_default_tick(tick);
+    let mut txn = begin(&mut world, tick, open)?;
     for (attr, values) in values {
         for value in values {
             txn.retract(target.id, attr, Value::Str(value), None)
                 .map_err(store)?;
         }
     }
-    let committed = txn.commit().map_err(store)?;
+    let committed = commit(txn, open)?;
     eprintln!(
         "event=account_dropped user={} host={}",
         name.user, name.host
