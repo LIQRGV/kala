@@ -1,4 +1,17 @@
 use super::trusted_parent;
+use std::cell::RefCell;
+
+thread_local! {
+    /// Runs once, in `SocketLock::take`, after the lock file is opened and
+    /// before it is flock-ed: the window in which another server can finish
+    /// shutting down and remove the file.
+    static BETWEEN_OPEN_AND_LOCK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+pub(super) fn between_open_and_lock() {
+    if let Some(hook) = BETWEEN_OPEN_AND_LOCK.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+}
 
 #[test]
 fn socket_parent_owner_and_write_permissions_are_both_trusted() {
@@ -55,4 +68,42 @@ fn staging_directory_is_created_private_under_umask_000() {
         .mode()
         & 0o7777;
     assert_eq!(mode, 0o700, "staging directory was created {mode:o}");
+}
+
+// A server shutting down removes its lock file while it still holds the lock.
+// A start that had already opened that file must not treat a lock on the
+// removed inode as the lock: a third server would create and lock a new file
+// and both would "hold" the path.
+#[test]
+fn a_lock_on_a_removed_lock_file_is_not_taken_for_the_lock() {
+    use rustix::fs::{AtFlags, statat};
+    let dir = tempfile::tempdir().unwrap();
+    let parent = std::fs::File::open(dir.path()).unwrap();
+    let socket = dir.path().join("bolt.sock");
+    let lock_path = dir.path().join(".bolt.sock.lock");
+    std::fs::write(&lock_path, b"").unwrap();
+    let removed = lock_path.clone();
+    BETWEEN_OPEN_AND_LOCK.with(|h| {
+        *h.borrow_mut() = Some(Box::new(move || std::fs::remove_file(removed).unwrap()));
+    });
+    let lock =
+        super::SocketLock::take(&parent, std::ffi::OsStr::new("bolt.sock"), &socket).unwrap();
+    let named = statat(&parent, ".bolt.sock.lock", AtFlags::SYMLINK_NOFOLLOW)
+        .expect("the held lock file must exist at its name");
+    // (The inode number may equal the removed file's: it is free again once
+    // the first descriptor is closed. What matters is that the lock is on the
+    // file now at the name.)
+    assert!(super::same_inode(&named, &lock.identity));
+    // A second start is refused while this one holds it.
+    let error = super::SocketLock::take(&parent, std::ffi::OsStr::new("bolt.sock"), &socket)
+        .err()
+        .unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("is already in use by another kala serve"),
+        "{error}"
+    );
+    drop(lock);
+    assert!(!lock_path.exists());
 }

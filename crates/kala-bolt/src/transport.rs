@@ -65,7 +65,7 @@ impl Transport for Tcp {
 pub(crate) enum Listener {
     Tcp(TcpListener),
     #[cfg(unix)]
-    Unix(unix::BoundUnix),
+    Unix(Box<unix::BoundUnix>),
 }
 impl Listener {
     pub(crate) fn bind(addr: &ListenAddr, mode: u32) -> io::Result<Self> {
@@ -78,7 +78,7 @@ impl Listener {
             ListenAddr::Unix(path) => {
                 #[cfg(unix)]
                 {
-                    unix::BoundUnix::bind(path, mode).map(Self::Unix)
+                    unix::BoundUnix::bind(path, mode).map(|bound| Self::Unix(Box::new(bound)))
                 }
                 #[cfg(not(unix))]
                 {

@@ -2,7 +2,7 @@
 use super::{ListenAddr, Peer, ShutdownHandle, Transport, invalid, remaining};
 use rustix::fs::{self as fs, AtFlags, FileType, FlockOperation, Mode, OFlags, Stat};
 use rustix::net::{self as net, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read, Write};
 #[cfg(target_os = "linux")]
@@ -14,7 +14,7 @@ use std::os::unix::{
     net::{UnixListener, UnixStream},
 };
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub(super) fn validate_path(path: &Path) -> io::Result<()> {
     // sockaddr_un's pathname must leave room for the terminating NUL.
@@ -121,18 +121,126 @@ fn staging_directory(parent: &Path, parent_stat: &Stat) -> io::Result<tempfile::
     }
 }
 
-struct DirectoryLock<'a>(&'a File);
-impl<'a> DirectoryLock<'a> {
-    fn take(directory: &'a File) -> io::Result<Self> {
-        // Never let another process holding a directory lock hang startup or
-        // shutdown. Cooperating Kala processes fail closed on a busy lifecycle.
-        fs::flock(directory, FlockOperation::NonBlockingLockExclusive)?;
-        Ok(Self(directory))
+/// How long a start waits for the lock file before reporting "in use".
+/// Long enough for a server that is shutting down on the same path to let
+/// go, short enough that a path that is really in use fails promptly.
+const LOCK_WAIT: Duration = Duration::from_secs(1);
+const LOCK_RETRY: Duration = Duration::from_millis(20);
+
+/// The lock file next to the socket, `.<socket name>.lock`, flock-ed
+/// exclusively for the listener's whole lifetime (as PostgreSQL does).
+///
+/// Holding it is what proves that a socket already at the path does not
+/// belong to a live Kala server, so the stale check does not have to infer
+/// that from a connect error. It is a file of our own (mode 0600), not the
+/// parent directory: any user who can open a directory read-only can flock
+/// it and would block every start and cleanup.
+struct SocketLock {
+    file: File,
+    parent: File,
+    name: OsString,
+    identity: Stat,
+}
+impl SocketLock {
+    fn take(parent: &File, socket_name: &OsStr, socket_path: &Path) -> io::Result<Self> {
+        let mut name = OsString::from(".");
+        name.push(socket_name);
+        name.push(".lock");
+        let shown = socket_path.with_file_name(&name);
+        let unusable = |kind, reason: &dyn std::fmt::Display| {
+            io::Error::new(
+                kind,
+                format!(
+                    "lock file {} cannot be used ({reason}); it must be a regular file owned by this user, and symlinks are refused: remove it and start again",
+                    shown.display()
+                ),
+            )
+        };
+        let euid = rustix::process::geteuid().as_raw();
+        let deadline = Instant::now() + LOCK_WAIT;
+        loop {
+            // Read-only is enough for flock. NOFOLLOW: never create or lock
+            // through a symlink. NONBLOCK and NOCTTY: opening a FIFO or a
+            // terminal someone planted there must neither hang nor have side
+            // effects.
+            let file = fs::openat(
+                parent,
+                &name,
+                OFlags::RDONLY
+                    | OFlags::CREATE
+                    | OFlags::NOFOLLOW
+                    | OFlags::CLOEXEC
+                    | OFlags::NONBLOCK
+                    | OFlags::NOCTTY,
+                Mode::from_raw_mode(0o600),
+            )
+            .map_err(|e| {
+                let e = io::Error::from(e);
+                unusable(e.kind(), &e)
+            })?;
+            #[cfg(test)]
+            tests::between_open_and_lock();
+            let identity = fs::fstat(&file)?;
+            if FileType::from_raw_mode(identity.st_mode) != FileType::RegularFile {
+                return Err(unusable(
+                    io::ErrorKind::AlreadyExists,
+                    &"it is not a regular file",
+                ));
+            }
+            if identity.st_uid != euid {
+                return Err(unusable(
+                    io::ErrorKind::PermissionDenied,
+                    &"it belongs to another user",
+                ));
+            }
+            match fs::flock(&file, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => {
+                    // A holder removes the file before it lets go (see Drop),
+                    // so a lock on a file that is no longer at the name is
+                    // worth nothing: open the current file and try again.
+                    let current = fs::statat(parent, &name, AtFlags::SYMLINK_NOFOLLOW);
+                    if current.is_ok_and(|c| same_inode(&c, &identity)) {
+                        return Ok(Self {
+                            file: File::from(file),
+                            parent: parent.try_clone()?,
+                            name,
+                            identity,
+                        });
+                    }
+                }
+                Err(rustix::io::Errno::WOULDBLOCK) => {}
+                Err(e) => {
+                    let e = io::Error::from(e);
+                    return Err(unusable(e.kind(), &e));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!(
+                        "unix://{} is already in use by another kala serve (lock file {} is held)",
+                        socket_path.display(),
+                        shown.display()
+                    ),
+                ));
+            }
+            std::thread::sleep(LOCK_RETRY);
+        }
     }
 }
-impl Drop for DirectoryLock<'_> {
+impl Drop for SocketLock {
     fn drop(&mut self) {
-        let _ = fs::flock(self.0, FlockOperation::Unlock);
+        // Remove the file while the lock is still held, then let go. A start
+        // that was waiting on this file then finds its name gone (or naming a
+        // newer file) and retries, so two servers can never both hold "the"
+        // lock. After a crash the empty file stays; the next start reuses it.
+        let still_ours = fs::fstat(&self.parent).is_ok_and(|p| trusted_parent_stat(&p))
+            && fs::statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW)
+                .is_ok_and(|current| same_inode(&current, &self.identity));
+        if still_ours {
+            let _ = fs::unlinkat(&self.parent, &self.name, AtFlags::empty());
+        }
+        let _ = fs::flock(&self.file, FlockOperation::Unlock);
     }
 }
 
@@ -163,6 +271,60 @@ fn probe_socket() -> io::Result<OwnedFd> {
     }
 }
 
+/// What a connect to an existing socket says about its listener.
+enum Probe {
+    /// Something accepted the connection, or queued it.
+    Live,
+    /// Nothing listens on it.
+    Stale,
+    /// This user may not connect to it (or hard-link it), so nobody knows.
+    Unknown,
+}
+
+/// Connects to the socket `old` at `name`, without blocking, through a short
+/// private hard link: a long basename could make the pinned-directory alias
+/// exceed sun_path even when the requested path fits, and the link pins the
+/// checked inode so a replacement symlink is never followed.
+fn probe(
+    parent: &File,
+    name: &OsStr,
+    stage_dir: &File,
+    stage_path: &Path,
+    old: &Stat,
+) -> io::Result<Probe> {
+    use rustix::io::Errno;
+    let socket = probe_socket()?;
+    match fs::linkat(parent, name, stage_dir, "p", AtFlags::empty()) {
+        Ok(()) => {}
+        // protected_hardlinks refuses links to another user's socket.
+        Err(Errno::PERM | Errno::ACCESS) => return Ok(Probe::Unknown),
+        Err(e) => return Err(e.into()),
+    }
+    let linked = fs::statat(stage_dir, "p", AtFlags::SYMLINK_NOFOLLOW)?;
+    if !same_socket(old, &linked) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "Unix socket changed while checking stale path",
+        ));
+    }
+    let address = SocketAddrUnix::new(directory_path(stage_dir, stage_path).join("p"))?;
+    match net::connect(&socket, &address) {
+        Ok(()) | Err(Errno::AGAIN | Errno::INPROGRESS) => Ok(Probe::Live),
+        // On Linux this means no listener: a full backlog answers EAGAIN.
+        // BSD-family kernels (macOS, FreeBSD) also answer ECONNREFUSED when a
+        // live listener's backlog is full. A live Kala server is never taken
+        // for stale that way, because the caller holds the lock file; what
+        // remains there is a non-Kala listener with a full backlog on the
+        // same path, whose socket file would be replaced. Accepted, and
+        // documented in the README.
+        Err(Errno::CONNREFUSED) => Ok(Probe::Stale),
+        // Connecting needs write permission on the socket, which the server
+        // that created it may have withheld from itself (--unix.mode 0000).
+        Err(Errno::ACCESS | Errno::PERM) => Ok(Probe::Unknown),
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn trusted_parent(uid: u32, mode: u32, euid: u32) -> bool {
     (uid == euid || uid == 0) && (mode & 0o022 == 0 || mode & 0o1000 != 0)
 }
@@ -186,10 +348,11 @@ fn socket_mode(mode: u32) -> Mode {
 #[path = "unix_tests.rs"]
 mod tests;
 
+fn same_inode(a: &Stat, b: &Stat) -> bool {
+    a.st_dev == b.st_dev && a.st_ino == b.st_ino
+}
 fn same_socket(a: &Stat, b: &Stat) -> bool {
-    FileType::from_raw_mode(b.st_mode) == FileType::Socket
-        && a.st_dev == b.st_dev
-        && a.st_ino == b.st_ino
+    FileType::from_raw_mode(b.st_mode) == FileType::Socket && same_inode(a, b)
 }
 
 pub(crate) struct BoundUnix {
@@ -198,6 +361,9 @@ pub(crate) struct BoundUnix {
     parent: File,
     name: OsString,
     identity: Stat,
+    /// Declared last: released (and its file removed) only after `Drop` has
+    /// removed the socket and the listener is closed.
+    _lock: SocketLock,
 }
 impl BoundUnix {
     pub(super) fn bind(path: &Path, mode: u32) -> io::Result<Self> {
@@ -230,7 +396,9 @@ impl BoundUnix {
                 "Unix socket parent must belong to this user or root and not be group/other writable unless sticky",
             ));
         }
-        let locked = DirectoryLock::take(&parent)?;
+        // Held from here until this listener is dropped; also released, and
+        // the lock file removed, on every early return below.
+        let lock = SocketLock::take(&parent, &name, path)?;
         let parent_alias = directory_path(&parent, parent_path);
         let stage = staging_directory(&parent_alias, &parent_stat)?;
         // Created 0700 minus the umask: never wider, but a restrictive caller
@@ -257,32 +425,34 @@ impl BoundUnix {
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
-                        "Unix socket in a sticky directory belongs to another user",
+                        "Unix socket in a sticky directory belongs to another user and cannot be replaced: remove it as that user or choose another path",
                     ));
                 }
-                let probe = probe_socket()?;
-                // A long basename may make the fd alias exceed sun_path even
-                // when the requested path fits. Probe a short, private hard link
-                // to the checked inode; never follow a replacement symlink.
-                fs::linkat(&parent, &name, &stage_dir, "p", AtFlags::empty())?;
-                let probe_identity = fs::statat(&stage_dir, "p", AtFlags::SYMLINK_NOFOLLOW)?;
-                if !same_socket(&old, &probe_identity) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "Unix socket changed while checking stale path",
-                    ));
-                }
-                let probe_path = directory_path(&stage_dir, stage.path()).join("p");
-                let address = SocketAddrUnix::new(&probe_path)?;
-                match net::connect(&probe, &address) {
-                    Err(rustix::io::Errno::CONNREFUSED) => (),
-                    Ok(()) | Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INPROGRESS) => {
+                let euid = rustix::process::geteuid().as_raw();
+                match probe(&parent, &name, &stage_dir, stage.path(), &old)? {
+                    Probe::Stale => (),
+                    Probe::Live => {
                         return Err(io::Error::new(
                             io::ErrorKind::AddrInUse,
-                            "Unix socket already in use",
+                            format!(
+                                "unix://{} is already in use: a listener that is not a kala serve answers on it",
+                                path.display()
+                            ),
                         ));
                     }
-                    Err(e) => return Err(e.into()),
+                    // We hold the Kala lock, so no live Kala server owns this
+                    // socket; it is ours, in a trusted parent: a leftover.
+                    Probe::Unknown if old.st_uid == euid => (),
+                    Probe::Unknown => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!(
+                                "unix://{} holds a socket owned by another user (uid {}) that this user may not probe, so it cannot be told whether a server still uses it: remove the file or choose another path",
+                                path.display(),
+                                old.st_uid
+                            ),
+                        ));
+                    }
                 }
                 let current = fs::statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)?;
                 if !same_socket(&old, &current) {
@@ -301,13 +471,13 @@ impl BoundUnix {
         fs::linkat(&stage_dir, "s", &parent, &name, AtFlags::empty())?;
         drop(stage_dir);
         drop(stage);
-        drop(locked);
         Ok(Self {
             listener,
             path: path.to_owned(),
             parent,
             name,
             identity,
+            _lock: lock,
         })
     }
     pub(super) fn accept(&self) -> io::Result<super::Accepted> {
@@ -340,7 +510,6 @@ impl AcceptedUnix {
 impl Drop for BoundUnix {
     fn drop(&mut self) {
         let cleanup = || -> io::Result<()> {
-            let _lock = DirectoryLock::take(&self.parent)?;
             let parent = fs::fstat(&self.parent)?;
             if !trusted_parent_stat(&parent) {
                 return Err(io::Error::new(
