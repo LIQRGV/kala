@@ -544,21 +544,13 @@ impl Txn<'_> {
     /// Resolves a handle including entities created earlier in this transaction.
     pub fn entity_by_handle(&self, name: &str) -> Option<EntityId> {
         self.ids
-            .defs
-            .iter()
-            .find(|d| d.handle.as_deref() == Some(name))
-            .map(|d| d.id)
+            .entity_by_handle(name)
             .or_else(|| self.world.entity_by_handle(name))
     }
     /// The entity's handle, including entities created earlier in this
     /// transaction (the reverse of [`Txn::entity_by_handle`]).
     pub fn handle_of(&self, id: EntityId) -> Option<&str> {
-        self.ids
-            .defs
-            .iter()
-            .find(|d| d.id == id)
-            .and_then(|d| d.handle.as_deref())
-            .or_else(|| self.world.handle_of(id))
+        self.ids.handle_of(id).or_else(|| self.world.handle_of(id))
     }
     /// `CHARACTER#1`, `edge#9`, as [`World::format_id`] formats it, with
     /// node types this transaction declared.
