@@ -1059,3 +1059,97 @@ fn an_acknowledgement_does_not_cover_other_damaged_bytes_of_the_same_length() {
     a.assert(greg, "tag", s("a"), Some(Tick(2))).unwrap();
     assert_clean(&a);
 }
+
+// ---- R (round 2): an explicit catch-up waits a moment for a writer ----
+
+#[test]
+fn an_explicit_catch_up_waits_briefly_for_a_writer_and_begin_does_not() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    for read_only in [false, true] {
+        let (_dir, path, mut w, greg) = world();
+        let mut r = if read_only {
+            World::open_read_only(&path).unwrap()
+        } else {
+            World::open(&path).unwrap()
+        };
+        w.assert(greg, "tag", s("new"), Some(Tick(1))).unwrap();
+        assert_eq!(w.latest_tx(), TxId(2));
+        // A writer is in the middle of its next commit: the file has grown
+        // and the exclusive lock is held.
+        let held = hold_lock(&path);
+        // A transaction's own catch-up never waits: it begins on what the
+        // handle has.
+        if !read_only {
+            let t = r.begin();
+            assert_eq!(t.snapshot_tx(), TxId(1), "begin applied nothing");
+            drop(t);
+        }
+        assert_eq!(r.latest_tx(), TxId(1));
+        // The writer finishes a few milliseconds into the catch-up.
+        let (go, start) = mpsc::channel::<()>();
+        let writer = std::thread::spawn(move || {
+            start.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+            drop(held);
+        });
+        go.send(()).unwrap();
+        assert_eq!(r.catch_up(), Ok(1), "read_only={read_only}: waited for it");
+        assert_eq!(r.latest_tx(), TxId(2));
+        writer.join().unwrap();
+
+        // Bounded: behind a writer that keeps its lock, "nothing yet",
+        // after a wait far below a second.
+        w.assert(greg, "tag", s("newer"), Some(Tick(2))).unwrap();
+        let held = hold_lock(&path);
+        let started = Instant::now();
+        assert_eq!(r.catch_up(), Ok(0));
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(40), "it waited: {took:?}");
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        drop(held);
+        assert_eq!(r.catch_up(), Ok(1));
+    }
+}
+
+#[test]
+fn an_explicit_catch_up_makes_progress_behind_a_back_to_back_writer() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    let (_dir, path, mut w, greg) = world();
+    let mut r = World::open_read_only(&path).unwrap();
+    let mut r2 = World::open(&path).unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            // Commit after commit, as a dump being restored does.
+            let mut i = 0;
+            while !done.load(Ordering::Relaxed) {
+                w.assert(greg, "tag", s(&format!("t{i}")), Some(Tick(i)))
+                    .unwrap();
+                i += 1;
+            }
+            w.latest_tx()
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    for handle in [&mut r, &mut r2] {
+        // Five times in a row a catch-up moves the handle forward.
+        let mut steps = 0;
+        while steps < 5 {
+            let before = handle.latest_tx();
+            assert!(Instant::now() < deadline, "no progress: {steps} steps");
+            let applied = handle.catch_up().unwrap();
+            if applied > 0 {
+                assert!(handle.latest_tx() > before);
+                steps += 1;
+            }
+        }
+    }
+    done.store(true, Ordering::Relaxed);
+    let last = writer.join().unwrap();
+    assert_eq!(r.catch_up().map(|_| r.latest_tx()), Ok(last));
+    assert_clean(&r);
+}

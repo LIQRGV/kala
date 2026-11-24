@@ -174,6 +174,25 @@ fn try_read_lock(file: &File) -> Result<Option<ReadLock<'_>>, Error> {
     })
 }
 
+/// [`try_read_lock`], tried for up to `wait` (zero: one attempt): `None`
+/// if a writer held its exclusive lock all that time. Polls as [`lock`]
+/// does.
+fn read_lock_within(file: &File, wait: Duration) -> Result<Option<ReadLock<'_>>, Error> {
+    let started = Instant::now();
+    let mut pause = Duration::from_millis(1);
+    loop {
+        if let Some(lock) = try_read_lock(file)? {
+            return Ok(Some(lock));
+        }
+        let left = wait.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return Ok(None);
+        }
+        std::thread::sleep(pause.min(left));
+        pause = (pause * 2).min(MAX_LOCK_POLL);
+    }
+}
+
 /// What one attempt to take a file's shared lock came to.
 #[derive(Debug, PartialEq, Eq)]
 enum SharedAttempt {
@@ -309,10 +328,11 @@ impl Tail {
 /// cuts the transaction off again, and a reader that had applied it would
 /// have shown data and entry IDs that never were committed. So when the
 /// file is longer than the tip, the read happens under the file's
-/// **shared** lock, taken without waiting: writers hold the exclusive lock
-/// across write, fsync and any rollback, so no append is in flight while
-/// it is held. If a writer holds its lock right now, this returns an empty
-/// tail ("not yet": a later read finds what that writer committed). When
+/// **shared** lock: writers hold the exclusive lock across write, fsync
+/// and any rollback, so no append is in flight while it is held. If a
+/// writer holds its lock now and still does after `wait` (zero: one
+/// attempt, no waiting), this returns an empty tail ("not yet": a later
+/// read finds what that writer committed). `wait` is unused when `locked`. When
 /// the file ends exactly at the tip (the common case) no lock is taken at
 /// all: the read is bounded by that length, so it can't reach an append
 /// that starts meanwhile, and readers cost a writer nothing.
@@ -325,10 +345,11 @@ fn read_tail(
     tip: &ChainTip,
     next_entry: u64,
     locked: bool,
+    wait: Duration,
 ) -> Result<Tail, Error> {
     let mut len = file.metadata()?.len();
     let _shared = if !locked && len > tip.end {
-        let Some(shared) = try_read_lock(file)? else {
+        let Some(shared) = read_lock_within(file, wait)? else {
             return Ok(Tail::nothing());
         };
         // Stable now: nothing appends or cuts while the lock is held.
@@ -394,9 +415,14 @@ fn read_tail(
 /// log file at `path` is opened for this one read, as a regular file only.
 /// A path that no longer names a Kala log of this format is
 /// [`Error::LogDiverged`]; a missing file is [`Error::Io`].
-pub(crate) fn read_tail_at(path: &Path, tip: &ChainTip, next_entry: u64) -> Result<Tail, Error> {
+pub(crate) fn read_tail_at(
+    path: &Path,
+    tip: &ChainTip,
+    next_entry: u64,
+    wait: Duration,
+) -> Result<Tail, Error> {
     let file = open_regular(path, OpenOptions::new().read(true))?;
-    read_tail(&file, tip, next_entry, false)
+    read_tail(&file, tip, next_entry, false, wait)
 }
 
 /// The length of the log file at `path` now (one `stat`).
@@ -438,6 +464,13 @@ pub(crate) fn scan_file(mut file: &File) -> Result<Scanned, Error> {
     })
 }
 
+/// How long an explicit catch-up (`World::catch_up`) waits for the shared
+/// lock while a writer holds the exclusive one, before it reports "nothing
+/// yet". A commit holds its lock for a write and an fsync, so this is
+/// enough to slip in between two commits of a writer that makes one after
+/// another, and short enough to call before every command.
+pub(crate) const CATCH_UP_WAIT: Duration = Duration::from_millis(50);
+
 /// How long a read-only open waits for the shared lock it settles its
 /// first, lock-free read under (see `World::open_read_only`). A commit
 /// holds the writer lock for a write and an fsync; an open that can't have
@@ -465,19 +498,7 @@ impl LogFile {
     /// Takes the file's shared lock, trying for up to `wait`: `None` if a
     /// writer held its exclusive lock all that time.
     pub(crate) fn settle_lock(&self, wait: Duration) -> Result<Option<SettleLock<'_>>, Error> {
-        let started = Instant::now();
-        let mut pause = Duration::from_millis(1);
-        loop {
-            if let Some(lock) = try_read_lock(&self.0)? {
-                return Ok(Some(SettleLock(lock)));
-            }
-            let left = wait.saturating_sub(started.elapsed());
-            if left.is_zero() {
-                return Ok(None);
-            }
-            std::thread::sleep(pause.min(left));
-            pause = (pause * 2).min(MAX_LOCK_POLL);
-        }
+        Ok(read_lock_within(&self.0, wait)?.map(SettleLock))
     }
 
     /// [`read_tail`] of this file after `tip`, under the shared lock
@@ -488,7 +509,7 @@ impl LogFile {
         tip: &ChainTip,
         next_entry: u64,
     ) -> Result<Tail, Error> {
-        read_tail(&self.0, tip, next_entry, true)
+        read_tail(&self.0, tip, next_entry, true, Duration::ZERO)
     }
 }
 
@@ -653,12 +674,13 @@ impl LogWriter {
     /// too. `held` is the writer lock if the caller has it: then the read
     /// is authoritative (see `World::apply_tail` for what may be done about
     /// an incomplete tail). Without it the tail is read under the shared
-    /// lock, or not at all while a writer holds its own (see
-    /// [`read_tail`]).
+    /// lock, waited for up to `wait`, or not at all while a writer holds
+    /// its own (see [`read_tail`]).
     pub(crate) fn read_tail(
         &self,
         held: Option<&WriterLock>,
         next_entry: u64,
+        wait: Duration,
     ) -> Result<Tail, Error> {
         let tip = self.tip.ok_or(Error::LogDiverged)?;
         if !self.path_is_this_file()? {
@@ -668,7 +690,7 @@ impl LogWriter {
         // very open file, so the shared lock must not be (it would replace
         // the exclusive one).
         debug_assert!(held.is_none_or(|h| Arc::ptr_eq(&h.file, &self.file)));
-        read_tail(&self.file, &tip, next_entry, held.is_some())
+        read_tail(&self.file, &tip, next_entry, held.is_some(), wait)
     }
 
     /// Whether the writer's path still names the file it has open.

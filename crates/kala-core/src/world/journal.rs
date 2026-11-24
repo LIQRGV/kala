@@ -3,6 +3,7 @@
 //! file they are appended to.
 
 use super::*;
+use std::time::Duration;
 
 /// The correction state of one revision chain (keyed by its base entry in
 /// [`Journal::chains`]). A chain no correction has touched has none: see
@@ -171,14 +172,20 @@ impl Journal {
 
     /// What the log file holds past the last transaction this handle
     /// applied (see `log::Tail`); `None` in memory. `held` is the writer
-    /// lock if the caller has it. Applies nothing and modifies nothing.
-    pub(super) fn read_tail(&mut self, held: Option<&WriterLock>) -> Result<Option<Tail>, Error> {
+    /// lock if the caller has it; without it, the read waits up to `wait`
+    /// for a writer to release its lock. Applies nothing and modifies
+    /// nothing.
+    pub(super) fn read_tail(
+        &mut self,
+        held: Option<&WriterLock>,
+        wait: Duration,
+    ) -> Result<Option<Tail>, Error> {
         let next_entry = self.next_entry().0;
         let tail = match (&self.log, &self.reader) {
-            (Some(log), _) => log.read_tail(held, next_entry)?,
+            (Some(log), _) => log.read_tail(held, next_entry, wait)?,
             (None, Some(reader)) => {
                 let tip = reader.tip.ok_or(Error::LogDiverged)?;
-                log::read_tail_at(&reader.path, &tip, next_entry)?
+                log::read_tail_at(&reader.path, &tip, next_entry, wait)?
             }
             (None, None) => return Ok(None),
         };

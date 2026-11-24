@@ -1156,7 +1156,10 @@ impl Txn<'_> {
     /// back first: they were staged on a schema that is no longer the
     /// latest.
     fn catch_up_under_lock(&mut self, held: &WriterLock) -> Result<usize, Error> {
-        let Some(tail) = self.world.read_tail(Some(held))? else {
+        let Some(tail) = self
+            .world
+            .read_tail(Some(held), std::time::Duration::ZERO)?
+        else {
             return Ok(0);
         };
         if tail.tip.is_some()

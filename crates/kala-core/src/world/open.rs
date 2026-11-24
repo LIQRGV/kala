@@ -407,7 +407,7 @@ impl World {
         let settled = match first {
             Ok((mut world, Some(tip))) => {
                 writer.stand_at(Some(tip));
-                match writer.read_tail(Some(&held), world.journal.next_entry().0) {
+                match writer.read_tail(Some(&held), world.journal.next_entry().0, Duration::ZERO) {
                     Ok(tail) => world.replay_entries(&tail.entries).map(|()| {
                         if let Some(tip) = tail.tip {
                             writer.advance(tip);

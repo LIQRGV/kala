@@ -9,14 +9,18 @@
 //!
 //! **Catch-up** ([`World::catch_up`]) reads what follows the last
 //! transaction this handle applied and applies it as a replay would. It
-//! never waits and never takes the writer lock:
+//! never takes the writer lock:
 //!
 //! - when the file is longer than the handle's log, the tail is read under
-//!   the file's **shared** lock, taken without waiting. Writers hold the
-//!   exclusive lock across write, fsync and any rollback, so a reader never
-//!   applies a transaction that isn't durable yet (and that a failed fsync
-//!   would take back). If a writer holds its lock right now, the catch-up
-//!   applies nothing ("not yet") and a later one finds what was committed;
+//!   the file's **shared** lock. Writers hold the exclusive lock across
+//!   write, fsync and any rollback, so a reader never applies a
+//!   transaction that isn't durable yet (and that a failed fsync would
+//!   take back). If a writer holds its lock right now, an explicit
+//!   [`World::catch_up`] waits for it a moment (at most 50 ms: a commit in
+//!   progress finishes, and a writer committing back to back is caught
+//!   between two commits); the catch-up [`World::begin`] makes never
+//!   waits. If the writer still holds its lock, the catch-up applies
+//!   nothing ("not yet") and a later one finds what was committed;
 //! - an incomplete last transaction (torn, or all there but failing its
 //!   checksum) is left alone: nothing of it is applied, nothing on disk is
 //!   touched. Only a commit, under the writer lock, cuts one;
@@ -52,12 +56,16 @@ impl World {
     /// transactions plus one re-read of the handle's last transaction, which
     /// proves the log before it unchanged; never that of the whole log.
     ///
-    /// Never waits, never takes the writer lock and never modifies the
-    /// file. A transaction is applied only once it is durable: when the
-    /// file has grown, its tail is read under the file's shared lock, and
-    /// if a writer holds its exclusive lock at that moment (a commit, an
-    /// open or a cut in progress) nothing is applied and this returns
-    /// `Ok(0)`; a later call applies what that writer committed. When the
+    /// Never takes the writer lock and never modifies the file. A
+    /// transaction is applied only once it is durable: when the file has
+    /// grown, its tail is read under the file's shared lock. If a writer
+    /// holds its exclusive lock at that moment (a commit, an open or a cut
+    /// in progress), this waits for it, at most 50 ms: long enough for a
+    /// commit to finish, so a caller that asks keeps up even with a writer
+    /// that commits back to back. If the writer holds its lock for longer,
+    /// nothing is applied and this returns `Ok(0)`; a later call applies
+    /// what that writer committed. (The catch-up [`World::begin`] makes
+    /// doesn't wait at all.) When the
     /// file hasn't grown no lock is taken at all. A last transaction that
     /// is incomplete (cut short, or all there but failing its checksum) is
     /// left alone and not counted. Only a commit, which holds the writer
@@ -78,8 +86,14 @@ impl World {
     ///   also refuses every later `catch_up` and write with that error.
     /// - [`Error::Io`] if the file can't be read.
     pub fn catch_up(&mut self) -> Result<usize, Error> {
+        self.catch_up_within(log::CATCH_UP_WAIT)
+    }
+
+    /// [`World::catch_up`], waiting up to `wait` for a writer to release
+    /// its lock (zero: not at all).
+    fn catch_up_within(&mut self, wait: Duration) -> Result<usize, Error> {
         self.gate.follows_log()?;
-        match self.read_tail(None)? {
+        match self.read_tail(None, wait)? {
             Some(tail) => self.apply_tail(tail, None),
             None => Ok(0),
         }
@@ -151,7 +165,7 @@ impl World {
     pub fn cut_acknowledged_tail(&mut self) -> Result<&RecoveryReport, Error> {
         self.writable()?;
         if let Some(held) = self.lock_log()?
-            && let Some(tail) = self.read_tail(Some(&held))?
+            && let Some(tail) = self.read_tail(Some(&held), Duration::ZERO)?
         {
             self.apply_tail(tail, Some(&held))?;
         }
@@ -159,12 +173,14 @@ impl World {
     }
 
     /// The catch-up [`World::begin`] makes: nothing but one `stat` when the
-    /// file is exactly as long as the log this handle applied. Errors are
+    /// file is exactly as long as the log this handle applied, and never a
+    /// wait for a writer (the commit catches up under the lock anyway).
+    /// Errors are
     /// left for the commit, which checks again under the lock (a diverged
     /// log is remembered and refuses the transaction's first write).
     pub(super) fn catch_up_if_grown(&mut self) {
         if !self.journal.file_ends_at_tip() {
-            let _ = self.catch_up();
+            let _ = self.catch_up_within(Duration::ZERO);
         }
     }
 
@@ -181,7 +197,7 @@ impl World {
         let Some(held) = self.lock_log()? else {
             return Ok(None);
         };
-        if let Some(tail) = self.read_tail(Some(&held))? {
+        if let Some(tail) = self.read_tail(Some(&held), Duration::ZERO)? {
             self.apply_tail(tail, Some(&held))?;
         }
         Ok(Some(held))
@@ -199,10 +215,15 @@ impl World {
     }
 
     /// What the log file holds past the last transaction this handle
-    /// applied; `None` in memory. A diverged file stops the handle from
-    /// following it (see [`World::catch_up`]).
-    pub(super) fn read_tail(&mut self, held: Option<&WriterLock>) -> Result<Option<Tail>, Error> {
-        let tail = self.journal.read_tail(held);
+    /// applied; `None` in memory. Without the writer lock (`held`), waits
+    /// up to `wait` for a writer to release its own. A diverged file stops
+    /// the handle from following it (see [`World::catch_up`]).
+    pub(super) fn read_tail(
+        &mut self,
+        held: Option<&WriterLock>,
+        wait: Duration,
+    ) -> Result<Option<Tail>, Error> {
+        let tail = self.journal.read_tail(held, wait);
         if let Err(Error::LogDiverged) = tail {
             self.gate.stop_following(Error::LogDiverged);
         }

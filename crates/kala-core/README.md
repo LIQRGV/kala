@@ -298,17 +298,21 @@ world locked.
 **Catch-up.** `World::catch_up` applies the transactions other handles appended
 since this one last looked and returns how many. It reads only those
 transactions (plus one re-read of the handle's own last transaction), validates
-them exactly as `World::open` validates a log, never waits and never changes
-the file. `World::begin` and the auto-committed writes do it first, and every
-commit does it again under the writer lock. A read-only handle
+them exactly as `World::open` validates a log and never changes the file.
+`World::begin` and the auto-committed writes do it first (without ever
+waiting), and every commit does it again under the writer lock. A read-only handle
 (`World::open_read_only`) can catch up too.
 
 **Readers wait out a commit in progress.** A transaction is applied by other
 handles only once it is durable. A writer holds the exclusive lock across its
 write, its fsync and (if the fsync fails) the truncation that takes the
 transaction back; a catch-up that finds the file grown reads the new tail
-under the file's *shared* lock, which it takes without waiting. If a writer
-holds its lock at that moment, the catch-up applies nothing and returns
+under the file's *shared* lock. If a writer holds its lock at that moment, an
+explicit `World::catch_up` waits for it, at most 50 ms (a commit in progress
+finishes in that time, so a handle that asks keeps up even behind a writer
+committing back to back, such as a dump being restored); the catch-up inside
+`World::begin` doesn't wait at all. If the writer still holds its lock, the
+catch-up applies nothing and returns
 `Ok(0)`: "not yet", and the next one finds what was committed. So `Ok(0)`
 means "nothing new that is durable yet", not "the file has nothing new". When
 the file hasn't grown, a catch-up takes no lock at all, so readers never slow a
