@@ -93,12 +93,14 @@ fn parameter_in_second_untyped_rule_position_names_its_position() {
 }
 
 #[test]
-fn parameter_typed_elsewhere_still_rejects_an_untyped_rule_position() {
-    assert_untyped(
-        "[:find ?e :in ?p :rules [[(r ?x) (r ?x)]] :where [?p :ally_of ?e] (r ?p)]",
-        "r",
-        1,
-    );
+fn parameter_typed_elsewhere_is_accepted_in_an_untyped_rule_position() {
+    // The parameter has a type from the fact pattern, so the query compiles as
+    // it always did, whichever clause comes first; the rule yields no rows.
+    let world = world();
+    for body in ["[?p :ally_of ?e] (r ?p)", "(r ?p) [?p :ally_of ?e]"] {
+        let query = format!("[:find ?e :in ?p :at -210 :rules [[(r ?x) (r ?x)]] :where {body}]");
+        assert!(rows(&world, &query, &param(&world)).is_empty(), "{query}");
+    }
 }
 
 #[test]
