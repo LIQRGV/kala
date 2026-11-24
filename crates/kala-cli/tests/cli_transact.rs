@@ -454,8 +454,8 @@ fn dry_run_refuses_damaged_tail_needing_acknowledgement_without_touching_it() {
     assert_eq!(damage::dir_snapshot(f.dir.path()), before);
 }
 
-/// `kala transact` with `KALA_BUSY_TIMEOUT_MS` set (the internal knob for
-/// how long a write waits for the writer lock).
+/// `kala transact --busy-timeout <busy_ms>ms` (how long a write waits for
+/// the writer lock).
 fn transact_waiting(f: &Fx, text: &str, busy_ms: &str) -> Output {
     let input = f.dir.path().join("writes.edn");
     fs::write(&input, text).unwrap();
@@ -463,7 +463,7 @@ fn transact_waiting(f: &Fx, text: &str, busy_ms: &str) -> Output {
         .arg("transact")
         .arg(&f.path)
         .arg(&input)
-        .env("KALA_BUSY_TIMEOUT_MS", busy_ms)
+        .arg(format!("--busy-timeout={busy_ms}ms"))
         .output()
         .unwrap()
 }

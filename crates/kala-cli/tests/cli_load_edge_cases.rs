@@ -251,7 +251,7 @@ fn force_while_the_world_is_open_in_another_process_is_refused() {
         .arg(&f)
         .arg(&path)
         .arg("--force")
-        .env("KALA_BUSY_TIMEOUT_MS", "100")
+        .args(["--busy-timeout", "100ms"])
         .output()
         .unwrap();
     assert_exit1(&o);

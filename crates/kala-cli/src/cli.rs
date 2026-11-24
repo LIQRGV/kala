@@ -10,6 +10,7 @@
 #![allow(rustdoc::broken_intra_doc_links, rustdoc::invalid_html_tags)]
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
 
@@ -31,6 +32,41 @@ pub(crate) fn parse_canon(s: &str) -> Result<Canon, String> {
         .parse::<u64>()
         .map(Canon)
         .map_err(|_| "expected `tx#N` or `N` (N a non-negative integer)".to_string())
+}
+
+/// The longest `--busy-timeout`: a wait is always bounded.
+pub const MAX_BUSY_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+/// A `--busy-timeout` value: a whole number with a unit, `500ms`, `5s` or
+/// `2m`; a bare number is seconds (like `--idle-timeout`); `0` means don't
+/// wait at all. At most [`MAX_BUSY_TIMEOUT`].
+pub(crate) fn parse_busy_timeout(s: &str) -> Result<Duration, String> {
+    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+    let duration = s[..digits]
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| match &s[digits..] {
+            "ms" => Some(Duration::from_millis(n)),
+            "" | "s" => Some(Duration::from_secs(n)),
+            "m" => n.checked_mul(60).map(Duration::from_secs),
+            _ => None,
+        });
+    duration.filter(|d| *d <= MAX_BUSY_TIMEOUT).ok_or_else(|| {
+        "expected a duration such as `500ms`, `5s` or `2m` (a bare number is seconds; \
+         `0` fails at once; at most 60m)"
+            .to_string()
+    })
+}
+
+/// The `--concurrency` values, default first.
+pub const CONCURRENCY_MODES: [&str; 2] = ["optimistic", "weak"];
+
+/// A value clap accepted for `--concurrency` (one of [`CONCURRENCY_MODES`]).
+pub(crate) fn concurrency(mode: &str) -> kala_core::Concurrency {
+    match mode {
+        "weak" => kala_core::Concurrency::Weak,
+        _ => kala_core::Concurrency::Optimistic,
+    }
 }
 
 /// The tick and canon options shared by point-in-time reads.
@@ -138,6 +174,11 @@ pub struct CreateArgs {
     pub world: PathBuf,
     #[arg(long)]
     pub schema: Option<PathBuf>,
+    /// Accepted like on the other write commands (`500ms`, `5s`, `2m`; a
+    /// bare number is seconds). A new world is built in a private file and
+    /// then placed, so there is no other writer to wait for.
+    #[arg(long, value_name = "DURATION", value_parser = parse_busy_timeout)]
+    pub busy_timeout: Option<Duration>,
 }
 
 // `kala export`.
@@ -209,6 +250,11 @@ pub struct LoadArgs {
     /// Replace the world file if it exists.
     #[arg(long)]
     pub force: bool,
+    /// How long to wait for the world's writer lock while another writer
+    /// commits: `500ms`, `5s`, `2m` (a bare number is seconds); `0` fails
+    /// at once. Default: 5s.
+    #[arg(long, value_name = "DURATION", value_parser = parse_busy_timeout)]
+    pub busy_timeout: Option<Duration>,
 }
 
 // `kala asof`.
@@ -391,6 +437,22 @@ pub struct TransactArgs {
     /// quarantine file before writing.
     #[arg(long)]
     pub acknowledge_recovery: bool,
+    /// The concurrency mode of forms that don't name one with a leading
+    /// `[:concurrency …]`: `optimistic` refuses a form (exit 4) if another
+    /// writer changed something it read; `weak` keeps only the store rules.
+    #[arg(
+        long,
+        value_name = "MODE",
+        default_value = CONCURRENCY_MODES[0],
+        value_parser = clap::builder::PossibleValuesParser::new(CONCURRENCY_MODES),
+        conflicts_with = "create"
+    )]
+    pub concurrency: String,
+    /// How long to wait for the world's writer lock while another writer
+    /// commits: `500ms`, `5s`, `2m` (a bare number is seconds); `0` fails
+    /// at once. Default: 5s.
+    #[arg(long, value_name = "DURATION", value_parser = parse_busy_timeout)]
+    pub busy_timeout: Option<Duration>,
 }
 
 // `kala repl`.
@@ -414,6 +476,19 @@ pub struct ReplArgs {
     /// `kala info`) to a quarantine file.
     #[arg(long, requires = "write")]
     pub acknowledge_recovery: bool,
+    /// With --write: the session's starting `.concurrency` mode.
+    #[arg(
+        long,
+        value_name = "MODE",
+        requires = "write",
+        value_parser = clap::builder::PossibleValuesParser::new(CONCURRENCY_MODES)
+    )]
+    pub concurrency: Option<String>,
+    /// How long to wait for the world's writer lock while another writer
+    /// commits: `500ms`, `5s`, `2m` (a bare number is seconds); `0` fails
+    /// at once. Default: 5s.
+    #[arg(long, value_name = "DURATION", value_parser = parse_busy_timeout, requires = "write")]
+    pub busy_timeout: Option<Duration>,
 }
 
 // `kala explain`.
@@ -443,6 +518,11 @@ pub struct UserWrite {
     /// `kala info`) to a quarantine file, then apply the change.
     #[arg(long)]
     pub acknowledge_recovery: bool,
+    /// How long to wait for system.kala's writer lock while another writer
+    /// commits: `500ms`, `5s`, `2m` (a bare number is seconds); `0` fails
+    /// at once. Default: 5s.
+    #[arg(long, value_name = "DURATION", value_parser = parse_busy_timeout)]
+    pub busy_timeout: Option<Duration>,
 }
 
 /// Local administrative operations, serialized by the system world's writer lock.

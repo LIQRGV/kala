@@ -61,7 +61,11 @@ pub fn run(args: &LoadArgs) -> Result<String, CliError> {
 
     // The old world's writer lock is held across the rename, so no commit
     // to it is in progress while it is replaced.
-    let old = if force { lock_old(world) } else { Ok(None) };
+    let old = if force {
+        lock_old(world, args.busy_timeout)
+    } else {
+        Ok(None)
+    };
     old.and_then(|old| match old {
         Some(mut old) => old
             .with_writer_lock(|| place(&tmp, world, force))
@@ -113,8 +117,9 @@ fn refuse_dir(world: &Path) -> CliError {
 
 /// Before `--force` replaces `world`: opens the old world for writing (so
 /// the caller can take its writer lock for the rename; the open itself
-/// waits for a commit in progress in another process and is refused if the
-/// lock stays held). Nothing there (or gone meanwhile): `None`. An old file
+/// waits for a commit in progress in another process, up to `busy_timeout`
+/// (`--busy-timeout`; `None` is kala-core's default, 5 s), and is refused
+/// if the lock stays held). Nothing there (or gone meanwhile): `None`. An old file
 /// that doesn't open as a world (corrupt, not a Kala log, unreadable) has
 /// no lock to respect and is replaced as asked: `None` too. A directory is
 /// refused.
@@ -127,7 +132,10 @@ fn refuse_dir(world: &Path) -> CliError {
 /// Opening runs kala-core's normal recovery, so an old world with a torn
 /// tail is cut first and its tail saved to a `.torn-` quarantine file next
 /// to it, which stays after the replace.
-fn lock_old(world: &Path) -> Result<Option<World>, CliError> {
+fn lock_old(
+    world: &Path,
+    busy_timeout: Option<std::time::Duration>,
+) -> Result<Option<World>, CliError> {
     if !exists(world) {
         return Ok(None);
     }
@@ -135,7 +143,8 @@ fn lock_old(world: &Path) -> Result<Option<World>, CliError> {
         return Err(refuse_dir(world));
     }
     refuse_system_file(world)?;
-    match World::open_waiting(world, super::transact::busy_timeout()) {
+    let wait = busy_timeout.unwrap_or(kala_core::log::DEFAULT_BUSY_TIMEOUT);
+    match World::open_waiting(world, wait) {
         Ok(w) => {
             super::transact::refuse_system(&w)?;
             Ok(Some(w))
