@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use super::encode::EncodedTxn;
 use super::fault::ArmedFaults;
 use super::file::{open_regular, read_log_file, read_to_len, sync_parent_dir};
-use super::format::HEADER_LEN;
+use super::format::{BEGIN_LEN, HEADER_LEN};
 use super::scan::{Scan, ScanFrom, check_header, is_same_txn, scan, scan_txns};
 use super::{ChainTip, LOG_FORMAT_VERSION, LOG_MAGIC, LogEntry};
 use crate::error::Error;
@@ -581,9 +581,18 @@ impl LogWriter {
     /// before the transaction: the caller is told the transaction failed, so
     /// it must not reappear on reopen if the bytes reach the disk anyway. A
     /// failed write may leave a torn tail, which reopening cuts.
+    ///
+    /// Before anything is written the file and this writer must agree (see
+    /// [`LogWriter::continues_file`]); if they don't, nothing is written or
+    /// cut, the writer is marked failed and this is [`Error::LogDiverged`].
     pub(crate) fn append(&mut self, _held: &WriterLock, txn: &EncodedTxn) -> Result<(), Error> {
         self.check()?;
+        #[cfg(feature = "test-hooks")]
+        super::fault::fire(super::fault::LogHook::BeforeAppend);
         let buf = &txn.bytes;
+        if !self.continues_file(txn)? {
+            return Err(self.refuse(Error::LogDiverged));
+        }
         let res = self
             .faults
             .before_write()
@@ -621,6 +630,55 @@ impl LogWriter {
         self.tip = tip_of(txn, self.len, end);
         self.len = end;
         Ok(())
+    }
+}
+
+impl LogWriter {
+    /// Whether appending `txn` now continues the log this writer knows,
+    /// checked under the lock right before the write:
+    ///
+    /// - the file is exactly as long as the log the writer has applied
+    ///   (one `fstat`). The write is an append and a failed fsync is rolled
+    ///   back with a truncation to that length, so a file that is longer
+    ///   (bytes this writer hasn't seen) or shorter would end up holding a
+    ///   transaction that doesn't follow what is before it, or lose another
+    ///   writer's committed one to the rollback;
+    /// - `txn` is the transaction after the writer's tip: its tx is the
+    ///   tip's plus one and its `Commit` checksum chains from the tip's.
+    ///
+    /// The lock makes all of this true by construction. It is checked
+    /// anyway, because the lock is advisory and not every file system
+    /// honours it (some network mounts, a Windows drive seen from WSL), a
+    /// program that ignores it may write the file, and a caller that caught
+    /// a panic between an append and its bookkeeping would otherwise go on
+    /// with a stale length.
+    fn continues_file(&self, txn: &EncodedTxn) -> Result<bool, Error> {
+        let Some(tip) = self.tip else {
+            return Ok(false);
+        };
+        let Some(super::EntryBody::Commit { tx, checksum }) = txn.entries.last().map(|e| &e.body)
+        else {
+            return Ok(false);
+        };
+        let Some(covered) = txn
+            .bytes
+            .len()
+            .checked_sub(4)
+            .and_then(|end| txn.bytes.get(BEGIN_LEN..end))
+        else {
+            return Ok(false);
+        };
+        Ok(self.len == tip.end
+            && self.file.metadata()?.len() == self.len
+            && tip.tx.0.checked_add(1) == Some(tx.0)
+            && super::chained_checksum(tip.checksum, covered) == *checksum)
+    }
+
+    /// Marks the writer failed with `why` (nothing more is appended until
+    /// the world is reopened) and returns `why`.
+    pub(crate) fn refuse(&mut self, why: Error) -> Error {
+        self.failed.get_or_insert(why.clone());
+        why
     }
 }
 

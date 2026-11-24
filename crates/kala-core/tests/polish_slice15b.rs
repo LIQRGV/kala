@@ -517,3 +517,55 @@ fn readers_looping_catch_up_never_keep_a_writer_out() {
     assert!(took < Duration::from_secs(60), "200 commits took {took:?}");
     assert_clean(&w);
 }
+
+// ---- D: the file and the handle must agree before anything is appended ----
+
+/// Commits on `w` while `foreign` does something to the file between the
+/// commit's catch-up (under the lock) and its append: what a program that
+/// ignores the lock, or a file system whose locks do nothing, allows.
+fn commit_with_foreign_change(foreign: impl FnOnce(&Path) + 'static) {
+    let (_dir, path, mut w, greg) = world();
+    w.assert(greg, "tag", s("a"), Some(Tick(1))).unwrap();
+    let before = World::open_read_only(&path).unwrap();
+    let p = path.clone();
+    let changed = Rc::new(RefCell::new(Vec::new()));
+    let out = changed.clone();
+    on_log_hook(LogHook::BeforeAppend, move || {
+        foreign(&p);
+        *out.borrow_mut() = bytes(&p);
+    });
+    let res = w.assert(greg, "tag", s("b"), Some(Tick(2)));
+    assert_eq!(res.unwrap_err(), Error::LogDiverged);
+    assert!(
+        bytes(&path) == *changed.borrow(),
+        "a refused append writes nothing and cuts nothing"
+    );
+    // The handle's own state is what it was, and it appends no more.
+    assert_eq!(w.latest_tx(), TxId(2));
+    assert_eq!(state(&w, greg), state(&before, greg));
+    assert_eq!(
+        w.assert(greg, "tag", s("c"), Some(Tick(3))).unwrap_err(),
+        Error::LogDiverged
+    );
+    assert!(bytes(&path) == *changed.borrow());
+}
+
+#[test]
+fn an_append_is_refused_when_the_file_grew_under_the_lock() {
+    commit_with_foreign_change(|path| {
+        use std::io::Write;
+        let mut f = OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(b"foreign bytes").unwrap();
+    });
+}
+
+#[test]
+fn an_append_is_refused_when_the_file_shrank_under_the_lock() {
+    commit_with_foreign_change(|path| {
+        let b = bytes(path);
+        let last = *common::spans(&b).last().unwrap();
+        // Another writer's "rollback": the handle's last transaction is gone.
+        let f = OpenOptions::new().write(true).open(path).unwrap();
+        f.set_len(last.start as u64).unwrap();
+    });
+}

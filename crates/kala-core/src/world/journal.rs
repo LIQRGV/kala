@@ -375,28 +375,40 @@ impl Journal {
 
     /// Appends one encoded transaction to the log file and fsyncs it, under
     /// the writer lock `held` (see [`Journal::lock`]); does nothing in
-    /// memory.
+    /// memory. Refused with [`Error::LogDiverged`], nothing written and the
+    /// log writer marked failed, unless the file ends where this handle's
+    /// log does and `txn` is the transaction that follows it.
     pub(super) fn append(
         &mut self,
         held: Option<&WriterLock>,
         txn: &EncodedTxn,
     ) -> Result<(), Error> {
-        // The two views of the chain agree: the file's last committed
-        // transaction is the last one kept here.
-        debug_assert!(
-            self.log
-                .as_ref()
-                .and_then(LogWriter::tip)
-                .is_none_or(|tip| tip.checksum == self.chain_checksum()),
-            "invariant: a transaction is encoded to chain from the file's last one"
-        );
-        match self.log.as_mut() {
-            Some(log) => log.append(
-                held.expect("invariant: a commit to a log file holds its writer lock"),
-                txn,
-            ),
-            None => Ok(()),
+        let (chain, next_entry, next_tx) =
+            (self.chain_checksum(), self.next_entry(), self.next_tx());
+        let Some(log) = self.log.as_mut() else {
+            return Ok(());
+        };
+        // The two views of the log agree: the file's last committed
+        // transaction is the last one kept here, and `txn` was numbered to
+        // follow it. True by construction; checked for real, because a
+        // transaction appended to a file that isn't where this handle
+        // thinks it is would be a duplicate tx or a broken link (see
+        // `LogWriter::continues_file` for how that could come about).
+        let follows = log
+            .tip()
+            .is_some_and(|tip| tip.checksum == chain && tip.tx.0.checked_add(1) == Some(next_tx.0))
+            && txn.entries.first().is_some_and(|e| e.id == next_entry)
+            && matches!(
+                txn.entries.last().map(|e| &e.body),
+                Some(EntryBody::Commit { tx, .. }) if *tx == next_tx
+            );
+        if !follows {
+            return Err(log.refuse(Error::LogDiverged));
         }
+        log.append(
+            held.expect("invariant: a commit to a log file holds its writer lock"),
+            txn,
+        )
     }
 }
 
