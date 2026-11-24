@@ -152,16 +152,7 @@ fn a_writer_with_an_unacknowledged_recovery_catches_up_over_a_migration() {
     other.acknowledge_recovery();
     let mut tx = other.begin();
     tx.migrate_attribute("age", to_str()).unwrap();
-    match tx.commit() {
-        Ok(_) => {}
-        Err(Error::RecoveryRequired { .. }) => {
-            other.acknowledge_recovery();
-            let mut tx = other.begin();
-            tx.migrate_attribute("age", to_str()).unwrap();
-            tx.commit().unwrap();
-        }
-        Err(e) => panic!("{e:?}"),
-    }
+    tx.commit().unwrap();
 
     assert_eq!(u.catch_up().unwrap(), 1);
     let fresh = World::open_read_only(&path).unwrap();
@@ -171,4 +162,46 @@ fn a_writer_with_an_unacknowledged_recovery_catches_up_over_a_migration() {
         u.assert(greg, "tag", s("x"), Some(Tick(1))),
         Err(Error::RecoveryUnacknowledged)
     ));
+}
+
+// ---- L: doctor on a handle doesn't judge another handle's append in
+// progress ----
+
+#[test]
+fn doctor_on_a_handle_ignores_an_incomplete_tail_past_what_it_applied() {
+    use kala_core::doctor::{Finding, doctor_log};
+    let (_dir, path, mut w, greg) = world();
+    w.assert(greg, "tag", s("a"), Some(Tick(1))).unwrap();
+    let clean = bytes(&path);
+    // Another handle commits; its transaction, cut short, is what a commit
+    // in progress looks like to anyone reading the file meanwhile.
+    let mut other = World::open(&path).unwrap();
+    other.assert(greg, "tag", s("b"), Some(Tick(2))).unwrap();
+    drop(other);
+    let full = bytes(&path);
+    let is_tail = |f: &Finding| matches!(f, Finding::IncompleteTail { .. });
+    for (what, cut) in [
+        ("torn", 5usize),
+        ("begin only", full.len() - clean.len() - 10),
+    ] {
+        std::fs::write(&path, &full[..full.len() - cut]).unwrap();
+        let on_handle = doctor(&w, &DoctorOptions::default());
+        assert!(on_handle.is_clean(), "{what}: {on_handle:?}");
+        // The file as a whole still reports it.
+        let on_file = doctor_log(&path, &DoctorOptions::default()).unwrap();
+        assert!(on_file.findings.iter().any(is_tail), "{what}: {on_file:?}");
+    }
+    // All there, checksum wrong (an append whose pages aren't all in yet).
+    let mut damaged = full.clone();
+    let last = *common::spans(&full).last().unwrap();
+    damaged[last.body_start + 6] ^= 0xFF;
+    std::fs::write(&path, &damaged).unwrap();
+    assert_clean(&w);
+    // A handle that has applied the transaction is told when it goes bad.
+    std::fs::write(&path, &full).unwrap();
+    assert_eq!(w.catch_up().unwrap(), 1);
+    assert_clean(&w);
+    std::fs::write(&path, &full[..full.len() - 5]).unwrap();
+    let report = doctor(&w, &DoctorOptions::default());
+    assert!(report.findings.iter().any(is_tail), "{report:?}");
 }
