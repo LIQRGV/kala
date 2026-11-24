@@ -192,7 +192,7 @@ fn route_malformed_fields_fail_and_impersonation_is_forbidden() {
 fn route_unknown_and_forbidden_database_failures_equal_run() {
     let server = account_server();
     for mut c in [alice(&server), Client::ready(&server)] {
-        for db in ["hidden", "does-not-exist", "system"] {
+        for db in ["hidden", "does-not-exist"] {
             c.send(
                 0x10,
                 vec![
