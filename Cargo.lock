@@ -445,6 +445,7 @@ dependencies = [
  "kala-query",
  "kala-system",
  "libc",
+ "nix 0.32.0",
  "proptest",
  "rpassword",
  "rustyline",

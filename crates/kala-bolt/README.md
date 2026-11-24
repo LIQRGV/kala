@@ -22,8 +22,10 @@ Port 0 selects a free port, reported by a stdout startup line for each listener
 lines; neither queries, parameters nor credentials are logged. `localhost`
 resolves to `127.0.0.1`; `127.0.0.0/8` and `::1` are accepted. Other listen
 addresses require accounts and `--insecure-allow-plaintext`; `--auth none`
-always requires loopback. SIGINT closes every listener and client socket,
-cancels queries and joins connection threads.
+always requires loopback. Setting the shutdown flag closes every listener and
+client socket, cancels queries and joins connection threads; `kala serve` sets
+it on SIGINT or SIGTERM (and SIGHUP), so `systemctl stop` and `docker stop`
+shut down cleanly and remove Unix socket files.
 
 A single discovered user database is the implicit default (`system` is excluded). With multiple databases,
 set `--default-db` or supply the driver's session database. The library exports
@@ -92,7 +94,9 @@ files and symlinks are refused without deletion. Clean shutdown removes only
 the socket inode this listener created. Lifecycle operations use nonblocking
 directory locks: lock contention fails closed, and cleanup logs a diagnostic
 and leaves a stale socket if it cannot safely take the lock. A subsequent start
-can reclaim that stale socket. A private directory also prevents unrelated
+can reclaim that stale socket.
+`kala serve` runs this cleanup on SIGINT, SIGTERM and SIGHUP; only an
+uncatchable kill (SIGKILL, power loss) leaves the socket file behind. A private directory also prevents unrelated
 users from taking its directory lock.
 
 A Unix peer matches **only `localhost`**, so `root@localhost` trust and password

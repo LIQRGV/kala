@@ -1,5 +1,5 @@
 //! PR #17 (slice 16) review polish, through the real `kala serve` binary:
-//! the auth log names the transport.
+//! SIGTERM runs the clean shutdown, and the auth log names the transport.
 #![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -151,6 +151,40 @@ fn log_on(stream: &mut (impl Read + Write)) {
         ],
     );
     success(stream);
+}
+
+// `systemctl stop` and `docker stop` send SIGTERM, not SIGINT, and a closed
+// terminal sends SIGHUP: both must run the same shutdown as Ctrl-C (drain,
+// close, remove the socket file) and exit 0.
+#[test]
+fn sigterm_and_sighup_shut_down_cleanly_and_remove_the_socket() {
+    for signal in ["-TERM", "-HUP"] {
+        let dir = short_dir();
+        let path = dir.path().join("bolt.sock");
+        let unix = format!("unix://{}", path.display());
+        let mut serving = Serving::start(dir.path(), &[&unix]);
+        assert!(path.exists());
+        let mut client = UnixStream::connect(&path).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        log_on(&mut client);
+        let status = serving.signal(signal);
+        assert!(
+            status.success(),
+            "{signal} must exit 0 after a clean shutdown, got {status:?}; {}",
+            serving.stderr()
+        );
+        assert!(!path.exists(), "socket file survived {signal}");
+        // The open client was closed by the shutdown, not left to a killed process.
+        let mut byte = [0];
+        assert_eq!(client.read(&mut byte).unwrap(), 0);
+        assert!(
+            serving.stderr().contains("event=bolt_disconnected"),
+            "{}",
+            serving.stderr()
+        );
+    }
 }
 
 // A Unix peer has no IP: the auth log says so instead of `localhost`, and

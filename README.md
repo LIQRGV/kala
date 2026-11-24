@@ -98,7 +98,7 @@ to manage per-database grants. Password accounts use Argon2id; non-loopback
 listeners require `--insecure-allow-plaintext` until TLS is available.
 `--auth none` remains a loopback-only development option. The server is read-only.
 Changes committed by `kala transact` become visible on the next query.
-Ctrl-C stops the server. Cypher reads and routing are supported; explicit transactions,
+Ctrl-C (SIGINT) or SIGTERM stops the server cleanly. Cypher reads and routing are supported; explicit transactions,
 Neo4j Browser and writes over Bolt are not supported yet. See the
 [Bolt support and limits](crates/kala-bolt/README.md) and the opt-in
 [driver E2E tests](e2e/README.md).

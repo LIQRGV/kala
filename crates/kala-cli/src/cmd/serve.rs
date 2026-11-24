@@ -29,6 +29,10 @@ pub fn run(args: &ServeArgs) -> Result<String, CliError> {
     };
     // Never create the directory, in either auth mode.
     super::user::require_directory(dir)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    // Before the server starts any thread: see `stop_on_termination`.
+    #[cfg(unix)]
+    stop_on_termination(&stop)?;
     let server = if args.auth == "accounts" {
         Server::bind_accounts(dir, config)
     } else {
@@ -49,7 +53,6 @@ pub fn run(args: &ServeArgs) -> Result<String, CliError> {
             );
         }
     }
-    let stop = Arc::new(AtomicBool::new(false));
     let signal_stop = Arc::clone(&stop);
     ctrlc::set_handler(move || signal_stop.store(true, Ordering::Relaxed))
         .map_err(|e| CliError::Store(format!("installing serve signal handler: {e}")))?;
@@ -62,6 +65,40 @@ pub fn run(args: &ServeArgs) -> Result<String, CliError> {
     drop(stdout);
     server.run(stop).map_err(server_error)?;
     Ok(String::new())
+}
+/// Makes SIGTERM and SIGHUP stop the server the way Ctrl-C does: `systemctl
+/// stop` and `docker stop` send SIGTERM, and a default-disposition death
+/// would skip the drain and leave Unix socket files behind.
+///
+/// The two signals are blocked in the calling thread and a dedicated thread
+/// waits for them with sigwait. Threads inherit the mask of the thread that
+/// starts them, so this must run before any other thread exists: afterwards
+/// only the waiting thread ever receives them. No signal handler is
+/// installed, and SIGINT stays with `ctrlc`.
+#[cfg(unix)]
+fn stop_on_termination(stop: &Arc<AtomicBool>) -> Result<(), CliError> {
+    use nix::sys::signal::{SigSet, Signal};
+    let failed = |e: &dyn std::fmt::Display| {
+        CliError::Store(format!("installing serve termination handling: {e}"))
+    };
+    let mut signals = SigSet::empty();
+    signals.add(Signal::SIGTERM);
+    signals.add(Signal::SIGHUP);
+    signals.thread_block().map_err(|e| failed(&e))?;
+    let stop = Arc::clone(stop);
+    std::thread::Builder::new()
+        .name("serve-signals".into())
+        .spawn(move || {
+            loop {
+                match signals.wait() {
+                    Ok(_) => stop.store(true, Ordering::Relaxed),
+                    Err(nix::errno::Errno::EINTR) => {}
+                    Err(_) => return,
+                }
+            }
+        })
+        .map_err(|e| failed(&e))?;
+    Ok(())
 }
 /// Parse only octal permission bits, never special file-mode flags.
 pub(crate) fn unix_mode(value: &str) -> Result<u32, String> {

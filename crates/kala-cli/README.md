@@ -291,7 +291,11 @@ non-loopback listener. `--auth none` remains loopback-only.
 
 No `--listen` still binds `127.0.0.1:7687`. Unsupported URI schemes fail rather
 than selecting another transport. `neo4j://` is a client routing URI and cannot
-be a listener. All listeners share `--max-connections` and stop on Ctrl-C.
+be a listener. All listeners share `--max-connections` and stop on Ctrl-C
+(SIGINT) or SIGTERM; SIGHUP does the same. Each of them runs the same clean
+shutdown: connections are closed, queries cancelled, Unix socket files removed
+and the exit status is 0, so `systemctl stop` and `docker stop` need no special
+handling.
 
 ```sh
 kala serve worlds --listen bolt://127.0.0.1:7687 \
@@ -316,8 +320,8 @@ kala serve: listening on unix:///run/kala/bolt.sock
 ```
 
 A failed start serves nothing, prints no startup lines, and cleans up sockets
-created by earlier binds. Unix sockets are also removed on clean shutdown,
-provided the path still names this server's inode.
+created by earlier binds. Unix sockets are also removed on clean shutdown
+(SIGINT or SIGTERM), provided the path still names this server's inode.
 
 `--advertised-address HOST:PORT` is the address routing drivers (`neo4j://`)
 and `SHOW DATABASES` are given. Without it they get the local address of each

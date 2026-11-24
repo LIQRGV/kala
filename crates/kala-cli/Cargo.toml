@@ -39,6 +39,11 @@ rpassword = { version = "=7.4.0", default-features = false }
 # Security-consultant approved: platform constants only, for safe nonblocking,
 # no-follow history opens. Already transitive through the terminal crates.
 libc = "0.2"
+# `kala serve` only: safe sigwait-based SIGTERM/SIGHUP shutdown (no handler,
+# no unsafe). The same nix release ctrlc already resolves to, so the lockfile
+# gains no package. ctrlc's `termination` feature is not used because it is
+# crate-wide and would make the interactive REPL swallow SIGTERM at its prompt.
+nix = { version = "0.32", default-features = false, features = ["signal"] }
 
 [dev-dependencies]
 # End-to-end tests run the real binary in temp dirs and parse its JSON output
