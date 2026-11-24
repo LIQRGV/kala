@@ -324,3 +324,158 @@ fn a_weak_retract_dropped_as_undeclared_is_judged_again_at_commit() {
     assert_eq!(report.changed, 0);
     assert!(std::fs::read(&path).unwrap() == before);
 }
+
+// ---- K (round 2): a read of a new edge under a new attribute ----
+
+/// `pair()` plus Carnath and Ashford; `:present` is declared (and one edge
+/// interned) unless `infer_present`.
+fn pair_with_places(infer_present: bool) -> (tempfile::TempDir, PathBuf, World, World) {
+    let (dir, path, mut a, _) = pair();
+    run(
+        &mut a,
+        "[[:create :PLACE :carnath] [:create :PLACE :ashford]]",
+    );
+    if !infer_present {
+        run(&mut a, "[:assert :greg :present :varrow :at 1]");
+    }
+    let b = World::open(&path).unwrap();
+    (dir, path, a, b)
+}
+
+const SET_ON_NEW_EDGE: &str = "[[:assert :greg :present :carnath :at 1]
+      [:set [:greg :present :carnath] :disguised true :at 1]]";
+
+#[test]
+fn a_set_on_a_new_edge_under_a_new_attribute_conflicts_when_the_edge_is_merged() {
+    // `:disguised` is undeclared when T begins; both writers infer it
+    // identically, and both intern the same edge. T's `:set` read "this
+    // edge has no :disguised": no longer true.
+    for infer_present in [false, true] {
+        let (_d, path, mut a, mut b) = pair_with_places(infer_present);
+        let form = parse_write(SET_ON_NEW_EDGE).unwrap();
+        let mut tb = b.begin();
+        let staged = stage(&mut tb, &form, None).unwrap();
+        run(
+            &mut a,
+            "[[:assert :greg :present :carnath :at 1]
+              [:assert [:greg :present :carnath] :disguised false :at 1]]",
+        );
+        let before = std::fs::read(&path).unwrap();
+        let outcome = commit(tb, staged);
+        let Err(WriteError {
+            cause: Failure::Store(Error::Conflict(conflict)),
+            ..
+        }) = outcome
+        else {
+            panic!("infer_present={infer_present}: expected a conflict, got {outcome:?}");
+        };
+        let carnath = a.entity_by_handle("carnath").unwrap();
+        let edge = a.edge_id(greg(&a), "present", carnath).unwrap();
+        assert_eq!(
+            conflict.key,
+            ConflictKey::EntityAttribute {
+                entity: edge.into(),
+                attr: "disguised".into()
+            }
+        );
+        assert!(std::fs::read(&path).unwrap() == before, "nothing written");
+        // Decided again on what is there now (a tick later: the same
+        // tick can't hold both ops), the `:set` replaces the other
+        // writer's value.
+        let again = parse_write("[:set [:greg :present :carnath] :disguised true :at 2]").unwrap();
+        let report = execute(&mut b, &again, None).unwrap();
+        assert_eq!(report.changed, 2, "retract false, assert true");
+        assert!(b.overlaps("disguised").unwrap().is_empty());
+        assert_eq!(
+            b.as_of(edge.into(), "disguised", Tick(2)).unwrap(),
+            [Value::Bool(true)]
+        );
+        clean(&b);
+    }
+}
+
+#[test]
+fn a_set_on_a_new_edge_under_a_new_attribute_commits_when_another_edge_was_interned() {
+    let (_d, _path, mut a, mut b) = pair_with_places(false);
+    let mut tb = b.begin();
+    let staged = stage(&mut tb, &parse_write(SET_ON_NEW_EDGE).unwrap(), None).unwrap();
+    // The same attribute, inferred identically, on a different edge.
+    run(
+        &mut a,
+        "[[:assert :greg :present :ashford :at 1]
+          [:assert [:greg :present :ashford] :disguised false :at 1]]",
+    );
+    let report = commit(tb, staged).expect("nothing it read was written");
+    assert_eq!((report.changed, report.declared), (2, 0));
+    let carnath = b.entity_by_handle("carnath").unwrap();
+    let edge = b.edge_id(greg(&b), "present", carnath).unwrap();
+    assert_eq!(
+        b.as_of(edge.into(), "disguised", Tick(1)).unwrap(),
+        [Value::Bool(true)]
+    );
+    assert!(b.overlaps("disguised").unwrap().is_empty());
+    clean(&b);
+}
+
+#[test]
+fn a_weak_set_on_a_new_edge_under_a_new_attribute_commits_over_a_merged_edge() {
+    let (_d, _path, mut a, mut b) = pair_with_places(false);
+    let mut tb = b.begin();
+    tb.set_concurrency(Concurrency::Weak);
+    let staged = stage(&mut tb, &parse_write(SET_ON_NEW_EDGE).unwrap(), None).unwrap();
+    run(
+        &mut a,
+        "[[:assert :greg :present :carnath :at 1]
+          [:assert [:greg :present :carnath] :disguised false :at 1]]",
+    );
+    // Weak mode: store rules only, the lost update is allowed.
+    let report = commit(tb, staged).expect("weak mode never conflicts on reads");
+    assert_eq!(
+        report.changed, 1,
+        "the edge already holds; the property is new"
+    );
+    let carnath = b.entity_by_handle("carnath").unwrap();
+    let edge = b.edge_id(greg(&b), "present", carnath).unwrap();
+    assert_eq!(b.as_of(edge.into(), "disguised", Tick(1)).unwrap().len(), 2);
+    // Wrong input, consistent answers: the overlap is reported, not hidden.
+    assert_eq!(report.warnings.introduced.len(), 1);
+    assert_eq!(b.overlaps("disguised").unwrap().len(), 1);
+}
+
+#[test]
+fn a_set_on_an_entity_found_missing_conflicts_when_another_writer_creates_it() {
+    // The sibling case for entities: `:create … :if-missing` allocates a
+    // provisional entity, reads on it record nothing by themselves, and
+    // the commit would settle it on the entity a newer commit created. The
+    // free handle it found is the read that conflicts.
+    for attr in ["age", "mood"] {
+        let (_d, path, mut a, mut b) = pair();
+        let form = parse_write(&format!(
+            "[[:create :CHARACTER :mara :if-missing] [:set :mara :{attr} 30 :at 10]]"
+        ))
+        .unwrap();
+        let mut tb = b.begin();
+        let staged = stage(&mut tb, &form, None).unwrap();
+        run(
+            &mut a,
+            &format!("[[:create :CHARACTER :mara] [:assert :mara :{attr} 29 :at 10]]"),
+        );
+        let before = std::fs::read(&path).unwrap();
+        let outcome = commit(tb, staged);
+        let Err(WriteError {
+            cause: Failure::Store(Error::Conflict(conflict)),
+            ..
+        }) = outcome
+        else {
+            panic!("{attr}: expected a conflict, got {outcome:?}");
+        };
+        assert_eq!(
+            conflict.key,
+            ConflictKey::Handle {
+                handle: "mara".into()
+            },
+            "{attr}"
+        );
+        assert!(std::fs::read(&path).unwrap() == before, "nothing written");
+    }
+}

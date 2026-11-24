@@ -792,12 +792,16 @@ impl Txn<'_> {
     /// Like every `note_*` method: fails with [`Error::UnknownAttribute`]
     /// (or [`Error::UnknownEntity`], [`Error::UnknownNodeType`]) without
     /// poisoning the transaction, and does nothing under
-    /// [`Concurrency::Weak`].
+    /// [`Concurrency::Weak`]. A name that isn't declared is still a read,
+    /// of its absence: if the transaction goes on to commit, a newer
+    /// commit that declared the name conflicts
+    /// ([`ConflictKey::Undeclared`]).
     pub fn note_read(&self, entity: EntityId, attr: &str) -> Result<(), Error> {
-        let (attr_id, dir) = self
+        let resolved = self
             .world
             .catalog
-            .resolve_neighbor_attr(attr, Direction::Out)?;
+            .resolve_neighbor_attr(attr, Direction::Out);
+        let (attr_id, dir) = self.or_absent(attr, resolved)?;
         self.note_side(entity, attr_id, attr, dir.reads_out())
     }
 
@@ -806,10 +810,11 @@ impl Txn<'_> {
     /// any newer entry whose value is `target` under `attr`. See
     /// [`Txn::note_read`] for names, errors and bidirectional attributes.
     pub fn note_reverse_read(&self, target: EntityId, attr: &str) -> Result<(), Error> {
-        let (attr_id, dir) = self
+        let resolved = self
             .world
             .catalog
-            .resolve_neighbor_attr(attr, Direction::In)?;
+            .resolve_neighbor_attr(attr, Direction::In);
+        let (attr_id, dir) = self.or_absent(attr, resolved)?;
         self.note_side(target, attr_id, attr, dir.reads_out())
     }
 
@@ -821,7 +826,7 @@ impl Txn<'_> {
         if let Value::Ref(target) = value {
             return self.note_reverse_read(*target, attr);
         }
-        let attr_id = self.attr_id(attr)?;
+        let attr_id = self.or_absent(attr, self.attr_id(attr))?;
         let encoded = value.encode()?;
         let Some(mut reads) = self.reads() else {
             return Ok(());
@@ -839,16 +844,22 @@ impl Txn<'_> {
     /// conflicts with a newer commit that created an entity of that type
     /// (a phantom).
     pub fn note_type_scan(&self, node_type: &str) -> Result<(), Error> {
-        let id = *self
-            .world
-            .catalog
-            .node_type_by_name
-            .get(node_type)
-            .ok_or_else(|| Error::UnknownNodeType(node_type.to_owned()))?;
+        let id = self.world.catalog.node_type_by_name.get(node_type).copied();
         let Some(mut reads) = self.reads() else {
-            return Ok(());
+            return id
+                .map(|_| ())
+                .ok_or_else(|| Error::UnknownNodeType(node_type.to_owned()));
         };
         let at = self.ops.len();
+        let Some(id) = id else {
+            // "No such type" is a read of its absence (no entities of it):
+            // a newer declaration of the name invalidates it.
+            reads
+                .undeclared_types
+                .entry(node_type.to_owned())
+                .or_insert(at);
+            return Err(Error::UnknownNodeType(node_type.to_owned()));
+        };
         if usize::from(id.0) >= self.snapshot.node_types {
             reads
                 .undeclared_types
@@ -864,7 +875,7 @@ impl Txn<'_> {
     /// attribute): the commit then conflicts with any newer entry or schema
     /// change on it. An inverse name stands for its base attribute.
     pub fn note_read_attribute(&self, attr: &str) -> Result<(), Error> {
-        let attr_id = self.world.catalog.attr_or_inverse_id(attr)?;
+        let attr_id = self.or_absent(attr, self.world.catalog.attr_or_inverse_id(attr))?;
         let Some(mut reads) = self.reads() else {
             return Ok(());
         };
@@ -973,29 +984,31 @@ impl Txn<'_> {
             return;
         };
         let at = self.ops.len();
-        if self.provisional_attr(attr) {
-            // Nobody else wrote an attribute that didn't exist, unless a
-            // newer commit declared the same name. An entity only this
-            // transaction knows has no facts there either way.
-            if !self.provisional(entity) {
-                let both = self.world.catalog.is_bidirectional(attr);
-                if forward || both {
-                    self.note_new_attr(&mut reads, attr, NewAttrKey::Forward(entity));
-                }
-                if !forward || both {
-                    self.note_new_attr(&mut reads, attr, NewAttrKey::Reverse(entity));
-                }
-            }
-            return;
-        }
         if self.provisional(entity) {
             // Nobody else wrote an entity only this transaction knows,
-            // unless it is an edge a newer commit interned too.
+            // unless it is an edge a newer commit interned too: then the
+            // commit merges the two, and the newer commit may have written
+            // the edge's properties, under an attribute this transaction
+            // declared as well (both inferred the same definition). An
+            // entity that settles on a newer commit's (find-or-create) is
+            // caught by the free handle it read.
             if entity.is_edge() {
                 reads
                     .provisional
                     .entry(entity)
                     .or_insert_with(|| (at, name.to_owned()));
+            }
+            return;
+        }
+        if self.provisional_attr(attr) {
+            // Nobody else wrote an attribute that didn't exist, unless a
+            // newer commit declared the same name.
+            let both = self.world.catalog.is_bidirectional(attr);
+            if forward || both {
+                self.note_new_attr(&mut reads, attr, NewAttrKey::Forward(entity));
+            }
+            if !forward || both {
+                self.note_new_attr(&mut reads, attr, NewAttrKey::Reverse(entity));
             }
             return;
         }
@@ -1006,6 +1019,18 @@ impl Txn<'_> {
         if !forward || both {
             reads.read_reverse(entity, attr, at);
         }
+    }
+
+    /// Passes `resolved` (attribute `name`, looked up for a read) through.
+    /// A lookup that failed because the name is undeclared is a read of
+    /// its absence, which a caller may decide from ("no such attribute:
+    /// nothing there"): recorded, so a newer declaration of the name
+    /// conflicts.
+    pub(super) fn or_absent<T>(&self, name: &str, resolved: Result<T, Error>) -> Result<T, Error> {
+        if matches!(resolved, Err(Error::UnknownAttribute(_))) {
+            self.note_undeclared_attr(name);
+        }
+        resolved
     }
 
     /// Records that `handle` was found free.

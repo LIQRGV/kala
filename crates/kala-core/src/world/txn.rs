@@ -308,7 +308,8 @@ impl Txn<'_> {
         if self.poisoned {
             return Err(Error::TransactionAborted);
         }
-        let (attr_id, def) = self.world.catalog.resolve(&self.ids, entity, attr)?;
+        let resolved = self.world.catalog.resolve(&self.ids, entity, attr);
+        let (attr_id, def) = self.or_absent(attr, resolved)?;
         // The read `[:set …]` decides from: a newer entry on this entity
         // and attribute invalidates it.
         self.note_key(entity, attr_id, attr, true);

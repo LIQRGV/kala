@@ -874,3 +874,92 @@ fn a_conflict_on_a_merged_edge_names_the_edge_it_turned_out_to_be() {
     );
     assert_eq!(conflict.operation, 1, "the read was made before op 2");
 }
+
+// ---- O (round 2): a read that failed on an undeclared name read its
+// absence ----
+
+#[test]
+fn a_read_of_an_undeclared_name_conflicts_once_a_newer_commit_declares_it() {
+    type Read = fn(&Txn<'_>, EntityId) -> Result<(), Error>;
+    let reads: [(&str, Read, &str); 6] = [
+        ("note_read", |t, e| t.note_read(e, "mood"), "mood"),
+        (
+            "note_reverse_read",
+            |t, e| t.note_reverse_read(e, "mood"),
+            "mood",
+        ),
+        (
+            "note_value_read",
+            |t, _| t.note_value_read("mood", &s("grim")),
+            "mood",
+        ),
+        (
+            "note_read_attribute",
+            |t, _| t.note_read_attribute("mood"),
+            "mood",
+        ),
+        (
+            "values_at",
+            |t, e| {
+                let meter = WorkMeter::bounded(1_000, None);
+                t.values_at(e, "mood", Tick(1), 4, 1 << 10, &meter)
+                    .map(|_| ())
+            },
+            "mood",
+        ),
+        (
+            "note_type_scan",
+            |t, _| t.note_type_scan("FACTION"),
+            "FACTION",
+        ),
+    ];
+    for (what, read, name) in reads {
+        // The caller treats "no such name" as "nothing there" and writes.
+        let (_dir, path, mut a, greg) = world();
+        let mut b = World::open(&path).unwrap();
+        let mut tb = b.begin();
+        let err = read(&tb, greg).unwrap_err();
+        assert!(
+            matches!(err, Error::UnknownAttribute(_) | Error::UnknownNodeType(_)),
+            "{what}: {err:?}"
+        );
+        tb.assert(greg, "tag", s("moodless"), Some(Tick(1)))
+            .unwrap();
+        // Meanwhile the name is declared and used.
+        let mut ta = a.begin();
+        ta.declare_attribute(AttrDef::new(
+            "mood",
+            ValueType::Str,
+            Kind::State,
+            Cardinality::One,
+        ))
+        .unwrap();
+        ta.declare_node_type("FACTION").unwrap();
+        ta.assert(greg, "mood", s("grim"), Some(Tick(1))).unwrap();
+        ta.create_entity("FACTION", Some("ashen")).unwrap();
+        ta.commit().unwrap();
+        let before = bytes(&path);
+        let outcome = tb.commit();
+        let Err(Error::Conflict(conflict)) = outcome else {
+            panic!("{what}: expected a conflict, got {outcome:?}");
+        };
+        assert_eq!(
+            conflict.key,
+            ConflictKey::Undeclared { name: name.into() },
+            "{what}"
+        );
+        assert!(bytes(&path) == before, "{what}: nothing written");
+
+        // Still undeclared at commit: nothing to conflict with.
+        let (_dir, path, mut a, greg) = world();
+        let mut b = World::open(&path).unwrap();
+        let mut tb = b.begin();
+        read(&tb, greg).unwrap_err();
+        tb.assert(greg, "tag", s("moodless"), Some(Tick(1)))
+            .unwrap();
+        a.assert(greg, "tag", s("unrelated"), Some(Tick(2)))
+            .unwrap();
+        assert_eq!(tb.commit().unwrap().changed, 1, "{what}");
+        assert_clean(&b);
+    }
+}
