@@ -89,6 +89,13 @@ impl SchemaSnapshot {
                     || old.reverse_cardinality != new.reverse_cardinality
             })
     }
+    /// Whether the schema at the snapshot has `name`, as an attribute's
+    /// name or its inverse name.
+    pub(super) fn declares(&self, name: &str) -> bool {
+        self.attributes
+            .iter()
+            .any(|def| def.name == name || def.inverse.as_deref() == Some(name))
+    }
     pub(super) fn restore(self, catalog: &mut Catalog) {
         catalog.attributes = self.attributes;
         catalog.attribute_history = self.history;
@@ -536,6 +543,47 @@ impl Txn<'_> {
                 op,
             },
             |txn| txn.infer_write_attribute_op(name, value, op),
+        )
+    }
+    /// A write through schema-on-write, as one operation: the attribute is
+    /// inferred from `value` if it is undeclared
+    /// ([`Txn::infer_write_attribute`]), then the fact is asserted or
+    /// retracted ([`Txn::assert_with_precision`],
+    /// [`Txn::retract_with_precision`]). `None` if the write was dropped:
+    /// a retract of an attribute that doesn't exist (and isn't inferred
+    /// for it) changes nothing.
+    ///
+    /// Use this, not the two calls, for a write that may be committed over
+    /// newer transactions: the commit then makes the **whole** operation
+    /// again, so a retract dropped here is judged against the attribute if
+    /// a newer commit declared it meanwhile. Made as two calls, only the
+    /// inference would be made again and the dropped retract lost.
+    pub fn write_inferring(
+        &mut self,
+        entity: EntityId,
+        attr: &str,
+        value: &Value,
+        tick: Option<Tick>,
+        op: Op,
+        precision: Precision,
+    ) -> Result<Option<WriteResult>, Error> {
+        let tick = self.write_tick(tick);
+        self.recorded(
+            |_| Call::InferredWrite {
+                entity,
+                attr: attr.to_owned(),
+                value: value.clone(),
+                tick,
+                op,
+                precision,
+            },
+            |txn| {
+                if !txn.infer_write_attribute(attr, value, op)? {
+                    return Ok(None);
+                }
+                txn.write(entity, attr, value, Some(tick), op, precision)
+                    .map(Some)
+            },
         )
     }
     fn infer_write_attribute_op(

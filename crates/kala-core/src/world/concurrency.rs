@@ -214,6 +214,15 @@ pub(super) enum Call {
         value: Value,
         op: Op,
     },
+    /// [`Txn::write_inferring`]: the inference and the write it guards.
+    InferredWrite {
+        entity: EntityId,
+        attr: String,
+        value: Value,
+        tick: Tick,
+        op: Op,
+        precision: Precision,
+    },
     InferAttribute {
         name: String,
         value: Value,
@@ -284,15 +293,144 @@ pub(super) struct ReadSet {
     /// Corrected (or read) chains by base entry, with the entry as the
     /// caller named it and the chain's attribute: a newer correction of it.
     entries: HashMap<EntryId, (usize, EntryId, AttrId)>,
-    /// Attribute and node type names found undeclared in the committed
-    /// schema: a newer declaration of the name.
-    undeclared_attrs: HashMap<String, usize>,
+    /// Attribute names the committed schema lacked when the transaction
+    /// began, which it found undeclared or declared itself and then read:
+    /// a newer declaration of the name (see [`NewAttrRead`]).
+    new_attrs: HashMap<String, NewAttrRead>,
+    /// Node type names found undeclared in the committed schema: a newer
+    /// declaration of the name.
     undeclared_types: HashMap<String, usize>,
     /// Provisional edges whose properties (or incoming refs) were read: a
     /// conflict if the edge turns out to be one a newer commit interned.
     provisional: HashMap<EntityId, (usize, String)>,
     /// Past [`MAX_READ_KEYS`]: only `attrs` and `any_define` grow.
     coarse: bool,
+}
+
+/// How many entities one [`NewAttrRead`] keeps exactly; past it the read
+/// is of the whole attribute.
+const MAX_NEW_ATTR_KEYS: usize = 64;
+
+/// What a transaction read under an attribute name that the committed
+/// schema didn't have when it began. Nobody else can have written such an
+/// attribute, unless a newer commit declared the same name.
+#[derive(Debug)]
+struct NewAttrRead {
+    /// The operation count at the first read.
+    at: usize,
+    /// The definition this transaction gave the name (declared or
+    /// inferred) before it read under it; `None` if it read the name's
+    /// **absence** (a retract dropped because the attribute didn't exist, a
+    /// lookup of the definition that found none).
+    def: Option<AttrDef>,
+    /// The whole attribute was read (a value lookup, a scan, an absence).
+    whole: bool,
+    /// Entities whose values were read, and targets whose referrers were.
+    forward: HashSet<EntityId>,
+    reverse: HashSet<EntityId>,
+}
+
+/// Which part of a newly declared attribute a read covered.
+#[derive(Clone, Copy, Debug)]
+enum NewAttrKey {
+    Whole,
+    Forward(EntityId),
+    Reverse(EntityId),
+}
+
+impl NewAttrRead {
+    fn add(&mut self, key: NewAttrKey) {
+        match key {
+            NewAttrKey::Whole => self.whole = true,
+            NewAttrKey::Forward(e) => {
+                self.forward.insert(e);
+            }
+            NewAttrKey::Reverse(e) => {
+                self.reverse.insert(e);
+            }
+        }
+        if self.forward.len() + self.reverse.len() > MAX_NEW_ATTR_KEYS {
+            self.whole = true;
+            self.forward.clear();
+            self.reverse.clear();
+        }
+    }
+
+    /// Whether a newer commit, which declared the name as `committed` (now
+    /// attribute `id`), invalidates the read: the first conflicting key.
+    ///
+    /// A definition other than the transaction's own does: what it read
+    /// (or dropped, or inferred) depended on the name being free, and its
+    /// operations would mean something else now. The **same** definition
+    /// doesn't by itself: making the transaction's declaration again finds
+    /// it done ("0 declared") and its writes land on the one attribute, as
+    /// they would for a single writer. Then only facts the newer commits
+    /// stored under the attribute matter, where the transaction read
+    /// "nothing here": on an entity (or target) it read, or anywhere if it
+    /// read the whole attribute.
+    fn conflict(
+        &self,
+        name: &str,
+        id: AttrId,
+        committed: &AttrDef,
+        tail: &[EntryInfo],
+    ) -> Option<ConflictKey> {
+        if self.def.as_ref() != Some(committed) {
+            return Some(ConflictKey::Undeclared {
+                name: name.to_owned(),
+            });
+        }
+        tail.iter().find_map(|entry| {
+            let (entity, attr, value, ..) = as_fact_or_marker(&entry.body)?;
+            if attr != id {
+                return None;
+            }
+            if self.whole {
+                return Some(ConflictKey::Attribute {
+                    attr: name.to_owned(),
+                });
+            }
+            if self.forward.contains(&entity) {
+                return Some(ConflictKey::EntityAttribute {
+                    entity,
+                    attr: name.to_owned(),
+                });
+            }
+            match value {
+                Value::Ref(target) if self.reverse.contains(target) => Some(ConflictKey::Reverse {
+                    target: *target,
+                    attr: name.to_owned(),
+                }),
+                _ => None,
+            }
+        })
+    }
+}
+
+/// The entity, attribute and value of a `Fact`, `DELETED` or `Revised`
+/// entry; `None` for any other entry.
+fn as_fact_or_marker(body: &EntryBody) -> Option<(EntityId, AttrId, &Value)> {
+    match body {
+        EntryBody::Fact {
+            entity,
+            attr,
+            value,
+            ..
+        }
+        | EntryBody::Deleted {
+            entity,
+            attr,
+            value,
+            ..
+        }
+        | EntryBody::Revised {
+            entity,
+            attr,
+            value,
+            ..
+        } => Some((*entity, *attr, value)),
+        _ => None,
+    }
 }
 
 impl ReadSet {
@@ -520,12 +658,22 @@ impl ReadSet {
                 | EntryBody::Commit { .. } => {}
             }
         }
-        // Names the transaction found undeclared: declared now?
-        for (attr, at) in &self.undeclared_attrs {
-            if world.catalog.attr_by_name.contains_key(attr)
-                || world.catalog.inverse_by_name.contains_key(attr)
-            {
-                return conflict(ConflictKey::Undeclared { name: attr.clone() }, *at);
+        // Names the committed schema lacked when the transaction began:
+        // declared by a newer commit?
+        for (attr, read) in &self.new_attrs {
+            let key = match world.catalog.attr_by_name.get(attr) {
+                Some(id) => {
+                    let committed = &world.catalog.attributes[id.0 as usize];
+                    read.conflict(attr, *id, committed, tail)
+                }
+                // Taken as another attribute's inverse name.
+                None if world.catalog.inverse_by_name.contains_key(attr) => {
+                    Some(ConflictKey::Undeclared { name: attr.clone() })
+                }
+                None => None,
+            };
+            if let Some(key) = key {
+                return conflict(key, read.at);
             }
         }
         for (node_type, at) in &self.undeclared_types {
@@ -573,16 +721,20 @@ impl Txn<'_> {
     /// after it began (see [`Concurrency`]; the default is
     /// [`Concurrency::Optimistic`]). Choose before the transaction reads:
     /// under [`Concurrency::Weak`] reads aren't recorded, so going back to
-    /// optimistic afterwards counts as having read everything (any newer
-    /// commit then conflicts).
+    /// optimistic after a read was made that way counts as having read
+    /// everything (any newer commit then conflicts). A transaction that
+    /// has read nothing yet changes mode freely.
     pub fn set_concurrency(&mut self, mode: Concurrency) {
         match (self.concurrency, mode) {
             (Concurrency::Optimistic, Concurrency::Weak) => {
                 *self.reads.borrow_mut() = ReadSet::default();
             }
             (Concurrency::Weak, Concurrency::Optimistic) => {
-                let at = self.ops.len();
-                self.reads.borrow_mut().read_all(at);
+                // Only reads that went unrecorded can't be vouched for.
+                if self.unrecorded_reads.get() {
+                    let at = self.ops.len();
+                    self.reads.borrow_mut().read_all(at);
+                }
             }
             _ => {}
         }
@@ -672,7 +824,7 @@ impl Txn<'_> {
         };
         let at = self.ops.len();
         if self.provisional_attr(attr_id) {
-            reads.undeclared_attrs.entry(attr.to_owned()).or_insert(at);
+            self.note_new_attr(&mut reads, attr_id, NewAttrKey::Whole);
         } else {
             reads.read_value(attr_id, encoded, at);
         }
@@ -714,7 +866,7 @@ impl Txn<'_> {
         };
         let at = self.ops.len();
         if self.provisional_attr(attr_id) {
-            reads.undeclared_attrs.entry(attr.to_owned()).or_insert(at);
+            self.note_new_attr(&mut reads, attr_id, NewAttrKey::Whole);
         } else {
             reads.read_attr(attr_id, at);
         }
@@ -731,9 +883,55 @@ impl Txn<'_> {
     }
 
     /// The read set, if this transaction records reads: optimistic, on a
-    /// world other handles can write.
+    /// world other handles can write. Every read asks here, so a read made
+    /// under [`Concurrency::Weak`] is remembered as one that went
+    /// unrecorded (see [`Txn::set_concurrency`]).
     fn reads(&self) -> Option<RefMut<'_, ReadSet>> {
-        (self.track && self.concurrency == Concurrency::Optimistic).then(|| self.reads.borrow_mut())
+        if !self.track {
+            return None;
+        }
+        if self.concurrency == Concurrency::Weak {
+            self.unrecorded_reads.set(true);
+            return None;
+        }
+        Some(self.reads.borrow_mut())
+    }
+
+    /// Whether the committed schema this transaction began on has `name`,
+    /// as an attribute's name or its inverse name. The transaction's own
+    /// schema edits (a rename away, a new declaration) don't count.
+    fn declared_at_snapshot(&self, name: &str) -> bool {
+        match &self.schema_before {
+            Some(before) => before.declares(name),
+            None => {
+                self.world.catalog.attr_by_name.contains_key(name)
+                    || self.world.catalog.inverse_by_name.contains_key(name)
+            }
+        }
+    }
+
+    /// Records a read under `attr`, an attribute this transaction declared
+    /// itself. Nobody else wrote an attribute that didn't exist, unless a
+    /// newer commit declared the same name: recorded only if the committed
+    /// schema had no such name when the transaction began (a name the
+    /// transaction freed by renaming its attribute away and then declared
+    /// anew was never "found undeclared" by anyone).
+    fn note_new_attr(&self, reads: &mut ReadSet, attr: AttrId, key: NewAttrKey) {
+        let def = &self.world.catalog.attributes[attr.0 as usize];
+        if self.declared_at_snapshot(&def.name) {
+            return;
+        }
+        reads
+            .new_attrs
+            .entry(def.name.clone())
+            .or_insert_with(|| NewAttrRead {
+                at: self.ops.len(),
+                def: Some(def.clone()),
+                whole: false,
+                forward: HashSet::new(),
+                reverse: HashSet::new(),
+            })
+            .add(key);
     }
 
     fn provisional_attr(&self, attr: AttrId) -> bool {
@@ -773,8 +971,17 @@ impl Txn<'_> {
         let at = self.ops.len();
         if self.provisional_attr(attr) {
             // Nobody else wrote an attribute that didn't exist, unless a
-            // newer commit declared the same name.
-            reads.undeclared_attrs.entry(name.to_owned()).or_insert(at);
+            // newer commit declared the same name. An entity only this
+            // transaction knows has no facts there either way.
+            if !self.provisional(entity) {
+                let both = self.world.catalog.is_bidirectional(attr);
+                if forward || both {
+                    self.note_new_attr(&mut reads, attr, NewAttrKey::Forward(entity));
+                }
+                if !forward || both {
+                    self.note_new_attr(&mut reads, attr, NewAttrKey::Reverse(entity));
+                }
+            }
             return;
         }
         if self.provisional(entity) {
@@ -804,12 +1011,32 @@ impl Txn<'_> {
         }
     }
 
-    /// Records that attribute `name` was found undeclared.
+    /// Records that attribute `name` was found undeclared: a read of its
+    /// absence, which any newer declaration of the name invalidates.
+    /// Nothing is recorded for a name the committed schema had when the
+    /// transaction began (it is undeclared here only because the
+    /// transaction itself renamed it away, which no newer commit can
+    /// change).
     pub(super) fn note_undeclared_attr(&self, name: &str) {
-        if let Some(mut reads) = self.reads() {
-            let at = self.ops.len();
-            reads.undeclared_attrs.entry(name.to_owned()).or_insert(at);
+        let Some(mut reads) = self.reads() else {
+            return;
+        };
+        if self.declared_at_snapshot(name) {
+            return;
         }
+        let at = self.ops.len();
+        let read = reads
+            .new_attrs
+            .entry(name.to_owned())
+            .or_insert_with(|| NewAttrRead {
+                at,
+                def: None,
+                whole: true,
+                forward: HashSet::new(),
+                reverse: HashSet::new(),
+            });
+        read.def = None;
+        read.whole = true;
     }
 
     /// Records a read of the revision chain of base entry `base` (of
@@ -905,9 +1132,13 @@ impl<'w> Txn<'w> {
         let moved_to = self.world.latest_tick();
         let tick_moved = (self.used_base_tick.get()
             && moved_to != base_tick
-            && ops
-                .iter()
-                .any(|r| matches!(r.call, Call::Write { tick, .. } if tick == base_tick)))
+            && ops.iter().any(|r| {
+                matches!(
+                    r.call,
+                    Call::Write { tick, .. } | Call::InferredWrite { tick, .. }
+                        if tick == base_tick
+                )
+            }))
         .then_some(TickMoved {
             from: base_tick,
             to: moved_to,
@@ -1000,6 +1231,28 @@ impl<'w> Txn<'w> {
                 }
                 Call::InferWriteAttribute { name, value, op } => {
                     fresh.infer_write_attribute(name, &value_of(value), *op)?;
+                }
+                // Made again as a whole: a retract that was dropped because
+                // the attribute didn't exist is judged against the
+                // attribute a newer commit declared, as one writer's would.
+                Call::InferredWrite {
+                    entity,
+                    attr,
+                    value,
+                    tick,
+                    op,
+                    precision,
+                } => {
+                    let written = fresh.write_inferring(
+                        translate(*entity),
+                        attr,
+                        &value_of(value),
+                        Some(*tick),
+                        *op,
+                        *precision,
+                    )?;
+                    outcome.precision =
+                        written.is_some_and(|w| w.changed > 0).then_some(*precision);
                 }
                 Call::InferAttribute { name, value } => {
                     fresh.infer_attribute(name, &value_of(value))?;

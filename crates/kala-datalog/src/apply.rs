@@ -345,7 +345,9 @@ pub fn execute_in(
     mode: Concurrency,
 ) -> Result<WriteReport, WriteError> {
     let mut tx = w.begin();
-    tx.set_concurrency(mode);
+    // Set once: switching modes on a transaction is for callers who mean
+    // it (see `Txn::set_concurrency`).
+    tx.set_concurrency(form.concurrency.unwrap_or(mode));
     let staged = stage_with(&mut tx, form, default, policy)?;
     commit(tx, staged)
 }
@@ -383,7 +385,8 @@ pub fn commit(tx: Txn<'_>, staged: StagedWrite) -> Result<WriteReport, WriteErro
 /// doesn't leaves the mode the caller chose. The mode belongs to the whole
 /// transaction: a caller staging several forms into one should let only
 /// the first name it (going weak drops the reads recorded so far; going
-/// back to optimistic counts as having read everything).
+/// back to optimistic after a read made under weak counts as having read
+/// everything).
 ///
 /// Uses the default [`WritePolicy`]: a system world is refused.
 pub fn stage(
@@ -675,20 +678,18 @@ fn stage_fact(tx: &mut Txn<'_>, op: &WriteOp, state: &FormState) -> Result<Stage
     let e = subject(tx, s)?;
     let v = value(tx, v)?;
     let tick = state.fact_tick(tx, *at);
-    if !tx
-        .infer_write_attribute(&attr.name, &v, *op)
-        .map_err(Failure::Store)?
-    {
+    // One native operation, so a commit over newer transactions makes the
+    // inference and the write again together (a retract dropped here for
+    // an undeclared attribute is judged again if it was declared since).
+    let Some(r) = tx
+        .write_inferring(e, &attr.name, &v, Some(tick), *op, *precision)
+        .map_err(|error| fact_failure(tx, e, error))?
+    else {
         return Ok(Staged {
             tick,
             ..Staged::schema(state.fallback)
         });
-    }
-    let r = match op {
-        Op::Assert => tx.assert_with_precision(e, &attr.name, v, Some(tick), *precision),
-        Op::Retract => tx.retract_with_precision(e, &attr.name, v, Some(tick), *precision),
-    }
-    .map_err(|error| fact_failure(tx, e, error))?;
+    };
     // A no-op stores nothing, so it reports no precision (changing a
     // held fact's precision needs `:correct`).
     Ok(Staged {

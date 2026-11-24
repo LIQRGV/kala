@@ -238,6 +238,8 @@ pub struct Txn<'w> {
     pub(super) snapshot: Snapshot,
     /// Whether a write fell back to `base_tick`.
     pub(super) used_base_tick: Cell<bool>,
+    /// A read was made under [`Concurrency::Weak`], which records none.
+    pub(super) unrecorded_reads: Cell<bool>,
     /// A replay regenerating what a committed transaction staged (a
     /// migration's copy): nothing of it is written, so the world's write
     /// gate (read-only, unacknowledged recovery, failed log) isn't asked.
@@ -1764,6 +1766,7 @@ impl World {
             ids_exposed: false,
             snapshot,
             used_base_tick: Cell::new(false),
+            unrecorded_reads: Cell::new(false),
             replaying: false,
         }
     }
