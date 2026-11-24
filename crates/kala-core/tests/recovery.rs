@@ -173,8 +173,9 @@ fn assert_corrupt_untouched(p: &Path) {
 }
 
 /// `p` holds the fixture log with the LAST transaction damaged (all its bytes
-/// present) and no valid begin record after it. open() must cut it exactly
-/// like a torn tail but report `CutCause::Damaged`: file cut back to `keep`,
+/// present) and no valid begin record after it. open() must report it as
+/// `CutCause::Damaged` and leave it out of the world and in the file; once
+/// acknowledged it is cut exactly like a torn tail: file cut back to `keep`,
 /// quarantine `<file>.torn-<keep>` holds exactly the cut bytes, the world is
 /// the one before the last txn (`before`), and a second open is clean.
 /// read_log must ignore the damaged tail without touching the file.
@@ -192,7 +193,14 @@ fn assert_cut_as_damaged(p: &Path, keep: u64, before: &str, e: &Ents) {
             "read_log ignores the damaged tail"
         );
     }
-    let w = open_ok(p);
+    let mut w = open_ok(p);
+    let r = w.recovery().clone();
+    assert_eq!(r.cause, Some(CutCause::Damaged));
+    assert_eq!(r.bytes_cut, damaged.len() as u64 - keep);
+    // The open reports the damaged tail and leaves it out of the world;
+    // the cut takes an acknowledgement.
+    assert_eq!(snapshot(&w, e), before);
+    common::acknowledge_and_cut(&mut w, p, &damaged);
     let r = w.recovery().clone();
     assert_eq!(r.cause, Some(CutCause::Damaged));
     assert_eq!(r.bytes_cut, damaged.len() as u64 - keep);

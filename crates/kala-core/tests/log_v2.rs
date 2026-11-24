@@ -200,7 +200,7 @@ fn assert_damaged_cut(path: &Path, orig: &[u8], file: &[u8], keep: usize, label:
         quarantine_files(path).is_empty(),
         "{label}: read_log quarantined"
     );
-    let w = match World::open(path) {
+    let mut w = match World::open(path) {
         Ok(w) => w,
         Err(e) => panic!("{label}: expected a cut, got {e:?}"),
     };
@@ -214,6 +214,8 @@ fn assert_damaged_cut(path: &Path, orig: &[u8], file: &[u8], keep: usize, label:
         (file.len() - keep) as u64,
         "{label}: bytes_cut"
     );
+    // The open reports the damaged tail; the cut takes an acknowledgement.
+    common::acknowledge_and_cut(&mut w, path, file);
     let q = qpath(path, &format!(".torn-{keep}"));
     assert_eq!(
         quarantine_of(&w),

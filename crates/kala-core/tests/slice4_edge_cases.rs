@@ -331,10 +331,12 @@ fn damaged_world() -> (tempfile::TempDir, PathBuf, World) {
 
 fn faulted_append_after_acknowledgement(fault: LogFault) {
     let (_d, path, mut w) = damaged_world();
-    let report = w.recovery().clone();
     let greg = w.entity_by_handle("greg").unwrap();
+    // The open reported the damaged tail and left it in the file; the
+    // acknowledgement licenses the cut, made here before the faulted write.
+    common::acknowledge_and_cut(&mut w, &path, &bytes(&path));
+    let report = w.recovery().clone();
     let file_after_open = bytes(&path);
-    w.acknowledge_recovery();
     w.inject_log_fault(fault);
     // acknowledged, so the failure is the fault's, not the gate's
     let err = w

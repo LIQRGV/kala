@@ -652,20 +652,22 @@ fn writer(directory: &Path, open: &mut Open) -> Result<World, SystemError> {
     let path = directory.join("system.kala");
     let mut world = open_writer(&path, open)?;
     let damaged = world.recovery().cause == Some(kala_core::CutCause::Damaged);
+    // Validated first: the open only reports a damaged tail and leaves it
+    // in the file, so a world that isn't a valid system world is refused
+    // with nothing cut.
+    validate(&world)?;
     if damaged {
         // Reachable only with `Recovery::Acknowledge`: the refusing open
-        // never cuts a damaged tail. Recorded before anything else can
-        // fail, because the tail is already gone from the log.
-        let report = world.recovery();
+        // fails on a damaged tail. The caller's acknowledgement licenses
+        // the cut, made now under the writer lock (quarantine file first),
+        // and recorded as soon as the tail is gone from the log.
+        world.acknowledge_recovery();
+        let report = world.cut_acknowledged_tail().map_err(store)?.clone();
         eprintln!(
             "event=system_recovery_acknowledged bytes_cut={}",
             report.bytes_cut
         );
-        open.recovered = Some(report.clone());
-    }
-    validate(&world)?;
-    if damaged {
-        world.acknowledge_recovery();
+        open.recovered = Some(report);
     }
     Ok(world)
 }

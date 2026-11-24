@@ -781,11 +781,13 @@ fn transact_and_repl_write_on_damaged_system_world_name_the_flag_and_leave_the_f
     assert_eq!(tree(dir.path()), before);
 }
 
-/// Observed (reported to the caller): with the flag the damaged tail IS cut
-/// to a quarantine file before the system world is refused, so the refusal
-/// is not side-effect free. Pinned as observed.
+/// Was `..._refuse_system_world_after_cutting_tail`, which pinned an
+/// observed wart: the open cut the damaged tail before the system world was
+/// refused. An open no longer cuts a damaged tail (PR #20 review, item B):
+/// the flag's cut happens after the refusal, so the refusal is side-effect
+/// free.
 #[test]
-fn transact_and_repl_write_with_acknowledge_recovery_refuse_system_world_after_cutting_tail() {
+fn transact_and_repl_write_with_acknowledge_recovery_refuse_system_world_without_cutting_tail() {
     for which in ["transact", "repl"] {
         let (dir, damaged, start) = damaged_system();
         let scratch = tempfile::tempdir().unwrap();
@@ -808,10 +810,10 @@ fn transact_and_repl_write_with_acknowledge_recovery_refuse_system_world_after_c
             stderr(&o)
         );
         assert_no_hash(&o);
-        // No write applied: the file is exactly the valid prefix.
-        assert_eq!(fs::read(&world).unwrap(), damaged[..start], "{which}");
+        // Nothing written, nothing cut, nothing quarantined.
+        assert!(fs::read(&world).unwrap() == damaged, "{which}");
         let q = dir.path().join(format!("system.kala.torn-{start}"));
-        assert_eq!(fs::read(&q).unwrap(), damaged[start..], "{which}");
+        assert!(!q.exists(), "{which}");
     }
 }
 

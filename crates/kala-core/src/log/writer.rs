@@ -268,7 +268,7 @@ impl LogWriter {
     /// to `busy_timeout` too.
     ///
     /// Fails as [`read_log`](super::read_log) does, or with `replay`'s error. Only once both
-    /// succeeded is a torn tail (bytes past the last committed transaction,
+    /// succeeded is a *torn* tail (bytes past the last committed transaction,
     /// see the module docs) cut off, so the next append lands right after
     /// the last commit. The cut bytes are first saved, durably, to a
     /// quarantine file (see [`quarantine`]); if that fails, the open fails
@@ -276,15 +276,18 @@ impl LogWriter {
     /// untouched. A clean log is never modified, so opening is idempotent.
     /// The returned [`RecoveryReport`] says what was cut and where it went.
     ///
-    /// With `cut_damaged` false, a *damaged* tail (see
-    /// [`CutCause::Damaged`]) is not cut: the open fails with
-    /// [`Error::RecoveryRequired`] under the lock, before anything is
-    /// quarantined or cut, and the file is untouched. Torn tails are cut
+    /// A *damaged* tail (see [`CutCause::Damaged`]) is never cut here: it
+    /// may have been acknowledged, so its bytes stay in the file, where
+    /// every handle sees them under the lock, until a commit cuts them
+    /// with its caller's acknowledgement (`World::apply_tail`). With
+    /// `report_damaged` it is reported (its length and cause, no
+    /// quarantine file) and the writer stands right before it; without, the
+    /// open fails with [`Error::RecoveryRequired`]. Torn tails are cut
     /// either way.
     pub(crate) fn open<T>(
         path: &Path,
         replay: impl FnOnce(&[LogEntry]) -> Result<T, Error>,
-        cut_damaged: bool,
+        report_damaged: bool,
         busy_timeout: Duration,
     ) -> Result<(T, LogWriter, RecoveryReport), Error> {
         // One handle for reading, cutting and appending, so the bytes
@@ -304,7 +307,7 @@ impl LogWriter {
             cause,
             tip,
         } = scan(&bytes)?;
-        if !cut_damaged && valid_len != bytes.len() && cause == Some(CutCause::Damaged) {
+        if !report_damaged && valid_len != bytes.len() && cause == Some(CutCause::Damaged) {
             return Err(Error::RecoveryRequired {
                 bytes: (bytes.len() - valid_len) as u64,
             });
@@ -322,8 +325,22 @@ impl LogWriter {
             faults: ArmedFaults::default(),
         };
         let mut report = RecoveryReport::default();
-        if let Some(cause) = cause.filter(|_| valid_len != bytes.len()) {
-            report = writer.cut_tail(&held, &bytes[valid_len..], cause)?;
+        match cause.filter(|_| valid_len != bytes.len()) {
+            // Never acknowledged to anyone: cut now.
+            Some(CutCause::Torn) => {
+                report = writer.cut_tail(&held, &bytes[valid_len..], CutCause::Torn)?;
+            }
+            // May have been acknowledged: reported, and left in the file
+            // for every handle on it to see under the lock, until one of
+            // them cuts it with its caller's acknowledgement.
+            Some(CutCause::Damaged) => {
+                report = RecoveryReport {
+                    bytes_cut: (bytes.len() - valid_len) as u64,
+                    quarantine: None,
+                    cause: Some(CutCause::Damaged),
+                };
+            }
+            None => {}
         }
         Ok((replayed, writer, report))
     }

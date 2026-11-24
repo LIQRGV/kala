@@ -128,8 +128,13 @@ fn damaged_last_txn_is_quarantined_and_cut_with_cause_damaged() {
     std::fs::write(&path, &file).unwrap();
     let cut_bytes = file[last.start..].to_vec();
 
-    let w = open_ok(&path);
+    let mut w = open_ok(&path);
     assert_eq!(w.latest_tx(), TxId(3));
+    let r = w.recovery();
+    assert_eq!(r.cause, Some(CutCause::Damaged));
+    assert_eq!(r.bytes_cut, cut_bytes.len() as u64);
+    // Reported at open; quarantined and cut once acknowledged.
+    common::acknowledge_and_cut(&mut w, &path, &file);
     let r = w.recovery();
     assert_eq!(r.cause, Some(CutCause::Damaged));
     assert_eq!(r.bytes_cut, cut_bytes.len() as u64);
@@ -171,9 +176,10 @@ fn damaged_last_txn_with_trailing_garbage_and_no_begin_record_is_cut_whole() {
     damage_body(&mut file, last);
     file.extend_from_slice(&[0xAB; 7]);
     std::fs::write(&path, &file).unwrap();
-    let w = open_ok(&path);
+    let mut w = open_ok(&path);
     assert_eq!(w.recovery().cause, Some(CutCause::Damaged));
     assert_eq!(w.recovery().bytes_cut, (file.len() - last.start) as u64);
+    common::acknowledge_and_cut(&mut w, &path, &file);
     let q = w.recovery().quarantine.clone().unwrap();
     assert_eq!(std::fs::read(q).unwrap(), file[last.start..].to_vec());
     assert_eq!(w.latest_tx(), TxId(3));
@@ -660,10 +666,11 @@ fn damaged_last_txn_followed_by_a_valid_begin_with_a_lower_tx_is_cut_as_damaged(
         damage_body(&mut file, last);
         file.extend_from_slice(&begin_raw(BEGIN_TAG, lower, 0, 0));
         std::fs::write(&path, &file).unwrap();
-        let w = open_ok(&path);
+        let mut w = open_ok(&path);
         assert_eq!(w.recovery().cause, Some(CutCause::Damaged), "tx {lower}");
         assert_eq!(w.latest_tx(), TxId(3), "tx {lower}");
         assert_eq!(w.recovery().bytes_cut, (file.len() - last.start) as u64);
+        common::acknowledge_and_cut(&mut w, &path, &file);
         let q = qpath(&path, &format!(".torn-{}", last.start));
         assert_eq!(w.recovery().quarantine, Some(q.clone()));
         drop(w);
@@ -694,10 +701,11 @@ fn a_valid_begin_record_inside_the_damaged_body_does_not_block_the_cut() {
     assert_ne!(file, orig);
     assert_eq!(file.len(), orig.len());
     std::fs::write(&path, &file).unwrap();
-    let w = open_ok(&path);
+    let mut w = open_ok(&path);
     assert_eq!(w.recovery().cause, Some(CutCause::Damaged));
     assert_eq!(w.latest_tx(), TxId(3));
     assert_eq!(w.recovery().bytes_cut, (file.len() - last.start) as u64);
+    common::acknowledge_and_cut(&mut w, &path, &file);
     drop(w);
     assert_eq!(bytes(&path), file[..last.start]);
 }

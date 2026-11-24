@@ -286,15 +286,29 @@ impl World {
     /// lock again only while one of its transactions commits.
     ///
     /// A torn tail (a last transaction cut short by a crash mid-append, or a
-    /// zero-filled tail) or a damaged one (a last transaction whose bytes
-    /// are all there but fail its body checksum, with no valid begin record
-    /// after it; exact rules in [`crate::log`]) is cut off the file and
-    /// fsynced once the rest has replayed cleanly; the world then continues
-    /// entry IDs and tx from the last committed transaction. Before the cut,
-    /// the cut bytes are saved and fsynced to `<path>.torn-<valid_len>`
-    /// (with `-1`, `-2`, ... added if that exists); if saving them fails,
-    /// this fails with [`Error::Io`] and the log is not cut.
-    /// [`World::recovery`] reports what was cut, why and where it was saved.
+    /// zero-filled tail) was never acknowledged to anyone: it is cut off
+    /// the file and fsynced once the rest has replayed cleanly; the world
+    /// then continues entry IDs and tx from the last committed transaction.
+    /// Before the cut, the cut bytes are saved and fsynced to
+    /// `<path>.torn-<valid_len>` (with `-1`, `-2`, ... added if that
+    /// exists); if saving them fails, this fails with [`Error::Io`] and the
+    /// log is not cut. [`World::recovery`] reports what was cut, why and
+    /// where it was saved.
+    ///
+    /// A damaged tail (a last transaction whose bytes are all there but
+    /// fail its body checksum, with no valid begin record after it; exact
+    /// rules in [`crate::log`]) may have been acknowledged, so the open
+    /// only reports it: the transaction is left out of the world and **in
+    /// the file**, [`World::recovery`] says how long it is (no quarantine
+    /// file yet), and every write fails with
+    /// [`Error::RecoveryUnacknowledged`] until
+    /// [`World::acknowledge_recovery`] is called. The next commit then
+    /// saves it to the quarantine file and cuts it, under the writer lock.
+    /// Because the bytes stay until then, every other handle on the file,
+    /// in any process, meets the same damaged tail at its own next commit
+    /// and is refused in the same way: none can reuse the lost
+    /// transaction's entry IDs without its own caller's acknowledgement.
+    ///
     /// Any other damage, in any transaction, is [`Error::Corrupt`] instead,
     /// with the file untouched.
     pub fn open(path: &Path) -> Result<World, Error> {
@@ -302,12 +316,13 @@ impl World {
     }
 
     /// Like [`World::open`], but a *damaged* last transaction (see
-    /// [`CutCause::Damaged`]) is not cut: the open fails with
-    /// [`Error::RecoveryRequired`] and the file is left untouched (no cut,
-    /// no quarantine file). The check runs under the writer lock, so no
-    /// other open can change the tail in between. Use it where a damaged
-    /// tail must be reviewed before it is cut (it may hold an acknowledged
-    /// write); then [`World::open`] and [`World::acknowledge_recovery`].
+    /// [`CutCause::Damaged`]) fails the open with
+    /// [`Error::RecoveryRequired`] instead of being reported by an opened
+    /// world; the file is left untouched either way. The check runs under
+    /// the writer lock, so no other handle can change the tail in between.
+    /// Use it where a damaged tail must be reviewed before anything is
+    /// written (it may hold an acknowledged write); then [`World::open`]
+    /// and [`World::acknowledge_recovery`].
     /// Clean logs and torn tails open exactly as with [`World::open`].
     pub fn open_refusing_damaged(path: &Path) -> Result<World, Error> {
         Self::open_with(path, false, log::DEFAULT_BUSY_TIMEOUT)
@@ -330,11 +345,16 @@ impl World {
         Self::open_with(path, false, busy_timeout)
     }
 
-    fn open_with(path: &Path, cut_damaged: bool, busy_timeout: Duration) -> Result<World, Error> {
+    fn open_with(
+        path: &Path,
+        report_damaged: bool,
+        busy_timeout: Duration,
+    ) -> Result<World, Error> {
         let (mut world, writer, recovery) =
-            LogWriter::open(path, World::replay, cut_damaged, busy_timeout)?;
+            LogWriter::open(path, World::replay, report_damaged, busy_timeout)?;
         world.journal.attach_log(writer);
-        world.gate = WriteGate::after_recovery(recovery);
+        let end = world.journal.chain_tip().map_or(0, |tip| tip.end);
+        world.gate = WriteGate::after_recovery(recovery, end);
         Ok(world)
     }
 

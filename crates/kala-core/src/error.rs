@@ -209,17 +209,22 @@ pub enum Error {
     /// only keeps out other Kala worlds, not other programs writing the
     /// file.
     WorldLocked,
-    /// [`World::open`](crate::World::open) cut a *damaged* tail off the log
+    /// [`World::open`](crate::World::open) found a *damaged* tail on the log
     /// (a committed-looking last transaction whose checksum fails; see
     /// [`CutCause::Damaged`](crate::CutCause::Damaged)), and nobody has
-    /// looked at it yet: the world reads normally but refuses every write
-    /// until [`World::acknowledge_recovery`](crate::World::acknowledge_recovery)
+    /// looked at it yet: the world reads normally (without that
+    /// transaction) but refuses every write until
+    /// [`World::acknowledge_recovery`](crate::World::acknowledge_recovery)
     /// is called, so new writes don't silently land on top of lost canon.
+    /// The damaged bytes are still in the file; the first commit after the
+    /// acknowledgement cuts them to a quarantine file.
     RecoveryUnacknowledged,
-    /// [`World::open_refusing_damaged`](crate::World::open_refusing_damaged)
-    /// found a *damaged* last transaction of `bytes` bytes and left the file
-    /// untouched; [`World::open`](crate::World::open) would cut it to a
-    /// quarantine file.
+    /// [`World::open_refusing_damaged`](crate::World::open_refusing_damaged),
+    /// or a commit holding the writer lock, found a *damaged* last
+    /// transaction of `bytes` bytes and left the file untouched. Cutting it
+    /// (to a quarantine file) takes an acknowledgement: after a refused
+    /// commit, [`World::acknowledge_recovery`](crate::World::acknowledge_recovery)
+    /// and commit again.
     RecoveryRequired {
         /// The size of the damaged tail.
         bytes: u64,
@@ -586,12 +591,14 @@ impl fmt::Display for Error {
             ),
             Error::RecoveryRequired { bytes } => write!(
                 f,
-                "the last transaction is damaged ({bytes} bytes); opening for writing \
-                 would cut it to a quarantine file"
+                "the last transaction is damaged ({bytes} bytes); writing needs an \
+                 acknowledgement (World::acknowledge_recovery), after which the next commit \
+                 cuts it to a quarantine file"
             ),
             Error::RecoveryUnacknowledged => f.write_str(
-                "opening the log cut off a damaged transaction; acknowledge the recovery \
-                 (World::acknowledge_recovery) before writing",
+                "the log ends in a damaged transaction, which opening it left out; \
+                 acknowledge the recovery (World::acknowledge_recovery) before writing: the \
+                 next commit then cuts it to a quarantine file",
             ),
             Error::ReadOnly => f.write_str("world is open read-only; writes are refused"),
             Error::LogDiverged => f.write_str(

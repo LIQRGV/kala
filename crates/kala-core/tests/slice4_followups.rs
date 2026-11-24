@@ -208,20 +208,30 @@ fn damaged_cut_txn_commit_is_refused() {
 #[test]
 fn acknowledge_recovery_unlocks_writes_and_recovery_still_reports_the_cut() {
     let (_d, path, mut w, entry) = damaged_world();
-    let report_before = w.recovery().clone();
-    assert!(report_before.bytes_cut > 0);
+    let report_at_open = w.recovery().clone();
+    assert!(report_at_open.bytes_cut > 0);
+    assert_eq!(report_at_open.quarantine, None, "reported, not yet cut");
+    let damaged = bytes(&path);
     w.acknowledge_recovery();
     assert_eq!(
         *w.recovery(),
-        report_before,
+        report_at_open,
         "report survives acknowledgement"
     );
+    assert_eq!(bytes(&path), damaged, "acknowledging alone cuts nothing");
     let greg = w.entity_by_handle("greg").unwrap();
 
+    // The first acknowledged commit quarantines and cuts the damaged tail.
     let r = w
         .assert(greg, "name", Value::Str("Gregor".into()), t(2))
         .unwrap();
     assert_eq!(r.changed, 1);
+    let report_before = w.recovery().clone();
+    assert_eq!(report_before.cause, report_at_open.cause);
+    assert_eq!(report_before.bytes_cut, report_at_open.bytes_cut);
+    let q = report_before.quarantine.clone().expect("quarantined");
+    let keep = damaged.len() - report_at_open.bytes_cut as usize;
+    assert_eq!(bytes(&q), damaged[keep..]);
     w.retract(greg, "name", Value::Str("Gregor".into()), t(3))
         .unwrap();
     w.correct(entry, Correction::Delete).unwrap();
@@ -251,14 +261,33 @@ fn acknowledge_recovery_twice_is_harmless() {
         .unwrap();
 }
 
+// Was `reopening_the_truncated_file_needs_no_acknowledgement`: an open used
+// to cut the damaged tail, so a second open found a clean file and wrote
+// over the lost transaction's entry IDs with nobody having acknowledged
+// (PR #20 review, item B). The tail now stays until it is acknowledged.
 #[test]
-fn reopening_the_truncated_file_needs_no_acknowledgement() {
+fn reopening_a_world_whose_damaged_tail_nobody_acknowledged_still_refuses() {
     let (_d, path, w, _e) = damaged_world();
+    let report = w.recovery().clone();
+    let damaged = bytes(&path);
     drop(w); // never acknowledged
+    assert_eq!(bytes(&path), damaged, "the open cut nothing");
     let mut w2 = open_ok(&path);
-    assert_eq!(*w2.recovery(), RecoveryReport::default());
+    assert_eq!(*w2.recovery(), report);
     let greg = w2.entity_by_handle("greg").unwrap();
+    unack(
+        w2.assert(greg, "name", Value::Str("A".into()), t(7)),
+        "reopened, unacknowledged",
+    );
+    assert_eq!(bytes(&path), damaged);
+    w2.acknowledge_recovery();
     w2.assert(greg, "name", Value::Str("A".into()), t(7))
+        .unwrap();
+    drop(w2);
+    // Cut and committed over: now the file reopens clean.
+    let mut w3 = open_ok(&path);
+    assert_eq!(*w3.recovery(), RecoveryReport::default());
+    w3.assert(greg, "name", Value::Str("B".into()), t(8))
         .unwrap();
 }
 

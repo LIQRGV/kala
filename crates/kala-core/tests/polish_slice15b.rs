@@ -164,6 +164,143 @@ fn a_writer_with_an_unacknowledged_recovery_catches_up_over_a_migration() {
     ));
 }
 
+// ---- B: a damaged tail stays in the file until a handle that
+// acknowledged it commits ----
+
+/// `b` was opened before `tx N` (a tag on greg) was appended by another
+/// handle; then tx N's body is damaged on disk. Returns the damaged span.
+fn damaged_behind(path: &Path, greg: EntityId) -> (World, common::Span) {
+    let b = World::open(path).unwrap();
+    let mut third = World::open(path).unwrap();
+    third
+        .assert(greg, "tag", s("acknowledged-then-damaged"), Some(Tick(1)))
+        .unwrap();
+    drop(third);
+    let span = damage_last_txn(path);
+    (b, span)
+}
+
+#[test]
+fn opening_a_damaged_world_reports_the_tail_and_leaves_it_in_the_file() {
+    let (_dir, path, w, greg) = world();
+    drop(w);
+    let (_b, span) = damaged_behind(&path, greg);
+    let damaged = bytes(&path);
+
+    let mut a = World::open(&path).unwrap();
+    assert_eq!(bytes(&path), damaged, "the open cut nothing");
+    assert_eq!(quarantine_files(&path), Vec::<PathBuf>::new());
+    let r = a.recovery().clone();
+    assert_eq!(r.cause, Some(CutCause::Damaged));
+    assert_eq!(r.bytes_cut, (span.end - span.start) as u64);
+    assert_eq!(r.quarantine, None, "nothing is quarantined before the cut");
+    // The damaged transaction is not applied.
+    assert_eq!(a.as_of(greg, "tag", Tick(1)).unwrap(), vec![]);
+    assert_eq!(a.latest_tx(), TxId(1));
+    // Writes are refused until acknowledged; the file stays as it is.
+    assert!(matches!(
+        a.assert(greg, "tag", s("x"), Some(Tick(1))),
+        Err(Error::RecoveryUnacknowledged)
+    ));
+    assert_eq!(bytes(&path), damaged);
+
+    // Acknowledged: the next commit quarantines, cuts and commits.
+    a.acknowledge_recovery();
+    a.assert(greg, "tag", s("x"), Some(Tick(1))).unwrap();
+    let q = quarantine_files(&path);
+    assert_eq!(q.len(), 1);
+    assert_eq!(bytes(&q[0]), damaged[span.start..]);
+    assert_eq!(bytes(&path)[..span.start], damaged[..span.start]);
+    let r = a.recovery();
+    assert_eq!(r.cause, Some(CutCause::Damaged));
+    assert_eq!(r.bytes_cut, (span.end - span.start) as u64);
+    assert_eq!(r.quarantine.as_deref(), Some(q[0].as_path()));
+    assert_eq!(a.latest_tx(), TxId(2));
+    assert_clean(&a);
+    drop(a);
+    let again = World::open(&path).unwrap();
+    assert_eq!(again.recovery().cause, None);
+    assert_eq!(again.as_of(greg, "tag", Tick(1)).unwrap(), vec![s("x")]);
+}
+
+#[test]
+fn a_handle_already_open_cannot_reuse_a_damaged_tails_entry_ids_unacknowledged() {
+    let (_dir, path, w, greg) = world();
+    drop(w);
+    let (mut b, span) = damaged_behind(&path, greg);
+    let damaged = bytes(&path);
+
+    // "Process A" opens the damaged world (and never acknowledges).
+    let mut a = World::open(&path).unwrap();
+    assert_eq!(a.recovery().cause, Some(CutCause::Damaged));
+    assert_eq!(bytes(&path), damaged);
+
+    // B's tip is before the damaged transaction. Its commit must not land
+    // where that transaction's entry IDs were without anyone acknowledging.
+    for _ in 0..2 {
+        match b.assert(greg, "tag", s("from-b"), Some(Tick(2))) {
+            Err(Error::RecoveryRequired { bytes }) => {
+                assert_eq!(bytes, (span.end - span.start) as u64);
+            }
+            other => panic!("expected RecoveryRequired, got {other:?}"),
+        }
+        assert_eq!(bytes(&path), damaged, "a refused commit touches nothing");
+        assert_eq!(quarantine_files(&path), Vec::<PathBuf>::new());
+    }
+
+    // B acknowledges: its next commit quarantines, cuts and commits.
+    b.acknowledge_recovery();
+    let res = b.assert(greg, "tag", s("from-b"), Some(Tick(2))).unwrap();
+    let q = quarantine_files(&path);
+    assert_eq!(q.len(), 1, "the damaged bytes were saved before the cut");
+    assert_eq!(bytes(&q[0]), damaged[span.start..]);
+    assert_eq!(b.recovery().cause, Some(CutCause::Damaged));
+    assert_eq!(b.recovery().quarantine.as_deref(), Some(q[0].as_path()));
+    assert_eq!(res.entries.len(), 1);
+    assert_eq!(b.latest_tx(), TxId(2));
+    assert_clean(&b);
+
+    // A never acknowledged what its open reported: still refused.
+    let committed = bytes(&path);
+    assert!(matches!(
+        a.assert(greg, "tag", s("from-a"), Some(Tick(3))),
+        Err(Error::RecoveryUnacknowledged)
+    ));
+    assert_eq!(bytes(&path), committed);
+    // Once it does, it writes on top of B's commit.
+    a.acknowledge_recovery();
+    a.assert(greg, "tag", s("from-a"), Some(Tick(3))).unwrap();
+    assert_eq!(a.latest_tx(), TxId(3));
+    assert_eq!(quarantine_files(&path).len(), 1);
+    assert_clean(&a);
+}
+
+#[test]
+fn an_acknowledged_damaged_tail_can_be_cut_without_a_commit() {
+    let (_dir, path, w, greg) = world();
+    drop(w);
+    let (_b, span) = damaged_behind(&path, greg);
+    let damaged = bytes(&path);
+
+    let mut a = World::open(&path).unwrap();
+    // Not acknowledged: refused, nothing touched.
+    assert!(matches!(
+        a.cut_acknowledged_tail(),
+        Err(Error::RecoveryUnacknowledged)
+    ));
+    assert_eq!(bytes(&path), damaged);
+    a.acknowledge_recovery();
+    let report = a.cut_acknowledged_tail().unwrap().clone();
+    assert_eq!(report.cause, Some(CutCause::Damaged));
+    let q = quarantine_files(&path);
+    assert_eq!(report.quarantine.as_deref(), Some(q[0].as_path()));
+    assert_eq!(bytes(&q[0]), damaged[span.start..]);
+    assert_eq!(bytes(&path), damaged[..span.start]);
+    // Again: nothing more to cut, the report stays.
+    assert_eq!(a.cut_acknowledged_tail().unwrap(), &report);
+    assert_eq!(quarantine_files(&path).len(), 1);
+}
+
 // ---- L: doctor on a handle doesn't judge another handle's append in
 // progress ----
 
@@ -204,4 +341,38 @@ fn doctor_on_a_handle_ignores_an_incomplete_tail_past_what_it_applied() {
     std::fs::write(&path, &full[..full.len() - 5]).unwrap();
     let report = doctor(&w, &DoctorOptions::default());
     assert!(report.findings.iter().any(is_tail), "{report:?}");
+}
+
+#[test]
+fn an_acknowledgement_covers_only_the_damaged_tail_that_was_reported() {
+    let (_dir, path, w, greg) = world();
+    drop(w);
+    let (mut b, _) = damaged_behind(&path, greg);
+    // A reports the tail at open and acknowledges it, but doesn't commit yet.
+    let mut a = World::open(&path).unwrap();
+    a.acknowledge_recovery();
+    // B is refused, acknowledges, cuts and commits; a third writer's commit
+    // on top is then damaged: another tail, which A has never seen.
+    assert!(matches!(
+        b.assert(greg, "tag", s("b"), Some(Tick(2))),
+        Err(Error::RecoveryRequired { .. })
+    ));
+    b.acknowledge_recovery();
+    b.assert(greg, "tag", s("b"), Some(Tick(2))).unwrap();
+    b.assert(greg, "tag", s("second-loss"), Some(Tick(3)))
+        .unwrap();
+    drop(b);
+    damage_last_txn(&path);
+    let damaged = bytes(&path);
+    // A's old acknowledgement doesn't license cutting it.
+    assert!(matches!(
+        a.assert(greg, "tag", s("a"), Some(Tick(4))),
+        Err(Error::RecoveryRequired { .. })
+    ));
+    assert!(bytes(&path) == damaged, "nothing cut");
+    assert_eq!(quarantine_files(&path).len(), 1);
+    a.acknowledge_recovery();
+    a.assert(greg, "tag", s("a"), Some(Tick(4))).unwrap();
+    assert_eq!(quarantine_files(&path).len(), 2);
+    assert_clean(&a);
 }

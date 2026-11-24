@@ -350,14 +350,19 @@ fn a_damaged_last_transaction_still_requires_acknowledgement() {
         assert_eq!(read(&p), b, "refused without a cut");
         let mut w = World::open(&p).unwrap();
         assert_eq!(w.recovery().cause, Some(CutCause::Damaged), "byte {at}");
-        assert!(w.recovery().quarantine.is_some());
+        // Reported, not cut: the bytes stay until the acknowledged commit.
+        assert!(w.recovery().quarantine.is_none());
+        assert_eq!(read(&p), b, "opened without a cut");
         assert_eq!(w.latest_tx(), TxId(3));
         assert!(matches!(
             w.assert(greg, "tag", s("again"), Some(Tick(7))),
             Err(Error::RecoveryUnacknowledged)
         ));
+        assert_eq!(read(&p), b, "refused without a cut");
         w.acknowledge_recovery();
         w.assert(greg, "tag", s("again"), Some(Tick(7))).unwrap();
+        let q = w.recovery().quarantine.clone().expect("quarantined");
+        assert_eq!(read(&q), b[sp.start..], "the damaged bytes were saved");
         drop(w);
         let after = read(&p);
         assert_eq!(after[..sp.start], good[..sp.start]);

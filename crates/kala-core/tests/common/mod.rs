@@ -190,3 +190,32 @@ pub fn replace_last_body(bytes: &mut Vec<u8>, body: &[u8]) {
     bytes.truncate(s.start);
     bytes.extend_from_slice(&txn(s.tx, body));
 }
+
+/// What an author does after `World::open` reported a damaged last
+/// transaction on `w` (the log at `path`, whose bytes are `damaged`):
+/// acknowledges it and has it cut. First proves what the open must
+/// guarantee: the file is exactly as it was, nothing is quarantined, and
+/// nothing is cut for a caller who hasn't acknowledged.
+pub fn acknowledge_and_cut(w: &mut kala_core::World, path: &std::path::Path, damaged: &[u8]) {
+    let unchanged = || {
+        assert!(
+            std::fs::read(path).unwrap() == damaged,
+            "a damaged tail is left in the file until it is acknowledged"
+        );
+    };
+    unchanged();
+    assert_eq!(
+        w.recovery().quarantine,
+        None,
+        "nothing is quarantined before the cut"
+    );
+    assert_eq!(
+        w.cut_acknowledged_tail().err(),
+        Some(kala_core::Error::RecoveryUnacknowledged)
+    );
+    unchanged();
+    w.acknowledge_recovery();
+    let report = w.cut_acknowledged_tail().unwrap();
+    assert_eq!(report.cause, Some(kala_core::CutCause::Damaged));
+    assert!(report.quarantine.is_some(), "cut bytes are quarantined");
+}

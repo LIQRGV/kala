@@ -22,8 +22,10 @@
 //! is appending, so an incomplete tail is a dead writer's. A torn one is
 //! cut (quarantine file and [`World::recovery`] report, as
 //! [`World::open`] does); a damaged one is cut only once the caller has
-//! seen the refusal ([`Error::RecoveryRequired`]) and called
-//! [`World::acknowledge_recovery`].
+//! seen it reported (by [`World::open`], or by a commit's refusal,
+//! [`Error::RecoveryRequired`]) and called
+//! [`World::acknowledge_recovery`]. No open cuts a damaged tail, so every
+//! handle on the file meets it here and none writes past it unasked.
 
 use super::*;
 use std::time::Duration;
@@ -105,6 +107,35 @@ impl World {
         Ok(f())
     }
 
+    /// Brings the log file to its committed end now, without committing
+    /// anything: takes the writer lock (waiting up to the busy timeout),
+    /// applies what other handles appended and cuts an incomplete last
+    /// transaction exactly as a commit would (see [`Txn::commit`]): a torn
+    /// one always, a damaged one only if this handle reported it (at
+    /// [`World::open`] or by a refused commit) and
+    /// [`World::acknowledge_recovery`] was called since. Returns
+    /// [`World::recovery`], which then names the quarantine file.
+    ///
+    /// For a caller that acknowledged a damaged tail and wants it out of
+    /// the file before (or without) its first commit, such as a command
+    /// run with `--acknowledge-recovery`. With nothing to cut it changes
+    /// nothing on disk.
+    ///
+    /// Fails as a commit's locking does, the file untouched:
+    /// [`Error::ReadOnly`], [`Error::RecoveryUnacknowledged`],
+    /// [`Error::RecoveryRequired`] (a damaged tail nobody acknowledged
+    /// on this handle), [`Error::WorldLocked`], [`Error::LogDiverged`],
+    /// [`Error::Corrupt`] or [`Error::Io`].
+    pub fn cut_acknowledged_tail(&mut self) -> Result<&RecoveryReport, Error> {
+        self.writable()?;
+        if let Some(held) = self.lock_log()?
+            && let Some(tail) = self.read_tail(Some(&held))?
+        {
+            self.apply_tail(tail, Some(&held))?;
+        }
+        Ok(self.recovery())
+    }
+
     /// The catch-up [`World::begin`] makes: nothing but one `stat` when the
     /// file is exactly as long as the log this handle applied. Errors are
     /// left for the commit, which checks again under the lock (a diverged
@@ -165,8 +196,8 @@ impl World {
     /// Then the incomplete last transaction, if there is one. Without the
     /// lock (`held` is `None`) it is ignored: it may be an append in
     /// progress. With it, a torn one is cut to a quarantine file, and a
-    /// damaged one is cut only if a commit refused it before and the
-    /// refusal was acknowledged; else this fails with
+    /// damaged one is cut only if this handle reported it before (its open,
+    /// or a commit's refusal) and that was acknowledged; else this fails with
     /// [`Error::RecoveryRequired`], the file untouched. Either cut becomes
     /// the handle's [`World::recovery`] report.
     ///
@@ -193,12 +224,13 @@ impl World {
         let Some(held) = held else {
             return Ok(applied);
         };
+        // An in-memory buffer's length always fits a u64.
+        let rest_len = tail.rest.len() as u64;
+        // The tail starts where the committed log, now all applied, ends.
+        let rest_at = self.journal.chain_tip().map_or(0, |tip| tip.end);
         match tail.cause {
-            Some(CutCause::Damaged) if !self.gate.may_cut_damaged_tail() => {
-                return Err(Error::RecoveryRequired {
-                    // An in-memory buffer's length always fits a u64.
-                    bytes: tail.rest.len() as u64,
-                });
+            Some(CutCause::Damaged) if !self.gate.may_cut_damaged_tail((rest_at, rest_len)) => {
+                return Err(Error::RecoveryRequired { bytes: rest_len });
             }
             Some(cause) => {
                 let report = self.journal.cut_tail(held, &tail.rest, cause)?;

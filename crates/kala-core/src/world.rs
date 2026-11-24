@@ -303,8 +303,8 @@ impl FactDef {
     }
 }
 
-/// Why [`World::open`] cut a tail off the log (recovery rules in
-/// [`crate::log`]).
+/// Why a tail is cut off the log, by [`World::open`] or by a commit
+/// (recovery rules in [`crate::log`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CutCause {
     /// The last transaction was cut short (or is a zero-filled tail).
@@ -314,15 +314,23 @@ pub enum CutCause {
     Damaged,
 }
 
-/// What [`World::open`] did to recover the log: how many bytes of a torn or
-/// damaged tail it cut off, why, and where it saved them. A clean open, a
-/// new world ([`World::create`]) and an in-memory world report the default:
-/// nothing cut, no quarantine file, no cause. A world from
-/// [`World::open_read_only`] reports what `World::open` would cut, with no
+/// What recovering the log took: how many bytes of a torn or damaged tail
+/// were (or are to be) cut off, why, and where they were saved. A clean
+/// open, a new world ([`World::create`]) and an in-memory world report the
+/// default: nothing cut, no quarantine file, no cause.
+///
+/// [`World::open`] cuts a torn tail itself and reports it with its
+/// quarantine file. A damaged tail it only reports (`cause` and
+/// `bytes_cut`, `quarantine: None`): the bytes stay in the file until a
+/// commit made after [`World::acknowledge_recovery`] cuts them, and the
+/// report then names the quarantine file. A commit that cuts a tail another
+/// writer left behind replaces the report the same way. A world from
+/// [`World::open_read_only`] reports what a writer would cut, with no
 /// quarantine file (nothing is written).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RecoveryReport {
-    /// Bytes cut off the end of the log (0 if the log was clean).
+    /// Bytes of the incomplete tail: cut off the end of the log, or (no
+    /// quarantine file yet) still to be cut. 0 if the log was clean.
     pub bytes_cut: u64,
     /// The quarantine file holding exactly the cut bytes, if any were cut
     /// (always `None` for [`World::open_read_only`]).
@@ -561,29 +569,46 @@ impl World {
     }
 
     /// `Err(ReadOnly)` for a world from [`World::open_read_only`], else
-    /// `Err(RecoveryUnacknowledged)` until a damaged-tail cut is
+    /// `Err(RecoveryUnacknowledged)` until a damaged tail is
     /// acknowledged (see [`World::acknowledge_recovery`]).
     fn accepts_writes(&self) -> Result<(), Error> {
         self.gate.accepts_writes()
     }
 
-    /// Acknowledges what [`World::open`] cut off the log, allowing writes
-    /// again.
+    /// Acknowledges a damaged last transaction this handle reported,
+    /// allowing writes again and licensing the cut.
     ///
-    /// After an open that cut a damaged tail ([`CutCause::Damaged`]: bytes
-    /// that look committed but fail their checksum, saved to the quarantine
-    /// file), every write fails with [`Error::RecoveryUnacknowledged`]
-    /// until this is called, so the author decides what the lost canon
-    /// means before writing on top of it. [`World::recovery`] keeps
-    /// reporting the cut afterwards. On any other world (torn cut, clean
-    /// open, [`World::create`], [`World::in_memory`]) and when called again
-    /// this does nothing. On a world from [`World::open_read_only`] it does
-    /// nothing either: writes stay refused with [`Error::ReadOnly`].
+    /// A damaged tail ([`CutCause::Damaged`]: bytes that look committed but
+    /// fail their checksum) may be a write that was acknowledged to someone,
+    /// and cutting it frees its entry IDs for reuse. So it is never cut
+    /// behind the caller's back, by any handle in any process:
+    ///
+    /// - [`World::open`] reports it ([`World::recovery`]), leaves it in the
+    ///   file and out of the world, and every write then fails with
+    ///   [`Error::RecoveryUnacknowledged`];
+    /// - a handle that was already open finds it when a commit takes the
+    ///   writer lock: that commit fails with [`Error::RecoveryRequired`],
+    ///   the file untouched.
+    ///
+    /// Either way, after this call the handle's next commit (or
+    /// [`World::cut_acknowledged_tail`]) saves the damaged bytes to a
+    /// quarantine file, cuts them under the lock and goes ahead;
+    /// [`World::recovery`] then names the quarantine file. The author
+    /// decides what the lost canon means before writing on top of it, and
+    /// an entry ID noted from the lost transaction must not be used in a
+    /// `correct` afterwards. An acknowledgement covers the damaged tail the
+    /// handle has reported, never one it hasn't seen.
+    ///
+    /// On any other world (torn cut, clean open, [`World::create`],
+    /// [`World::in_memory`]) and when called again this does nothing. On a
+    /// world from [`World::open_read_only`] it does nothing either: writes
+    /// stay refused with [`Error::ReadOnly`].
     pub fn acknowledge_recovery(&mut self) {
         self.gate.acknowledge_recovery();
     }
 
-    /// What opening the log did to recover it (see [`RecoveryReport`]).
+    /// What recovering the log took, at open or in a later commit of this
+    /// handle (see [`RecoveryReport`]).
     pub fn recovery(&self) -> &RecoveryReport {
         self.gate.recovery()
     }

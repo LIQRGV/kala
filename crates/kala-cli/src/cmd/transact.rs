@@ -76,8 +76,9 @@ pub struct Report {
 /// checksum fails) may have been acknowledged to a writer, so it is never
 /// cut without `acknowledge`: kala-core refuses it under the writer lock,
 /// before anything is cut or quarantined, so retrying can't get past it.
-/// System worlds are refused once the writer has opened (so a system world
-/// with an acknowledged damaged tail is recovered before it is refused).
+/// With `acknowledge` it is cut (to a quarantine file) here, before any
+/// form runs. System worlds are refused once the writer has opened and
+/// before anything is cut.
 ///
 /// The open takes the world's writer lock (so does each later commit),
 /// waiting for another writer up to `busy_timeout` (`--busy-timeout`;
@@ -104,7 +105,13 @@ pub fn open_write(
     })?;
     refuse_system(&w)?;
     if w.recovery().cause == Some(kala_core::CutCause::Damaged) {
+        // The open only reported the damaged tail (kala-core leaves it in
+        // the file until a handle that acknowledged it cuts it). The flag
+        // is the acknowledgement: cut it now, under the writer lock, so
+        // the command leaves the world recovered whatever its forms do.
         w.acknowledge_recovery();
+        w.cut_acknowledged_tail()
+            .map_err(|e| CliError::at_path(path, &e))?;
     }
     Ok(w)
 }

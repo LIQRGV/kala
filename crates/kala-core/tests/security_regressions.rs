@@ -175,7 +175,7 @@ fn assert_damage_cut(path: &Path, f: impl FnOnce(&mut Vec<u8>), keep: usize, lab
         quarantine_files(path).is_empty(),
         "{label}: read_log quarantined"
     );
-    let w = match World::open(path) {
+    let mut w = match World::open(path) {
         Ok(w) => w,
         Err(e) => panic!("{label}: expected a cut, got {e:?}"),
     };
@@ -185,6 +185,8 @@ fn assert_damage_cut(path: &Path, f: impl FnOnce(&mut Vec<u8>), keep: usize, lab
         (bytes.len() - keep) as u64,
         "{label}"
     );
+    // The open reports the damaged tail; the cut takes an acknowledgement.
+    common::acknowledge_and_cut(&mut w, path, &bytes);
     let q = qpath(path, &format!(".torn-{keep}"));
     assert_eq!(w.recovery().quarantine, Some(q.clone()), "{label}");
     assert_eq!(w.latest_tx(), TxId(2), "{label}: tx3 is gone");
