@@ -54,6 +54,11 @@ size/depth bounds and failure/RESET behavior. TLS and WebSocket are planned as
 wrappers of this seam. `Transport` requires no raw descriptor, and
 `Server::with_transport_wrapper` can decorate accepted streams; conformance
 also runs through a wrapper that splits every read and write into single bytes.
+The peer used for account matching and the reached address are read from the
+accepted connection before it is wrapped, so a wrapper cannot change who
+connected. Per-socket setup happens after `accept`: a connection that cannot be
+set up is dropped with `event=bolt_connection_dropped` and the server keeps
+accepting.
 
 `ServerConfig::listen` is a list of `ListenAddr` values; `Server::local_addrs()`
 returns every actual bound endpoint in order. `--listen` accepts bare
@@ -73,7 +78,8 @@ Unix paths must be absolute and fit the platform's `sun_path` limit (107 bytes
 on Linux, excluding the trailing NUL). Socket permissions default to `0600`;
 `--unix.mode` accepts octal permission bits through `0777`. Other users gain
 write permission only if it is explicitly requested, for example `0666`.
-Creation binds in a private `0700` staging directory, sets the requested mode,
+Creation binds in a private staging directory (created `0700`, whatever the
+umask), sets the requested mode,
 then publishes with a no-clobber hard link on the same filesystem. There is no
 public permission window and no process-global umask change. The filesystem
 must support hard links to socket inodes.
@@ -88,19 +94,64 @@ canonical directory ancestry; staging may use a shorter writable ancestor on
 the same filesystem to fit `sun_path`. Processes with the same UID and root
 share filesystem authority and are outside this boundary.
 
-An existing socket is replaced only when a nonblocking connect is refused;
-a live socket, including a full backlog, reports `already in use`. Regular
-files and symlinks are refused without deletion. Clean shutdown removes only
-the socket inode this listener created. Lifecycle operations use nonblocking
-directory locks: lock contention fails closed, and cleanup logs a diagnostic
-and leaves a stale socket if it cannot safely take the lock. A subsequent start
-can reclaim that stale socket.
-`kala serve` runs this cleanup on SIGINT, SIGTERM and SIGHUP; only an
-uncatchable kill (SIGKILL, power loss) leaves the socket file behind. A private directory also prevents unrelated
-users from taking its directory lock.
+**Lock file.** Next to the socket the server keeps a lock file named
+`.<socket name>.lock` (for `/run/kala/bolt.sock`: `/run/kala/.bolt.sock.lock`),
+created with mode `0600`, empty, and `flock`-ed exclusively for as long as the
+listener exists, as PostgreSQL does. It decides Kala against Kala: a second
+`kala serve` on the same path waits up to about one second (so a restart that
+overlaps a shutdown works) and then fails with `unix:///path is already in use
+by another kala serve (lock file … is held)`; the running server's socket is
+never touched. The lock file must be a regular file owned by the server's user:
+a symlink, a directory or another user's file at that name is refused with an
+error naming it, and is left untouched. The parent directory itself is not
+locked, so a user who can merely open that directory cannot block a start or a
+shutdown. Clean shutdown removes the socket first, then the lock file (while
+the lock is still held; a start that was waiting notices the file is gone and
+takes a fresh one), then lets go. After a crash both files stay; the empty lock
+file is harmless and the next start reuses it.
+
+**An existing socket file.** With the lock held, a socket already at the path
+cannot belong to a live Kala server. It is still probed with a nonblocking
+connect, to protect a listener that is not Kala:
+
+- the connection is accepted or queued: `already in use`, nothing is changed;
+- the connection is refused: the socket is a leftover and is replaced;
+- the server may not connect (a leftover created with `--unix.mode 0000` or
+  `0060` denies its own user): replaced if this user owns it; if another user
+  owns it, the start fails with an error naming the path and the remedy
+  (remove the file or choose another path).
+
+On Linux a live listener with a full backlog answers "try again", so it counts
+as in use. BSD-family kernels (macOS, FreeBSD) answer "refused" in that case as
+well, so there a non-Kala listener with a full backlog on the same path can be
+taken for a leftover and its socket file replaced. Kala servers are not
+affected, because the lock file decides between them.
+
+Regular files and symlinks at the socket path are refused without deletion.
+Clean shutdown removes only the socket inode this listener created; if the
+parent directory's permissions were loosened meanwhile it logs
+`event=bolt_socket_cleanup_failed` and leaves the socket, which a later start
+reclaims. `kala serve` runs this cleanup on SIGINT, SIGTERM and SIGHUP; only an
+uncatchable kill (SIGKILL, power loss) leaves the two files behind.
+
+**Who may connect.** `--unix.mode` is the access control of a Unix listener.
+A new `system` database has `root@localhost` with `trust` (no password) and
+`admin:*`, and a Unix peer is `localhost`, so until that account gets a
+password every user who can open the socket is an administrator. With the
+default `0600` that is the server's own user; `0660` adds the socket's group;
+`0666` means every local user, which is what the default TCP loopback listener
+already allows. For a group of users, give the socket a directory of its own,
+owned by the server's user with the clients' group and mode `0750`, and use
+`--unix.mode 0660`. A parent directory that is group- or other-writable
+without the sticky bit is refused (a `0770` directory, for example): anyone
+who can write to it could swap the socket. Clients connect by path, so no
+ancestor directory of the socket should be writable by other users either;
+Linux does not check the ancestors (it pins the parent directory), the other
+Unix platforms refuse an untrusted ancestor.
 
 A Unix peer matches **only `localhost`**, so `root@localhost` trust and password
-accounts work; IP patterns and `%` do not match it. Socket and directory
+accounts work; IP patterns and `%` never match it (an account that exists only
+as `alice@%` cannot log in over the socket; add `alice@localhost`). Socket and directory
 permissions are the access boundary, not peer-credential authentication. Some
 Unix systems do not enforce socket write permissions, so restrict the directory
 as well. IP-only custom authenticators retain their existing API and refuse

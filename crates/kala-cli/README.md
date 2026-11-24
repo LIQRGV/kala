@@ -304,12 +304,35 @@ kala serve worlds --listen bolt://127.0.0.1:7687 \
 
 `--unix.mode` sets octal socket permissions (default `0600`, permitted values
 `0000` through `0777`; special mode bits are refused). Granting other-write
-requires an explicit mode such as `0666`. Use a private directory; a shared
-writable parent must be sticky, and the parent must belong to this user or root.
+requires an explicit mode such as `0666`.
+
+The mode decides who can log in. A new server directory has `root@localhost`
+with `trust` (no password) and admin rights, and a Unix peer counts as
+`localhost`, so every user who can open the socket is an administrator until
+you set a password (`kala user set DIR root@localhost --password-stdin`). With
+`0600` that is only the user running the server. `0666` means every local
+user, which the default TCP listener on `127.0.0.1` already allows.
+
+- Unix peers match only `localhost` accounts. A `%` host pattern never matches
+  one: `alice@%` cannot log in over the socket, `alice@localhost` can.
+- For a group of users: put the socket in a directory of its own, owned by the
+  server's user with that group and mode `0750`, and use `--unix.mode 0660`.
+- The parent directory must belong to the server's user or root. If it is
+  group- or other-writable it must be sticky (like `/tmp`); a `0770` directory
+  is refused, because anyone who can write to it could replace the socket.
+- Clients connect by path, so no directory above the socket should be writable
+  by other users.
+
+Next to the socket the server keeps an empty lock file, `.<socket name>.lock`
+(mode `0600`), locked while it runs. A second `kala serve` on the same path
+fails with `already in use by another kala serve`. A socket left by a crashed
+server is replaced on the next start; the lock file is removed on clean
+shutdown and may remain after a crash, which is harmless.
 See [transport lifecycle and platform rules](../kala-bolt/README.md#transports-and-multiple-listeners).
-Unix peers match only `localhost` accounts. They count as local for auth and
-plaintext rules; adding a non-loopback TCP listener still requires the usual
-opt-in. Official Neo4j drivers cannot connect to the Unix socket.
+
+Unix listeners count as local for auth and plaintext rules; adding a
+non-loopback TCP listener still requires the usual opt-in. Official Neo4j
+drivers cannot connect to the Unix socket.
 
 Startup prints one line per bound listener in the requested order, only after
 all binds succeed (port zero is replaced by its actual port):
