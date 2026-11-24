@@ -789,7 +789,11 @@ fn unix_maximum_length_paths_bind_and_replace_stale_sockets() {
     assert!(!path.exists());
 }
 
+// Linux only: a full backlog answers EAGAIN there, while BSD-family kernels
+// (macOS, FreeBSD) answer ECONNREFUSED, and rustix has no SOCK_NONBLOCK /
+// SOCK_CLOEXEC socket flags on Apple targets.
 #[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn unix_live_socket_with_full_backlog_does_not_block_startup() {
     use rustix::net::{self, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
     let dir = world_dir();

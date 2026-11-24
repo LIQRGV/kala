@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+use std::os::fd::OwnedFd;
 use std::os::unix::{
     ffi::OsStrExt,
     fs::PermissionsExt,
@@ -94,7 +95,10 @@ fn staging_directory(parent: &Path, parent_stat: &Stat) -> io::Result<tempfile::
         // A short private name in a writable ancestor on the same filesystem
         // avoids imposing an extra staging-name limit on the configured path.
         for candidate in parent.ancestors() {
-            if std::fs::metadata(candidate)?.dev() != parent_stat.st_dev {
+            // dev_t is i32 on Apple targets and u64 on Linux; compare as u64.
+            #[allow(clippy::unnecessary_cast)]
+            let parent_dev = parent_stat.st_dev as u64;
+            if std::fs::metadata(candidate)?.dev() != parent_dev {
                 break;
             }
             match tempfile::Builder::new().prefix(".k-").tempdir_in(candidate) {
@@ -122,6 +126,33 @@ impl<'a> DirectoryLock<'a> {
 impl Drop for DirectoryLock<'_> {
     fn drop(&mut self) {
         let _ = fs::flock(self.0, FlockOperation::Unlock);
+    }
+}
+
+/// A nonblocking, close-on-exec Unix stream socket for the stale probe.
+fn probe_socket() -> io::Result<OwnedFd> {
+    // Apple targets have no SOCK_NONBLOCK / SOCK_CLOEXEC (rustix does not
+    // define the flags there), so both are set with fcntl after creation.
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        Ok(net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+            None,
+        )?)
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        let socket = net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::empty(),
+            None,
+        )?;
+        rustix::io::fcntl_setfd(&socket, rustix::io::FdFlags::CLOEXEC)?;
+        fs::fcntl_setfl(&socket, OFlags::NONBLOCK)?;
+        Ok(socket)
     }
 }
 
@@ -221,12 +252,7 @@ impl BoundUnix {
                         "Unix socket in a sticky directory belongs to another user",
                     ));
                 }
-                let probe = net::socket_with(
-                    AddressFamily::UNIX,
-                    SocketType::STREAM,
-                    SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
-                    None,
-                )?;
+                let probe = probe_socket()?;
                 // A long basename may make the fd alias exceed sun_path even
                 // when the requested path fits. Probe a short, private hard link
                 // to the checked inode; never follow a replacement symlink.
