@@ -74,17 +74,79 @@ fn lock(file: &Arc<File>, timeout: Duration) -> Result<WriterLock, Error> {
     }
 }
 
+/// The raw OS errors with which this platform says "files can't be locked
+/// here" (see [`locking_unsupported`]), besides whatever the standard
+/// library reports as [`ErrorKind::Unsupported`](std::io::ErrorKind).
+///
+/// - Linux, Android: `ENOLCK` (37), `ENOSYS` (38), `EOPNOTSUPP` = `ENOTSUP`
+///   (95).
+/// - macOS, iOS: `ENOLCK` (77), `ENOSYS` (78), `ENOTSUP` (45), `EOPNOTSUPP`
+///   (102).
+/// - FreeBSD, NetBSD, OpenBSD, DragonFly: `ENOLCK` (77), `ENOSYS` (78),
+///   `EOPNOTSUPP` (45).
+/// - Windows: `ERROR_INVALID_FUNCTION` (1) and `ERROR_NOT_SUPPORTED` (50),
+///   what a file system without `LockFileEx` answers.
+/// - Anywhere else: none (only `ErrorKind::Unsupported`).
+///
+/// `ENOLCK` is what NFS and similar mounts answer without a lock service.
+/// Linux also answers it when the kernel has no memory for a lock record;
+/// a reader then reads without the lock, as every reader did before
+/// readers locked at all.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const UNSUPPORTED_LOCK_ERRNOS: &[i32] = &[37, 38, 95];
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const UNSUPPORTED_LOCK_ERRNOS: &[i32] = &[77, 78, 45, 102];
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+const UNSUPPORTED_LOCK_ERRNOS: &[i32] = &[77, 78, 45];
+#[cfg(windows)]
+const UNSUPPORTED_LOCK_ERRNOS: &[i32] = &[1, 50];
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    windows
+)))]
+const UNSUPPORTED_LOCK_ERRNOS: &[i32] = &[];
+
+/// Whether `e`, the error of an attempt to lock a file, says that files
+/// can't be locked here at all (a network or shared mount without a lock
+/// service, a platform without file locks), not that this attempt failed:
+/// its kind is `Unsupported`, or its raw OS error is one of
+/// [`UNSUPPORTED_LOCK_ERRNOS`]. Contention is never an error
+/// (`TryLockError::WouldBlock`), and everything else (`EIO`, `EBADF`,
+/// `EACCES`, `EINTR`, ...) is a real failure.
+fn locking_unsupported(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::Unsupported
+        || e.raw_os_error()
+            .is_some_and(|errno| UNSUPPORTED_LOCK_ERRNOS.contains(&errno))
+}
+
 /// The log file's shared lock, held by a reader for the length of one read
 /// of the file's tail: no writer is between its write and its fsync (or
 /// its rollback) while it is held, so what the reader sees past the last
 /// committed transaction is durable or a dead writer's. Dropping it
 /// releases the lock.
-struct ReadLock<'f>(&'f File);
+///
+/// `None` inside: files can't be locked here, so nothing is held (see
+/// [`try_read_lock`]).
+struct ReadLock<'f>(Option<&'f File>);
 
 impl Drop for ReadLock<'_> {
     fn drop(&mut self) {
         // Explicitly, as for `WriterLock`.
-        let _ = self.0.unlock();
+        if let Some(file) = self.0 {
+            let _ = file.unlock();
+        }
     }
 }
 
@@ -92,13 +154,43 @@ impl Drop for ReadLock<'_> {
 /// exclusive one: one attempt, never waiting. `None` if a writer does (a
 /// commit, an open or a cut is in progress).
 ///
+/// Where files can't be locked at all (see [`locking_unsupported`]) the
+/// reader proceeds as if it held the lock, with nothing held: before
+/// readers took this lock they read such files too, and failing every
+/// read-only open and catch-up there would help nobody. The writer's
+/// exclusive lock fails on such a file system as well, and a writer that
+/// can't lock refuses to append, so no Kala append can be in flight there.
+/// Any other error is returned. (Only this shared lock is lenient: the
+/// exclusive lock in [`lock`] returns every error.)
+///
 /// `file` must not be an open file whose exclusive lock the caller holds:
 /// a lock belongs to the open file, so this would turn it into a shared
 /// one.
 fn try_read_lock(file: &File) -> Result<Option<ReadLock<'_>>, Error> {
-    match file.try_lock_shared() {
-        Ok(()) => Ok(Some(ReadLock(file))),
-        Err(TryLockError::WouldBlock) => Ok(None),
+    Ok(match judge_shared_attempt(file.try_lock_shared())? {
+        SharedAttempt::Held => Some(ReadLock(Some(file))),
+        SharedAttempt::Busy => None,
+        SharedAttempt::Unsupported => Some(ReadLock(None)),
+    })
+}
+
+/// What one attempt to take a file's shared lock came to.
+#[derive(Debug, PartialEq, Eq)]
+enum SharedAttempt {
+    /// The lock is held.
+    Held,
+    /// A writer holds the exclusive lock.
+    Busy,
+    /// Files can't be locked here at all.
+    Unsupported,
+}
+
+/// Judges the result of `File::try_lock_shared`.
+fn judge_shared_attempt(result: Result<(), TryLockError>) -> Result<SharedAttempt, Error> {
+    match result {
+        Ok(()) => Ok(SharedAttempt::Held),
+        Err(TryLockError::WouldBlock) => Ok(SharedAttempt::Busy),
+        Err(TryLockError::Error(e)) if locking_unsupported(&e) => Ok(SharedAttempt::Unsupported),
         Err(TryLockError::Error(e)) => Err(Error::from(e)),
     }
 }
@@ -798,4 +890,74 @@ fn quarantine(path: &Path, source: &File, valid_len: u64, tail: &[u8]) -> Result
         return Err(e);
     }
     Ok(qpath)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error as IoError, ErrorKind};
+
+    fn judge(e: IoError) -> Result<SharedAttempt, Error> {
+        judge_shared_attempt(Err(TryLockError::Error(e)))
+    }
+
+    #[test]
+    fn a_shared_lock_attempt_is_held_busy_or_unsupported() {
+        assert_eq!(judge_shared_attempt(Ok(())), Ok(SharedAttempt::Held));
+        assert_eq!(
+            judge_shared_attempt(Err(TryLockError::WouldBlock)),
+            Ok(SharedAttempt::Busy)
+        );
+        // "Files can't be locked here": the reader goes on without a lock.
+        assert_eq!(
+            judge(IoError::from(ErrorKind::Unsupported)),
+            Ok(SharedAttempt::Unsupported)
+        );
+        assert!(!UNSUPPORTED_LOCK_ERRNOS.is_empty() || cfg!(not(any(unix, windows))));
+        for errno in UNSUPPORTED_LOCK_ERRNOS {
+            assert_eq!(
+                judge(IoError::from_raw_os_error(*errno)),
+                Ok(SharedAttempt::Unsupported),
+                "os error {errno}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_unsupported_lock_errors_on_linux_are_enolck_eopnotsupp_and_enosys() {
+        // ENOLCK, ENOSYS, EOPNOTSUPP (= ENOTSUP).
+        for errno in [37, 38, 95] {
+            assert_eq!(
+                judge(IoError::from_raw_os_error(errno)),
+                Ok(SharedAttempt::Unsupported),
+                "os error {errno}"
+            );
+        }
+    }
+
+    #[test]
+    fn any_other_error_of_a_shared_lock_attempt_is_an_io_error() {
+        let kinds = [
+            ErrorKind::PermissionDenied,
+            ErrorKind::NotFound,
+            ErrorKind::Interrupted,
+            ErrorKind::InvalidInput,
+            ErrorKind::OutOfMemory,
+            ErrorKind::Other,
+        ];
+        for kind in kinds {
+            let got = judge(IoError::from(kind));
+            assert!(matches!(got, Err(Error::Io { .. })), "{kind:?}: {got:?}");
+        }
+        // EIO, EBADF, EINTR, EACCES: the same number on every Unix.
+        #[cfg(unix)]
+        for errno in [5, 9, 4, 13] {
+            let got = judge(IoError::from_raw_os_error(errno));
+            assert!(
+                matches!(got, Err(Error::Io { .. })),
+                "os error {errno}: {got:?}"
+            );
+        }
+    }
 }
