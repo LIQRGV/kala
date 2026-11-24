@@ -423,6 +423,9 @@ impl World {
         let (mut world, rest, cause) = settled?;
         // An in-memory buffer's length always fits a u64.
         let rest_len = rest.len() as u64;
+        // The tail starts where the committed log ends.
+        let end = writer.tip().map_or(0, |tip| tip.end);
+        let damaged = (cause == Some(CutCause::Damaged)).then(|| DamagedTail::new(end, &rest));
         let recovery = match cause {
             Some(CutCause::Damaged) if !report_damaged => {
                 return Err(Error::RecoveryRequired { bytes: rest_len });
@@ -440,9 +443,8 @@ impl World {
             None => RecoveryReport::default(),
         };
         drop(held);
-        let end = writer.tip().map_or(0, |tip| tip.end);
         world.journal.attach_log(writer);
-        world.gate = WriteGate::after_recovery(recovery, end);
+        world.gate = WriteGate::after_recovery(recovery, damaged);
         Ok(Some(world))
     }
 

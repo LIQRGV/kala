@@ -1015,3 +1015,47 @@ fn reads_recorded_before_a_switch_to_weak_count_again_after_switching_back() {
         .unwrap();
     assert_eq!(tb.commit().unwrap().changed, 1);
 }
+
+// ---- Q (round 2): an acknowledgement is for the damaged bytes reported ----
+
+#[test]
+fn an_acknowledgement_does_not_cover_other_damaged_bytes_of_the_same_length() {
+    let (_dir, path, mut w, greg) = world();
+    w.assert(greg, "tag", s("lost"), Some(Tick(1))).unwrap();
+    drop(w);
+    let span = damage_last_txn(&path);
+    // A is shown the damaged tail D1 and acknowledges it.
+    let mut a = World::open(&path).unwrap();
+    assert_eq!(a.recovery().cause, Some(CutCause::Damaged));
+    let reported = a.recovery().bytes_cut;
+    a.acknowledge_recovery();
+    // Before A cuts, the tail becomes other damaged bytes: same place,
+    // same length (another writer cut D1 and its own commit of the same
+    // size was damaged in turn).
+    let mut other = bytes(&path);
+    other[span.body_start + 7] ^= 0xFF;
+    std::fs::write(&path, &other).unwrap();
+    // Not the tail A's caller was told about: refused, nothing touched.
+    assert_eq!(
+        a.cut_acknowledged_tail().map(|_| ()),
+        Err(Error::RecoveryRequired { bytes: reported })
+    );
+    assert!(bytes(&path) == other, "nothing cut");
+    assert!(quarantine_files(&path).is_empty());
+    assert!(matches!(
+        a.assert(greg, "tag", s("a"), Some(Tick(2))),
+        Err(Error::RecoveryRequired { .. })
+    ));
+    assert!(bytes(&path) == other, "nothing cut by a commit either");
+    // Reported now (by those refusals); acknowledged, it is cut.
+    a.acknowledge_recovery();
+    let report = a.cut_acknowledged_tail().unwrap().clone();
+    assert_eq!(report.bytes_cut, reported);
+    assert_eq!(report.cause, Some(CutCause::Damaged));
+    let quarantined = quarantine_files(&path);
+    assert_eq!(quarantined.len(), 1);
+    assert!(bytes(&quarantined[0]) == other[other.len() - reported as usize..]);
+    assert_eq!(bytes(&path).len() as u64, other.len() as u64 - reported);
+    a.assert(greg, "tag", s("a"), Some(Tick(2))).unwrap();
+    assert_clean(&a);
+}

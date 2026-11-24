@@ -219,7 +219,8 @@ impl World {
     /// lock (`held` is `None`) it is ignored: it may be an append in
     /// progress. With it, a torn one is cut to a quarantine file, and a
     /// damaged one is cut only if this handle reported it before (its open,
-    /// or a commit's refusal) and that was acknowledged; else this fails with
+    /// or a commit's refusal) and that was acknowledged (the same bytes at
+    /// the same place: see `DamagedTail`); else this fails with
     /// [`Error::RecoveryRequired`], the file untouched. Either cut becomes
     /// the handle's [`World::recovery`] report.
     ///
@@ -251,7 +252,11 @@ impl World {
         // The tail starts where the committed log, now all applied, ends.
         let rest_at = self.journal.chain_tip().map_or(0, |tip| tip.end);
         match tail.cause {
-            Some(CutCause::Damaged) if !self.gate.may_cut_damaged_tail((rest_at, rest_len)) => {
+            Some(CutCause::Damaged)
+                if !self
+                    .gate
+                    .may_cut_damaged_tail(DamagedTail::new(rest_at, &tail.rest)) =>
+            {
                 return Err(Error::RecoveryRequired { bytes: rest_len });
             }
             Some(cause) => {

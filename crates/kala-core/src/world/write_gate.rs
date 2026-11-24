@@ -27,16 +27,39 @@ pub(super) struct WriteGate {
     /// The open, or a commit under the lock (which refused with
     /// [`Error::RecoveryRequired`]), found a damaged tail and left it in
     /// the file; nobody acknowledged it yet.
-    /// Which one: where it starts in the file and how long it is.
+    /// Which one: where it starts in the file, how long it is and a
+    /// checksum of its bytes.
     damaged_tail_seen: Option<DamagedTail>,
     /// [`World::acknowledge_recovery`] was called after that: the next
     /// commit may cut that damaged tail (and no other).
     may_cut_damaged: Option<DamagedTail>,
 }
 
-/// A damaged tail as a handle saw it: `(offset in the file, length)`. An
-/// acknowledgement licenses cutting exactly the tail that was reported.
-pub(super) type DamagedTail = (u64, u64);
+/// A damaged tail as a handle saw it. An acknowledgement licenses cutting
+/// exactly the tail that was reported: other damaged bytes at the same
+/// place, even of the same length, are another tail (another writer's
+/// lost transaction), which needs its own report and acknowledgement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DamagedTail {
+    /// Where it starts in the file: the end of the committed log.
+    offset: u64,
+    /// How many bytes it is.
+    len: u64,
+    /// The CRC-32 of those bytes.
+    crc: u32,
+}
+
+impl DamagedTail {
+    /// The damaged tail `bytes`, found at `offset` in the file.
+    pub(super) fn new(offset: u64, bytes: &[u8]) -> DamagedTail {
+        DamagedTail {
+            offset,
+            // An in-memory buffer's length always fits a u64.
+            len: bytes.len() as u64,
+            crc: crc32fast::hash(bytes),
+        }
+    }
+}
 
 impl WriteGate {
     /// The gate of a new world: writes accepted, nothing recovered.
@@ -45,15 +68,17 @@ impl WriteGate {
     }
 
     /// The gate of a world opened for writing whose open reported
-    /// `recovery`: a damaged tail must be acknowledged before writes.
-    pub(super) fn after_recovery(recovery: RecoveryReport, end: u64) -> WriteGate {
-        let damaged = recovery.cause == Some(CutCause::Damaged);
+    /// `recovery`: a damaged tail (`damaged`, left in the file) must be
+    /// acknowledged before writes.
+    pub(super) fn after_recovery(
+        recovery: RecoveryReport,
+        damaged: Option<DamagedTail>,
+    ) -> WriteGate {
         WriteGate {
-            recovery_unacknowledged: damaged,
-            // The open reported the damaged tail (it starts at `end`, where
-            // the committed log ends) and left it in the file: an
-            // acknowledgement licenses the next commit to cut it.
-            damaged_tail_seen: damaged.then_some((end, recovery.bytes_cut)),
+            recovery_unacknowledged: damaged.is_some(),
+            // The open reported the damaged tail and left it in the file:
+            // an acknowledgement licenses the next commit to cut it.
+            damaged_tail_seen: damaged,
             recovery,
             ..WriteGate::default()
         }
