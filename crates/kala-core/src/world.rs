@@ -885,6 +885,17 @@ impl World {
         self.catalog.attr_name(id)
     }
 
+    /// Whether this is Kala's own `system` (accounts) world: its schema
+    /// declares the [`SYSTEM_NODE_TYPE`](crate::SYSTEM_NODE_TYPE) marker.
+    /// Recognized by content, never by file name, so a renamed copy is still
+    /// a system world. Shared write appliers refuse such a world unless
+    /// their caller explicitly allows it (account management and restores).
+    pub fn is_system(&self) -> bool {
+        self.catalog
+            .node_type_by_name
+            .contains_key(crate::SYSTEM_NODE_TYPE)
+    }
+
     /// Every declared node type name, in ID (= declaration) order.
     pub fn node_types(&self) -> impl Iterator<Item = &str> {
         self.catalog.node_types.iter().map(|nt| nt.name.as_str())

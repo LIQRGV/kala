@@ -97,18 +97,27 @@ fn is_zero(n: &u128) -> bool {
 fn user(s: impl Into<String>) -> CliError {
     CliError::User(s.into())
 }
-/// Apply one form after enforcing the CLI's system-world policy.
+/// Apply one form after enforcing the CLI's system-world policy. The shared
+/// applier refuses a system world too (its default policy); the CLI's own
+/// check comes first so its message names `kala user`.
 pub fn execute(w: &mut World, form: &WriteTxn, default: Option<Tick>) -> Result<Report, CliError> {
     refuse_system(w)?;
-    execute_restore(w, form, default)
+    let report = kala_lang::write::execute(w, form, default).map_err(write_err)?;
+    Ok(committed_report(w, report))
 }
-/// Create-mode restores own a private file and may restore system worlds.
+/// Create-mode restores own a private file. `system` says the genesis of the
+/// dump being restored declared the system marker: only then may the applier
+/// write a system world.
 pub(super) fn execute_restore(
     w: &mut World,
     form: &WriteTxn,
     default: Option<Tick>,
+    system: bool,
 ) -> Result<Report, CliError> {
-    let report = kala_lang::write::execute(w, form, default).map_err(write_err)?;
+    let policy = kala_lang::write::WritePolicy {
+        allow_system: system,
+    };
+    let report = kala_lang::write::execute_with(w, form, default, policy).map_err(write_err)?;
     Ok(committed_report(w, report))
 }
 fn write_err(e: kala_lang::write::WriteError) -> CliError {
@@ -117,6 +126,7 @@ fn write_err(e: kala_lang::write::WriteError) -> CliError {
         Failure::Store(e) => core_err(e),
         Failure::Migration { error, labels } => migrate_err(&labels, *error),
         Failure::UnknownEntity(s) => user(format!("unknown entity `{}`", escape::value(&s))),
+        Failure::SystemWorld => user("system world is managed only by `kala user`"),
         cause => user(
             kala_lang::write::WriteError {
                 operation: None,

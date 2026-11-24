@@ -24,6 +24,9 @@ pub enum Failure {
     ExpectedFact,
     ExpectedCorrection,
     Genesis,
+    /// The world is Kala's `system` database and the caller's [`WritePolicy`]
+    /// does not allow writing it.
+    SystemWorld,
     /// Empty replacements cannot infer an attribute's type.
     EmptyUnknownAttribute(String),
     /// Events can only be removed from canon through a correction.
@@ -83,6 +86,9 @@ impl std::fmt::Display for WriteError {
                     )?;
                 }
                 Ok(())
+            }
+            Failure::SystemWorld => {
+                f.write_str("the system database is written only through account management")
             }
             Failure::Genesis => f.write_str(":genesis must be first; use kala transact --create"),
         }
@@ -179,14 +185,37 @@ fn value(tx: &Txn<'_>, v: &WriteValue) -> Result<Value, Failure> {
     })
 }
 
-/// Stage and commit one form. Authorization and file recovery belong to the caller.
+/// What the caller lets a write form touch. The default refuses Kala's own
+/// `system` database: accounts change only through account management
+/// (`kala user`), whatever grants an identity holds, so an adapter that
+/// forgets its own check still cannot write them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WritePolicy {
+    /// Apply forms to a system-marked world ([`World::is_system`]). Only for
+    /// a caller that owns the file, such as restoring an accounts dump into a
+    /// new private file.
+    pub allow_system: bool,
+}
+
+/// Stage and commit one form under the default [`WritePolicy`] (a system
+/// world is refused). Authorization and file recovery belong to the caller.
 pub fn execute(
     w: &mut World,
     form: &WriteTxn,
     default: Option<Tick>,
 ) -> Result<WriteReport, WriteError> {
+    execute_with(w, form, default, WritePolicy::default())
+}
+
+/// [`execute`] under an explicit policy.
+pub fn execute_with(
+    w: &mut World,
+    form: &WriteTxn,
+    default: Option<Tick>,
+    policy: WritePolicy,
+) -> Result<WriteReport, WriteError> {
     let mut tx = w.begin();
-    let staged = stage(&mut tx, form, default)?;
+    let staged = stage_with(&mut tx, form, default, policy)?;
     let result = tx.commit().map_err(|e| WriteError {
         operation: None,
         cause: Failure::Store(e),
@@ -196,12 +225,33 @@ pub fn execute(
 
 /// Stage into a caller-owned transaction without committing. Every error poisons
 /// it, including name-resolution errors, so no partial form can be committed.
+///
+/// Uses the default [`WritePolicy`]: a system world is refused.
 pub fn stage(
     tx: &mut Txn<'_>,
     form: &WriteTxn,
     default: Option<Tick>,
 ) -> Result<StagedWrite, WriteError> {
-    let result = stage_form(tx, form, default);
+    stage_with(tx, form, default, WritePolicy::default())
+}
+
+/// [`stage`] under an explicit policy.
+pub fn stage_with(
+    tx: &mut Txn<'_>,
+    form: &WriteTxn,
+    default: Option<Tick>,
+    policy: WritePolicy,
+) -> Result<StagedWrite, WriteError> {
+    // Checked before anything is resolved or staged, so a refusal reveals
+    // nothing about the accounts (not even whether a handle exists).
+    let result = if tx.is_system() && !policy.allow_system {
+        Err(WriteError {
+            operation: None,
+            cause: Failure::SystemWorld,
+        })
+    } else {
+        stage_form(tx, form, default)
+    };
     if result.is_err() {
         tx.abort();
     }

@@ -5,7 +5,7 @@ use kala_core::{AttrDef, Cardinality, EntityId, Kind, Schema, Tick, Txn, Value, 
 use std::{collections::BTreeSet, fmt, fs, io, path::Path};
 
 /// Content marker; filenames alone never identify a system world.
-pub const SYSTEM_MARKER: &str = "_KALA_SYSTEM";
+pub const SYSTEM_MARKER: &str = kala_core::SYSTEM_NODE_TYPE;
 const VERSION_HANDLE: &str = "_kala_system";
 const ATTRS: [&str; 5] = ["user", "host", "plugin", "password_hash", "grant"];
 
@@ -144,7 +144,7 @@ fn schema() -> Schema {
 }
 /// Recognize the system marker by content, including renamed copies.
 pub fn is_system(world: &World) -> bool {
-    world.node_types().any(|name| name == SYSTEM_MARKER)
+    world.is_system()
 }
 /// The system attribute no query may read: comparisons, aggregates and
 /// negations over it would reveal hashes even with output redacted.

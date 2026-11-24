@@ -247,7 +247,9 @@ mod tests {
 /// Shared write entry point; server adapters need no language-crate dependency.
 pub mod write {
     pub use kala_core::write::{StagedWrite, WriteOperation, WriteReport};
-    pub use kala_datalog::apply::{Failure, WriteError, execute, stage};
+    pub use kala_datalog::apply::{
+        Failure, WriteError, WritePolicy, execute, execute_with, stage, stage_with,
+    };
     pub use kala_datalog::ast::WriteTxn;
     pub use kala_datalog::{parse_write, parse_writes, write_forms};
 }

@@ -184,7 +184,8 @@ fn restore_transactions(
         if form.genesis {
             return Err(user("genesis must be the first and only genesis form"));
         }
-        transact::execute_restore(world, &form, None).map_err(|e| failed(i + 1, e.message()))?;
+        transact::execute_restore(world, &form, None, system)
+            .map_err(|e| failed(i + 1, e.message()))?;
     }
     Ok(())
 }

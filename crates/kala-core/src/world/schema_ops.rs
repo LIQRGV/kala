@@ -537,6 +537,10 @@ impl Txn<'_> {
     pub fn attribute(&self, name: &str) -> Option<&AttrDef> {
         self.world.attribute(name)
     }
+    /// Whether the transaction writes a system world ([`World::is_system`]).
+    pub fn is_system(&self) -> bool {
+        self.world.is_system()
+    }
     /// Resolves a handle including entities created earlier in this transaction.
     pub fn entity_by_handle(&self, name: &str) -> Option<EntityId> {
         self.ids

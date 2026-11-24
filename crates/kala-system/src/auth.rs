@@ -58,14 +58,21 @@ pub struct Identity {
     pub grants: Vec<String>,
 }
 impl Identity {
-    /// Whether this identity may write the named database (separate from read).
+    /// Whether this identity may write the named database (separate from
+    /// read: `write` does not imply `read`, nor the reverse).
+    ///
+    /// `system` is never writable through this check, whatever the grants,
+    /// `admin:system` and `admin:*` included: accounts change only through
+    /// account management (`kala user`). `admin` still implies reading
+    /// `system`; see [`Identity::permits_read`].
     pub fn permits_write(&self, db: &str) -> bool {
-        self.grants.iter().any(|grant| {
-            grant.split_once(':').is_some_and(|(privilege, target)| {
-                (target == "*" || target == db)
-                    && (privilege == "admin" || (db != "system" && privilege == "write"))
+        db != "system"
+            && self.grants.iter().any(|grant| {
+                grant.split_once(':').is_some_and(|(privilege, target)| {
+                    (target == "*" || target == db)
+                        && (privilege == "admin" || privilege == "write")
+                })
             })
-        })
     }
 
     /// Whether this identity has the stored backup privilege. Local file

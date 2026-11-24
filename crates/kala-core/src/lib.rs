@@ -35,7 +35,7 @@ pub use overlap::{
 };
 pub use schema::{
     AttrDef, AttributeOptions, BUILTIN_NAME_PREFIX, Cardinality, Kind, MigrationOptions,
-    MigrationReport, RESERVED_NAME_PREFIX, RefDirection, Schema, SchemaChange,
+    MigrationReport, RESERVED_NAME_PREFIX, RefDirection, SYSTEM_NODE_TYPE, Schema, SchemaChange,
 };
 pub use tick::{Precision, Tick};
 pub use value::{MAX_INDEXED_STRING_BYTES, Value, ValueError, ValueType, fold_for_search};

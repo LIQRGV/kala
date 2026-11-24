@@ -11,8 +11,16 @@ fn permits_write_truth_table_keeps_read_and_write_independent() {
         (vec!["read:*"], "varrow", false, true),
         (vec!["write:system"], "system", false, false),
         (vec!["write:*"], "system", false, false),
-        (vec!["admin:system"], "system", true, true),
-        (vec!["admin:*"], "system", true, true),
+        // `system` is written only through account management (`kala user`):
+        // no grant makes it writable, while admin still reads it.
+        (vec!["admin:system"], "system", false, true),
+        (vec!["admin:*"], "system", false, true),
+        (
+            vec!["admin:*", "write:*", "write:system"],
+            "system",
+            false,
+            true,
+        ),
         (vec!["admin:varrow"], "system", false, false),
         (vec!["write:other"], "varrow", false, false),
         (
