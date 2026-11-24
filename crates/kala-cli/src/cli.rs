@@ -396,7 +396,7 @@ pub struct TransactArgs {
 // `kala repl`.
 #[derive(Debug, Args)]
 pub struct ReplArgs {
-    /// Enable writes and hold the world's exclusive writer lock.
+    /// Enable writes; each commit takes the world's exclusive writer lock.
     #[arg(long, conflicts_with = "canon")]
     pub write: bool,
     /// The world file.

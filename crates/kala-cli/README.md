@@ -211,9 +211,12 @@ rerun with `--acknowledge-recovery`. That cuts the damaged bytes to a
 `<world>.torn-N` quarantine file and continues. A torn tail (a write cut short,
 never acknowledged) is cut without asking.
 
-`kala repl WORLD --write` holds the exclusive writer lock until exit and queries
-see each successful commit immediately. Another writer gets exit 3 with a locked
-world message. Without `--write`, write forms are refused. `.at` supplies the
+`kala repl WORLD --write` takes the exclusive writer lock only while a
+transaction commits, and queries see each successful commit immediately. Another
+writer (a `kala transact` on the same world) can commit while the session is
+open; the session applies what it committed before its next command. A write
+waits up to 5 seconds for a lock another writer holds, then exits 3 with a
+locked world message. Without `--write`, write forms are refused. `.at` supplies the
 write default: an op's `:at` wins over the transaction's `:at`, then session `.at`,
 then the latest tick captured when the transaction began. `.canon` and `.reload`
 are refused in write mode; an explicit query `:canon` still reads an older draft.

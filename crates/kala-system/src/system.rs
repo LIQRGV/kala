@@ -73,7 +73,7 @@ impl fmt::Display for SystemError {
             Self::LastAdmin => "cannot remove the last account with admin:*",
             Self::ReservedSystem => "system is reserved for accounts; use kala user",
             Self::InvalidSystem => "invalid or unsupported system world",
-            Self::Busy => "system world is open in another writer; retry the command",
+            Self::Busy => "system world is being written by another writer; retry the command",
             Self::Store => "system world could not be read or written",
             Self::Password => "password hashing failed",
             Self::NoSuchDirectory => "no such directory",
@@ -100,6 +100,10 @@ impl std::error::Error for SystemError {}
 fn store(error: kala_core::Error) -> SystemError {
     match error {
         kala_core::Error::WorldLocked => SystemError::Busy,
+        // Another account change was committed between this one's read of
+        // the accounts and its commit; nothing was written. Running the
+        // command again applies it to the accounts as they are now.
+        kala_core::Error::SnapshotStale { .. } => SystemError::Busy,
         kala_core::Error::RecoveryRequired { bytes } => SystemError::RecoveryRequired { bytes },
         // Only the version number: nothing of the file's content.
         kala_core::Error::UnsupportedVersion(version)
@@ -557,32 +561,20 @@ struct Open {
     recovery: Recovery,
     recovered: Option<kala_core::RecoveryReport>,
 }
-/// How often, and how far apart, [`open_writer`] retries a locked world.
-const LOCK_RETRIES: u32 = 20;
-const LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
-
-/// Opens the system world for writing, waiting briefly if it is locked.
+/// Opens the system world for writing.
 ///
-/// The lock can outlive the handle that took it by a moment: a process
-/// spawning a child from another thread shares its open files with the child
-/// until the child execs, so a just-closed world (the one `ensure` created)
-/// can still look locked. A real second writer holds the lock for longer than
-/// the retries last, and is still reported as [`SystemError::Busy`].
+/// The open needs the writer lock, which another `kala user` command, or a
+/// process that just closed the world, may hold for a moment (a process
+/// spawning a child from another thread shares its open files with the
+/// child until the child execs). kala-core waits for it up to its busy
+/// timeout (5 s); a writer that holds it longer is reported as
+/// [`SystemError::Busy`].
 fn open_writer(path: &Path, recovery: Recovery) -> Result<World, SystemError> {
-    let mut attempt = 0;
-    loop {
-        let opened = match recovery {
-            Recovery::Refuse => World::open_refusing_damaged(path),
-            Recovery::Acknowledge => World::open(path),
-        };
-        match opened {
-            Err(kala_core::Error::WorldLocked) if attempt < LOCK_RETRIES => {
-                attempt += 1;
-                std::thread::sleep(LOCK_RETRY_DELAY);
-            }
-            other => return other.map_err(store),
-        }
+    match recovery {
+        Recovery::Refuse => World::open_refusing_damaged(path),
+        Recovery::Acknowledge => World::open(path),
     }
+    .map_err(store)
 }
 fn writer(directory: &Path, open: &mut Open) -> Result<World, SystemError> {
     // `ensure` validates the committed prefix read-only, so a world that is

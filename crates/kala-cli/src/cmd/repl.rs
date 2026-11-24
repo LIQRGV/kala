@@ -23,7 +23,7 @@ use crate::cli::{ReplArgs, parse_canon};
 use crate::error::CliError;
 use crate::escape;
 
-const HELP: &str = "Datalog session (read-only snapshot by default; --write holds the writer lock)\n\
+const HELP: &str = "Datalog session (read-only snapshot by default; --write takes the writer lock per commit)\n\
 .at [T]          set/clear default story tick\n\
 .canon [C]       set/clear default canon (N or tx#N)\n\
 .param NAME VALUE / .unparam NAME / .params\n\
@@ -179,6 +179,7 @@ impl<'a> Session<'a> {
     }
 
     fn query(&mut self, text: &str, explain: bool) -> Result<String, CliError> {
+        self.catch_up()?;
         self.cancel.store(false, Ordering::Relaxed);
         let prepared = kala_datalog::prepare_with(&self.ctx.world, text, &self.defaults)
             .map_err(|e| CliError::User(format!("query: {e}")))?;
@@ -206,6 +207,21 @@ impl<'a> Session<'a> {
         Ok(render_result(&self.ctx.world, &rs, self.json))
     }
 
+    /// In write mode the world's writer lock is free between commands, so
+    /// other processes may have committed: apply what they appended before
+    /// this command reads or writes, and read at the new latest canon. (A
+    /// read-only session stays the snapshot it opened; see `.reload`.)
+    fn catch_up(&mut self) -> Result<(), CliError> {
+        if self.write {
+            self.ctx
+                .world
+                .catch_up()
+                .map_err(|e| CliError::at_path(self.path, &e))?;
+            self.ctx.canon = self.ctx.world.latest_tx();
+        }
+        Ok(())
+    }
+
     fn form(&mut self, text: &str) -> Result<String, CliError> {
         // Only a recognised write form goes to the write path; anything
         // else is parsed as a query, so a malformed query keeps the query
@@ -217,6 +233,7 @@ impl<'a> Session<'a> {
                     return Err(user("write form refused; start with --write"));
                 }
                 let form = kala_datalog::parse_write(text).map_err(|e| user(e.to_string()))?;
+                self.catch_up()?;
                 let report =
                     super::transact::execute(&mut self.ctx.world, &form, self.defaults.at)?;
                 self.ctx.canon = self.ctx.world.latest_tx();
@@ -331,6 +348,7 @@ impl<'a> Session<'a> {
             ".load" => self.load(arg),
             ".info" => {
                 no_arg(arg)?;
+                self.catch_up()?;
                 Ok(Action::Output(super::info::snapshot(
                     self.path,
                     &self.ctx.world,
@@ -339,7 +357,11 @@ impl<'a> Session<'a> {
             }
             ".reload" => self.reload(arg),
             ".limits" => no_arg(arg).map(|()| Action::Output(limits_text())),
-            ".schema" => no_arg(arg).map(|()| Action::Output(self.schema())),
+            ".schema" => {
+                no_arg(arg)?;
+                self.catch_up()?;
+                Ok(Action::Output(self.schema()))
+            }
             _ => Err(user(format!(
                 "unknown command `{}`; use .help for commands",
                 escape::value(command)
@@ -592,7 +614,7 @@ fn drive(
     if interactive && args.write {
         output(
             &mut io::stdout().lock(),
-            "Write mode: holding the writer lock; other writers are blocked until exit.\n",
+            "Write mode: each commit takes the writer lock; commits by other writers are seen on the next command.\n",
         )?;
     }
     let mut failed = false;

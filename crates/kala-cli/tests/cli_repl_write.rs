@@ -1,4 +1,5 @@
-//! Write sessions hold one lock, commit atomically and read their latest canon.
+//! Write sessions take the writer lock per commit, commit atomically and read
+//! the latest canon, other processes' commits included.
 mod common;
 use common::*;
 use kala_core::World;
@@ -245,26 +246,74 @@ impl Drop for Live {
     }
 }
 
+/// `kala transact WORLD` with `text` as its forms, from another process.
+fn transact(f: &Fx, text: &str) -> Output {
+    let input = f.dir.path().join("other-writes.edn");
+    std::fs::write(&input, text).unwrap();
+    f.run("transact", &[input.to_str().unwrap(), "--json"])
+}
+
+/// Slice 15b: the writer lock is taken per transaction, so an open, idle
+/// `kala repl --write` no longer keeps other writers out, and it sees their
+/// commits on its next command. (Was
+/// `write_mode_holds_lock_until_quit_and_allows_readers`, which pinned the
+/// lifetime lock.)
 #[test]
-fn write_mode_holds_lock_until_quit_and_allows_readers() {
+fn write_mode_leaves_the_lock_free_and_sees_other_commits() {
     let f = build(EMPTY);
     let mut live = Live::new(&f);
     live.send(".json on\n[:find ?a :where [:greg :age ?a]]\n");
     assert!(live.result()["rows"].as_array().unwrap().is_empty());
-    assert!(matches!(
-        World::open(&f.path),
-        Err(kala_core::Error::WorldLocked)
-    ));
     assert!(World::open_read_only(&f.path).is_ok());
+
+    // The REPL is open and idle: another process commits to the same world.
+    let o = transact(&f, "[:assert :greg :age 18 :at -300]");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let other: Json = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(other["changed"], 1);
+    let other_tx = other["tx"].as_u64().unwrap();
+
+    // The REPL's next query sees that commit, without a restart.
+    live.send("[:find ?a :at -300 :where [:greg :age ?a]]\n");
+    let rows = live.result()["rows"].clone();
+    assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
+    assert!(rows.to_string().contains("18"), "{rows}");
+
+    // And its next write lands right after it, on the state it left.
     live.send("[:assert :greg :age 18 :at -300]\n");
-    assert_eq!(live.result()["changed"], 1);
+    let noop = live.result();
+    assert_eq!(noop["changed"], 0, "already held since the other commit");
+    live.send("[:assert :greg :age 19 :at -200]\n");
+    let mine = live.result();
+    assert_eq!(mine["changed"], 1);
+    assert_eq!(mine["tx"].as_u64().unwrap(), other_tx + 1);
+
+    // A write the REPL makes right after another process's commit, with no
+    // query in between, catches up first too.
+    let o = transact(&f, "[:assert :greg :name \"Greg\" :at 0]");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    live.send("[:assert :greg :age 20 :at -100]\n");
+    let mine = live.result();
+    assert_eq!(mine["changed"], 1);
+    assert_eq!(mine["tx"].as_u64().unwrap(), other_tx + 3);
+    live.send("[:find ?n :at 0 :where [:greg :name ?n]]\n");
+    assert_eq!(live.result()["rows"].as_array().unwrap().len(), 1);
+
     let reader = World::open_read_only(&f.path).unwrap();
-    assert_eq!(
-        reader
-            .as_of(f.id("greg"), "age", kala_core::Tick(-300))
-            .unwrap(),
-        [kala_core::Value::I64(18)]
-    );
+    let greg = f.id("greg");
+    for (tick, age) in [(-300, 18), (-200, 19), (-100, 20)] {
+        assert!(
+            reader
+                .as_of(greg, "age", kala_core::Tick(tick))
+                .unwrap()
+                .contains(&kala_core::Value::I64(age)),
+            "age {age} at {tick}"
+        );
+    }
+    // The store is sound (the three ages overlap: a schema warning, as
+    // for one writer).
+    let report = kala_core::doctor::doctor_log(&f.path, &Default::default()).unwrap();
+    assert!(report.errors().is_empty(), "{report:?}");
     live.send(".quit\n");
     assert!(live.child.wait().unwrap().success());
     assert!(World::open(&f.path).is_ok());

@@ -43,8 +43,10 @@ In the REPL, ask:
 [:find ?n ?p :at 800 :where [:nerys :name ?n] [:nerys :located_in ?p]]
 ```
 
-The row is `"Nerys"  varrow`. `.quit` releases the writer lock. While this session
-is open, other writers are blocked. Queries see commits immediately. A failed op
+The row is `"Nerys"  varrow`. The session takes the writer lock only while one
+of its transactions commits, so other writers (a `kala transact` in a second
+terminal) can commit while it is open, and its next command sees their commits.
+Queries see commits immediately. A failed op
 aborts its whole transaction; the error names the op, and the REPL stays open.
 
 You can enter that same transaction vector directly in the write REPL. Use

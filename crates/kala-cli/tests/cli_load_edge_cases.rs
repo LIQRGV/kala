@@ -234,6 +234,9 @@ fn read_only_output_directory_is_a_store_error_and_leaves_nothing() {
     );
 }
 
+/// Slice 15b: the lock is held per transaction, so what `--force` must not
+/// replace under is a commit in progress (here: the lock itself, held by
+/// this process), after waiting the busy timeout.
 #[test]
 fn force_while_the_world_is_open_in_another_process_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -241,11 +244,51 @@ fn force_while_the_world_is_open_in_another_process_is_refused() {
     let path = dir.path().join("w.kala");
     let held: World = load_fixture_to(OTHER_FIXTURE, &path).unwrap();
     let before = fs::read(&path).unwrap();
-    let o = load(&f, path.as_os_str(), &["--force"]);
+    let lock = fs::File::open(&path).unwrap();
+    lock.try_lock().expect("the lock is free");
+    let o = std::process::Command::new(env!("CARGO_BIN_EXE_kala"))
+        .arg("load")
+        .arg(&f)
+        .arg(&path)
+        .arg("--force")
+        .env("KALA_BUSY_TIMEOUT_MS", "100")
+        .output()
+        .unwrap();
     assert_exit1(&o);
     assert_eq!(fs::read(&path).unwrap(), before, "old world was replaced");
     assert_eq!(held.latest_tick().0, 5);
+    drop(lock);
     drop(held);
     // Only the world and the fixture remain (no temp file).
+    assert_eq!(dir_names(dir.path()), vec!["f.yaml", "w.kala"]);
+}
+
+/// A process that merely has the old world open holds no lock any more: the
+/// world is replaced, and that handle refuses to write to a log that is no
+/// longer its own instead of appending to the replaced (unlinked) file.
+#[test]
+fn force_replaces_under_an_idle_handle_which_then_refuses_to_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = fixture_file(dir.path(), RESOLVED_FIXTURE);
+    let path = dir.path().join("w.kala");
+    let mut idle: World = load_fixture_to(OTHER_FIXTURE, &path).unwrap();
+    let before = fs::read(&path).unwrap();
+    let o = load(&f, path.as_os_str(), &["--force"]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let replaced = fs::read(&path).unwrap();
+    assert_ne!(replaced, before, "the world was replaced");
+    assert_eq!(idle.catch_up().unwrap_err(), kala_core::Error::LogDiverged);
+    let mut txn = idle.begin();
+    assert_eq!(
+        txn.declare_node_type("FACTION").unwrap_err(),
+        kala_core::Error::LogDiverged
+    );
+    drop(txn);
+    assert_eq!(fs::read(&path).unwrap(), replaced, "never written");
     assert_eq!(dir_names(dir.path()), vec!["f.yaml", "w.kala"]);
 }

@@ -4,10 +4,12 @@
 //! once the whole fixture has loaded, so a failing fixture never leaves a
 //! world behind and `--force` with a failing fixture keeps the old world.
 //!
-//! `--force` replaces a world only while holding its lock: the old world is
-//! opened (taking kala-core's exclusive lock) right before the rename and
-//! kept open across it, so a world open in another process is never
-//! replaced under it. A directory is never replaced.
+//! `--force` replaces a world only while holding its writer lock: the old
+//! world is opened right before the rename and its lock held across it, so
+//! it is never replaced in the middle of another process's commit. A
+//! process that merely has the old world open holds no lock (the lock is
+//! per transaction); its next write or catch-up finds its log gone
+//! (`LogDiverged`) and writes nothing. A directory is never replaced.
 
 use std::fmt::Write as _;
 use std::fs::{self, File};
@@ -52,16 +54,21 @@ pub fn run(args: &LoadArgs) -> Result<String, CliError> {
         remove_quietly(&tmp);
         return Err(error);
     }
-    // Summarise before dropping the world: dropping releases its file lock,
-    // which must happen before the file is moved into place.
+    // Summarise before dropping the world: it must be closed before the
+    // file is moved into place.
     let summary = summary(&loaded, fixture, world);
     drop(loaded);
 
-    // The old world's lock, held until the rename is done and the
-    // directory synced (dropped at the end of this function).
-    let _held = if force { lock_old(world) } else { Ok(None) }
-        .and_then(|held| place(&tmp, world, force).map(|()| held))
-        .inspect_err(|_| remove_quietly(&tmp))?;
+    // The old world's writer lock is held across the rename, so no commit
+    // to it is in progress while it is replaced.
+    let old = if force { lock_old(world) } else { Ok(None) };
+    old.and_then(|old| match old {
+        Some(mut old) => old
+            .with_writer_lock(|| place(&tmp, world, force))
+            .map_err(|e| locked_or(world, &e))?,
+        None => place(&tmp, world, force),
+    })
+    .inspect_err(|_| remove_quietly(&tmp))?;
     // Make the rename durable; best effort (the log itself is already
     // fsynced by kala-core).
     if let Ok(d) = File::open(&dir) {
@@ -104,12 +111,18 @@ fn refuse_dir(world: &Path) -> CliError {
     ))
 }
 
-/// Before `--force` replaces `world`: opens the old world to take its lock,
-/// so one open in another process is refused, and returns it so the caller
-/// holds the lock across the rename. Nothing there (or gone meanwhile):
-/// `None`. An old file that doesn't open as a world (corrupt, not a Kala
-/// log, unreadable) has no lock to respect and is replaced as asked:
-/// `None` too. A directory is refused.
+/// Before `--force` replaces `world`: opens the old world for writing (so
+/// the caller can take its writer lock for the rename; the open itself
+/// waits for a commit in progress in another process and is refused if the
+/// lock stays held). Nothing there (or gone meanwhile): `None`. An old file
+/// that doesn't open as a world (corrupt, not a Kala log, unreadable) has
+/// no lock to respect and is replaced as asked: `None` too. A directory is
+/// refused.
+///
+/// A process that merely has the old world open, without a commit in
+/// progress, holds no lock (the lock is per transaction): the world is
+/// replaced, and that process's next write or catch-up reports that its
+/// log is gone (`LogDiverged`) instead of writing to the replaced file.
 ///
 /// Opening runs kala-core's normal recovery, so an old world with a torn
 /// tail is cut first and its tail saved to a `.torn-` quarantine file next
@@ -122,16 +135,25 @@ fn lock_old(world: &Path) -> Result<Option<World>, CliError> {
         return Err(refuse_dir(world));
     }
     refuse_system_file(world)?;
-    match World::open(world) {
+    match World::open_waiting(world, super::transact::busy_timeout()) {
         Ok(w) => {
             super::transact::refuse_system(&w)?;
             Ok(Some(w))
         }
-        Err(kala_core::Error::WorldLocked) => Err(CliError::User(format!(
-            "{} is open in another process (its lock is held); close it before replacing it with --force",
-            escape::path(world)
-        ))),
+        Err(e @ kala_core::Error::WorldLocked) => Err(locked_or(world, &e)),
         Err(_) => Ok(None),
+    }
+}
+
+/// The error of a `--force` replace that couldn't take the old world's
+/// writer lock.
+fn locked_or(world: &Path, e: &kala_core::Error) -> CliError {
+    match e {
+        kala_core::Error::WorldLocked => CliError::User(format!(
+            "{} is being written by another process (its lock is held); close it before replacing it with --force",
+            escape::path(world)
+        )),
+        e => CliError::at_path(world, e),
     }
 }
 

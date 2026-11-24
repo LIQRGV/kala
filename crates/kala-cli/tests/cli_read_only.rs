@@ -76,9 +76,13 @@ fn every_read_command_succeeds_while_the_world_is_open_elsewhere() {
     let before = std::fs::read(&fx.path).unwrap();
     let dir_before = dir_snapshot(fx.dir.path());
 
-    let held = World::open(&fx.path).expect("test process takes the lock");
+    // Slice 15b: an open writer world holds the lock only while it commits,
+    // so the lock is also held explicitly, as a commit in progress does.
+    let held = World::open(&fx.path).expect("a writer world, open elsewhere");
+    let lock = std::fs::File::open(&fx.path).unwrap();
+    lock.try_lock().expect("test process takes the lock");
     assert_eq!(
-        World::open(&fx.path).unwrap_err(),
+        World::open_waiting(&fx.path, std::time::Duration::ZERO).unwrap_err(),
         kala_core::Error::WorldLocked,
         "precondition: the lock is held"
     );
@@ -107,6 +111,7 @@ fn every_read_command_succeeds_while_the_world_is_open_elsewhere() {
             ok_stdout(&fx.path, c, r, false);
         }
     }
+    drop(lock);
     drop(held);
     assert_eq!(std::fs::read(&fx.path).unwrap(), before);
     assert_eq!(dir_snapshot(fx.dir.path()), dir_before);

@@ -60,10 +60,11 @@ pub struct Report {
 /// System worlds are refused once the writer has opened (so a system world
 /// with an acknowledged damaged tail is recovered before it is refused).
 pub fn open_write(path: &Path, acknowledge: bool) -> Result<World, CliError> {
+    let wait = busy_timeout();
     let opened = if acknowledge {
-        World::open(path)
+        World::open_waiting(path, wait)
     } else {
-        World::open_refusing_damaged(path)
+        World::open_refusing_damaged_waiting(path, wait)
     };
     let mut w = opened.map_err(|e| match e {
         kala_core::Error::WorldLocked => CliError::Store(format!(
@@ -84,6 +85,21 @@ pub fn open_write(path: &Path, acknowledge: bool) -> Result<World, CliError> {
     }
     Ok(w)
 }
+/// How long a write command waits for the world's writer lock: kala-core's
+/// default (5 s), which is also what the opened world's commits wait.
+///
+/// `KALA_BUSY_TIMEOUT_MS` (milliseconds; `0` = fail at once) overrides it.
+/// It is an internal knob for the test suite, not a documented interface:
+/// the `--busy-timeout` flag replaces it.
+pub(crate) fn busy_timeout() -> std::time::Duration {
+    std::env::var("KALA_BUSY_TIMEOUT_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map_or(
+            kala_core::log::DEFAULT_BUSY_TIMEOUT,
+            std::time::Duration::from_millis,
+        )
+}
 /// System worlds can be changed only through account management.
 pub(crate) fn refuse_system(world: &World) -> Result<(), CliError> {
     if kala_system::is_system(world) {
@@ -100,9 +116,27 @@ fn user(s: impl Into<String>) -> CliError {
 /// Apply one form after enforcing the CLI's system-world policy. The shared
 /// applier refuses a system world too (its default policy); the CLI's own
 /// check comes first so its message names `kala user`.
+///
+/// Another process may commit to the world between this form's start and
+/// its commit; kala-core then refuses the commit, having written nothing
+/// and caught the world up ([`kala_core::Error::SnapshotStale`]). The form
+/// is applied again from scratch on the caught-up world, as if it had been
+/// submitted a moment later, a bounded number of times. (Stage 2 of slice
+/// 15b: the conflict check that lets a form commit over commits it doesn't
+/// conflict with replaces this loop.)
 pub fn execute(w: &mut World, form: &WriteTxn, default: Option<Tick>) -> Result<Report, CliError> {
+    const STALE_RETRIES: usize = 32;
     refuse_system(w)?;
-    let report = kala_lang::write::execute(w, form, default).map_err(write_err)?;
+    let mut attempt = 0;
+    let report = loop {
+        match kala_lang::write::execute(w, form, default) {
+            Err(kala_lang::write::WriteError {
+                cause: kala_lang::write::Failure::Store(kala_core::Error::SnapshotStale { .. }),
+                ..
+            }) if attempt < STALE_RETRIES => attempt += 1,
+            other => break other.map_err(write_err)?,
+        }
+    };
     Ok(committed_report(w, report))
 }
 /// Create-mode restores own a private file. `system` says the genesis of the
