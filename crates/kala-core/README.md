@@ -287,7 +287,11 @@ the file is created. Between transactions it holds nothing, so an idle handle
 never blocks another writer. Opening reads and replays the log *without* the
 lock (so opening a large world doesn't keep others from committing), then takes
 it for a moment to settle what it read: transactions committed during the
-replay are applied, a torn tail is cut, a damaged one is reported. A commit that finds the lock
+replay are applied, a torn tail is cut, a damaged one is reported. (Only if
+that first read can't be settled, because it failed, found no committed
+transaction, or its last transaction was cut from the file meanwhile, is the
+whole file read and replayed a second time under the lock, and other writers
+wait that long.) A commit that finds the lock
 held tries again, sleeping briefly, for up to the **busy timeout**
 (`World::set_busy_timeout`, `World::open_waiting`; default 5 s, zero = one
 attempt), then fails with `Error::WorldLocked` having written nothing. The lock
@@ -319,7 +323,15 @@ the file hasn't grown, a catch-up takes no lock at all, so readers never slow a
 writer down when nothing changed. An incomplete last transaction is likewise
 "not yet": ignored, not judged; only a commit, holding the writer lock, cuts
 one. `World::open_read_only` settles its snapshot the same way, waiting up to
-100 ms for a commit in progress.
+100 ms for a commit in progress. It reads and replays the log with no lock and
+normally holds the shared lock only for a re-read of the last transaction and
+what was appended since; only if that first read can't be settled (it failed,
+found no committed transaction, or its last transaction is no longer in the
+file) is the whole file read and replayed again under the shared lock, and
+writers wait that long. Where files can't be locked at all (some network and
+shared mounts: the lock call answers "unsupported" or "no locks available"),
+readers go on without the shared lock rather than fail; a writer's exclusive
+lock fails there too, and a writer that can't lock doesn't append.
 
 **Recovery.** A *torn* last transaction (a writer died mid-append) was never
 acknowledged to anyone: `World::open` and every commit cut it, under the lock,

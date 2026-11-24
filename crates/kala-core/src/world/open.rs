@@ -285,11 +285,15 @@ impl World {
     /// large world doesn't keep other handles from committing meanwhile.
     /// The open then takes the exclusive (advisory) lock for a moment to
     /// settle what it read, exactly as a commit's catch-up does: the last
-    /// transaction it replayed is re-read (if it is gone or changed, the
-    /// whole file is read again under the lock), transactions committed
+    /// transaction it replayed is re-read, transactions committed
     /// during the replay are applied, and an incomplete tail is judged
     /// with no writer in the middle of an append. The world returned is the
-    /// file's state at that moment. If another handle holds the lock (a
+    /// file's state at that moment. The lock is held for longer, for a
+    /// second read and replay of the whole file (other writers wait that
+    /// long, up to their busy timeout), only when the lock-free read can't
+    /// be settled: it failed (it caught the file being created or cut, or
+    /// the file is corrupt), it found no committed transaction, or its
+    /// last transaction is gone or changed (a tail was cut meanwhile). If another handle holds the lock (a
     /// commit, an open's last step or a cut in progress) this waits for it
     /// up to 5 seconds (see [`World::open_waiting`]), then fails with
     /// [`Error::WorldLocked`], the file untouched: no cut, no quarantine.
@@ -478,13 +482,21 @@ impl World {
     ///
     /// Never takes the writer lock, and succeeds while another handle holds
     /// it. The log is read and replayed with no lock at all; then that look
-    /// is settled under the file's **shared** lock (held only for a re-read
-    /// of the last transaction and of what was appended since, never for
-    /// the length of the log), so the snapshot holds no transaction whose
-    /// writer was still between its write and its fsync: such a
-    /// transaction is taken back if the fsync fails. The open waits for
-    /// that lock at most a tenth of a second, which a commit in progress
-    /// takes to finish. If a writer holds its lock longer than that, the
+    /// is settled under the file's **shared** lock, so the snapshot holds
+    /// no transaction whose writer was still between its write and its
+    /// fsync: such a transaction is taken back if the fsync fails.
+    /// Normally the shared lock is held only for a re-read of the last
+    /// transaction and of what was appended since, not for the length of
+    /// the log. It is held for a whole second read and replay of the file
+    /// (writers wait that long, up to their busy timeout) only when the
+    /// lock-free look can't be settled: it failed (it caught the file
+    /// being created or cut, or the file is corrupt, which the second look
+    /// then reports), it found no committed transaction, or its last
+    /// transaction is no longer in the file (a failed fsync took it back,
+    /// or a tail was cut, between the look and the lock). The open waits
+    /// for the shared lock at most a tenth of a second, which a commit in
+    /// progress takes to finish. If a writer holds its lock longer than
+    /// that, the
     /// world is returned as it was read; in the one case where that writer
     /// then fails its fsync and takes its transaction back, the next
     /// [`World::catch_up`] of this world reports [`Error::LogDiverged`].
