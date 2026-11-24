@@ -37,6 +37,11 @@ pub fn run(args: &ServeArgs) -> Result<String, CliError> {
         Server::bind(dir, config)
     }
     .map_err(server_error)?;
+    if !addr.ip().is_loopback() && args.advertised_address.is_none() {
+        eprintln!(
+            "kala serve: WARNING: no --advertised-address on a non-loopback listener; routing drivers and SHOW DATABASES get each connection's local address, which may be unreachable from outside"
+        );
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let signal_stop = Arc::clone(&stop);
     ctrlc::set_handler(move || signal_stop.store(true, Ordering::Relaxed))

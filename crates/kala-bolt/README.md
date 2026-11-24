@@ -261,12 +261,30 @@ ROUTE is accepted only when authenticated and Ready. It returns a routing table
 with ttl=300, the resolved database name, and the single advertised address in
 WRITE, READ and ROUTE roles. Writer=true and the WRITE role keep driver routing
 usable; write queries still fail. Database authorization and unknown-database
-errors are shared with RUN. Impersonation is forbidden. Client routing-context
-addresses are never echoed.
+errors are shared with RUN, with one exception: ROUTE for `system` answers any
+authenticated identity, so a routing driver (`neo4j://`) can reach the database
+listing there. That table grants nothing; RUN still refuses a non-admin's reads
+of `system`. Client routing-context addresses are never echoed.
+
+Impersonation (`imp_user`, a driver session's `impersonated_user`) is refused
+on both ROUTE and RUN with `Neo.ClientError.Security.Forbidden`
+("impersonation is not supported"); a request is never run with the
+connection's own grants instead. A non-string `imp_user` is an invalid request.
+
+RUN checks that the database exists and may be read before it parses the query,
+so a malformed query on an unknown or forbidden database gets the database
+error. A Path whose nodes would include an edge (a ref attribute may point at
+one) is refused with an execution error; return its nodes and relationships
+separately.
 
 `kala serve --advertised-address HOST:PORT` sets the public endpoint; without
 it, the table uses the connection's local socket address (including its actual
-port when listening on port 0). The Python suite exercises both forms. HELLO's
+port when listening on port 0). **Set `--advertised-address` whenever the
+listen address is not loopback:** with `--listen 0.0.0.0:7687` behind NAT, a
+proxy or a container, the local socket address is an internal one, and ROUTE
+and SHOW DATABASES would hand it to remote clients, which then cannot connect.
+`kala serve` prints a startup warning in that case. The Python suite exercises
+both forms. HELLO's
 `Neo4j/5.0.0` and components' `5.0.0` are Bolt compatibility versions; HELLO's
 `kala_version` is Kala's actual version.
 

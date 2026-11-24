@@ -227,6 +227,12 @@ See [Bolt accounts and listen rules](../kala-bolt/README.md) for host precedence
 database authorization and the explicit plaintext opt-in needed for a
 non-loopback listener. `--auth none` remains loopback-only.
 
+`--advertised-address HOST:PORT` is the address routing drivers (`neo4j://`)
+and `SHOW DATABASES` are given. Without it they get the local address of each
+connection, which is fine on loopback. Set it for every non-loopback listen
+(`--listen 0.0.0.0:7687` behind NAT or in a container would otherwise hand out
+an internal address); `kala serve` warns on stderr when it is missing.
+
 
 ## Changing and inspecting the schema
 
