@@ -122,12 +122,10 @@ pub fn with_file_lock<T>(
 ) -> Result<Option<T>, Error> {
     let file = match open_regular(path, OpenOptions::new().read(true)) {
         Ok(file) => Arc::new(file),
-        Err(Error::Io { kind, .. })
-            if matches!(
-                kind,
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
-            ) =>
-        {
+        Err(Error::Io {
+            kind: std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput,
+            ..
+        }) => {
             return Ok(None);
         }
         Err(e) => return Err(e),

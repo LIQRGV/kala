@@ -161,25 +161,42 @@
 //!   next transaction's stored `Commit` checksum no longer matches. (The
 //!   last transaction has no successor: replacing it gives another valid
 //!   log, which only a handle that had applied the original can notice.)
-//! - **One transaction proves the prefix.** A handle remembers a
-//!   [`ChainTip`]: where the last transaction it applied starts and ends,
-//!   its tx and `link(n)`. To learn whether the log it knows is still a
-//!   prefix of the file, it re-reads just those bytes ([`chain_tip_holds`]):
-//!   a sound begin record for that tx, a matching `body_crc`, and a `Commit`
-//!   carrying the remembered checksum. Any writer that rewrote an earlier
-//!   transaction had to write a different link there (replay would refuse
-//!   its log otherwise), and a link's four bytes feed the next link through
-//!   a CRC, which maps different 4-byte prefixes of otherwise equal input
-//!   to different results: the difference reaches every later `Commit`
-//!   whose own bytes are the same, including the tip's. The cost is the
-//!   size of one transaction, whatever the log's length.
+//! - **One transaction tells a handle whether a Kala writer rewrote its
+//!   history.** A handle remembers a [`ChainTip`]: where the last
+//!   transaction it applied starts and ends, its tx and `link(n)`. It
+//!   re-reads just those bytes ([`chain_tip_holds`]): a sound begin record
+//!   for that tx, a matching `body_crc`, and a `Commit` carrying the
+//!   remembered checksum. A Kala writer only ever cuts a log's end and
+//!   appends: if it cut into the history this handle applied and wrote
+//!   other transactions there, it wrote a different link at the point
+//!   where the histories part (its log wouldn't replay otherwise), and a
+//!   link's four bytes feed the next link through a CRC, which maps
+//!   different 4-byte prefixes of otherwise equal input to different
+//!   results: the difference reaches every later `Commit` whose own bytes
+//!   are the same, including the one at the tip. The cost is the size of
+//!   one transaction, whatever the log's length.
 //!
-//! What it is not: authentication. CRC32 is 32 bits and anyone can compute
-//! it, so a program that edits the file on purpose can forge a chain, and
-//! two *different* histories agree on a link by accident with probability
-//! about 2^-32. The chain is for cooperating Kala writers (a recovery cut or
-//! an fsync-failure truncation followed by new commits, a file replaced by
-//! a restored copy) and for storage damage.
+//! What that re-read proves, precisely: that **no Kala writer cut and
+//! rewrote the history this handle applied**, up to one accidental CRC32
+//! collision (about 2^-32). The body checksum and the chained checksum are
+//! both CRC32 over the same bytes and must not be counted as two
+//! independent checks.
+//!
+//! What it does not prove:
+//!
+//! - that the bytes of *earlier* transactions are still what the handle
+//!   applied. Only the tip transaction is read, so a bit that flipped in an
+//!   earlier transaction since (storage damage) goes unnoticed by it.
+//!   Recomputing every link does notice: that is what `World::open` and
+//!   `kala doctor` do, at the cost of the whole log;
+//! - anything against a program that edits the file on purpose. CRC32 is
+//!   not authentication: anyone can compute it and forge a chain. File
+//!   permissions are the boundary against that.
+//!
+//! So the chain is for cooperating Kala writers (a recovery cut or an
+//! fsync-failure truncation followed by new commits, a file replaced by a
+//! restored copy or by `kala load --force`), checked cheaply at every
+//! catch-up and commit; storage damage is found by the full scans.
 //!
 //! **Numbering.** Entry IDs start at 1 and grow by one per entry across the whole
 //! log; tx numbers start at 0 (the genesis transaction holding the schema)
@@ -442,10 +459,14 @@ pub struct ChainTip {
 /// the committed transaction `tip` describes: a sound begin record for
 /// `tip.tx` whose body fills exactly that range and matches its `body_crc`,
 /// ending in a `Commit` for `tip.tx` that carries `tip.checksum`. Because
-/// that checksum is chained, `true` means every byte before `tip.end` is
-/// what the handle that recorded `tip` applied (up to CRC32's strength; see
-/// the module docs). `false` means the file diverged: it is shorter, or
-/// those bytes are another transaction, or damaged.
+/// that checksum is chained, `true` means no Kala writer cut and rewrote
+/// the history the handle that recorded `tip` applied (up to an accidental
+/// CRC32 collision, about 2^-32). It reads only that one transaction, so it
+/// says nothing about a byte damaged since in an *earlier* transaction:
+/// `World::open` and `kala doctor`, which recompute every link, find that
+/// (see "The checksum chain" in the module docs). `false` means the file
+/// diverged: it is shorter, or those bytes are another transaction, or
+/// damaged.
 ///
 /// Reads only that transaction, never the rest of the file, takes no lock
 /// and modifies nothing. Fails with [`Error::Io`] if the file can't be read

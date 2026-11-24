@@ -214,6 +214,15 @@ rerun with `--acknowledge-recovery`. That cuts the damaged bytes to a
 `<world>.torn-N` quarantine file and continues. A torn tail (a write cut short,
 never acknowledged) is cut without asking.
 
+The damaged bytes stay in the file until some command is run with
+`--acknowledge-recovery`: no process cuts them on its own, so none can write
+over the lost transaction's entry IDs unasked. A write session that was
+already open when the damage appeared is refused at its next write (`the last
+transaction is damaged … rerun with --acknowledge-recovery`): quit it and
+start it again with the flag. Entry IDs noted from the lost transaction must
+not be used in a `:correct` afterwards. Read commands leave the damaged
+transaction out and keep working.
+
 `kala repl WORLD --write` takes the exclusive writer lock only while a
 transaction commits, and queries see each successful commit immediately. An
 open session **no longer blocks other writers**: a `kala transact` (or another
@@ -230,8 +239,15 @@ are refused in write mode; an explicit query `:canon` still reads an older draft
 
 Any number of `kala` processes may write one world file. They take turns, one
 transaction at a time: the writer lock is held only while a form commits (and
-while a world opens), never by an idle session. Nothing needs to be running in
-between; this is the SQLite model.
+for the last moment of opening a world for writing: the log itself is read
+without the lock, so starting a command on a large world doesn't keep the
+others out), never by an idle session. Nothing needs to be running in between;
+this is the SQLite model.
+
+A commit is seen by other processes only once it is durable: a session that
+looks at the file while another writer is in the middle of a commit skips it
+for now and picks it up at its next command. It never shows a transaction that
+the other writer then has to take back.
 
 **Waiting for the lock: `--busy-timeout`.** A write that finds another writer
 mid-commit waits for it, by default up to 5 seconds, then gives up with exit 3
@@ -319,7 +335,10 @@ the same-tick conflict error, as always).
 write session (or `kala repl --write --concurrency weak`), or
 `[:concurrency :weak]` as the first op of one transaction turns the read check
 off: the store's own rules still hold (duplicate handles, same-tick conflicts,
-an entry corrected twice), but a `:set` decided from a stale read goes through,
+an entry that another writer corrected meanwhile: `log entry#N was already
+corrected by a newer transaction (now rev R); nothing was written`, whether
+that correction replaced or deleted it), but a `:set` decided from a stale read
+goes through,
 which can leave a cardinality-one attribute with two values (reported as the
 usual overlap warning). The default is `optimistic`, and a form's own
 `[:concurrency …]` wins over the flag and the session setting:
@@ -348,10 +367,15 @@ failed; use `kala transact` when a script needs to tell a conflict apart.)
 **Replacing a world that is open elsewhere.** `kala load --force` replaces a
 world while holding its writer lock, so never in the middle of another
 process's commit: if a commit is in progress it waits the busy timeout and
-then refuses (exit 1, the old world untouched). A process that merely has the
-world open (an idle `kala repl --write`) holds no lock, so the world **is**
-replaced under it. That process's next command finds that its file is gone
-and writes nothing:
+then refuses (exit 1, the old world untouched). The same goes for an old file
+that doesn't open as a world (a corrupt log may still be one that a running
+process is committing to): it is replaced only under its lock. The lock is
+checked to be the lock of the file the path names at that moment, so two
+`load --force` racing each other can't replace a world under a third process's
+commit: the second one looks at the file that is there now and waits for that
+file's lock. A process that merely has the world open (an idle
+`kala repl --write`) holds no lock, so the world **is** replaced under it.
+That process's next command finds that its file is gone and writes nothing:
 
 ```text
 error: varrow.kala: the world file was cut back, rewritten or replaced by another process (for example `kala load --force`) while this command had it open; nothing was written; run the command again (in a REPL session: quit and start it again)

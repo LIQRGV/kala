@@ -181,10 +181,11 @@ assert_eq!(world.format_id(greg), "CHARACTER#3");
   `Cardinality`; `.bidirectional()`, `.inverse(..)`, `.reverse_one()`,
   `.unindexed()`).
 - `World::in_memory`, `World::create`, `World::open`: a world in memory or
-  in a log file (reopening replays the log and recovers from a torn tail).
-  `World::open_read_only`: the same replay as a snapshot, with no lock and
-  no change to the file (`recovery()` reports what `open` would cut); every
-  write fails with `Error::ReadOnly`.
+  in a log file (reopening replays the log, cuts a torn tail and reports a
+  damaged one: see "Recovery" below).
+  `World::open_read_only`: the same replay as a snapshot, without the writer
+  lock and with no change to the file (`recovery()` reports what a writer
+  would cut); every write fails with `Error::ReadOnly`.
 - Several handles on one file (`World::catch_up`, `World::set_busy_timeout`,
   `Concurrency`, `Error::Conflict`, `Error::LogDiverged`): see
   "Concurrent writers" below.
@@ -205,8 +206,9 @@ assert_eq!(world.format_id(greg), "CHARACTER#3");
   checksums are chained (format 6: each covers the one before, the first the
   file header), so the last transaction a handle applied (`ChainTip`: its
   byte range, tx and checksum) stands for its whole history. Re-reading that
-  one transaction tells whether the file still starts with what the handle
-  knows, or was cut and rewritten underneath it. Files of an older format
+  one transaction tells whether another Kala writer cut and rewrote that
+  history underneath the handle (see "The checksum chain" below for what
+  it does not tell). Files of an older format
   are refused (`Error::UnsupportedVersion`): dump with the older binary,
   `kala transact --create` with this one.
 - `doctor`, `doctor_log`: the read-only integrity checker (`Report`,
@@ -280,9 +282,12 @@ assert_eq!(a.catch_up()?, 0, "the commit caught up first");
 ```
 
 **The lock is per commit.** A writable world holds the log file's exclusive lock
-only while it opens (the scan and any recovery cut), while one transaction
-commits, and while the file is created. Between transactions it holds nothing,
-so an idle handle never blocks another writer. A commit that finds the lock
+only while one transaction commits, for the last step of an open, and while
+the file is created. Between transactions it holds nothing, so an idle handle
+never blocks another writer. Opening reads and replays the log *without* the
+lock (so opening a large world doesn't keep others from committing), then takes
+it for a moment to settle what it read: transactions committed during the
+replay are applied, a torn tail is cut, a damaged one is reported. A commit that finds the lock
 held tries again, sleeping briefly, for up to the **busy timeout**
 (`World::set_busy_timeout`, `World::open_waiting`; default 5 s, zero = one
 attempt), then fails with `Error::WorldLocked` having written nothing. The lock
@@ -293,14 +298,52 @@ world locked.
 **Catch-up.** `World::catch_up` applies the transactions other handles appended
 since this one last looked and returns how many. It reads only those
 transactions (plus one re-read of the handle's own last transaction), validates
-them exactly as `World::open` validates a log, takes no lock and never changes
+them exactly as `World::open` validates a log, never waits and never changes
 the file. `World::begin` and the auto-committed writes do it first, and every
-commit does it again under the lock. Without the lock an incomplete last
-transaction is "not yet" (another writer may be mid-append): it is ignored,
-not judged. Only a commit, holding the lock, cuts a torn tail; a damaged one
-fails the commit with `Error::RecoveryRequired` until
-`World::acknowledge_recovery`. A read-only handle (`World::open_read_only`) can
-catch up too.
+commit does it again under the writer lock. A read-only handle
+(`World::open_read_only`) can catch up too.
+
+**Readers wait out a commit in progress.** A transaction is applied by other
+handles only once it is durable. A writer holds the exclusive lock across its
+write, its fsync and (if the fsync fails) the truncation that takes the
+transaction back; a catch-up that finds the file grown reads the new tail
+under the file's *shared* lock, which it takes without waiting. If a writer
+holds its lock at that moment, the catch-up applies nothing and returns
+`Ok(0)`: "not yet", and the next one finds what was committed. So `Ok(0)`
+means "nothing new that is durable yet", not "the file has nothing new". When
+the file hasn't grown, a catch-up takes no lock at all, so readers never slow a
+writer down when nothing changed. An incomplete last transaction is likewise
+"not yet": ignored, not judged; only a commit, holding the writer lock, cuts
+one. `World::open_read_only` settles its snapshot the same way, waiting up to
+100 ms for a commit in progress.
+
+**Recovery.** A *torn* last transaction (a writer died mid-append) was never
+acknowledged to anyone: `World::open` and every commit cut it, under the lock,
+after saving it to a `<file>.torn-N` quarantine file. A *damaged* one (all its
+bytes are there, its checksum fails, nothing valid follows) may be a write that
+*was* acknowledged, and cutting it frees its entry IDs for reuse, so it is
+never cut behind a caller's back, by any handle in any process:
+
+- `World::open` reports it (`recovery()`: cause and length, no quarantine file
+  yet), leaves it out of the world and **in the file**, and refuses every
+  write with `Error::RecoveryUnacknowledged`
+  (`World::open_refusing_damaged` fails the open instead);
+- a handle that was already open meets it at its next commit, under the lock:
+  that commit fails with `Error::RecoveryRequired`, the file untouched;
+- after `World::acknowledge_recovery()`, that handle's next commit (or
+  `World::cut_acknowledged_tail()`) quarantines the bytes, cuts them and goes
+  ahead. An acknowledgement covers the tail the handle reported, not a later
+  one, and a handle that never acknowledged stays refused.
+
+Because the bytes stay until then, no process can write over the lost
+transaction's entry IDs without its own caller having been told. An entry ID
+noted from the lost transaction must not be used in a `correct` afterwards.
+
+**The file under an append.** Before a commit writes, under the lock, it checks
+that the file ends exactly where the handle's log does and that the transaction
+continues it (tx, entry IDs, chained checksum). If not (a file system whose
+locks do nothing, a program that ignores the lock), nothing is written and the
+commit fails with `Error::LogDiverged`.
 
 **A diverged handle.** If the file is no longer the log a handle applied
 (shorter than its last transaction, that transaction replaced, the header
@@ -382,26 +425,45 @@ often, never less.
 **Weak mode.** `Txn::set_concurrency(Concurrency::Weak)` records no reads and
 checks none: the commit still catches up, re-applies, renumbers and warns
 about the latest tick, and the store's rules still refuse a duplicate handle,
-a same-tick opposite op or a second correction of an entry; but a write
+a same-tick opposite op or a correction of an entry that a newer transaction
+corrected meanwhile (`Error::AlreadyCorrected`, whether that one replaced or
+deleted: a correction is never stacked on another writer's); but a write
 decided from a stale read goes through (a lost update: both `:set`s commit
 and Greg is in two places, with the usual overlap warning). It is an explicit
 choice per transaction; the world's `:concurrency` setting accepts only
 `optimistic`.
 
-**The reader window.** A handle that applied a transaction whose fsync then
-failed in the writer, or that a later recovery cut, may have shown it to
-readers before finding out (after which it is diverged). That window is the
-same as for a reader opened just before a crash, and is not closed.
+**The reader window.** It is closed for catch-ups and for writable opens: they
+never apply a transaction whose writer is still between its write and its
+fsync (above). What remains: a `World::open_read_only` made while a writer
+holds its lock for longer than 100 ms returns the file as read, and if that
+writer's fsync then fails, the snapshot has shown a transaction that was taken
+back; its next `catch_up` reports `Error::LogDiverged`. And a transaction whose
+writer *died* after its write is in the file for everyone, durable or not, as
+after any crash.
+
+**Replacing a world file.** `World::with_writer_lock(f)` runs `f` under the
+writer lock for work on the file as a whole, and only if the path still names
+the file the handle has open (otherwise `Error::LogDiverged`: another process
+replaced it first, and the lock held would be the wrong file's).
+`log::with_file_lock(path, timeout, f)` does the same for a file that doesn't
+open as a world. `kala load --force` replaces a world through these, so it
+never replaces a file in the middle of a commit to it, and two forced loads
+can't make a writer commit to an unlinked file.
 
 **The checksum chain.** Each transaction's commit checksum also covers the
 previous transaction's (the first chains from the file header), so the last
-transaction a handle applied stands for its whole history: re-reading that
-one transaction (`World::chain_tip`, `log::chain_tip_holds`) proves the file
-still begins with what the handle knows, at a cost independent of the log's
-length, and `kala doctor` verifies every link. The checksum is CRC32: it
-detects accidental rewrites (a cut and re-append, a replaced file, disk
-damage), not forgery. Someone who can write the file can recompute the chain;
-file permissions are the boundary against that.
+transaction a handle applied stands for its whole history. Re-reading that
+one transaction (`World::chain_tip`, `log::chain_tip_holds`; every catch-up
+and commit does it) proves that no Kala writer cut and rewrote the history the
+handle applied (a recovery cut or an fsync-failure truncation followed by new
+commits, a replaced file), at a cost independent of the log's length, up to
+an accidental CRC32 collision of about 2^-32. (The body checksum and the
+chained checksum are both CRC32 over the same bytes: one check, not two.) It
+does **not** detect a bit that flipped later in an *earlier* transaction: only
+the tip is re-read. `World::open` and `kala doctor` recompute every link and
+do. Nor is it protection against forgery: someone who can write the file can
+recompute the chain; file permissions are the boundary against that.
 
 Transaction commit results count fact and correction entries in `changed` and
 reported schema actions in `declared` (no-ops count zero). Deprecated attributes

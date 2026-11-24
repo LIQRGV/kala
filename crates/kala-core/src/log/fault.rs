@@ -107,10 +107,14 @@ pub enum LogHook {
     BeforeSync,
 }
 
+/// A hook armed for a point: what to run there, once.
+#[cfg(feature = "test-hooks")]
+type ArmedHook = (LogHook, Box<dyn FnOnce()>);
+
 #[cfg(feature = "test-hooks")]
 thread_local! {
     /// The hooks armed on this thread, each run once.
-    static HOOKS: std::cell::RefCell<Vec<(LogHook, Box<dyn FnOnce()>)>> =
+    static HOOKS: std::cell::RefCell<Vec<ArmedHook>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 

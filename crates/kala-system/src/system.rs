@@ -762,7 +762,7 @@ fn add_inner(
         password,
     } = secret;
     let mut world = writer(directory, open)?;
-    if find(&read_accounts(&world)?, &name).is_some() {
+    if find(&read_accounts(&world)?, name).is_some() {
         return Err(SystemError::AccountExists);
     }
     let key = name.key();
@@ -842,7 +842,7 @@ fn set_inner(
     } = secret;
     let mut world = writer(directory, open)?;
     let accounts = read_accounts(&world)?;
-    let old = find(&accounts, &name).ok_or(SystemError::AccountNotFound)?;
+    let old = find(&accounts, name).ok_or(SystemError::AccountNotFound)?;
     let tick = next_tick(&world)?;
     let mut txn = begin(&mut world, tick, open)?;
     replace(

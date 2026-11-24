@@ -616,8 +616,9 @@ impl World {
     /// Where this handle's log stands in the file: the last committed
     /// transaction it has applied, with its byte range and its chained
     /// checksum. [`log::chain_tip_holds`] re-reads just that transaction to
-    /// tell whether everything this handle applied is still what the file
-    /// holds (another process may have cut and rewritten it). `None` for an
+    /// tell whether another Kala writer cut and rewrote the history this
+    /// handle applied (it does not notice later damage to an earlier
+    /// transaction: opening the world or `kala doctor` does). `None` for an
     /// in-memory world. A failed commit doesn't move it.
     pub fn chain_tip(&self) -> Option<log::ChainTip> {
         self.journal.chain_tip()
