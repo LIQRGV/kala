@@ -11,6 +11,7 @@ mod query;
 mod registry;
 mod server;
 mod session;
+pub mod transport;
 pub use server::{Server, ServerConfig};
 
 // The `system` database lives in kala-system; `crate::system` names it here.

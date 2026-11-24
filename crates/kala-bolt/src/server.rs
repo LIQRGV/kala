@@ -3,9 +3,10 @@ use crate::{
     auth::{Accounts, Authenticator, NoAuth, Plugin},
     registry::{Registry, SystemDb},
     session,
+    transport::{Listener, ShutdownHandle, Transport},
 };
 use std::io;
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{
     Arc,
@@ -56,13 +57,13 @@ impl Default for ServerConfig {
 }
 /// A bound server; account authentication bootstraps the system world if absent.
 pub struct Server {
-    listener: TcpListener,
+    listener: Listener,
     config: ServerConfig,
     registry: Arc<Registry>,
     auth: Arc<dyn Authenticator>,
 }
 struct Client {
-    socket: TcpStream,
+    socket: Box<dyn ShutdownHandle>,
     thread: JoinHandle<()>,
 }
 impl Server {
@@ -161,8 +162,7 @@ impl Server {
             config.default_db.clone(),
             system,
         )?);
-        let listener = TcpListener::bind(config.listen)?;
-        listener.set_nonblocking(true)?;
+        let listener = Listener::bind(config.listen)?;
         Ok(Self {
             listener,
             config,
@@ -185,7 +185,7 @@ impl Server {
                 break Ok(());
             }
             match self.listener.accept() {
-                Ok((stream, _)) => self.admit(stream, &mut clients, &shutdown),
+                Ok(stream) => self.admit(stream, &mut clients, &shutdown),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(5))
                 }
@@ -209,23 +209,17 @@ impl Server {
     }
     /// Gives an accepted connection its session thread, or closes it: over
     /// the connection cap, or when its socket or thread can't be set up.
-    fn admit(&self, stream: TcpStream, clients: &mut Clients, shutdown: &Arc<AtomicBool>) {
+    fn admit(&self, stream: Box<dyn Transport>, clients: &mut Clients, shutdown: &Arc<AtomicBool>) {
         if clients.active.len() >= self.config.max_connections {
-            let _ = stream.shutdown(Shutdown::Both);
+            if let Ok(handle) = stream.shutdown_handle() {
+                let _ = handle.shutdown();
+            }
             clients.refused.log(format_args!(
                 "event=bolt_connection_refused reason=connection_cap"
             ));
             return;
         }
-        // The listener is non-blocking, and on macOS/BSD and
-        // Windows an accepted socket inherits that; sessions use
-        // blocking reads with timeouts. A failure on one socket
-        // (reset by the peer, fd pressure) drops that client
-        // only, never the server.
-        let prepared = stream
-            .set_nonblocking(false)
-            .and_then(|()| stream.set_nodelay(true))
-            .and_then(|()| stream.try_clone());
+        let prepared = stream.shutdown_handle();
         let socket = match prepared {
             Ok(s) => s,
             Err(e) => {
@@ -233,7 +227,9 @@ impl Server {
                     "event=bolt_connection_dropped error={:?}",
                     e.kind()
                 ));
-                let _ = stream.shutdown(Shutdown::Both);
+                if let Ok(handle) = stream.shutdown_handle() {
+                    let _ = handle.shutdown();
+                }
                 return;
             }
         };
@@ -245,14 +241,14 @@ impl Server {
                     "event=bolt_connection_dropped error={:?}",
                     e.kind()
                 ));
-                let _ = socket.shutdown(Shutdown::Both);
+                let _ = socket.shutdown();
             }
         }
     }
     /// Starts the thread that serves one connection until it ends.
     fn spawn_session(
         &self,
-        stream: TcpStream,
+        stream: Box<dyn Transport>,
         id: u64,
         shutdown: &Arc<AtomicBool>,
     ) -> io::Result<JoinHandle<()>> {
@@ -315,7 +311,7 @@ impl Clients {
     /// Closes every socket, then joins every thread.
     fn close(self) {
         for client in &self.active {
-            let _ = client.socket.shutdown(Shutdown::Both);
+            let _ = client.socket.shutdown();
         }
         for client in self.active {
             let _ = client.thread.join();

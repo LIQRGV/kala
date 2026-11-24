@@ -1,22 +1,15 @@
 //! Chunk framing and absolute I/O deadlines, including trickling clients.
-use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use crate::transport::Transport;
+use std::io;
 use std::time::{Duration, Instant};
 
-fn remaining(deadline: Instant) -> io::Result<Duration> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .filter(|d| !d.is_zero())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "Bolt I/O deadline exceeded"))
-}
 pub(crate) fn read_exact_until(
-    stream: &mut TcpStream,
+    stream: &mut dyn Transport,
     mut bytes: &mut [u8],
     deadline: Instant,
 ) -> io::Result<()> {
     while !bytes.is_empty() {
-        stream.set_read_timeout(Some(remaining(deadline)?))?;
-        match stream.read(bytes) {
+        match stream.read_until(bytes, deadline) {
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => bytes = &mut bytes[n..],
             Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
@@ -25,10 +18,13 @@ pub(crate) fn read_exact_until(
     }
     Ok(())
 }
-fn write_all_until(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
+pub(crate) fn write_all_until(
+    stream: &mut dyn Transport,
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
     while !bytes.is_empty() {
-        stream.set_write_timeout(Some(remaining(deadline)?))?;
-        match stream.write(bytes) {
+        match stream.write_until(bytes, deadline) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(n) => bytes = &bytes[n..],
             Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
@@ -38,7 +34,7 @@ fn write_all_until(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) 
     Ok(())
 }
 pub(crate) fn read_message(
-    stream: &mut TcpStream,
+    stream: &mut dyn Transport,
     max: usize,
     timeout: Duration,
 ) -> io::Result<Vec<u8>> {
@@ -66,7 +62,7 @@ pub(crate) fn read_message(
     }
 }
 pub(crate) fn write_message(
-    stream: &mut TcpStream,
+    stream: &mut dyn Transport,
     bytes: &[u8],
     deadline: Instant,
 ) -> io::Result<()> {

@@ -9,9 +9,10 @@ use crate::{
     query,
     registry::Registry,
     server::ServerConfig,
+    transport::Transport,
 };
 use std::io;
-use std::net::{IpAddr, TcpStream};
+use std::net::IpAddr;
 use std::ops::ControlFlow;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
@@ -58,11 +59,19 @@ pub(crate) struct Shared<'a> {
     /// Set at shutdown; cancels running queries.
     pub stop: &'a AtomicBool,
 }
-pub(crate) fn serve(mut stream: TcpStream, id: u64, shared: &Shared<'_>) -> io::Result<()> {
+pub(crate) fn serve(
+    mut stream: Box<dyn Transport>,
+    id: u64,
+    shared: &Shared<'_>,
+) -> io::Result<()> {
     let config = shared.config;
-    let peer = stream.peer_addr()?.ip();
-    stream.set_write_timeout(Some(config.write_timeout))?;
-    let Some(minor) = handshake::negotiate(&mut stream, config.handshake_timeout)? else {
+    let peer = stream.peer()?;
+    let Some(minor) = handshake::negotiate(
+        stream.as_mut(),
+        config.handshake_timeout,
+        config.write_timeout,
+    )?
+    else {
         return Ok(());
     };
     eprintln!("event=bolt_negotiated connection_id={id} version=5.{minor}");
@@ -85,7 +94,7 @@ pub(crate) fn serve(mut stream: TcpStream, id: u64, shared: &Shared<'_>) -> io::
         started: Instant::now(),
     };
     loop {
-        let Some(message) = session.receive(&mut stream)? else {
+        let Some(message) = session.receive(stream.as_mut())? else {
             return Ok(());
         };
         let deadline = Instant::now() + config.write_timeout;
@@ -93,15 +102,15 @@ pub(crate) fn serve(mut stream: TcpStream, id: u64, shared: &Shared<'_>) -> io::
             return Ok(());
         }
         if session.state == State::Failed && !matches!(message, Ok(Message::Reset)) {
-            session.send(&mut stream, &Value::Structure(0x7e, vec![]), deadline)?;
+            session.send(stream.as_mut(), &Value::Structure(0x7e, vec![]), deadline)?;
             continue;
         }
         let result = match message {
-            Ok(msg) => session.handle(&mut stream, msg, shared.stop),
+            Ok(msg) => session.handle(stream.as_mut(), msg, shared.stop),
             Err(e) => Err(RequestError::Client(e)),
         };
         if let Err(error) = result
-            && session.fail(&mut stream, error)?.is_break()
+            && session.fail(stream.as_mut(), error)?.is_break()
         {
             return Ok(());
         }
@@ -111,7 +120,7 @@ impl Session<'_> {
     /// Reads and parses the next request. `None` ends the connection: the
     /// message was over the size limit or not PackStream, and the client
     /// has been told so (if it is still listening).
-    fn receive(&self, stream: &mut TcpStream) -> io::Result<Option<Result<Message, Failure>>> {
+    fn receive(&self, stream: &mut dyn Transport) -> io::Result<Option<Result<Message, Failure>>> {
         let config = self.config;
         let bytes = match chunk::read_message(stream, config.max_message_bytes, config.idle_timeout)
         {
@@ -147,7 +156,11 @@ impl Session<'_> {
     /// Reports a failed request. Breaks (the connection ends) if the client
     /// never authenticated; otherwise the session ignores requests until
     /// RESET.
-    fn fail(&mut self, stream: &mut TcpStream, error: RequestError) -> io::Result<ControlFlow<()>> {
+    fn fail(
+        &mut self,
+        stream: &mut dyn Transport,
+        error: RequestError,
+    ) -> io::Result<ControlFlow<()>> {
         let failure = match error {
             RequestError::Transport(error) => return Err(error),
             RequestError::Client(failure) => failure,
@@ -168,7 +181,7 @@ impl Session<'_> {
         self.state = State::Failed;
         Ok(ControlFlow::Continue(()))
     }
-    fn send(&self, stream: &mut TcpStream, value: &Value, deadline: Instant) -> io::Result<()> {
+    fn send(&self, stream: &mut dyn Transport, value: &Value, deadline: Instant) -> io::Result<()> {
         let bytes = packstream::encode_with_limits(
             value,
             self.config.max_message_bytes,
@@ -220,7 +233,7 @@ impl Session<'_> {
     /// only in the states the guards name; anything else is invalid.
     fn handle(
         &mut self,
-        stream: &mut TcpStream,
+        stream: &mut dyn Transport,
         msg: Message,
         stop: &AtomicBool,
     ) -> Result<(), RequestError> {
@@ -464,7 +477,7 @@ impl Session<'_> {
     /// all of them) and says whether more remain.
     fn pull(
         &mut self,
-        stream: &mut TcpStream,
+        stream: &mut dyn Transport,
         n: i64,
         qid: i64,
         discard: bool,
