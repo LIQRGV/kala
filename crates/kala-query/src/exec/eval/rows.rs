@@ -234,16 +234,43 @@ impl Exec<'_, '_> {
                         self.budget.emit(&mut out, row)?;
                     }
                 }
+                RowAction::NodeByHandle { var, handle } => {
+                    // The loop's step above pays for this row's one lookup.
+                    let Some(Val::Str(_, h)) = row[*handle].as_ref() else {
+                        continue;
+                    };
+                    let Some(e) = self.world.entity_by_handle(h) else {
+                        continue;
+                    };
+                    if self.defined_at_canon(e)? {
+                        let mut row = row;
+                        if put(&mut row, *var, Val::Ref(e)) {
+                            self.budget.emit(&mut out, row)?;
+                        }
+                    }
+                }
                 RowAction::Nodes {
                     var,
                     labels,
                     tick: t,
                 } => {
-                    if let Some(Val::Ref(e)) = row[*var].as_ref() {
-                        if self.node_labels(*e, labels, tick(t))? {
-                            self.budget.emit(&mut out, row)?;
+                    if let Some(bound) = row[*var].as_ref() {
+                        match bound {
+                            Val::Ref(e) => {
+                                if self.node_labels(*e, labels, tick(t))? {
+                                    self.budget.emit(&mut out, row)?;
+                                }
+                            }
+                            // A NULL node matches nothing.
+                            Val::Null => {}
+                            other => {
+                                return Err(QueryError::TypeMismatch(format!(
+                                    "a node pattern needs a node, got {}",
+                                    other.kind().name()
+                                )));
+                            }
                         }
-                    } else if row[*var].is_none() {
+                    } else {
                         self.read_view();
                         let view = *self.view;
                         let schema = self.world.at_canon(view.canon());

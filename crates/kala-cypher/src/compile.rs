@@ -21,6 +21,8 @@ pub(crate) fn compile(world: &World, text: &str, q: &Query) -> Result<Prepared, 
         nullable: false,
         unwind_params: BTreeMap::new(),
         list_params: BTreeSet::new(),
+        loose: BTreeSet::new(),
+        untyped: BTreeSet::new(),
     }
     .run(q)
 }
@@ -37,8 +39,16 @@ struct Compiler<'a> {
     serial: usize,
     used: BTreeSet<String>,
     canon: CanonSource,
-    /// Node variables some earlier operator already binds.
+    /// Variables some earlier operator already binds.
     bound: BTreeSet<Var>,
+    /// Bound variables that may hold NULL or something that is not a node:
+    /// whatever WITH computed, UNWIND or YIELD produced, a path, and what an
+    /// OPTIONAL MATCH bound. A node pattern checks one before reading from it.
+    loose: BTreeSet<Var>,
+    /// The loose variables whose kind is only known at run time (a WITH
+    /// expression, an UNWIND or YIELD value): a pattern may use one as a node
+    /// or as a relationship.
+    untyped: BTreeSet<Var>,
 }
 impl Compiler<'_> {
     fn error(&self, s: impl Into<String>) -> CypherError {
@@ -129,7 +139,7 @@ impl Compiler<'_> {
     ) -> Result<Var, CypherError> {
         if let Some(name) = name {
             if let Some((v, _, is_edge)) = self.bindings.get(name) {
-                if *is_edge != edge {
+                if *is_edge != edge && !self.untyped.contains(v) {
                     return Err(self.error("a variable cannot be both a node and a relationship"));
                 }
                 return Ok(v.clone());
@@ -307,6 +317,7 @@ impl Compiler<'_> {
                         var: var.clone(),
                         ordinal: self.ordinal.clone().expect("pipeline ordinal"),
                     });
+                    self.mark_computed(&var);
                     self.bindings
                         .insert(name.clone(), (var, TickSource::Default, false));
                     let parameter = match e {
@@ -349,6 +360,13 @@ impl Compiler<'_> {
             plan,
             params: self.params,
         })
+    }
+    /// Record a variable an UNWIND, YIELD or WITH expression bound: any
+    /// value, known only at run time.
+    fn mark_computed(&mut self, var: &Var) {
+        self.bound.insert(var.clone());
+        self.loose.insert(var.clone());
+        self.untyped.insert(var.clone());
     }
     fn reserve_names(&mut self, q: &Query) {
         for clause in &q.clauses {
@@ -399,6 +417,7 @@ impl Compiler<'_> {
             if self.bindings.contains_key(alias) {
                 return Err(self.error("YIELD variable already declared"));
             }
+            self.mark_computed(&columns[i]);
             self.bindings
                 .insert(alias.clone(), (columns[i].clone(), tick.clone(), false));
         }
@@ -445,7 +464,20 @@ impl Compiler<'_> {
         }
         let mut bindings = BTreeMap::new();
         let mut unwind_params = BTreeMap::new();
+        let (mut loose, mut untyped) = (BTreeSet::new(), BTreeSet::new());
         for (item, var) in q.items.iter().zip(&returned.find) {
+            // A variable passed through keeps what is known about it; any
+            // other expression can produce NULL or a value of any kind.
+            let source = match &item.expr {
+                Expr::Var(n) => self.bindings.get(n).map(|(v, _, _)| v),
+                _ => None,
+            };
+            if source.is_none_or(|v| self.loose.contains(v)) {
+                loose.insert(var.clone());
+            }
+            if source.is_none_or(|v| self.untyped.contains(v)) {
+                untyped.insert(var.clone());
+            }
             if let Expr::Param(p) = &item.expr {
                 unwind_params.insert(item.name.clone(), p.clone());
             }
@@ -473,6 +505,8 @@ impl Compiler<'_> {
         self.bindings = bindings;
         self.unwind_params = unwind_params;
         self.bound = returned.find.into_iter().collect();
+        self.loose = loose;
+        self.untyped = untyped;
         if let Some(e) = predicate {
             let e = self.expr(e)?;
             self.row(RowAction::Select(e));
@@ -521,6 +555,12 @@ impl Compiler<'_> {
         } else {
             None
         };
+        // A check inside an OPTIONAL MATCH body proves nothing about the
+        // rows the clause keeps, and what the body binds is NULL on them.
+        let outer = m.optional.then(|| {
+            let known: BTreeSet<Var> = self.bindings.values().map(|b| b.0.clone()).collect();
+            (self.loose.clone(), self.untyped.clone(), known)
+        });
         let mut scope = MatchScope {
             tick,
             edge_count: if m
@@ -547,6 +587,12 @@ impl Compiler<'_> {
                 body: Box::new(std::mem::replace(&mut self.root, Op::Unit)),
             };
         }
+        if let Some((loose, untyped, known)) = outer {
+            self.loose = loose;
+            self.untyped = untyped;
+            let new = self.bindings.values().map(|b| b.0.clone());
+            self.loose.extend(new.filter(|v| !known.contains(v)));
+        }
         Ok(())
     }
     /// One path: bind its node variables, seek nodes named by handle, expand
@@ -557,6 +603,7 @@ impl Compiler<'_> {
             .iter()
             .map(|n| self.bind_name(&n.name, &scope.tick, false))
             .collect::<Result<Vec<_>, _>>()?;
+        let checked = self.loose_node_checks(path, &vars, &scope.tick);
         let handles = self.handle_lookups(path, &vars)?;
         let mut segments = Vec::new();
         for (i, edge) in path.edges.iter().enumerate() {
@@ -617,7 +664,7 @@ impl Compiler<'_> {
                 segments.push(r);
             }
         }
-        self.node_filters(path, &vars, &handles, &scope.tick)?;
+        self.node_filters(path, &vars, &handles, &checked, &scope.tick)?;
         if let Some(name) = &path.name {
             if self.bindings.contains_key(name) {
                 return Err(self.error("path variable already declared"));
@@ -626,10 +673,37 @@ impl Compiler<'_> {
                 start: vars[0].clone(),
                 segments,
             });
+            // A path is a bound value that is never a node.
+            self.bound.insert(var.clone());
+            self.loose.insert(var.clone());
             self.bindings
                 .insert(name.clone(), (var, scope.tick.clone(), false));
         }
         Ok(())
+    }
+    /// Constrain every already-bound node variable of the path that may hold
+    /// NULL or a non-node (see `loose`) before anything reads from it: NULL
+    /// matches nothing and a non-node is a type error, so the seeks after it
+    /// only see nodes. Returns the node positions whose labels it checked.
+    fn loose_node_checks(
+        &mut self,
+        path: &Path,
+        vars: &[Var],
+        tick: &TickSource,
+    ) -> BTreeSet<usize> {
+        let mut checked = BTreeSet::new();
+        for (position, (node, var)) in path.nodes.iter().zip(vars).enumerate() {
+            if self.bound.contains(var) && self.loose.remove(var) {
+                self.untyped.remove(var);
+                self.row(RowAction::Nodes {
+                    var: var.clone(),
+                    labels: node.labels.clone(),
+                    tick: tick.clone(),
+                });
+                checked.insert(position);
+            }
+        }
+        checked
     }
     /// Turn each `{kala_handle: …}` property into a handle seek, and return
     /// the `(node position, property index)` pairs it consumed.
@@ -655,6 +729,26 @@ impl Compiler<'_> {
                     Expr::Param(p) => {
                         self.param(p, ParamKind::Value(ValueType::Str))?;
                         Term::Param(p.clone())
+                    }
+                    // A value an earlier clause bound: seek the node by it.
+                    // A node that is already bound is compared instead.
+                    Expr::Var(name) => {
+                        let seek = self
+                            .bindings
+                            .get(name)
+                            .map(|(h, _, _)| h.clone())
+                            .filter(|h| self.bound.contains(h) && !self.bound.contains(v));
+                        let Some(handle) = seek else { continue };
+                        if let Some(p) = self.unwind_params.get(name).cloned() {
+                            self.param(&p, ParamKind::Value(ValueType::Str))?;
+                        }
+                        self.row(RowAction::NodeByHandle {
+                            var: v.clone(),
+                            handle,
+                        });
+                        self.bound.insert(v.clone());
+                        handles.insert((position, i));
+                        continue;
                     }
                     // Other values stay ordinary (never-equal) property filters.
                     _ => continue,
@@ -742,10 +836,12 @@ impl Compiler<'_> {
         path: &Path,
         vars: &[Var],
         handles: &BTreeSet<(usize, usize)>,
+        checked: &BTreeSet<usize>,
         tick: &TickSource,
     ) -> Result<(), CypherError> {
         for (position, (node, var)) in path.nodes.iter().zip(vars).enumerate() {
-            if !self.bound.contains(var) || !node.labels.is_empty() {
+            let labelled = !node.labels.is_empty() && !checked.contains(&position);
+            if !self.bound.contains(var) || labelled {
                 self.row(RowAction::Nodes {
                     var: var.clone(),
                     labels: node.labels.clone(),

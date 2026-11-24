@@ -169,6 +169,20 @@ impl Compiler<'_, '_> {
                     .collect();
                 RowAction::Group { keys, aggregates }
             }
+            RowAction::NodeByHandle { var, handle } => {
+                let handle = match self.slots.get(handle) {
+                    Some(s) if bound.contains(&s) => s,
+                    _ => {
+                        return Err(QueryError::Plan(format!(
+                            "handle seek value ?{} is not bound by its input",
+                            handle.0
+                        )));
+                    }
+                };
+                let var = self.slots.slot(var);
+                bound.insert(var);
+                RowAction::NodeByHandle { var, handle }
+            }
             RowAction::Nodes { var, labels, tick } => {
                 let tick = self.row_tick(tick)?;
                 let var = self.slots.slot(var);

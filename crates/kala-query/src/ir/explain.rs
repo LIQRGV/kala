@@ -227,6 +227,12 @@ fn row_text(action: &crate::RowAction, world: &World, out: &mut String) {
                 bag_aggregate_text(a.function, a.distinct, a.argument.as_ref(), world, out);
             }
         }
+        RowAction::NodeByHandle { var, handle } => {
+            out.push_str("seek ");
+            out.push_str(&var_text(var));
+            out.push_str(" by handle ");
+            out.push_str(&var_text(handle));
+        }
         RowAction::Nodes { var, labels, tick } => {
             out.push_str("nodes ");
             out.push_str(&var_text(var));

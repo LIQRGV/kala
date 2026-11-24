@@ -134,7 +134,13 @@ pub enum RowAction<V = Var, C = Value> {
         keys: Vec<V>,
         aggregates: Vec<BagAggregate<V, C>>,
     },
-    /// Scan or constrain nodes; every label is required. Unknown labels match nothing.
+    /// Seek the node whose handle is the bound value `handle`. NULL, a
+    /// non-string or a string that is nobody's handle matches nothing; a
+    /// `var` that is already bound must be that node.
+    NodeByHandle { var: V, handle: V },
+    /// Scan nodes into an unbound `var`, or constrain a bound one: NULL
+    /// matches nothing, a value that is not an entity is a type error. Every
+    /// label is required. Unknown labels match nothing.
     Nodes {
         var: V,
         labels: Vec<String>,
@@ -164,7 +170,7 @@ impl<V, C> RowAction<V, C> {
                 }
             }
             Self::Values { rows, .. } => rows.attributes(out),
-            Self::CheckParameter { .. } | Self::Project { .. } => {}
+            Self::CheckParameter { .. } | Self::Project { .. } | Self::NodeByHandle { .. } => {}
             Self::Trail {
                 attr, properties, ..
             } => {
