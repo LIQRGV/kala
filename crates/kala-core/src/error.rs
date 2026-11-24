@@ -262,8 +262,8 @@ impl fmt::Display for Error {
                     f,
                     "{count} unconvertible change points migrating :{} ({} -> {}): ",
                     Echo(attr),
-                    crate::world::value_type_name(*from),
-                    crate::world::value_type_name(*to)
+                    from.name(),
+                    to.name()
                 )?;
                 write_list(f, examples, |f, e| {
                     write!(f, "{} @{} ", Echo(&e.entity.formatted), e.tick.0)?;

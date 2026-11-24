@@ -91,7 +91,6 @@ pub use index::IndexDump;
 pub(crate) use index::{Index, decode_e_row, decode_v_row, decode_vfold_row};
 pub use meter::{MeteredView, WorkMeter};
 pub(crate) use open::ReplayFault;
-pub(crate) use schema_ops::type_name as value_type_name;
 use schema_ops::{OrderedEntry, SchemaSnapshot};
 use std::borrow::Cow;
 use std::cmp::Ordering;
