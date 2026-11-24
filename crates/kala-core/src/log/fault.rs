@@ -1,7 +1,9 @@
-//! Test hooks: failures injected into the next log append. Everything the
+//! Test hooks: failures injected into the next log append, and code a test
+//! runs at a chosen point of an open or a commit. Everything the
 //! `test-hooks` feature adds to the log lives in this file; the writer only
-//! asks [`ArmedFaults`] before each write and fsync, and with the feature
-//! off nothing can arm one.
+//! asks [`ArmedFaults`] before each write and fsync and calls `fire` at the
+//! [`LogHook`] points, and with the feature off nothing can arm either
+//! (`fire` isn't even compiled).
 
 #[cfg(feature = "test-hooks")]
 use super::writer::LogWriter;
@@ -84,5 +86,53 @@ impl LogWriter {
             LogFault::PanicAfterLock => self.faults.panic_after_lock = true,
             LogFault::AbortAfterLock => self.faults.abort_after_lock = true,
         }
+    }
+}
+
+/// A place in the log code where a test can run something of its own (see
+/// [`on_log_hook`]): what another handle or process could do exactly then.
+/// Not part of the supported API.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogHook {
+    /// A writable open has replayed the log and is about to take the
+    /// writer lock.
+    OpenReplayed,
+    /// A commit holds the writer lock and has caught up; its transaction
+    /// is encoded and about to be written.
+    BeforeAppend,
+    /// A commit has written its transaction and is about to fsync it (or
+    /// to fail an injected fsync), still under the writer lock.
+    BeforeSync,
+}
+
+#[cfg(feature = "test-hooks")]
+thread_local! {
+    /// The hooks armed on this thread, each run once.
+    static HOOKS: std::cell::RefCell<Vec<(LogHook, Box<dyn FnOnce()>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` the next time log code on **this thread** reaches `point`,
+/// once. The hook is taken out before it runs, so what it does (a commit
+/// on another handle, say) doesn't fire it again. Not part of the
+/// supported API.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn on_log_hook(point: LogHook, f: impl FnOnce() + 'static) {
+    HOOKS.with(|hooks| hooks.borrow_mut().push((point, Box::new(f))));
+}
+
+/// Runs the hook a test armed for `point` on this thread, if any.
+#[cfg(feature = "test-hooks")]
+pub(super) fn fire(point: LogHook) {
+    let hook = HOOKS.with(|hooks| {
+        let mut hooks = hooks.borrow_mut();
+        let at = hooks.iter().position(|(p, _)| *p == point)?;
+        Some(hooks.remove(at).1)
+    });
+    if let Some(hook) = hook {
+        hook();
     }
 }

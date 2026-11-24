@@ -73,6 +73,35 @@ fn lock(file: &Arc<File>, timeout: Duration) -> Result<WriterLock, Error> {
     }
 }
 
+/// The log file's shared lock, held by a reader for the length of one read
+/// of the file's tail: no writer is between its write and its fsync (or
+/// its rollback) while it is held, so what the reader sees past the last
+/// committed transaction is durable or a dead writer's. Dropping it
+/// releases the lock.
+struct ReadLock<'f>(&'f File);
+
+impl Drop for ReadLock<'_> {
+    fn drop(&mut self) {
+        // Explicitly, as for `WriterLock`.
+        let _ = self.0.unlock();
+    }
+}
+
+/// Takes the shared advisory lock on a log file if no writer holds the
+/// exclusive one: one attempt, never waiting. `None` if a writer does (a
+/// commit, an open or a cut is in progress).
+///
+/// `file` must not be an open file whose exclusive lock the caller holds:
+/// a lock belongs to the open file, so this would turn it into a shared
+/// one.
+fn try_read_lock(file: &File) -> Result<Option<ReadLock<'_>>, Error> {
+    match file.try_lock_shared() {
+        Ok(()) => Ok(Some(ReadLock(file))),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(e)) => Err(Error::from(e)),
+    }
+}
+
 /// What a handle found past its [`ChainTip`] (see [`read_tail`]).
 #[derive(Debug)]
 pub(crate) struct Tail {
@@ -91,6 +120,17 @@ pub(crate) struct Tail {
 }
 
 impl Tail {
+    /// Nothing to apply (yet), nothing read.
+    fn nothing() -> Tail {
+        Tail {
+            entries: Vec::new(),
+            tip: None,
+            rest: Vec::new(),
+            cause: None,
+            bytes_read: 0,
+        }
+    }
+
     /// How many committed transactions the tail holds.
     pub(crate) fn txns(&self) -> usize {
         self.entries
@@ -113,14 +153,42 @@ impl Tail {
 /// meanwhile are left for the next read) are judged by the same recovery
 /// rules as a whole-file scan, chained from `tip.checksum`. Anything those
 /// rules call corrupt is [`Error::Corrupt`]; an incomplete last transaction
-/// is returned in [`Tail::rest`] for the caller to judge: without the
-/// writer lock it may simply be another writer's append in progress.
+/// is returned in [`Tail::rest`] for the caller to judge.
+///
+/// `locked` says the caller holds the file's exclusive lock (on this very
+/// open file). A caller that doesn't must never be shown a transaction a
+/// writer has written but not yet fsynced: if that fsync fails the writer
+/// cuts the transaction off again, and a reader that had applied it would
+/// have shown data and entry IDs that never were committed. So when the
+/// file is longer than the tip, the read happens under the file's
+/// **shared** lock, taken without waiting: writers hold the exclusive lock
+/// across write, fsync and any rollback, so no append is in flight while
+/// it is held. If a writer holds its lock right now, this returns an empty
+/// tail ("not yet": a later read finds what that writer committed). When
+/// the file ends exactly at the tip (the common case) no lock is taken at
+/// all: the read is bounded by that length, so it can't reach an append
+/// that starts meanwhile, and readers cost a writer nothing.
 ///
 /// Reads the header (12 bytes), the tip transaction and the tail, never
 /// the rest of the log; the buffer is sized by the file's real length and
 /// reserved fallibly. Modifies nothing.
-fn read_tail(mut file: &File, tip: &ChainTip, next_entry: u64) -> Result<Tail, Error> {
-    let len = file.metadata()?.len();
+fn read_tail(
+    mut file: &File,
+    tip: &ChainTip,
+    next_entry: u64,
+    locked: bool,
+) -> Result<Tail, Error> {
+    let mut len = file.metadata()?.len();
+    let _shared = if !locked && len > tip.end {
+        let Some(shared) = try_read_lock(file)? else {
+            return Ok(Tail::nothing());
+        };
+        // Stable now: nothing appends or cuts while the lock is held.
+        len = file.metadata()?.len();
+        Some(shared)
+    } else {
+        None
+    };
     if len < tip.end || tip.offset < HEADER_LEN as u64 || tip.end <= tip.offset {
         return Err(Error::LogDiverged);
     }
@@ -180,7 +248,7 @@ fn read_tail(mut file: &File, tip: &ChainTip, next_entry: u64) -> Result<Tail, E
 /// [`Error::LogDiverged`]; a missing file is [`Error::Io`].
 pub(crate) fn read_tail_at(path: &Path, tip: &ChainTip, next_entry: u64) -> Result<Tail, Error> {
     let file = open_regular(path, OpenOptions::new().read(true))?;
-    read_tail(&file, tip, next_entry)
+    read_tail(&file, tip, next_entry, false)
 }
 
 /// The length of the log file at `path` now (one `stat`).
@@ -395,19 +463,25 @@ impl LogWriter {
     /// and inode, on Unix; one `stat`): a file renamed over it would take
     /// every later writer's appends while this one kept reading, locking
     /// and writing the old, unlinked one, so that is [`Error::LogDiverged`]
-    /// too. `_held` is the writer lock if the caller has it (the read is
-    /// the same either way; what may be done about an incomplete tail is
-    /// not, see `World::apply_tail`).
+    /// too. `held` is the writer lock if the caller has it: then the read
+    /// is authoritative (see `World::apply_tail` for what may be done about
+    /// an incomplete tail). Without it the tail is read under the shared
+    /// lock, or not at all while a writer holds its own (see
+    /// [`read_tail`]).
     pub(crate) fn read_tail(
         &self,
-        _held: Option<&WriterLock>,
+        held: Option<&WriterLock>,
         next_entry: u64,
     ) -> Result<Tail, Error> {
         let tip = self.tip.ok_or(Error::LogDiverged)?;
         if !self.path_is_this_file()? {
             return Err(Error::LogDiverged);
         }
-        read_tail(&self.file, &tip, next_entry)
+        // The lock passed in is this writer's own: it was taken on this
+        // very open file, so the shared lock must not be (it would replace
+        // the exclusive one).
+        debug_assert!(held.is_none_or(|h| Arc::ptr_eq(&h.file, &self.file)));
+        read_tail(&self.file, &tip, next_entry, held.is_some())
     }
 
     /// Whether the writer's path still names the file it has open.
@@ -515,6 +589,8 @@ impl LogWriter {
             .before_write()
             .and_then(|()| (&*self.file).write_all(buf));
         let res = res.and_then(|()| {
+            #[cfg(feature = "test-hooks")]
+            super::fault::fire(super::fault::LogHook::BeforeSync);
             let synced = self
                 .faults
                 .before_sync()

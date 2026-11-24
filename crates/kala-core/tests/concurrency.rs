@@ -562,11 +562,19 @@ fn readers_and_catch_up_never_wait_for_the_lock() {
     w.assert(greg, "tag", tag("a"), Some(Tick(1))).unwrap();
     let held = hold_lock(&path);
     let started = Instant::now();
-    assert_eq!(other.catch_up().unwrap(), 1);
+    // A writer holds the lock: what it may be appending is not applied
+    // before it is durable (PR #20 review, item C), so a catch-up that
+    // finds new bytes reports "not yet" instead of reading them. It still
+    // never waits.
+    assert_eq!(other.catch_up().unwrap(), 0);
     let mut reader = World::open_read_only(&path).unwrap();
     assert_eq!(reader.catch_up().unwrap(), 0);
     assert!(started.elapsed() < Duration::from_secs(2));
     drop(held);
+    // Once the lock is free the transaction is there.
+    assert_eq!(other.catch_up().unwrap(), 1);
+    assert_eq!(reader.catch_up().unwrap(), 0);
+    assert_eq!(reader.latest_tx(), other.latest_tx());
 }
 
 #[test]

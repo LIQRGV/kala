@@ -253,7 +253,7 @@ mod writer; // the append side: create, open + cut, append
 
 pub(crate) use encode::{EncodedTxn, NewEntry, encode_txn, revised_payload_len};
 #[cfg(feature = "test-hooks")]
-pub use fault::LogFault;
+pub use fault::{LogFault, LogHook, on_log_hook};
 pub(crate) use file::read_log_file;
 pub(crate) use survey::{SurveyedTxn, TaggedFinding, survey};
 pub use writer::DEFAULT_BUSY_TIMEOUT;

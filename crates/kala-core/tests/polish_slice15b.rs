@@ -376,3 +376,144 @@ fn an_acknowledgement_covers_only_the_damaged_tail_that_was_reported() {
     assert_eq!(quarantine_files(&path).len(), 2);
     assert_clean(&a);
 }
+
+// ---- C: a reader never applies a transaction before it is fsynced ----
+
+use kala_core::log::{LogFault, LogHook, on_log_hook};
+use std::cell::RefCell;
+use std::rc::Rc;
+
+/// What a second handle (`r`, writable or read-only) saw when it looked at
+/// the file between a writer's write and its fsync.
+#[derive(Debug, Default)]
+struct Seen {
+    file_grew: bool,
+    catch_up: Option<Result<usize, Error>>,
+    latest_tx: Option<TxId>,
+    begin_snapshot: Option<TxId>,
+}
+
+fn look_before_sync(path: &Path, r: &Rc<RefCell<World>>, writer_len: u64) -> Rc<RefCell<Seen>> {
+    let seen = Rc::new(RefCell::new(Seen::default()));
+    let (r, out, path) = (r.clone(), seen.clone(), path.to_owned());
+    on_log_hook(LogHook::BeforeSync, move || {
+        let mut r = r.borrow_mut();
+        let mut seen = out.borrow_mut();
+        seen.file_grew = std::fs::metadata(&path).unwrap().len() > writer_len;
+        seen.catch_up = Some(r.catch_up());
+        // `begin` looks at the file too.
+        seen.begin_snapshot = Some(r.begin().snapshot_tx());
+        seen.latest_tx = Some(r.latest_tx());
+    });
+    seen
+}
+
+fn nothing_applied_before_the_fsync(read_only: bool) {
+    let (_dir, path, mut w, greg) = world();
+    let r = Rc::new(RefCell::new(if read_only {
+        World::open_read_only(&path).unwrap()
+    } else {
+        World::open(&path).unwrap()
+    }));
+    let before = bytes(&path);
+
+    // The fsync fails: the writer cuts its transaction back off the file.
+    let seen = look_before_sync(&path, &r, before.len() as u64);
+    w.inject_log_fault(LogFault::FailNextSync);
+    assert!(w.assert(greg, "tag", s("lost"), Some(Tick(1))).is_err());
+    let seen = seen.borrow();
+    assert!(seen.file_grew, "the hook ran with the bytes in the file");
+    assert_eq!(seen.catch_up, Some(Ok(0)), "not yet: {seen:?}");
+    assert_eq!(seen.latest_tx, Some(TxId(1)));
+    assert_eq!(seen.begin_snapshot, Some(TxId(1)));
+    assert!(bytes(&path) == before, "rolled back");
+
+    // The reader never saw it, so it has not diverged.
+    let mut r = Rc::try_unwrap(r).unwrap().into_inner();
+    assert_eq!(r.catch_up(), Ok(0));
+    assert_eq!(r.as_of(greg, "tag", Tick(1)).unwrap(), vec![]);
+    if !read_only {
+        let res = r.assert(greg, "tag", s("mine"), Some(Tick(1))).unwrap();
+        assert_eq!(res.entries, vec![EntryId(8)]);
+        assert_eq!(r.latest_tx(), TxId(2));
+    }
+    assert_clean(&r);
+}
+
+#[test]
+fn a_writable_handle_applies_nothing_between_a_write_and_its_failed_fsync() {
+    nothing_applied_before_the_fsync(false);
+}
+
+#[test]
+fn a_read_only_handle_applies_nothing_between_a_write_and_its_failed_fsync() {
+    nothing_applied_before_the_fsync(true);
+}
+
+#[test]
+fn a_handle_sees_a_transaction_once_its_fsync_succeeded() {
+    for read_only in [false, true] {
+        let (_dir, path, mut w, greg) = world();
+        let r = Rc::new(RefCell::new(if read_only {
+            World::open_read_only(&path).unwrap()
+        } else {
+            World::open(&path).unwrap()
+        }));
+        let before = bytes(&path).len() as u64;
+        let seen = look_before_sync(&path, &r, before);
+        w.assert(greg, "tag", s("kept"), Some(Tick(1))).unwrap();
+        let seen = seen.borrow();
+        assert!(seen.file_grew);
+        assert_eq!(seen.catch_up, Some(Ok(0)), "not yet: {seen:?}");
+        assert_eq!(seen.latest_tx, Some(TxId(1)));
+        let mut r = r.borrow_mut();
+        assert_eq!(r.catch_up(), Ok(1));
+        assert_eq!(r.as_of(greg, "tag", Tick(1)).unwrap(), vec![s("kept")]);
+    }
+}
+
+#[test]
+fn readers_looping_catch_up_never_keep_a_writer_out() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    let (_dir, path, mut w, greg) = world();
+    let done = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..8)
+        .map(|i| {
+            let (path, done) = (path.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut r = if i % 2 == 0 {
+                    World::open_read_only(&path).unwrap()
+                } else {
+                    World::open(&path).unwrap()
+                };
+                let mut applied = 0;
+                while !done.load(Ordering::Relaxed) {
+                    applied += r.catch_up().unwrap();
+                }
+                applied += r.catch_up().unwrap();
+                (applied, r.latest_tx())
+            })
+        })
+        .collect();
+    // The watchdog: a writer starved of the lock fails with WorldLocked
+    // after its busy timeout, and the whole run must stay far below what
+    // 200 timeouts would take.
+    w.set_busy_timeout(Duration::from_secs(5));
+    let started = Instant::now();
+    for i in 0..200 {
+        w.assert(greg, "tag", s(&format!("t{i}")), Some(Tick(i)))
+            .unwrap();
+    }
+    let took = started.elapsed();
+    done.store(true, Ordering::Relaxed);
+    for r in readers {
+        let (applied, latest) = r.join().unwrap();
+        assert_eq!(latest, TxId(201));
+        // Less than 200 if the reader opened after the first commits.
+        assert!(applied <= 200);
+    }
+    assert!(took < Duration::from_secs(60), "200 commits took {took:?}");
+    assert_clean(&w);
+}

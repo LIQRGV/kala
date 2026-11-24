@@ -8,11 +8,17 @@
 //!
 //! **Catch-up** ([`World::catch_up`]) reads what follows the last
 //! transaction this handle applied and applies it as a replay would. It
-//! takes no lock, so what it sees may be changing:
+//! never waits and never takes the writer lock:
 //!
+//! - when the file is longer than the handle's log, the tail is read under
+//!   the file's **shared** lock, taken without waiting. Writers hold the
+//!   exclusive lock across write, fsync and any rollback, so a reader never
+//!   applies a transaction that isn't durable yet (and that a failed fsync
+//!   would take back). If a writer holds its lock right now, the catch-up
+//!   applies nothing ("not yet") and a later one finds what was committed;
 //! - an incomplete last transaction (torn, or all there but failing its
-//!   checksum) is "not yet": another writer may be in the middle of its
-//!   append. Nothing of it is applied, nothing on disk is touched;
+//!   checksum) is left alone: nothing of it is applied, nothing on disk is
+//!   touched. Only a commit, under the writer lock, cuts one;
 //! - a file that no longer holds the handle's last transaction (shorter,
 //!   or other bytes there: see "The checksum chain" in [`crate::log`]) is
 //!   [`Error::LogDiverged`], and the handle stops following the file;
@@ -45,12 +51,16 @@ impl World {
     /// transactions plus one re-read of the handle's last transaction, which
     /// proves the log before it unchanged; never that of the whole log.
     ///
-    /// Takes no lock, never waits and never modifies the file. A last
-    /// transaction that is incomplete (cut short, or all there but failing
-    /// its checksum) may be another writer's append in progress: it is left
-    /// alone and not counted, and a later call applies it once it is whole.
-    /// Only a commit, which holds the writer lock, cuts such a tail (see
-    /// [`Txn::commit`]).
+    /// Never waits, never takes the writer lock and never modifies the
+    /// file. A transaction is applied only once it is durable: when the
+    /// file has grown, its tail is read under the file's shared lock, and
+    /// if a writer holds its exclusive lock at that moment (a commit, an
+    /// open or a cut in progress) nothing is applied and this returns
+    /// `Ok(0)`; a later call applies what that writer committed. When the
+    /// file hasn't grown no lock is taken at all. A last transaction that
+    /// is incomplete (cut short, or all there but failing its checksum) is
+    /// left alone and not counted. Only a commit, which holds the writer
+    /// lock, cuts such a tail (see [`Txn::commit`]).
     ///
     /// Fails with:
     /// - [`Error::LogDiverged`] if the file is no longer the log this handle
