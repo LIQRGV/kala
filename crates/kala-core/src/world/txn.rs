@@ -94,6 +94,8 @@ struct TouchedSide {
 /// The result of committing a transaction.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CommitResult {
+    /// Whether this call appended a transaction, including entity-only commits.
+    pub committed: bool,
     /// Schema changes, in operation order.
     pub schema: Vec<crate::schema::SchemaChange>,
     /// The transaction's number. If nothing was written (every write was a
@@ -159,6 +161,23 @@ pub struct Txn<'w> {
 }
 
 impl Txn<'_> {
+    /// Resolve an optional tick using the transaction's stable defaults.
+    pub fn write_tick(&self, tick: Option<Tick>) -> Tick {
+        tick.or(self.default_tick).unwrap_or(self.base_tick)
+    }
+    /// Number of primitive entries staged so far, for language report offsets.
+    pub fn staged_entry_count(&self) -> usize {
+        self.entries.len()
+    }
+    /// Poison the transaction after an adapter error; partial forms cannot commit.
+    pub fn abort(&mut self) {
+        self.poisoned = true;
+    }
+    /// Current committed correction target (staged corrections of it are refused).
+    pub fn current_change(&self, entry: EntryId) -> Result<Change, Error> {
+        self.world.current_change(entry)
+    }
+
     /// Sets the tick for this transaction's writes that don't give their
     /// own (`AT TICK` for the transaction). It wins over the world's latest
     /// tick; a write's own tick wins over it.
@@ -564,6 +583,7 @@ impl Txn<'_> {
         self.world.accepts_writes()?;
         if self.order.is_empty() {
             return Ok(CommitResult {
+                committed: false,
                 tx: self.world.latest_tx(),
                 changed: 0,
                 declared: 0,
@@ -587,6 +607,7 @@ impl Txn<'_> {
         self.world.journal.record(encoded.entries, self.tx);
         let warnings = before.warnings(self.world);
         Ok(CommitResult {
+            committed: true,
             tx: self.tx,
             changed: self.entries.len(),
             declared: self.schema_changes.len(),

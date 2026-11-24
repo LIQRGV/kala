@@ -16,6 +16,7 @@ pub mod tick;
 pub mod value;
 mod value_table;
 pub mod world;
+pub mod write;
 
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
