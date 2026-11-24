@@ -526,6 +526,7 @@ dependencies = [
  "argon2",
  "kala-core",
  "proptest",
+ "tempfile",
 ]
 
 [[package]]

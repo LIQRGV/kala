@@ -532,16 +532,39 @@ struct Open {
     recovery: Recovery,
     recovered: Option<kala_core::RecoveryReport>,
 }
+/// How often, and how far apart, [`open_writer`] retries a locked world.
+const LOCK_RETRIES: u32 = 20;
+const LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Opens the system world for writing, waiting briefly if it is locked.
+///
+/// The lock can outlive the handle that took it by a moment: a process
+/// spawning a child from another thread shares its open files with the child
+/// until the child execs, so a just-closed world (the one `ensure` created)
+/// can still look locked. A real second writer holds the lock for longer than
+/// the retries last, and is still reported as [`SystemError::Busy`].
+fn open_writer(path: &Path, recovery: Recovery) -> Result<World, SystemError> {
+    let mut attempt = 0;
+    loop {
+        let opened = match recovery {
+            Recovery::Refuse => World::open_refusing_damaged(path),
+            Recovery::Acknowledge => World::open(path),
+        };
+        match opened {
+            Err(kala_core::Error::WorldLocked) if attempt < LOCK_RETRIES => {
+                attempt += 1;
+                std::thread::sleep(LOCK_RETRY_DELAY);
+            }
+            other => return other.map_err(store),
+        }
+    }
+}
 fn writer(directory: &Path, open: &mut Open) -> Result<World, SystemError> {
     // `ensure` validates the committed prefix read-only, so a world that is
     // not a system world is refused before any recovery can cut its tail.
     ensure(directory)?;
     let path = directory.join("system.kala");
-    let mut world = match open.recovery {
-        Recovery::Refuse => World::open_refusing_damaged(&path),
-        Recovery::Acknowledge => World::open(&path),
-    }
-    .map_err(store)?;
+    let mut world = open_writer(&path, open.recovery)?;
     let damaged = world.recovery().cause == Some(kala_core::CutCause::Damaged);
     if damaged {
         // Reachable only with `Recovery::Acknowledge`: the refusing open
