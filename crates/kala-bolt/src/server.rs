@@ -220,7 +220,10 @@ impl Server {
         self.listeners.iter().map(Listener::local_addr).collect()
     }
     /// Wrap every accepted byte transport before running the shared session.
-    /// Wrappers must preserve peer metadata, deadlines and cancellation.
+    /// Wrappers must preserve deadlines and cancellation. The peer used for
+    /// account matching and the reached address are taken from the accepted
+    /// connection before it is wrapped, so a wrapper's own `peer` and
+    /// `local_addr` answers are never used.
     pub fn with_transport_wrapper(
         mut self,
         wrapper: impl Fn(Box<dyn Transport>) -> Box<dyn Transport> + Send + Sync + 'static,
@@ -290,6 +293,25 @@ impl Server {
                 return;
             }
         };
+        // Who connected, and where, is asked of the real connection before
+        // any wrapper sees it: a wrapper frames bytes and must not be able to
+        // turn a TCP client into a `localhost` peer.
+        let origin = stream.peer().and_then(|peer| {
+            Ok(session::Origin {
+                peer,
+                reached: stream.local_addr()?,
+            })
+        });
+        let origin = match origin {
+            Ok(origin) => origin,
+            Err(e) => {
+                clients.dropped.log(format_args!(
+                    "event=bolt_connection_dropped error={:?}",
+                    e.kind()
+                ));
+                return;
+            }
+        };
         let stream = match &self.wrapper {
             Some(wrap) => wrap(stream),
             None => stream,
@@ -309,7 +331,7 @@ impl Server {
             }
         };
         clients.next_id = clients.next_id.wrapping_add(1);
-        match self.spawn_session(stream, clients.next_id, shutdown) {
+        match self.spawn_session(stream, origin, clients.next_id, shutdown) {
             Ok(thread) => clients.active.push(Client { socket, thread }),
             Err(e) => {
                 clients.dropped.log(format_args!(
@@ -324,6 +346,7 @@ impl Server {
     fn spawn_session(
         &self,
         stream: Box<dyn Transport>,
+        origin: session::Origin,
         id: u64,
         shutdown: &Arc<AtomicBool>,
     ) -> io::Result<JoinHandle<()>> {
@@ -341,7 +364,7 @@ impl Server {
                     config: &config,
                     stop: &stop,
                 };
-                let result = session::serve(stream, id, &shared);
+                let result = session::serve(stream, origin, id, &shared);
                 eprintln!(
                     "event=bolt_disconnected connection_id={id} reason={:?}",
                     result.err().map(|e| e.kind())

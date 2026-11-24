@@ -59,13 +59,22 @@ pub(crate) struct Shared<'a> {
     /// Set at shutdown; cancels running queries.
     pub stop: &'a AtomicBool,
 }
+/// Where a connection comes from, as the accepted (unwrapped) connection
+/// reported it.
+pub(crate) struct Origin {
+    /// The peer identity used for account matching.
+    pub peer: Peer,
+    /// The reached endpoint, advertised when no address is configured.
+    pub reached: crate::transport::ListenAddr,
+}
 pub(crate) fn serve(
     mut stream: Box<dyn Transport>,
+    origin: Origin,
     id: u64,
     shared: &Shared<'_>,
 ) -> io::Result<()> {
     let config = shared.config;
-    let peer = stream.peer()?;
+    let Origin { peer, reached } = origin;
     let Some(minor) = handshake::negotiate(
         stream.as_mut(),
         config.handshake_timeout,
@@ -88,7 +97,7 @@ pub(crate) fn serve(
         advertised_address: config
             .advertised_address
             .clone()
-            .unwrap_or(stream.local_addr()?.to_string()),
+            .unwrap_or_else(|| reached.to_string()),
         output: None,
         db: String::new(),
         started: Instant::now(),

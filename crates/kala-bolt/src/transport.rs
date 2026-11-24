@@ -21,9 +21,11 @@ pub trait Transport: Send {
     fn write_until(&mut self, bytes: &[u8], deadline: Instant) -> io::Result<usize>;
     /// Obtain an independent handle that interrupts blocked I/O.
     fn shutdown_handle(&self) -> io::Result<Box<dyn ShutdownHandle>>;
-    /// The peer identity used for account matching.
+    /// The peer identity used for account matching. The server asks the
+    /// accepted connection itself, never a wrapper around it.
     fn peer(&self) -> io::Result<Peer>;
     /// The reached endpoint, used when no advertised address is configured.
+    /// As with `peer`, a wrapper's answer is not used by the server.
     fn local_addr(&self) -> io::Result<ListenAddr>;
 }
 
