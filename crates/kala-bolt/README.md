@@ -348,7 +348,7 @@ one) is refused with an execution error; return its nodes and relationships
 separately.
 
 `kala serve --advertised-address HOST:PORT` sets the public endpoint; without
-it, the table uses the connection's local socket address (including its actual
+it, TCP tables use the connection's local socket address (including its actual
 port when listening on port 0). **Set `--advertised-address` whenever the
 listen address is not loopback:** with `--listen 0.0.0.0:7687` behind NAT, a
 proxy or a container, the local socket address is an internal one, and ROUTE
@@ -360,5 +360,5 @@ both forms. HELLO's
 
 **Neo4j Browser and other web-page clients are not supported yet.** They need
 Bolt over WebSocket, UNION ALL, `dbms.showCurrentUser()`, `dbms.clientConfig()`,
-and SHOW PROCEDURES/FUNCTIONS. Those belong to a later slice; this server remains
-TCP-only.
+and SHOW PROCEDURES/FUNCTIONS. Those belong to a later slice; the current
+transports are TCP and Unix sockets.
