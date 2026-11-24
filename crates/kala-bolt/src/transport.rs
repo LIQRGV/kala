@@ -93,18 +93,46 @@ impl Listener {
             Self::Unix(listener) => Ok(ListenAddr::Unix(listener.path.clone())),
         }
     }
-    pub(crate) fn accept(&self) -> io::Result<Box<dyn Transport>> {
+    /// Take one pending connection, untouched. An error here is about the
+    /// listener (or the accept call), never about the accepted socket: its
+    /// setup is `Accepted::into_transport`, which fails per connection.
+    pub(crate) fn accept(&self) -> io::Result<Accepted> {
         match self {
-            Self::Tcp(listener) => {
-                let (stream, _) = listener.accept()?;
+            Self::Tcp(listener) => Ok(Accepted::Tcp(listener.accept()?.0)),
+            #[cfg(unix)]
+            Self::Unix(listener) => listener.accept(),
+        }
+    }
+}
+
+/// A connection as `accept` returned it, before any per-socket setup.
+pub(crate) enum Accepted {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(unix::AcceptedUnix),
+}
+impl Accepted {
+    /// Per-socket setup. A client that reset right after connecting makes
+    /// these calls fail (EINVAL on macOS), which must cost only that client.
+    pub(crate) fn into_transport(self) -> io::Result<Box<dyn Transport>> {
+        match self {
+            Self::Tcp(stream) => {
                 // Some platforms inherit nonblocking mode from the listener.
                 stream.set_nonblocking(false)?;
                 stream.set_nodelay(true)?;
                 Ok(Box::new(Tcp(stream)))
             }
             #[cfg(unix)]
-            Self::Unix(listener) => listener.accept(),
+            Self::Unix(accepted) => accepted.into_transport(),
         }
+    }
+    /// Close a connection that will not be served (over the connection cap).
+    pub(crate) fn close(self) {
+        let _ = match self {
+            Self::Tcp(stream) => stream.shutdown(Shutdown::Both),
+            #[cfg(unix)]
+            Self::Unix(accepted) => accepted.close(),
+        };
     }
 }
 

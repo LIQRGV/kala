@@ -3,7 +3,7 @@ use crate::{
     auth::{Accounts, Authenticator, NoAuth, Plugin},
     registry::{Registry, SystemDb},
     session,
-    transport::{ListenAddr, Listener, ShutdownHandle, Transport},
+    transport::{Accepted, ListenAddr, Listener, ShutdownHandle, Transport},
 };
 use std::io;
 use std::net::SocketAddr;
@@ -62,6 +62,8 @@ impl Default for ServerConfig {
 pub struct Server {
     listeners: Vec<Listener>,
     wrapper: Option<Arc<TransportWrapper>>,
+    /// Per-socket setup of an accepted connection; tests inject failures.
+    prepare: fn(Accepted) -> io::Result<Box<dyn Transport>>,
     config: ServerConfig,
     registry: Arc<Registry>,
     auth: Arc<dyn Authenticator>,
@@ -207,6 +209,7 @@ impl Server {
         Ok(Self {
             listeners,
             wrapper: None,
+            prepare: Accepted::into_transport,
             config,
             registry,
             auth,
@@ -267,16 +270,26 @@ impl Server {
     }
     /// Gives an accepted connection its session thread, or closes it: over
     /// the connection cap, or when its socket or thread can't be set up.
-    fn admit(&self, stream: Box<dyn Transport>, clients: &mut Clients, shutdown: &Arc<AtomicBool>) {
+    /// Nothing that goes wrong with one connection reaches the accept loop.
+    fn admit(&self, accepted: Accepted, clients: &mut Clients, shutdown: &Arc<AtomicBool>) {
         if clients.active.len() >= self.config.max_connections {
-            if let Ok(handle) = stream.shutdown_handle() {
-                let _ = handle.shutdown();
-            }
+            accepted.close();
             clients.refused.log(format_args!(
                 "event=bolt_connection_refused reason=connection_cap"
             ));
             return;
         }
+        let stream = match (self.prepare)(accepted) {
+            Ok(stream) => stream,
+            Err(e) => {
+                // The failed socket was dropped (closed) with the error.
+                clients.dropped.log(format_args!(
+                    "event=bolt_connection_dropped error={:?}",
+                    e.kind()
+                ));
+                return;
+            }
+        };
         let stream = match &self.wrapper {
             Some(wrap) => wrap(stream),
             None => stream,
@@ -467,8 +480,68 @@ fn valid_advertised_address(address: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::accept_error_is_fatal;
-    use std::io::{Error, ErrorKind};
+    use super::{Server, ServerConfig, accept_error_is_fatal};
+    use crate::transport::{Accepted, ListenAddr, Transport};
+    use std::io::{Error, ErrorKind, Read, Write};
+    use std::net::TcpStream;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    static PREPARED: AtomicUsize = AtomicUsize::new(0);
+    /// The first accepted socket fails its setup the way a client that reset
+    /// right after connecting does on macOS: setsockopt returns EINVAL, which
+    /// `accept_error_is_fatal` treats as a broken listener.
+    fn first_setup_fails(accepted: Accepted) -> std::io::Result<Box<dyn Transport>> {
+        if PREPARED.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(Error::from_raw_os_error(22));
+        }
+        accepted.into_transport()
+    }
+
+    // PR #17 polish: per-socket setup is not an accept error. One client whose
+    // socket can't be set up is dropped; the server keeps accepting.
+    #[test]
+    fn a_failed_socket_setup_drops_only_that_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ServerConfig {
+            listen: vec![ListenAddr::Tcp("127.0.0.1:0".parse().unwrap())],
+            ..ServerConfig::default()
+        };
+        let mut server = Server::bind(dir.path(), config).unwrap();
+        server.prepare = first_setup_fails;
+        let ListenAddr::Tcp(addr) = server.local_addrs().unwrap()[0].clone() else {
+            panic!("TCP listener")
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || server.run(shutdown));
+        let connect = || {
+            let stream = TcpStream::connect(addr)?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            Ok::<_, Error>(stream)
+        };
+        // The unlucky client is closed without a byte.
+        let mut dropped = connect().unwrap();
+        let mut byte = [0; 1];
+        assert!(matches!(dropped.read(&mut byte), Ok(0) | Err(_)));
+        // The next client is served: the handshake answers Bolt 5.4.
+        let served = connect().and_then(|mut next| {
+            next.write_all(&[
+                0x60, 0x60, 0xb0, 0x17, 0, 0, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ])?;
+            let mut version = [0; 4];
+            next.read_exact(&mut version)?;
+            Ok(version)
+        });
+        stop.store(true, Ordering::SeqCst);
+        let result = worker.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "one client's setup failure stopped the server: {result:?}"
+        );
+        assert_eq!(served.unwrap(), [0, 0, 4, 5]);
+    }
 
     // PR #4 review round 1: per-connection accept failures never stop the
     // server; only a broken listener does.

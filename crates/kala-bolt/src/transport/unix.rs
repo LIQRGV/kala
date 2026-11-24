@@ -302,13 +302,31 @@ impl BoundUnix {
             identity,
         })
     }
-    pub(super) fn accept(&self) -> io::Result<Box<dyn Transport>> {
+    pub(super) fn accept(&self) -> io::Result<super::Accepted> {
         let (stream, _) = self.listener.accept()?;
-        stream.set_nonblocking(false)?;
-        Ok(Box::new(Unix {
+        Ok(super::Accepted::Unix(AcceptedUnix {
             stream,
             path: self.path.clone(),
         }))
+    }
+}
+
+/// An accepted Unix connection before its per-socket setup.
+pub(crate) struct AcceptedUnix {
+    stream: UnixStream,
+    path: PathBuf,
+}
+impl AcceptedUnix {
+    pub(super) fn into_transport(self) -> io::Result<Box<dyn Transport>> {
+        // Some platforms inherit nonblocking mode from the listener.
+        self.stream.set_nonblocking(false)?;
+        Ok(Box::new(Unix {
+            stream: self.stream,
+            path: self.path,
+        }))
+    }
+    pub(super) fn close(self) -> io::Result<()> {
+        self.stream.shutdown(std::net::Shutdown::Both)
     }
 }
 impl Drop for BoundUnix {
