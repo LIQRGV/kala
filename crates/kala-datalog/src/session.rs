@@ -70,45 +70,8 @@ pub fn prepare_with(
     if query.canon.is_none() {
         query.canon = defaults.canon.map(|c| ast::CanonExpr::Int(c.0, query.span));
     }
-    let names: HashSet<&str> = query.rules.iter().map(|r| r.name.as_str()).collect();
-    // Only session rules the query can reach (through `:where`, its own rules
-    // and other session rules, negations included) are merged, so a broken
-    // session rule only fails the queries that use it.
-    let mut reach: HashSet<String> = HashSet::new();
-    let mut todo: Vec<String> = Vec::new();
-    calls_of(&query.calls, &query.nots, &query.ors, &mut todo);
-    for r in &query.rules {
-        calls_of(&r.calls, &r.nots, &r.ors, &mut todo);
-    }
-    while let Some(name) = todo.pop() {
-        if names.contains(name.as_str()) || !reach.insert(name.clone()) {
-            continue;
-        }
-        for r in defaults.rules.iter().filter(|r| r.name() == name) {
-            calls_of(&r.rule.calls, &r.rule.nots, &r.rule.ors, &mut todo);
-        }
-    }
-    let extra: Vec<&SessionRule> = defaults
-        .rules
-        .iter()
-        .filter(|r| !names.contains(r.name()) && reach.contains(r.name()))
-        .collect();
-    let mut bytes = text.len();
-    for rule in &extra {
-        bytes = bytes.saturating_add(rule.source().len());
-        if bytes > MAX_QUERY_BYTES {
-            return Err(DatalogError::limit(
-                None,
-                format!("query and session rules exceed {MAX_QUERY_BYTES} bytes"),
-            ));
-        }
-    }
-    if query.rules.len().saturating_add(extra.len()) > MAX_RULES {
-        return Err(DatalogError::limit(
-            None,
-            format!("more than {MAX_RULES} rule definitions in one query"),
-        ));
-    }
+    let extra = reachable_rules(&query, &defaults.rules);
+    check_merged_size(text, &query, &extra)?;
     // Each definition gets a disjoint virtual source range. Only spans change;
     // text is never spliced and the AST's semantics remain untouched.
     let mut sources = Vec::new();
@@ -124,22 +87,79 @@ pub fn prepare_with(
         check_limits(&query)?;
         crate::compile::compile(world, &query)
     };
-    compile().map_err(|mut error| {
-        if let Some(span) = error.span {
-            for &(offset, rule) in &sources {
-                if span.start >= offset && span.end <= offset + rule.source.len() {
-                    error.span = Some(Span::new(span.start - offset, span.end - offset));
-                    error.message = format!(
-                        "rule `{}`: {}",
-                        crate::error::show(rule.name()),
-                        error.message
-                    );
-                    return error.locate(&rule.source);
-                }
+    compile().map_err(|error| locate(error, &sources, text))
+}
+
+/// The session rules to merge into `query`: those it doesn't define itself
+/// and can reach.
+fn reachable_rules<'r>(query: &ast::Query, rules: &'r [SessionRule]) -> Vec<&'r SessionRule> {
+    let names: HashSet<&str> = query.rules.iter().map(|r| r.name.as_str()).collect();
+    // Only session rules the query can reach (through `:where`, its own rules
+    // and other session rules, negations included) are merged, so a broken
+    // session rule only fails the queries that use it.
+    let mut reach: HashSet<String> = HashSet::new();
+    let mut todo: Vec<String> = Vec::new();
+    calls_of(&query.calls, &query.nots, &query.ors, &mut todo);
+    for r in &query.rules {
+        calls_of(&r.calls, &r.nots, &r.ors, &mut todo);
+    }
+    while let Some(name) = todo.pop() {
+        if names.contains(name.as_str()) || !reach.insert(name.clone()) {
+            continue;
+        }
+        for r in rules.iter().filter(|r| r.name() == name) {
+            calls_of(&r.rule.calls, &r.rule.nots, &r.rule.ors, &mut todo);
+        }
+    }
+    rules
+        .iter()
+        .filter(|r| !names.contains(r.name()) && reach.contains(r.name()))
+        .collect()
+}
+
+/// Holds the query plus the session rules merged into it to the query size
+/// and rule-count limits.
+fn check_merged_size(
+    text: &str,
+    query: &ast::Query,
+    extra: &[&SessionRule],
+) -> Result<(), DatalogError> {
+    let mut bytes = text.len();
+    for rule in extra {
+        bytes = bytes.saturating_add(rule.source().len());
+        if bytes > MAX_QUERY_BYTES {
+            return Err(DatalogError::limit(
+                None,
+                format!("query and session rules exceed {MAX_QUERY_BYTES} bytes"),
+            ));
+        }
+    }
+    if query.rules.len().saturating_add(extra.len()) > MAX_RULES {
+        return Err(DatalogError::limit(
+            None,
+            format!("more than {MAX_RULES} rule definitions in one query"),
+        ));
+    }
+    Ok(())
+}
+
+/// Locates a compile error in the text it came from: a session rule's own
+/// source (each merged at the virtual offset in `sources`) or the query's.
+fn locate(mut error: DatalogError, sources: &[(usize, &SessionRule)], text: &str) -> DatalogError {
+    if let Some(span) = error.span {
+        for &(offset, rule) in sources {
+            if span.start >= offset && span.end <= offset + rule.source.len() {
+                error.span = Some(Span::new(span.start - offset, span.end - offset));
+                error.message = format!(
+                    "rule `{}`: {}",
+                    crate::error::show(rule.name()),
+                    error.message
+                );
+                return error.locate(&rule.source);
             }
         }
-        error.locate(text)
-    })
+    }
+    error.locate(text)
 }
 
 fn shift_span(span: &mut Span, offset: usize) {
@@ -188,62 +208,84 @@ fn shift_rule(r: &mut ast::Rule, offset: usize) {
         shift_span(&mut s.span, offset);
     }
     shift_body(
-        &mut r.clauses,
-        &mut r.calls,
-        &mut r.nots,
-        &mut r.ors,
-        &mut r.durings,
-        &mut r.fns,
+        BodyMut {
+            clauses: &mut r.clauses,
+            calls: &mut r.calls,
+            nots: &mut r.nots,
+            ors: &mut r.ors,
+            durings: &mut r.durings,
+            fns: &mut r.fns,
+        },
         offset,
     );
 }
 
-fn shift_body(
-    clauses: &mut [ast::Clause],
-    calls: &mut [ast::Call],
-    nots: &mut [ast::Not],
-    ors: &mut [ast::Or],
-    durings: &mut [ast::During],
-    fns: &mut [ast::FnClause],
-    offset: usize,
-) {
-    for clause in clauses {
-        match clause {
-            ast::Clause::Pattern(p) => shift_pattern(p, offset),
-            ast::Clause::At {
-                tick,
-                patterns,
-                span,
-            } => {
-                shift_span(span, offset);
-                match tick {
-                    ast::TickExpr::Int(_, s) => shift_span(s, offset),
-                    ast::TickExpr::Var(s) => shift_span(&mut s.span, offset),
-                }
-                for p in patterns {
-                    shift_pattern(p, offset);
-                }
-            }
-            ast::Clause::Pred(p) => {
-                shift_span(&mut p.span, offset);
-                shift_item(&mut p.left, offset);
-                shift_item(&mut p.right, offset);
-            }
+/// One body's clauses (a rule's, a `not`'s or an `or` branch's), by kind.
+struct BodyMut<'a> {
+    clauses: &'a mut [ast::Clause],
+    calls: &'a mut [ast::Call],
+    nots: &'a mut [ast::Not],
+    ors: &'a mut [ast::Or],
+    durings: &'a mut [ast::During],
+    fns: &'a mut [ast::FnClause],
+}
+
+impl<'a> BodyMut<'a> {
+    /// The body of a `not` or of an `or` branch.
+    fn of_conjunction(n: &'a mut ast::Not) -> BodyMut<'a> {
+        BodyMut {
+            clauses: &mut n.clauses,
+            calls: &mut n.calls,
+            nots: &mut n.nots,
+            ors: &mut n.ors,
+            durings: &mut n.durings,
+            fns: &mut n.fns,
         }
     }
-    for c in calls {
+}
+
+fn shift_clause(clause: &mut ast::Clause, offset: usize) {
+    match clause {
+        ast::Clause::Pattern(p) => shift_pattern(p, offset),
+        ast::Clause::At {
+            tick,
+            patterns,
+            span,
+        } => {
+            shift_span(span, offset);
+            match tick {
+                ast::TickExpr::Int(_, s) => shift_span(s, offset),
+                ast::TickExpr::Var(s) => shift_span(&mut s.span, offset),
+            }
+            for p in patterns {
+                shift_pattern(p, offset);
+            }
+        }
+        ast::Clause::Pred(p) => {
+            shift_span(&mut p.span, offset);
+            shift_item(&mut p.left, offset);
+            shift_item(&mut p.right, offset);
+        }
+    }
+}
+
+fn shift_body(body: BodyMut<'_>, offset: usize) {
+    for clause in body.clauses {
+        shift_clause(clause, offset);
+    }
+    for c in body.calls {
         shift_span(&mut c.span, offset);
         shift_span(&mut c.name_span, offset);
         for a in &mut c.args {
             shift_item(a, offset);
         }
     }
-    for d in durings {
+    for d in body.durings {
         shift_span(&mut d.span, offset);
         shift_span(&mut d.out.span, offset);
         shift_pattern(&mut d.pattern, offset);
     }
-    for f in fns {
+    for f in body.fns {
         shift_span(&mut f.span, offset);
         shift_span(&mut f.name_span, offset);
         for a in &mut f.args {
@@ -253,32 +295,16 @@ fn shift_body(
             shift_span(&mut s.span, offset);
         }
     }
-    for o in ors {
+    for o in body.ors {
         shift_span(&mut o.span, offset);
         for b in &mut o.branches {
             shift_span(&mut b.span, offset);
-            shift_body(
-                &mut b.clauses,
-                &mut b.calls,
-                &mut b.nots,
-                &mut b.ors,
-                &mut b.durings,
-                &mut b.fns,
-                offset,
-            );
+            shift_body(BodyMut::of_conjunction(b), offset);
         }
     }
-    for n in nots {
+    for n in body.nots {
         shift_span(&mut n.span, offset);
-        shift_body(
-            &mut n.clauses,
-            &mut n.calls,
-            &mut n.nots,
-            &mut n.ors,
-            &mut n.durings,
-            &mut n.fns,
-            offset,
-        );
+        shift_body(BodyMut::of_conjunction(n), offset);
     }
 }
 
