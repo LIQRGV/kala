@@ -376,7 +376,7 @@ impl World {
         node_type: &str,
         handle: Option<&str>,
     ) -> Result<EntityId, Error> {
-        let mut txn = self.begin();
+        let mut txn = self.begin_locked()?;
         let id = txn.create_entity(node_type, handle)?;
         txn.commit()?;
         Ok(id)

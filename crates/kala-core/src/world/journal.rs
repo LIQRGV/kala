@@ -45,9 +45,21 @@ pub(super) struct Journal {
     /// The log file, for a file-backed world; `None` in memory. Visible to
     /// the module for the `test_hooks` (fault injection, rebuilds).
     pub(super) log: Option<LogWriter>,
-    /// For a world opened read-only (no log writer): the last committed
-    /// transaction of the file it was read from.
-    read_tip: Option<log::ChainTip>,
+    /// For a world opened read-only (no log writer): the file it was read
+    /// from and the last committed transaction this handle applied.
+    pub(super) reader: Option<LogReader>,
+    /// Bytes of the log file read since the handle was opened (catch-ups
+    /// and commit checks): what a test measures a catch-up's cost by.
+    pub(super) bytes_read: u64,
+}
+
+/// Where a read-only world's log is and how far the handle has read it.
+#[derive(Clone, Debug)]
+pub(super) struct LogReader {
+    /// The log file's path: every catch-up opens it anew.
+    pub(super) path: PathBuf,
+    /// The last committed transaction applied.
+    pub(super) tip: Option<log::ChainTip>,
 }
 
 impl Journal {
@@ -58,7 +70,8 @@ impl Journal {
             chains: HashMap::new(),
             entries: Vec::new(),
             log: None,
-            read_tip: None,
+            reader: None,
+            bytes_read: 0,
         }
     }
 
@@ -102,13 +115,109 @@ impl Journal {
     pub(super) fn chain_tip(&self) -> Option<log::ChainTip> {
         match &self.log {
             Some(log) => log.tip(),
-            None => self.read_tip,
+            None => self.reader.as_ref().and_then(|r| r.tip),
         }
     }
 
-    /// Records the chain tip of the file a read-only world was read from.
-    pub(super) fn set_read_tip(&mut self, tip: Option<log::ChainTip>) {
-        self.read_tip = tip;
+    /// Makes this the journal of a read-only world read from `reader`'s
+    /// file up to its tip.
+    pub(super) fn set_reader(&mut self, reader: Option<LogReader>) {
+        self.reader = reader;
+    }
+
+    /// Takes the log file's writer lock for one commit, waiting up to the
+    /// busy timeout ([`Error::WorldLocked`] after it). `None` for a world
+    /// with no log writer (in memory, or read-only): nothing to lock.
+    pub(super) fn lock(&self) -> Result<Option<WriterLock>, Error> {
+        self.log.as_ref().map(LogWriter::lock).transpose()
+    }
+
+    /// How long [`Journal::lock`] waits (the default for a world with no
+    /// log writer, which never locks).
+    pub(super) fn busy_timeout(&self) -> std::time::Duration {
+        self.log
+            .as_ref()
+            .map_or(log::DEFAULT_BUSY_TIMEOUT, LogWriter::busy_timeout)
+    }
+
+    /// Sets how long [`Journal::lock`] waits; ignored without a log writer.
+    pub(super) fn set_busy_timeout(&mut self, timeout: std::time::Duration) {
+        if let Some(log) = self.log.as_mut() {
+            log.set_busy_timeout(timeout);
+        }
+    }
+
+    /// Whether the log file is exactly as long as the log this handle has
+    /// applied (one `stat`): then nothing was appended since. It can't see
+    /// a cut followed by a rewrite of the same length; only reading the
+    /// tail ([`Journal::read_tail`]) proves the prefix. `true` in memory;
+    /// `false` if the file can't be examined.
+    pub(super) fn file_ends_at_tip(&self) -> bool {
+        let (len, tip) = match (&self.log, &self.reader) {
+            (Some(log), _) => (log.file_len(), log.tip()),
+            (None, Some(reader)) => (log::file_len(&reader.path), reader.tip),
+            (None, None) => return true,
+        };
+        matches!((len, tip), (Ok(len), Some(tip)) if len == tip.end)
+    }
+
+    /// What the log file holds past the last transaction this handle
+    /// applied (see `log::Tail`); `None` in memory. `held` is the writer
+    /// lock if the caller has it. Applies nothing and modifies nothing.
+    pub(super) fn read_tail(&mut self, held: Option<&WriterLock>) -> Result<Option<Tail>, Error> {
+        let next_entry = self.next_entry().0;
+        let tail = match (&self.log, &self.reader) {
+            (Some(log), _) => log.read_tail(held, next_entry)?,
+            (None, Some(reader)) => {
+                let tip = reader.tip.ok_or(Error::LogDiverged)?;
+                log::read_tail_at(&reader.path, &tip, next_entry)?
+            }
+            (None, None) => return Ok(None),
+        };
+        self.bytes_read += tail.bytes_read;
+        Ok(Some(tail))
+    }
+
+    /// Moves the handle's place in the file past transactions it has just
+    /// applied from a tail: `tip` is the last of them.
+    pub(super) fn advance(&mut self, tip: log::ChainTip) {
+        match (self.log.as_mut(), self.reader.as_mut()) {
+            (Some(log), _) => log.advance(tip),
+            (None, Some(reader)) => reader.tip = Some(tip),
+            (None, None) => {}
+        }
+    }
+
+    /// Cuts an incomplete tail off the log file under the lock (see
+    /// `LogWriter::cut_tail`).
+    pub(super) fn cut_tail(
+        &mut self,
+        held: &WriterLock,
+        tail: &[u8],
+        cause: CutCause,
+    ) -> Result<RecoveryReport, Error> {
+        match self.log.as_mut() {
+            Some(log) => log.cut_tail(held, tail, cause),
+            None => Ok(RecoveryReport::default()),
+        }
+    }
+
+    /// Test hook point: an armed fault fires now that a commit holds the
+    /// lock (see `LogWriter::after_lock`).
+    pub(super) fn after_lock(&mut self, held: &WriterLock) {
+        if let Some(log) = self.log.as_mut() {
+            log.after_lock(held);
+        }
+    }
+
+    /// Replaces what this journal knows was committed (the kept entries,
+    /// the latest tx, the correction chains) by `rebuilt`'s, keeping its
+    /// own log file, reader and counters: the committed state rolled back
+    /// to a replay of a prefix of its entries.
+    pub(super) fn restore_committed(&mut self, rebuilt: Journal) {
+        self.latest_tx = rebuilt.latest_tx;
+        self.chains = rebuilt.chains;
+        self.entries = rebuilt.entries;
     }
 
     /// Keeps the entries of committed transaction `tx` (in log order, right
@@ -264,9 +373,14 @@ impl Journal {
         self.log.as_ref().map_or(Ok(()), LogWriter::check)
     }
 
-    /// Appends one encoded transaction to the log file and fsyncs it; does
-    /// nothing in memory.
-    pub(super) fn append(&mut self, txn: &EncodedTxn) -> Result<(), Error> {
+    /// Appends one encoded transaction to the log file and fsyncs it, under
+    /// the writer lock `held` (see [`Journal::lock`]); does nothing in
+    /// memory.
+    pub(super) fn append(
+        &mut self,
+        held: Option<&WriterLock>,
+        txn: &EncodedTxn,
+    ) -> Result<(), Error> {
         // The two views of the chain agree: the file's last committed
         // transaction is the last one kept here.
         debug_assert!(
@@ -277,7 +391,10 @@ impl Journal {
             "invariant: a transaction is encoded to chain from the file's last one"
         );
         match self.log.as_mut() {
-            Some(log) => log.append(txn),
+            Some(log) => log.append(
+                held.expect("invariant: a commit to a log file holds its writer lock"),
+                txn,
+            ),
             None => Ok(()),
         }
     }

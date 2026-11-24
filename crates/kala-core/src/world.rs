@@ -50,8 +50,9 @@
 //! struct: read-only and recovery state). The rest of the module is split by
 //! concern into submodules that share its scope: `ids` (node types, entities,
 //! handles, edges), `open` (replaying a log), `txn` (the write path and
-//! [`Txn`]), `meter` (bounded reads), `view` ([`View`]), `schema_ops` and
-//! `migration`. The indexes themselves sit behind the `store` module's
+//! [`Txn`]), `sync` (catching up with other handles on the same log file and
+//! committing under its lock), `meter` (bounded reads), `view` ([`View`]),
+//! `schema_ops` and `migration`. The indexes themselves sit behind the `store` module's
 //! ordered-map seam. Every hook of the `test-hooks` feature is in the
 //! `test_hooks` submodule.
 
@@ -63,6 +64,7 @@ mod meter;
 mod migration;
 mod open;
 mod schema_ops;
+mod sync;
 #[cfg(feature = "test-hooks")]
 mod test_hooks;
 mod txn;
@@ -74,7 +76,8 @@ use crate::id::{AttrId, EdgeId, EntityId, IdError, MAX_NODE_TYPE, NodeTypeId};
 use crate::interval::IntervalSet;
 use crate::key::{self, ValueRef};
 use crate::log::{
-    self, EncodedTxn, EntryBody, EntryId, LogEntry, LogWriter, NewEntry, SurveyedTxn,
+    self, EncodedTxn, EntryBody, EntryId, LogEntry, LogWriter, NewEntry, SurveyedTxn, Tail,
+    WriterLock,
 };
 use crate::overlap::{
     Interval, Overlap, Side, Warnings, find_overlaps, find_overlaps_touching, value_intervals,
@@ -726,7 +729,7 @@ impl World {
     /// (judged as for a write; for the current value only reachable
     /// through a crafted log).
     pub fn correct(&mut self, entry: EntryId, c: Correction) -> Result<WriteResult, Error> {
-        let mut txn = self.begin();
+        let mut txn = self.begin_locked()?;
         let mut res = txn.correct(entry, c)?;
         let commit = txn.commit()?;
         res.entries = commit.entries;

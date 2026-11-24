@@ -623,7 +623,9 @@ impl World {
             reverse_cardinality: def.reverse_cardinality,
             skip_unconvertible: skip,
         };
-        let mut txn = self.begin();
+        // Replay regenerates the copy on the world as replayed so far: no
+        // look at the file (this may itself be a catch-up in progress).
+        let mut txn = self.begin_without_catch_up();
         txn.migrate_attribute(&name, options)?;
         let encoded = txn.encode_ordered()?;
         let expected_marker = EntryBody::Schema(SchemaEdit::Migration {

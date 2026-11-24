@@ -256,7 +256,8 @@ pub(crate) use encode::{EncodedTxn, NewEntry, encode_txn, revised_payload_len};
 pub use fault::LogFault;
 pub(crate) use file::read_log_file;
 pub(crate) use survey::{SurveyedTxn, TaggedFinding, survey};
-pub(crate) use writer::LogWriter;
+pub use writer::DEFAULT_BUSY_TIMEOUT;
+pub(crate) use writer::{LogWriter, Tail, WriterLock, file_len, read_tail_at};
 
 /// First 8 bytes of every log file.
 pub const LOG_MAGIC: [u8; 8] = *b"KALALOG\0";

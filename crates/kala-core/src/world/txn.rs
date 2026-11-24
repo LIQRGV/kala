@@ -192,6 +192,11 @@ pub struct Txn<'w> {
     pub(super) schema_before: Option<SchemaSnapshot>,
     pub(super) schema_changes: Vec<SchemaChange>,
     pub(super) order: Vec<OrderedEntry>,
+    /// The writer lock, if the transaction took it when it began (the
+    /// auto-committed writes, see [`World::begin_locked`]): then the world
+    /// was caught up under it and nothing can have been appended since.
+    /// Released when the transaction commits or is dropped.
+    held: Option<WriterLock>,
 }
 
 impl Txn<'_> {
@@ -857,6 +862,35 @@ impl Txn<'_> {
     /// fsynced, and only then applied in memory. If that fails, the commit
     /// returns [`Error::Io`], nothing is applied, and the world refuses
     /// further writes.
+    ///
+    /// **Other handles on the same file.** The commit takes the log file's
+    /// exclusive lock for its own length only, waiting up to the world's
+    /// busy timeout for another holder ([`Error::WorldLocked`] after it; see
+    /// [`World::set_busy_timeout`]), and releases it on every path out, a
+    /// panic included. Under the lock it first looks at the file:
+    ///
+    /// - transactions other handles appended since this handle last looked
+    ///   are applied to the world (as [`World::catch_up`] does). If there
+    ///   are any, this transaction was staged on a world that is no longer
+    ///   the latest: the commit fails with [`Error::SnapshotStale`], writes
+    ///   nothing, and a transaction begun now sees them;
+    /// - a torn last transaction (a writer died mid-append) is cut off, as
+    ///   [`World::open`] cuts it: saved to a quarantine file first and
+    ///   reported by [`World::recovery`]. The commit then goes ahead;
+    /// - a damaged last transaction (all there, checksum wrong) is not cut:
+    ///   the commit fails with [`Error::RecoveryRequired`], the file
+    ///   untouched, and so does every later one until
+    ///   [`World::acknowledge_recovery`] is called; the next commit then
+    ///   cuts it (quarantine file, report) and goes ahead;
+    /// - a file that is no longer this handle's log is
+    ///   [`Error::LogDiverged`], and a tail that isn't a valid continuation
+    ///   is [`Error::Corrupt`] (see [`World::catch_up`]); nothing is
+    ///   written.
+    ///
+    /// The auto-committed writes ([`World::assert`], [`World::retract`],
+    /// [`World::correct`], [`World::create_entity`]) take the lock before
+    /// they stage their one write, so they are judged on the latest state
+    /// and never fail with [`Error::SnapshotStale`].
     pub fn commit(self) -> Result<CommitResult, Error> {
         self.commit_with(true)
     }
@@ -892,6 +926,22 @@ impl Txn<'_> {
                 schema: Vec::new(),
             });
         }
+        // The writer lock, from here until the log has the transaction (or
+        // this returns: the guard releases it on every path, a panic
+        // included). `None` only in memory.
+        let held = match self.held.take() {
+            Some(held) => Some(held),
+            None => match self.world.lock_log()? {
+                Some(held) => {
+                    let applied = self.catch_up_under_lock(&held)?;
+                    if applied > 0 {
+                        return self.commit_after_catch_up(held, applied, warn);
+                    }
+                    Some(held)
+                }
+                None => None,
+            },
+        };
         let encoded = self.encode_ordered()?;
         let scope = self.warning_scope(warn);
         // The staged schema edits were applied provisionally; the world is
@@ -900,7 +950,10 @@ impl Txn<'_> {
             before.restore(&mut self.world.catalog);
         }
         let before = OverlapsBefore::capture(scope, self.world);
-        self.world.journal.append(&encoded)?;
+        self.world.journal.append(held.as_ref(), &encoded)?;
+        // Durable: other handles may commit while this one updates its
+        // own copy.
+        drop(held);
         let entries = self.apply(&encoded);
         self.world.journal.set_latest_tx(self.tx);
         self.world.journal.record(encoded.entries, self.tx);
@@ -915,6 +968,49 @@ impl Txn<'_> {
             warnings,
             schema: std::mem::take(&mut self.schema_changes),
         })
+    }
+
+    /// The first thing a commit does once it holds the lock `held`: reads
+    /// what other handles appended since this handle last looked, applies
+    /// it to the world and returns how many transactions that was. An
+    /// incomplete tail is cut as [`World::apply_tail`] says. If anything
+    /// was appended, the transaction's provisional schema edits are taken
+    /// back first: they were staged on a schema that is no longer the
+    /// latest.
+    fn catch_up_under_lock(&mut self, held: &WriterLock) -> Result<usize, Error> {
+        let Some(tail) = self.world.read_tail(Some(held))? else {
+            return Ok(0);
+        };
+        if tail.tip.is_some()
+            && let Some(before) = self.schema_before.take()
+        {
+            before.restore(&mut self.world.catalog);
+        }
+        self.world.apply_tail(tail, Some(held))
+    }
+
+    /// What a commit does when `applied` (> 0) transactions were appended
+    /// to the log since this transaction began. It is handed the writer
+    /// lock `held` (taken for this commit; whatever it appends, it appends
+    /// under it), with the world caught up with those transactions and the
+    /// committed schema restored; everything the transaction staged
+    /// (`order`, `entries`, `ids`, `tx`, its judgements) is still relative
+    /// to the world it began on.
+    ///
+    /// This is where the optimistic commit plugs in (slice 15b, stage 3):
+    /// finalize the staged operations against the caught-up world, check
+    /// what the transaction read against the new entries, and append. Until
+    /// then a transaction never commits over a world it didn't see: it
+    /// fails with [`Error::SnapshotStale`] and writes nothing, and the
+    /// caller runs it again on the caught-up world.
+    fn commit_after_catch_up(
+        self,
+        held: WriterLock,
+        applied: usize,
+        _warn: bool,
+    ) -> Result<CommitResult, Error> {
+        drop(held);
+        Err(Error::SnapshotStale { applied })
     }
 
     /// Which overlap checks this commit's warnings compare before and
@@ -1263,7 +1359,7 @@ impl World {
         op: Op,
         precision: Precision,
     ) -> Result<WriteResult, Error> {
-        let mut txn = self.begin();
+        let mut txn = self.begin_locked()?;
         let mut res = txn.write(entity, attr, v, tick, op, precision)?;
         let commit = txn.commit()?;
         res.entries = commit.entries;
@@ -1485,7 +1581,20 @@ impl World {
     /// [`default`](Txn::set_default_tick) lands on it, so ticks written
     /// earlier in the same transaction don't move it. Nothing is visible
     /// until [`Txn::commit`]; dropping the transaction discards it.
+    ///
+    /// A world backed by a log file first applies what other handles
+    /// committed to it since this one last looked (a [`World::catch_up`]
+    /// that costs one `stat` when nothing was appended), so the transaction
+    /// starts from the latest committed state. That look takes no lock and
+    /// reports nothing: [`Txn::commit`] checks again under the writer lock.
     pub fn begin(&mut self) -> Txn<'_> {
+        self.catch_up_if_grown();
+        self.begin_without_catch_up()
+    }
+
+    /// Starts a write transaction on the world as this handle has it,
+    /// without looking at the log file.
+    pub(super) fn begin_without_catch_up(&mut self) -> Txn<'_> {
         let base_tick = self.latest_tick();
         let tx = self.next_tx();
         Txn {
@@ -1500,6 +1609,25 @@ impl World {
             schema_before: None,
             schema_changes: Vec::new(),
             order: Vec::new(),
+            held: None,
         }
+    }
+
+    /// Starts the transaction of an auto-committed write
+    /// ([`World::assert`], [`World::create_entity`], ...): the writer lock
+    /// is taken first (waiting up to the busy timeout) and the world caught
+    /// up under it, so the write is judged on the latest committed state
+    /// and its commit can't find the world changed. The lock is released
+    /// when the transaction commits or is dropped. A world that refuses
+    /// writes anyway, or has no log file, takes no lock.
+    ///
+    /// Fails, before anything is staged, as a commit's own locking does:
+    /// [`Error::WorldLocked`], [`Error::LogDiverged`], [`Error::Corrupt`],
+    /// [`Error::RecoveryRequired`] or [`Error::Io`].
+    pub(super) fn begin_locked(&mut self) -> Result<Txn<'_>, Error> {
+        let held = self.lock_and_catch_up()?;
+        let mut txn = self.begin_without_catch_up();
+        txn.held = held;
+        Ok(txn)
     }
 }

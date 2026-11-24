@@ -19,6 +19,16 @@ pub(super) struct WriteGate {
     /// Opened by [`World::open_read_only`]: every write is refused with
     /// [`Error::ReadOnly`]. Such a world has no log writer.
     read_only: bool,
+    /// Why the handle can't follow its log file any more
+    /// ([`Error::LogDiverged`], or the [`Error::Corrupt`] of a tail that
+    /// didn't replay): every later catch-up and write fails with it.
+    broken: Option<Error>,
+    /// A commit found a damaged tail under the lock and refused to cut it
+    /// ([`Error::RecoveryRequired`]); nobody acknowledged it yet.
+    damaged_tail_seen: bool,
+    /// [`World::acknowledge_recovery`] was called after such a commit: the
+    /// next commit may cut the damaged tail.
+    may_cut_damaged: bool,
 }
 
 impl WriteGate {
@@ -33,7 +43,7 @@ impl WriteGate {
         WriteGate {
             recovery_unacknowledged: recovery.cause == Some(CutCause::Damaged),
             recovery,
-            read_only: false,
+            ..WriteGate::default()
         }
     }
 
@@ -42,8 +52,8 @@ impl WriteGate {
     pub(super) fn read_only(recovery: RecoveryReport) -> WriteGate {
         WriteGate {
             recovery,
-            recovery_unacknowledged: false,
             read_only: true,
+            ..WriteGate::default()
         }
     }
 
@@ -54,6 +64,7 @@ impl WriteGate {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
+        self.follows_log()?;
         if self.recovery_unacknowledged {
             return Err(Error::RecoveryUnacknowledged);
         }
@@ -64,6 +75,46 @@ impl WriteGate {
     /// [`World::acknowledge_recovery`]). A read-only world stays read-only.
     pub(super) fn acknowledge_recovery(&mut self) {
         self.recovery_unacknowledged = false;
+        // Only a damaged tail a commit has already reported can be
+        // acknowledged: acknowledging in advance licenses nothing.
+        self.may_cut_damaged = self.damaged_tail_seen;
+    }
+
+    /// `Err` once the handle has lost its log file (see
+    /// [`WriteGate::stop_following`]).
+    pub(super) fn follows_log(&self) -> Result<(), Error> {
+        match &self.broken {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// Records that the handle can't follow its log file any more, and why:
+    /// every later catch-up and write fails with `why`.
+    pub(super) fn stop_following(&mut self, why: Error) {
+        self.broken.get_or_insert(why);
+    }
+
+    /// A commit holding the lock found a damaged tail: whether it may cut
+    /// it (a commit refused it before and the refusal was acknowledged).
+    /// If not, the refusal is remembered, for an acknowledgement to
+    /// license the next commit.
+    pub(super) fn may_cut_damaged_tail(&mut self) -> bool {
+        self.damaged_tail_seen = true;
+        self.may_cut_damaged
+    }
+
+    /// A commit holding the lock found no damaged tail (or cut it): a
+    /// licence to cut one is spent.
+    pub(super) fn no_damaged_tail(&mut self) {
+        self.damaged_tail_seen = false;
+        self.may_cut_damaged = false;
+    }
+
+    /// Records a cut a commit made under the lock: what
+    /// [`World::recovery`] reports from now on.
+    pub(super) fn set_recovery(&mut self, recovery: RecoveryReport) {
+        self.recovery = recovery;
     }
 
     /// What opening the log did to recover it.

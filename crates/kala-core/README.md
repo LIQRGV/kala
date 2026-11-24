@@ -185,6 +185,22 @@ assert_eq!(world.format_id(greg), "CHARACTER#3");
   `World::open_read_only`: the same replay as a snapshot, with no lock and
   no change to the file (`recovery()` reports what `open` would cut); every
   write fails with `Error::ReadOnly`.
+- Several handles on one file: a writable world takes the file's exclusive
+  (advisory) lock only while it opens and while one transaction commits,
+  waiting up to `World::set_busy_timeout` (default 5 s) for another holder
+  before `Error::WorldLocked`. `World::catch_up` applies what other handles
+  committed since (it reads only the new transactions, takes no lock and
+  never changes the file); `World::begin` and the auto-committed writes do
+  it first. A commit that finds newer transactions than its transaction
+  began on fails with `Error::SnapshotStale` and writes nothing (run it
+  again). Only a commit, under the lock, cuts a torn tail; a damaged one
+  fails it with `Error::RecoveryRequired` until
+  `World::acknowledge_recovery`. A handle whose file was cut below what it
+  applied, rewritten or replaced gets `Error::LogDiverged` and must be
+  reopened. A handle (or a `open_read_only` snapshot) that applied a
+  transaction whose fsync then failed, or that a recovery later cut, may
+  have shown it to readers before finding out: that window is the same as
+  for a reader opened just before a crash.
 - Writes: `World::create_entity`, `World::assert`, `World::retract` (and the
   `_with_precision` forms), `World::correct` with `Correction::{Delete,
   Replace}`; `World::begin` returns a `Txn` grouping writes into one

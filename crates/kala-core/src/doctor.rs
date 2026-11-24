@@ -361,8 +361,13 @@ pub fn doctor(world: &World, opts: &DoctorOptions) -> Report {
     let mut found = Vec::new();
     let txns = match world.log_path() {
         Some(path) => match log::read_log_file(path).and_then(|bytes| log::survey(&bytes)) {
-            Ok((txns, scanned)) => {
+            Ok((mut txns, scanned)) => {
                 found.extend(scanned);
+                // The handle is compared with the log it has applied: other
+                // handles may have committed past it (`World::catch_up`),
+                // and being behind the file is not an index mismatch.
+                let applied = world.latest_tx();
+                txns.retain(|t| t.tx <= applied);
                 Some(txns)
             }
             Err(e) => {

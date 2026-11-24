@@ -4,7 +4,9 @@
 //! [`survey`](super::survey()).
 
 use super::decode::parse_payload;
-use super::format::{BEGIN_COVERED, BEGIN_LEN, BEGIN_TAG, HEADER_LEN};
+use super::format::{
+    BEGIN_COVERED, BEGIN_LEN, BEGIN_TAG, COMMIT_FRAME_LEN, HEADER_LEN, KIND_COMMIT,
+};
 use super::{ChainTip, EntryBody, LOG_FORMAT_VERSION, LOG_MAGIC, LogEntry, MAX_ENTRY_BYTES};
 use crate::error::Error;
 use crate::world::CutCause;
@@ -14,13 +16,14 @@ use crate::world::TxId;
 pub(super) struct Scan {
     /// Entries of every committed transaction, in log order.
     pub(super) entries: Vec<LogEntry>,
-    /// Length of the valid prefix: the header plus every committed
-    /// transaction. Bytes past it are a torn or damaged tail.
+    /// Length of the valid prefix of the bytes scanned (for a whole file:
+    /// the header plus every committed transaction). Bytes past it are a
+    /// torn or damaged tail.
     pub(super) valid_len: usize,
     /// Why the bytes past `valid_len` aren't committed; `None` if there are
     /// none.
     pub(super) cause: Option<CutCause>,
-    /// The last committed transaction; `None` if there is none.
+    /// The last committed transaction scanned; `None` if there is none.
     pub(super) tip: Option<ChainTip>,
 }
 
@@ -63,14 +66,52 @@ fn next_frame(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
 /// carried from the header through every transaction, so a transaction that
 /// doesn't continue the log before it is [`Error::Corrupt`] too.
 pub(super) fn scan(bytes: &[u8]) -> Result<Scan, Error> {
-    let mut rest = check_header(bytes)?;
+    let rest = check_header(bytes)?;
+    let mut scan = scan_txns(
+        rest,
+        ScanFrom {
+            offset: HEADER_LEN as u64,
+            next_entry: 1,
+            next_tx: 0,
+            link: super::header_checksum(),
+        },
+    )?;
+    // Counted from the start of the file here.
+    scan.valid_len += HEADER_LEN;
+    Ok(scan)
+}
+
+/// Where a scan of transactions starts: the state a scan of everything
+/// before `offset` would have reached.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ScanFrom {
+    /// File offset of the first byte scanned (for [`ChainTip`]s and error
+    /// messages).
+    pub(super) offset: u64,
+    /// The entry ID the first entry must have.
+    pub(super) next_entry: u64,
+    /// The tx the first transaction must have.
+    pub(super) next_tx: u64,
+    /// The link the first transaction must chain from.
+    pub(super) link: u32,
+}
+
+/// Scans `bytes`, the transactions of a log from `from.offset` to the end
+/// of the file, by the recovery rules: the loop behind [`scan`] (the whole
+/// file, from just past the header) and behind a tail read (from a handle's
+/// [`ChainTip`]). [`Scan::valid_len`] counts from the start of `bytes`;
+/// [`Scan::tip`] is `None` if no transaction in `bytes` is committed.
+pub(super) fn scan_txns(bytes: &[u8], from: ScanFrom) -> Result<Scan, Error> {
+    let mut rest = bytes;
     let mut entries = Vec::new();
-    let mut next_entry = 1u64;
-    let mut next_tx = 0u64;
-    let mut link = super::header_checksum();
+    let mut next_entry = from.next_entry;
+    let mut next_tx = from.next_tx;
+    let mut link = from.link;
     let mut tip = None;
+    // In-memory buffer offsets always fit a u64.
+    let file_offset = |rest: &[u8]| from.offset + (bytes.len() - rest.len()) as u64;
     let cause = loop {
-        let at = bytes.len() - rest.len();
+        let at = file_offset(rest);
         let (begin, after_begin) = match begin_step(rest) {
             BeginStep::End => break None,
             BeginStep::Torn => break Some(CutCause::Torn),
@@ -108,7 +149,7 @@ pub(super) fn scan(bytes: &[u8]) -> Result<Scan, Error> {
                     "tx#{}: body checksum mismatch at offset {at}, followed by a valid \
                      begin record at offset {}",
                     begin.tx,
-                    bytes.len() - after_body.len() + later
+                    file_offset(after_body) + later as u64
                 )));
             }
             Err(fault) => return Err(Error::Corrupt(format!("tx#{}: {fault}", begin.tx))),
@@ -125,11 +166,10 @@ pub(super) fn scan(bytes: &[u8]) -> Result<Scan, Error> {
         // Rule 8: committed. Its checksum (just verified against `link`)
         // is the link the next transaction chains from.
         link = commit_checksum(&txn).unwrap_or(link);
-        // In-memory buffer offsets always fit a u64.
         tip = Some(ChainTip {
             tx: TxId(begin.tx),
-            offset: at as u64,
-            end: (bytes.len() - after_body.len()) as u64,
+            offset: at,
+            end: file_offset(after_body),
             checksum: link,
         });
         next_entry += txn.len() as u64;
@@ -170,6 +210,32 @@ pub(super) fn is_committed_txn(bytes: &[u8], tx: u64, checksum: u32) -> bool {
         return false;
     };
     begin.tx == tx && commit_checksum(&entries) == Some(checksum)
+}
+
+/// Whether `bytes` is still the committed transaction `tx` a handle
+/// applied, by its checksums alone: a sound begin record for `tx` whose
+/// body fills the rest and matches `body_crc`, ending in a `Commit` frame
+/// for `tx` that stores `checksum`. The body's other frames are not parsed
+/// (the handle parsed them when it applied the transaction): this is the
+/// check a commit makes of the previous transaction, so it costs one CRC
+/// over it and allocates nothing. Any writer that changed a byte of the log
+/// up to here had to store another chained checksum there (see "The
+/// checksum chain" in the module docs).
+pub(super) fn is_same_txn(bytes: &[u8], tx: u64, checksum: u32) -> bool {
+    let BeginStep::Begin(begin, body) = begin_step(bytes) else {
+        return false;
+    };
+    // frame = payload_len u32 | kind u8 | entry_id u64 | tx u64 | checksum u32
+    let Some((_, frame)) = body.split_last_chunk::<COMMIT_FRAME_LEN>() else {
+        return false;
+    };
+    begin.tx == tx
+        && usize::try_from(begin.body_len).is_ok_and(|n| n == body.len())
+        && crc32fast::hash(body) == begin.body_crc
+        && frame[..4] == ((COMMIT_FRAME_LEN - 4) as u32).to_le_bytes()
+        && frame[4] == KIND_COMMIT
+        && frame[13..21] == tx.to_le_bytes()
+        && frame[21..] == checksum.to_le_bytes()
 }
 
 /// The first half of judging the transaction at the start of `rest`

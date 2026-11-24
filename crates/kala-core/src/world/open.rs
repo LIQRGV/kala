@@ -2,6 +2,7 @@
 //! same validation a live write gets.
 
 use super::*;
+use std::time::Duration;
 
 /// Replay state spanning one transaction after the genesis, for the rules a
 /// single entry can't check on its own.
@@ -228,11 +229,14 @@ impl World {
     /// tx#0, and the file and its directory are fsynced. Like an in-memory
     /// world, the new world's [`latest_tx`](World::latest_tx) is `TxId(0)`.
     ///
-    /// The world holds an exclusive advisory lock on the file for its whole
-    /// lifetime (taken right after creating it, before writing), so a
-    /// [`World::open`] of the same file meanwhile fails with
-    /// [`Error::WorldLocked`]. Advisory means it keeps out other Kala
-    /// worlds, not other programs.
+    /// The file is written under its exclusive advisory lock (taken right
+    /// after creating it, before writing, released when this returns), so a
+    /// [`World::open`] of the same file meanwhile waits for the genesis to
+    /// be whole. Afterwards the world takes the lock only while one of its
+    /// transactions commits (see [`Txn::commit`]): other handles on the
+    /// file, in this process or others, can commit in between, and
+    /// [`World::catch_up`] applies what they wrote. Advisory means it keeps
+    /// out other Kala worlds, not other programs.
     ///
     /// Every later commit is appended to the file and fsynced before it
     /// becomes visible. If an append fails, the commit fails with
@@ -273,10 +277,13 @@ impl World {
     /// sits at another key without directly following its rev's `DELETED`
     /// marker, or lands on a key with a current entry, ...).
     ///
-    /// The file is locked exclusively (an advisory lock, held for the
-    /// world's lifetime) before it is read. If another world holds the lock
-    /// this fails with [`Error::WorldLocked`] and the file is untouched: no
-    /// cut, no quarantine.
+    /// The file is locked exclusively (an advisory lock) before it is read
+    /// and until this returns: the scan and any cut happen under it. If
+    /// another handle holds the lock (a commit, an open or a cut in
+    /// progress) this waits for it up to 5 seconds (see
+    /// [`World::open_waiting`]), then fails with [`Error::WorldLocked`], the
+    /// file untouched: no cut, no quarantine. The opened world takes the
+    /// lock again only while one of its transactions commits.
     ///
     /// A torn tail (a last transaction cut short by a crash mid-append, or a
     /// zero-filled tail) or a damaged one (a last transaction whose bytes
@@ -291,7 +298,7 @@ impl World {
     /// Any other damage, in any transaction, is [`Error::Corrupt`] instead,
     /// with the file untouched.
     pub fn open(path: &Path) -> Result<World, Error> {
-        Self::open_with(path, true)
+        Self::open_with(path, true, log::DEFAULT_BUSY_TIMEOUT)
     }
 
     /// Like [`World::open`], but a *damaged* last transaction (see
@@ -303,11 +310,29 @@ impl World {
     /// write); then [`World::open`] and [`World::acknowledge_recovery`].
     /// Clean logs and torn tails open exactly as with [`World::open`].
     pub fn open_refusing_damaged(path: &Path) -> Result<World, Error> {
-        Self::open_with(path, false)
+        Self::open_with(path, false, log::DEFAULT_BUSY_TIMEOUT)
     }
 
-    fn open_with(path: &Path, cut_damaged: bool) -> Result<World, Error> {
-        let (mut world, writer, recovery) = LogWriter::open(path, World::replay, cut_damaged)?;
+    /// [`World::open`], waiting up to `busy_timeout` (instead of the default
+    /// 5 s) for the writer lock the open needs; zero means one attempt. The
+    /// world's commits then wait as long (see
+    /// [`World::set_busy_timeout`]).
+    pub fn open_waiting(path: &Path, busy_timeout: Duration) -> Result<World, Error> {
+        Self::open_with(path, true, busy_timeout)
+    }
+
+    /// [`World::open_refusing_damaged`] with [`World::open_waiting`]'s
+    /// bounded wait for the writer lock.
+    pub fn open_refusing_damaged_waiting(
+        path: &Path,
+        busy_timeout: Duration,
+    ) -> Result<World, Error> {
+        Self::open_with(path, false, busy_timeout)
+    }
+
+    fn open_with(path: &Path, cut_damaged: bool, busy_timeout: Duration) -> Result<World, Error> {
+        let (mut world, writer, recovery) =
+            LogWriter::open(path, World::replay, cut_damaged, busy_timeout)?;
         world.journal.attach_log(writer);
         world.gate = WriteGate::after_recovery(recovery);
         Ok(world)
@@ -317,12 +342,11 @@ impl World {
     /// a snapshot of its committed transactions at the moment of the call,
     /// replayed exactly as [`World::open`] replays them, so every read
     /// answers as a `World::open` of the same bytes would. Commits appended
-    /// to the file afterwards (by a writer world) are not seen; open again
-    /// to see them.
+    /// to the file afterwards (by a writer world) are not seen until
+    /// [`World::catch_up`] is called (or the world is opened again).
     ///
-    /// Takes no lock, so it succeeds while another world (from
-    /// [`World::open`] or [`World::create`]) holds the file, and it never
-    /// keeps a writer out. It never modifies the file system: a torn or
+    /// Takes no lock, so it succeeds while a writer holds the file's lock
+    /// (a commit in progress), and it never keeps a writer out. It never modifies the file system: a torn or
     /// damaged tail is left in the file and only left out in memory, and
     /// [`World::recovery`] reports what `World::open` would cut
     /// (`bytes_cut`, `cause`) with `quarantine: None`.
@@ -340,7 +364,10 @@ impl World {
     /// [`Error::Corrupt`] for any damage other than a torn or damaged tail.
     pub fn open_read_only(path: &Path) -> Result<World, Error> {
         let (mut world, recovery, tip) = LogWriter::read_committed(path, World::replay)?;
-        world.journal.set_read_tip(tip);
+        world.journal.set_reader(Some(LogReader {
+            path: path.to_owned(),
+            tip,
+        }));
         world.gate = WriteGate::read_only(recovery);
         Ok(world)
     }

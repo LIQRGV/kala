@@ -200,10 +200,14 @@ pub enum Error {
     UnsupportedVersion(u32),
     /// The log file is damaged in a way that isn't a torn tail.
     Corrupt(String),
-    /// The log file is already open in another [`World`](crate::World)
-    /// (in this process or another one): it holds the file's exclusive
-    /// lock. The lock is advisory, so it only keeps out other Kala worlds,
-    /// not other programs writing the file.
+    /// The log file's exclusive lock is held by another
+    /// [`World`](crate::World) handle (in this process or another one) and
+    /// stayed held for the whole busy timeout
+    /// ([`World::set_busy_timeout`](crate::World::set_busy_timeout)): a
+    /// commit, an open or a recovery cut is in progress there. Nothing was
+    /// written; trying again later is safe. The lock is advisory, so it
+    /// only keeps out other Kala worlds, not other programs writing the
+    /// file.
     WorldLocked,
     /// [`World::open`](crate::World::open) cut a *damaged* tail off the log
     /// (a committed-looking last transaction whose checksum fails; see
@@ -225,6 +229,29 @@ pub enum Error {
     /// (a no-op included) is refused and nothing is appended to the log.
     /// Open the world with [`World::open`](crate::World::open) to write.
     ReadOnly,
+    /// The log file is no longer the log this handle applied: it is shorter
+    /// than the handle's last transaction, that transaction's bytes no
+    /// longer carry the chained checksum the handle recorded, the header
+    /// changed, or the path now names another file. Another process cut a
+    /// tail this handle had applied (a recovery or an fsync-failure
+    /// truncation) and possibly wrote on, or the file was replaced. Found by
+    /// [`World::catch_up`](crate::World::catch_up) or a commit; from then on
+    /// the handle refuses every catch-up and every write with this error
+    /// (its reads keep answering from what it had applied, which the file
+    /// no longer backs). Reopen the world.
+    LogDiverged,
+    /// A commit found that other transactions were appended to the log
+    /// since this transaction began (`applied` of them; this handle has now
+    /// applied them). Nothing was written. Begin a new transaction on the
+    /// caught-up world and run the writes again.
+    ///
+    /// A placeholder of the per-transaction lock (slice 15b, stage 2): the
+    /// conflict check that lets a transaction commit over newer commits it
+    /// doesn't conflict with replaces it.
+    SnapshotStale {
+        /// How many transactions were appended since this one began.
+        applied: usize,
+    },
 }
 
 impl fmt::Display for Error {
@@ -387,6 +414,15 @@ impl fmt::Display for Error {
                  (World::acknowledge_recovery) before writing",
             ),
             Error::ReadOnly => f.write_str("world is open read-only; writes are refused"),
+            Error::LogDiverged => f.write_str(
+                "the log file is no longer the log this world applied (it was cut, rewritten \
+                 or replaced by another process); reopen the world",
+            ),
+            Error::SnapshotStale { applied } => write!(
+                f,
+                "the world changed since this transaction began ({applied} newer \
+                 transaction(s)); nothing was written, run the transaction again"
+            ),
         }
     }
 }

@@ -239,9 +239,13 @@ fn reads_on_a_zero_filled_tail_are_the_valid_prefix_as_open_gives() {
 fn succeeds_while_a_writer_world_holds_the_file() {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("w.kala");
-    let held = load_fixture_to(VARROW, &p).expect("fixture world, lock held");
+    let held = load_fixture_to(VARROW, &p).expect("fixture world");
+    // Slice 15b: a writer world holds the lock only while it commits, so
+    // the lock is held here the way a commit in progress holds it.
+    let lock = std::fs::File::open(&p).unwrap();
+    lock.try_lock().expect("the lock is free");
     assert_eq!(
-        World::open(&p).unwrap_err(),
+        World::open_waiting(&p, std::time::Duration::ZERO).unwrap_err(),
         Error::WorldLocked,
         "precondition"
     );

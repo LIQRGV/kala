@@ -10,8 +10,11 @@
 //!   LAST txn (nothing valid after it) is also cut, as `CutCause::Damaged`.
 //! - H1(b): before cutting a torn tail, `open` writes the cut bytes to
 //!   `<path>.torn-<valid_len>` (`-1`, `-2`, ... if it exists), then cuts.
-//! - H2: `World::create` / `World::open` hold an exclusive lock for the
-//!   World's lifetime; a second `open` -> `Err(Error::WorldLocked)`.
+//! - H2: writers exclude each other through an exclusive lock on the log
+//!   file. Since slice 15b the lock is held per commit (and for an open or
+//!   a recovery cut), not for a World's lifetime: while it is held, an
+//!   `open` -> `Err(Error::WorldLocked)` and nothing is cut. The tests hold
+//!   the lock explicitly, as a commit in progress in another process does.
 //!   `read_log` takes no lock.
 
 use kala_core::log::read_log;
@@ -70,6 +73,22 @@ fn txns(bytes: &[u8]) -> Vec<Vec<(usize, usize)>> {
 
 fn open_err(path: &Path) -> Error {
     match World::open(path) {
+        Err(e) => e,
+        Ok(_) => panic!("open unexpectedly succeeded"),
+    }
+}
+
+/// Holds the log file's writer lock the way a commit in progress in another
+/// process does. Dropping the file releases it.
+fn hold_lock(path: &Path) -> std::fs::File {
+    let f = std::fs::File::open(path).expect("open the log");
+    f.try_lock().expect("the lock is free");
+    f
+}
+
+/// An open that doesn't wait for the lock.
+fn open_now_err(path: &Path) -> Error {
+    match World::open_waiting(path, std::time::Duration::ZERO) {
         Err(e) => e,
         Ok(_) => panic!("open unexpectedly succeeded"),
     }
@@ -470,12 +489,21 @@ fn t4_read_log_ignores_zero_tail() {
 
 #[test]
 fn h2_second_open_while_created_world_alive_is_locked() {
+    // Slice 15b: a created world holds the lock only while it works, so
+    // what excludes the second open is the lock itself, held here as a
+    // commit in progress would hold it.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("world.kala");
     let first = World::create(&path, schema()).unwrap();
     let before = std::fs::read(&path).unwrap();
-    assert_eq!(open_err(&path), Error::WorldLocked);
+    let held = hold_lock(&path);
+    assert_eq!(open_now_err(&path), Error::WorldLocked);
     assert_eq!(std::fs::read(&path).unwrap(), before);
+    drop(held);
+    assert!(
+        World::open(&path).is_ok(),
+        "open while the idle creator lives"
+    );
     drop(first);
     assert!(World::open(&path).is_ok(), "open after drop must succeed");
 }
@@ -488,8 +516,10 @@ fn h2_second_open_while_opened_world_alive_is_locked() {
         .ok()
         .unwrap();
     let before = std::fs::read(&path).unwrap();
-    assert_eq!(open_err(&path), Error::WorldLocked);
+    let held = hold_lock(&path);
+    assert_eq!(open_now_err(&path), Error::WorldLocked);
     assert_eq!(std::fs::read(&path).unwrap(), before);
+    drop(held);
     drop(first);
     let again = World::open(&path)
         .map_err(|e| panic!("{e:?}"))
@@ -505,13 +535,16 @@ fn h2_locked_open_does_not_cut_a_torn_tail() {
         .map_err(|e| panic!("{e:?}"))
         .ok()
         .unwrap();
-    // A second handle must not truncate or quarantine behind the first's back.
+    // A second handle must not truncate or quarantine behind the back of
+    // whoever holds the lock.
     let mut bytes = std::fs::read(&path).unwrap();
     bytes.extend_from_slice(&[0xEE; 6]);
     std::fs::write(&path, &bytes).unwrap();
-    assert_eq!(open_err(&path), Error::WorldLocked);
+    let held = hold_lock(&path);
+    assert_eq!(open_now_err(&path), Error::WorldLocked);
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
     assert!(quarantine_files(&path).is_empty());
+    drop(held);
     drop(first);
 }
 

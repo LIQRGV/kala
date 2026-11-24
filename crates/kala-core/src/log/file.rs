@@ -14,8 +14,8 @@ use crate::error::Error;
 /// and reads at most the length the opened file had (a snapshot: bytes a
 /// writer appends meanwhile are left for the next read).
 pub(crate) fn read_log_file(path: &Path) -> Result<Vec<u8>, Error> {
-    let mut file = open_regular(path, OpenOptions::new().read(true))?;
-    read_to_len(&mut file)
+    let file = open_regular(path, OpenOptions::new().read(true))?;
+    read_to_len(&file)
 }
 
 /// Opens `path` with `opts`, refusing anything but a regular file (after
@@ -77,7 +77,7 @@ fn refuse_non_regular(meta: &std::fs::Metadata) -> Result<(), Error> {
 /// endless length) can't make this read without bound. The buffer is
 /// reserved fallibly, so a length too big for memory is an error, not an
 /// abort.
-pub(super) fn read_to_len(file: &mut File) -> Result<Vec<u8>, Error> {
+pub(super) fn read_to_len(file: &File) -> Result<Vec<u8>, Error> {
     let len = file.metadata()?.len();
     let too_big = || {
         Error::from(std::io::Error::new(

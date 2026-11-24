@@ -17,14 +17,24 @@ pub enum LogFault {
     FailNextSync,
     /// The next append's write fails before any byte is written.
     FailNextWrite,
+    /// The next commit panics right after taking the writer lock, before
+    /// anything is appended.
+    PanicAfterLock,
+    /// The next commit aborts the whole process right after taking the
+    /// writer lock, before anything is appended: a writer that dies.
+    AbortAfterLock,
 }
 
 /// Faults injected by tests, consumed by the next append that reaches
-/// them. Both `false` in normal use.
+/// them. All `false` in normal use.
 #[derive(Debug, Default)]
 pub(super) struct ArmedFaults {
     fail_next_write: bool,
     fail_next_sync: bool,
+    /// The next commit panics once it holds the lock.
+    panic_after_lock: bool,
+    /// The next commit aborts the process once it holds the lock.
+    abort_after_lock: bool,
 }
 
 impl ArmedFaults {
@@ -35,6 +45,18 @@ impl ArmedFaults {
             return Err(injected("write"));
         }
         Ok(())
+    }
+
+    /// Called once a commit holds the writer lock, before it reads or
+    /// appends anything: panics (once) or aborts the process if such a
+    /// fault is armed.
+    pub(super) fn after_lock(&mut self) {
+        if std::mem::take(&mut self.abort_after_lock) {
+            std::process::abort();
+        }
+        if std::mem::take(&mut self.panic_after_lock) {
+            panic!("injected log fault: panic under the writer lock");
+        }
     }
 
     /// Called before an append's fsync: `Err` (once) if a sync fault is
@@ -59,6 +81,8 @@ impl LogWriter {
         match fault {
             LogFault::FailNextWrite => self.faults.fail_next_write = true,
             LogFault::FailNextSync => self.faults.fail_next_sync = true,
+            LogFault::PanicAfterLock => self.faults.panic_after_lock = true,
+            LogFault::AbortAfterLock => self.faults.abort_after_lock = true,
         }
     }
 }
