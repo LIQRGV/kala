@@ -363,6 +363,15 @@ impl Catalog {
         {
             return Err(Error::Schema("schema setting must be :strict or :infer; setting keys and values must be nonempty".into()));
         }
+        // The world's concurrency mode. Optimistic is also what an unset
+        // world uses; weak is chosen per transaction, never here.
+        if key == "concurrency" && value != "optimistic" {
+            return Err(Error::Schema(if value == "pessimistic" {
+                "concurrency setting :pessimistic is not supported yet; the only mode is :optimistic".into()
+            } else {
+                "concurrency setting must be :optimistic (weak is chosen per transaction)".into()
+            }));
+        }
         if self.setting(key) == Some(value) {
             return Err(Error::Schema("a setting no-op is not a log entry".into()));
         }

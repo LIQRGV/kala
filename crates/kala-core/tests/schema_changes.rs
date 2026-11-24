@@ -1338,18 +1338,18 @@ fn world_settings_and_node_origins_are_read_per_canon_and_survive_reopen() {
     let mut tx = world.begin();
     tx.infer_node_type("FACTION").unwrap();
     tx.world_setting("schema", "strict").unwrap();
-    tx.world_setting("concurrency", "weak").unwrap();
+    tx.world_setting("tick_unit", "day").unwrap();
     let first = tx.commit().unwrap().tx;
     let mut tx = world.begin();
     tx.declare_node_type("FACTION").unwrap();
     tx.world_setting("schema", "infer").unwrap();
-    tx.world_setting("concurrency", "optimistic").unwrap();
+    tx.world_setting("tick_unit", "hour").unwrap();
     let second = tx.commit().unwrap().tx;
     let reopened = World::open_read_only(&path).unwrap();
     for world in [&world, &reopened] {
         let genesis = world.at_canon(TxId(0));
         assert_eq!(genesis.settings().get("schema"), Some(&"infer"));
-        assert!(!genesis.settings().contains_key("concurrency"));
+        assert!(!genesis.settings().contains_key("tick_unit"));
         assert!(
             !genesis
                 .node_type_definitions()
@@ -1357,7 +1357,7 @@ fn world_settings_and_node_origins_are_read_per_canon_and_survive_reopen() {
         );
         let inferred = world.at_canon(first);
         assert_eq!(inferred.settings().get("schema"), Some(&"strict"));
-        assert_eq!(inferred.settings().get("concurrency"), Some(&"weak"));
+        assert_eq!(inferred.settings().get("tick_unit"), Some(&"day"));
         assert!(
             inferred
                 .node_type_definitions()
@@ -1365,7 +1365,7 @@ fn world_settings_and_node_origins_are_read_per_canon_and_survive_reopen() {
         );
         let declared = world.at_canon(second);
         assert_eq!(declared.settings().get("schema"), Some(&"infer"));
-        assert_eq!(declared.settings().get("concurrency"), Some(&"optimistic"));
+        assert_eq!(declared.settings().get("tick_unit"), Some(&"hour"));
         assert!(
             declared
                 .node_type_definitions()
@@ -1374,7 +1374,7 @@ fn world_settings_and_node_origins_are_read_per_canon_and_survive_reopen() {
     }
     let mut tx = world.begin();
     tx.world_setting("schema", "infer").unwrap();
-    tx.world_setting("concurrency", "optimistic").unwrap();
+    tx.world_setting("tick_unit", "hour").unwrap();
     let same = tx.commit().unwrap();
     assert_eq!(same.tx, second);
     assert!(same.schema.is_empty());
