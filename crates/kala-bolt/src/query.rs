@@ -5,8 +5,7 @@ use crate::packstream::{self, Value};
 use kala_core::{
     Cardinality, EntityId, MeteredView, Tick, Value as CoreValue, ValueType, WorkMeter, World,
 };
-use kala_datalog::ParamKind;
-use kala_query::{Datum, Limits, QueryError, QueryParams};
+use kala_query::{Datum, Limits, ParamKind, QueryError, QueryParams};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::AtomicBool;
 

@@ -120,79 +120,128 @@ pub fn run(args: &UserArgs) -> Result<String, CliError> {
     };
     // Checked before a password is read, so a typo costs no prompt.
     require_directory(dir)?;
-    let report = match command {
+    match command {
         UserCommand::Add {
             account,
             credentials,
             write,
             ..
-        }
-        | UserCommand::Set {
+        } => add(dir, account, credentials, write),
+        UserCommand::Set {
             account,
             credentials,
             write,
             ..
-        } => {
-            let password = password(credentials)?;
-            let password = password.as_ref().map(Credentials::expose);
-            let change = if matches!(command, UserCommand::Add { .. }) {
-                Change::Add { account, password }
-            } else {
-                Change::Set { account, password }
-            };
-            system::apply(dir, change, recovery(write))
-        }
+        } => set(dir, account, credentials, write),
         UserCommand::Grant {
             account,
             privilege,
             database,
             write,
             ..
-        } => system::apply(
-            dir,
-            Change::Grant {
-                account,
-                privilege,
-                db: database,
-            },
-            recovery(write),
-        ),
+        } => grant(dir, account, privilege, database, write),
         UserCommand::Revoke {
             account,
             privilege,
             database,
             write,
             ..
-        } => system::apply(
-            dir,
-            Change::Revoke {
-                account,
-                privilege,
-                db: database,
-            },
-            recovery(write),
-        ),
-        UserCommand::Drop { account, write, .. } => {
-            system::apply(dir, Change::Drop { account }, recovery(write))
-        }
-        UserCommand::List { .. } => {
-            let accounts = system::list(dir).map_err(|e| system_error(dir, e))?;
-            let mut out = String::new();
-            for account in accounts {
-                use std::fmt::Write;
-                let _ = writeln!(
-                    out,
-                    "{}@{} {} {}",
-                    account.user,
-                    account.host,
-                    account.plugin,
-                    account.grants.join(" ")
-                );
-            }
-            return Ok(out);
-        }
+        } => revoke(dir, account, privilege, database, write),
+        UserCommand::Drop { account, write, .. } => drop_account(dir, account, write),
+        UserCommand::List { .. } => list(dir),
+    }
+}
+
+fn add(
+    dir: &Path,
+    account: &str,
+    credentials: &UserCredentials,
+    write: &UserWrite,
+) -> Result<String, CliError> {
+    let report = {
+        let password = password(credentials)?;
+        let password = password.as_ref().map(Credentials::expose);
+        system::apply(dir, Change::Add { account, password }, recovery(write))
     };
+    applied(dir, report)
+}
+
+fn set(
+    dir: &Path,
+    account: &str,
+    credentials: &UserCredentials,
+    write: &UserWrite,
+) -> Result<String, CliError> {
+    let report = {
+        let password = password(credentials)?;
+        let password = password.as_ref().map(Credentials::expose);
+        system::apply(dir, Change::Set { account, password }, recovery(write))
+    };
+    applied(dir, report)
+}
+
+fn grant(
+    dir: &Path,
+    account: &str,
+    privilege: &str,
+    database: &str,
+    write: &UserWrite,
+) -> Result<String, CliError> {
+    let report = system::apply(
+        dir,
+        Change::Grant {
+            account,
+            privilege,
+            db: database,
+        },
+        recovery(write),
+    );
+    applied(dir, report)
+}
+
+fn revoke(
+    dir: &Path,
+    account: &str,
+    privilege: &str,
+    database: &str,
+    write: &UserWrite,
+) -> Result<String, CliError> {
+    let report = system::apply(
+        dir,
+        Change::Revoke {
+            account,
+            privilege,
+            db: database,
+        },
+        recovery(write),
+    );
+    applied(dir, report)
+}
+
+fn drop_account(dir: &Path, account: &str, write: &UserWrite) -> Result<String, CliError> {
+    let report = system::apply(dir, Change::Drop { account }, recovery(write));
+    applied(dir, report)
+}
+
+fn applied(dir: &Path, report: Applied) -> Result<String, CliError> {
     warn_recovered(dir, &report);
     let report = report.result.map_err(|e| system_error(dir, e))?;
     Ok(format!("{report}\n"))
+}
+
+fn list(dir: &Path) -> Result<String, CliError> {
+    let accounts = system::list(dir).map_err(|e| system_error(dir, e))?;
+    let mut out = String::new();
+    for account in accounts {
+        use std::fmt::Write;
+        let _ = writeln!(
+            out,
+            "{}@{} {} {}",
+            account.user,
+            account.host,
+            account.plugin,
+            account.grants.join(" ")
+        );
+    }
+    Ok(out)
 }

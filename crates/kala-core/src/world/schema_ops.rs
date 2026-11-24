@@ -571,7 +571,7 @@ impl Txn<'_> {
             if txn.world.attribute(name).is_some() { return Ok(()); }
             check_new_name(name)?;
             let ty = value.value_type();
-            if txn.world.world_setting("schema") == Some("strict") { return Err(Error::Schema(format!("attribute {:?} is not in the schema; declare it first: [:attribute :{} :{}]", name,name,type_name(ty)))); }
+            if txn.world.world_setting("schema") == Some("strict") { return Err(Error::Schema(format!("attribute {:?} is not in the schema; declare it first: [:attribute :{} :{}]", name,name,ty.name()))); }
             if let Value::Str(value) = value && value.len() > crate::MAX_INDEXED_STRING_BYTES { return Err(Error::Schema(format!("string over 256 bytes for an indexed attribute; declare it first: [:attribute :{} :string :unindexed]", name))); }
             let mut def = AttrDef::new(name,ty,Kind::State,if ty == ValueType::Ref { Cardinality::Many } else { Cardinality::One });
             def.inferred = true;
@@ -885,11 +885,6 @@ impl Txn<'_> {
             )
         })
     }
-}
-
-/// The stable spelling shared by write reports and explicit schema forms.
-pub fn type_name(ty: ValueType) -> &'static str {
-    ty.name()
 }
 
 impl<'w> View<'w> {
