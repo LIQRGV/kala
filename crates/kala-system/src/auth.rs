@@ -446,10 +446,17 @@ impl AccountVerifier {
         }
     }
 }
+#[cfg(test)]
+thread_local! {
+    /// How many passwords this thread has hashed (see `system::tests`).
+    pub(crate) static HASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 pub(crate) fn hash_password(password: &str) -> Result<Credentials, SystemError> {
     if password.is_empty() {
         return Err(SystemError::EmptyPassword);
     }
+    #[cfg(test)]
+    HASHED.with(|n| n.set(n.get() + 1));
     hash_bytes(password.as_bytes())
 }
 fn hash_bytes(password: &[u8]) -> Result<Credentials, SystemError> {

@@ -563,27 +563,50 @@ pub fn apply_waiting(
     // and it is decided again from the accounts as they are now. Bounded:
     // past it the caller sees `Busy` ("retry the command").
     const CONFLICT_RETRIES: usize = 16;
+    // What a change needs that doesn't depend on the accounts as read is
+    // made once, before the first attempt: above all the password's hash
+    // (argon2 is slow on purpose, and its salt is random: every attempt
+    // writes this one hash). As before, a bad account name or password
+    // fails here, before the system world is opened or created.
+    let secret = match &change {
+        Change::Add { account, password } | Change::Set { account, password } => {
+            match Secret::new(account, *password) {
+                Ok(secret) => Some(secret),
+                Err(e) => {
+                    return Applied {
+                        recovered: None,
+                        result: Err(e),
+                    };
+                }
+            }
+        }
+        _ => None,
+    };
     let mut attempt = 0;
     let result = loop {
         open.conflicted = false;
-        let result = match &change {
-            Change::Add { account, password } => {
-                add_inner(directory, account, *password, &mut open)
-            }
-            Change::Set { account, password } => {
-                set_inner(directory, account, *password, &mut open)
-            }
-            Change::Grant {
-                account,
-                privilege,
-                db,
-            } => change_grant(directory, account, privilege, db, true, &mut open),
-            Change::Revoke {
-                account,
-                privilege,
-                db,
-            } => change_grant(directory, account, privilege, db, false, &mut open),
-            Change::Drop { account } => drop_inner(directory, account, &mut open),
+        let result = match (&change, &secret) {
+            (Change::Add { .. }, Some(secret)) => add_inner(directory, secret, &mut open),
+            (Change::Set { .. }, Some(secret)) => set_inner(directory, secret, &mut open),
+            // `secret` is made for exactly these two changes, above.
+            (Change::Add { .. } | Change::Set { .. }, None) => Err(SystemError::InvalidSystem),
+            (
+                Change::Grant {
+                    account,
+                    privilege,
+                    db,
+                },
+                _,
+            ) => change_grant(directory, account, privilege, db, true, &mut open),
+            (
+                Change::Revoke {
+                    account,
+                    privilege,
+                    db,
+                },
+                _,
+            ) => change_grant(directory, account, privilege, db, false, &mut open),
+            (Change::Drop { account }, _) => drop_inner(directory, account, &mut open),
         };
         if open.conflicted && attempt < CONFLICT_RETRIES {
             attempt += 1;
@@ -594,6 +617,24 @@ pub fn apply_waiting(
     Applied {
         recovered: open.recovered,
         result,
+    }
+}
+/// An account's new authentication, made once for all attempts of an add or
+/// a set: the parsed name, the plugin and the password's hash.
+struct Secret {
+    name: AccountName,
+    plugin: Plugin,
+    password: Option<Credentials>,
+}
+impl Secret {
+    fn new(account: &str, password: Option<&str>) -> Result<Secret, SystemError> {
+        let name = AccountName::parse(account)?;
+        let (plugin, password) = authentication(&name, password)?;
+        Ok(Secret {
+            name,
+            plugin,
+            password,
+        })
     }
 }
 /// How [`writer`] may recover the log, and what it cut.
@@ -624,6 +665,8 @@ fn begin<'w>(world: &'w mut World, tick: Tick, open: &mut Open) -> Result<Txn<'w
 }
 /// Commits an account change begun with [`begin`].
 fn commit(txn: Txn<'_>, open: &mut Open) -> Result<kala_core::CommitResult, SystemError> {
+    #[cfg(test)]
+    tests::before_commit();
     txn.commit().map_err(|e| {
         open.conflicted = matches!(e, kala_core::Error::Conflict(_));
         store(e)
@@ -710,12 +753,14 @@ pub fn add(
 }
 fn add_inner(
     directory: &Path,
-    account: &str,
-    password: Option<&str>,
+    secret: &Secret,
     open: &mut Open,
 ) -> Result<WriteReport, SystemError> {
-    let name = AccountName::parse(account)?;
-    let (plugin, password) = authentication(&name, password)?;
+    let Secret {
+        name,
+        plugin,
+        password,
+    } = secret;
     let mut world = writer(directory, open)?;
     if find(&read_accounts(&world)?, &name).is_some() {
         return Err(SystemError::AccountExists);
@@ -787,12 +832,14 @@ pub fn set(
 }
 fn set_inner(
     directory: &Path,
-    account: &str,
-    password: Option<&str>,
+    secret: &Secret,
     open: &mut Open,
 ) -> Result<WriteReport, SystemError> {
-    let name = AccountName::parse(account)?;
-    let (plugin, password) = authentication(&name, password)?;
+    let Secret {
+        name,
+        plugin,
+        password,
+    } = secret;
     let mut world = writer(directory, open)?;
     let accounts = read_accounts(&world)?;
     let old = find(&accounts, &name).ok_or(SystemError::AccountNotFound)?;
@@ -965,4 +1012,66 @@ fn drop_inner(
         changed: committed.changed,
         tick,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// Run once, right before this thread's next account change
+        /// commits: what another process could commit at that moment.
+        static BEFORE_COMMIT: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn before_commit() {
+        let hook = BEFORE_COMMIT.with(|hook| hook.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn hashed() -> usize {
+        crate::auth::HASHED.with(std::cell::Cell::get)
+    }
+
+    /// PR #20 review, item M: a change that loses to another account
+    /// change is decided again, but its password is hashed only once.
+    #[test]
+    fn a_password_is_hashed_once_however_often_the_change_is_decided_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = |account: &'static str| {
+            let directory = dir.path().to_owned();
+            BEFORE_COMMIT.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    // Trust on loopback: no password, so no hash of its own.
+                    add(&directory, account, None).unwrap();
+                }));
+            });
+        };
+        let before = hashed();
+        other("bob@localhost");
+        add(dir.path(), "alice@localhost", Some("correct horse")).unwrap();
+        assert_eq!(hashed() - before, 1, "add: decided twice, hashed once");
+        other("carol@localhost");
+        set(dir.path(), "alice@localhost", Some("battery staple")).unwrap();
+        assert_eq!(hashed() - before, 2, "set: decided twice, hashed once");
+        // Both racing changes and both of ours are there.
+        let names: Vec<String> = list(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|a| format!("{}@{}", a.user, a.host))
+            .collect();
+        for account in ["alice@localhost", "bob@localhost", "carol@localhost"] {
+            assert!(names.iter().any(|n| n == account), "{names:?}");
+        }
+        // Errors that need no world still come before anything is opened.
+        let fresh = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            add(fresh.path(), "dave@localhost", Some("")),
+            Err(SystemError::EmptyPassword)
+        ));
+        assert!(!fresh.path().join("system.kala").exists());
+    }
 }
