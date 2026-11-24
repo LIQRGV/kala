@@ -55,6 +55,85 @@ fn bootstrap(dir: &Path) {
     assert!(dir.join("system.kala").is_file());
 }
 
+fn invalid_account_precedes_password(action: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let output = user(
+        dir.path(),
+        action,
+        &["bad account name", "--password-stdin"],
+        None,
+    );
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("account must be USER@HOST"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!stderr(&output).contains("password must contain"));
+    assert!(!dir.path().join("system.kala").exists());
+}
+
+#[test]
+fn user_add_invalid_account_precedes_empty_password() {
+    invalid_account_precedes_password("add");
+}
+
+#[test]
+fn user_set_invalid_account_precedes_empty_password() {
+    invalid_account_precedes_password("set");
+}
+
+#[test]
+fn valid_account_with_empty_stdin_keeps_password_error() {
+    for action in ["add", "set"] {
+        let dir = tempfile::tempdir().unwrap();
+        let output = user(
+            dir.path(),
+            action,
+            &["nosuch@localhost", "--password-stdin"],
+            None,
+        );
+        assert_eq!(code(&output), 1, "{}", stderr(&output));
+        assert!(
+            stderr(&output).contains("password must contain 1 to 4096 bytes"),
+            "{}",
+            stderr(&output)
+        );
+        assert!(!dir.path().join("system.kala").exists());
+    }
+}
+
+#[test]
+fn invalid_account_with_trust_keeps_syntax_error() {
+    for action in ["add", "set"] {
+        let dir = tempfile::tempdir().unwrap();
+        let output = user(dir.path(), action, &["bad account name", "--trust"], None);
+        assert_eq!(code(&output), 1, "{}", stderr(&output));
+        assert_eq!(
+            stderr(&output).trim(),
+            "kala: error: account must be USER@HOST with a nonempty ASCII user name of at most 64 bytes"
+        );
+    }
+}
+
+#[test]
+fn user_set_unknown_account_is_checked_after_reading_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = user(
+        dir.path(),
+        "set",
+        &["nosuch@localhost", "--password-stdin"],
+        Some(&format!("{SECRET}\n")),
+    );
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("account was not found"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(dir.path().join("system.kala").is_file());
+}
+
 #[test]
 fn user_commands_manage_password_trust_grants_and_drop() {
     let dir = tempfile::tempdir().unwrap();
