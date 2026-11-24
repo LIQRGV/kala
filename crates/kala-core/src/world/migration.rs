@@ -645,7 +645,13 @@ impl World {
         };
         // Replay regenerates the copy on the world as replayed so far: no
         // look at the file (this may itself be a catch-up in progress).
+        // Nor is it a write: a handle that refuses writes (read-only, an
+        // unacknowledged recovery, a failed log writer) still replays what
+        // others committed, so the write gate isn't asked and nothing is
+        // recorded for a commit that never happens.
         let mut txn = self.begin_without_catch_up();
+        txn.replaying = true;
+        txn.track = false;
         txn.migrate_attribute(&name, options)?;
         let encoded = txn.encode_ordered()?;
         let expected_marker = EntryBody::Schema(SchemaEdit::Migration {
