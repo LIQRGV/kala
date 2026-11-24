@@ -499,6 +499,14 @@ fn path_value(
     for id in path.nodes() {
         budget.step(meter)?;
         if !node_indices.contains_key(id) {
+            // A ref may target an edge, but a Bolt Path's node list holds
+            // only Nodes: drivers would hydrate a Relationship there as a node.
+            if id.as_edge().is_some() {
+                return Err(Failure::new(
+                    EXECUTION,
+                    "a path through an edge entity cannot be returned as a Path; return its nodes and relationships separately",
+                ));
+            }
             budget.charge(128)?;
             node_indices.insert(*id, nodes.len() as i64);
             nodes.push(entity_value(*id, view, tick, meter, budget)?);

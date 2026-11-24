@@ -328,10 +328,7 @@ impl Session<'_> {
     }
     fn route(&self, requested: Option<&str>, impersonate: bool) -> Result<Value, Failure> {
         if impersonate {
-            return Err(Failure::new(
-                crate::error::FORBIDDEN,
-                "impersonation is not supported",
-            ));
+            return Err(Failure::impersonation());
         }
         let db = self.database(requested)?;
         let servers = ["WRITE", "READ", "ROUTE"]
@@ -373,19 +370,37 @@ impl Session<'_> {
         extra: &Map,
         stop: &AtomicBool,
     ) -> Result<Value, Failure> {
+        // Before anything else: a query "as alice" must never run with the
+        // connection's own grants.
+        if crate::message::impersonated(extra)? {
+            return Err(Failure::impersonation());
+        }
         let requested = match extra.get("db") {
             None => None,
             Some(Value::String(s)) => Some(s.as_str()),
             _ => return Err(Failure::invalid()),
         };
         let name = self.registry.name(requested)?.to_owned();
-        let statement = query::server_statement(text, name == "system")?;
-        let metadata_listing = statement
-            .as_ref()
-            .is_some_and(|s| matches!(s.request, kala_lang::ServerRequest::Databases(_)));
-        if !(metadata_listing && name == "system") {
-            self.database(Some(&name))?;
-        }
+        let system = name == "system";
+        // Existence and authorization come before the query text is parsed,
+        // so a caller learns nothing about its text (not even that it is
+        // malformed) on a database it may not read.
+        let statement = match self.database(Some(&name)) {
+            Ok(_) => query::server_statement(text, system)?,
+            // The one exemption: a pure database listing on `system` (where
+            // tools ask for it) reads only registry names and the caller's
+            // own grants, never the system world. Whatever else the text is,
+            // malformed included, gets the database failure.
+            Err(denied) if system => match query::server_statement(text, true) {
+                Ok(Some(statement))
+                    if matches!(statement.request, kala_lang::ServerRequest::Databases(_)) =>
+                {
+                    Some(statement)
+                }
+                _ => return Err(denied),
+            },
+            Err(denied) => return Err(denied),
+        };
         self.started = Instant::now();
         eprintln!(
             "event=bolt_query_started connection_id={} db={name}",
@@ -407,7 +422,7 @@ impl Session<'_> {
                 stop,
                 self.config.max_message_bytes,
                 self.config.max_depth,
-                name == "system",
+                system,
             )?
         } else {
             let (_, world) = self.registry.get(Some(&name))?;

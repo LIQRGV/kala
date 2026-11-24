@@ -89,17 +89,23 @@ impl Message {
                     Some(Value::String(s)) => Some(s.clone()),
                     _ => return Err(Failure::invalid()),
                 };
-                let impersonate = match extra.get("imp_user") {
-                    None | Some(Value::Null) => false,
-                    Some(Value::String(_)) => true,
-                    _ => return Err(Failure::invalid()),
-                };
+                let impersonate = impersonated(&extra)?;
                 Self::Route { db, impersonate }
             }
             (0x12 | 0x13, 0) => Self::Unsupported,
             _ => return Err(Failure::invalid()),
         };
         Ok(msg)
+    }
+}
+/// Whether a ROUTE or RUN `extra` map asks to act as another user
+/// (`imp_user`). Absent or null is no; anything but a string is invalid.
+/// One check for both messages, so neither can accept what the other refuses.
+pub(crate) fn impersonated(extra: &Map) -> Result<bool, Failure> {
+    match extra.get("imp_user") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::String(_)) => Ok(true),
+        _ => Err(Failure::invalid()),
     }
 }
 fn map(value: Option<Value>) -> Result<Map, Failure> {

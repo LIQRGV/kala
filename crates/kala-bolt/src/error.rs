@@ -24,6 +24,11 @@ impl Failure {
     pub fn invalid() -> Self {
         Self::new(INVALID, "invalid Bolt message or session state")
     }
+    /// `imp_user` on ROUTE or RUN: Kala has no impersonation, and running
+    /// the request with the connection's own grants would fail open.
+    pub fn impersonation() -> Self {
+        Self::new(FORBIDDEN, "impersonation is not supported")
+    }
     pub fn value(self) -> Value {
         Value::Structure(
             0x7f,
