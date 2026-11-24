@@ -124,6 +124,10 @@ pub enum Finding {
     /// A transaction whose body checksum or `Commit` checksum doesn't match
     /// (or, at a begin record whose own checksum fails and isn't a
     /// zero-filled tail, the transaction expected there). It is skipped.
+    /// The `Commit` checksum is chained (see "The checksum chain" in
+    /// [`crate::log`]), so this is also what a transaction *replaced* by
+    /// another valid one looks like: the finding is at the first
+    /// transaction after it, which no longer continues the log.
     ChecksumMismatch {
         /// The transaction's tx.
         tx: TxId,

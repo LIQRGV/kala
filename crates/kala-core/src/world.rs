@@ -495,6 +495,7 @@ impl World {
         log::encode_txn(
             EntryId(1),
             TxId(0),
+            log::header_checksum(),
             node_types
                 .chain(attrs)
                 .chain(settings.iter().map(NewEntry::Schema)),
@@ -580,6 +581,16 @@ impl World {
     /// What opening the log did to recover it (see [`RecoveryReport`]).
     pub fn recovery(&self) -> &RecoveryReport {
         self.gate.recovery()
+    }
+
+    /// Where this handle's log stands in the file: the last committed
+    /// transaction it has applied, with its byte range and its chained
+    /// checksum. [`log::chain_tip_holds`] re-reads just that transaction to
+    /// tell whether everything this handle applied is still what the file
+    /// holds (another process may have cut and rewritten it). `None` for an
+    /// in-memory world. A failed commit doesn't move it.
+    pub fn chain_tip(&self) -> Option<log::ChainTip> {
+        self.journal.chain_tip()
     }
 
     /// The last committed transaction. Every write that stores a fact

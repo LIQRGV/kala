@@ -710,7 +710,7 @@ impl Crafted {
             body.extend(frame(*k, id, p));
             id += 1;
         }
-        let c = commit_frame(&body, id, self.next_tx);
+        let c = commit_frame(common::link(&self.bytes), &body, id, self.next_tx);
         body.extend(c);
         self.bytes.extend(txn(self.next_tx, &body));
         self.next_entry = id + 1;

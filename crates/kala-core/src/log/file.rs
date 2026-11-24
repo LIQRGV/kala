@@ -2,9 +2,10 @@
 //! bound, and the directory fsync that makes a new file durable.
 
 use std::fs::{File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+use super::format::HEADER_LEN;
 use crate::error::Error;
 
 /// Reads the bytes of the log file at `path`, for the readers that take no
@@ -89,6 +90,47 @@ pub(super) fn read_to_len(file: &mut File) -> Result<Vec<u8>, Error> {
     bytes.try_reserve_exact(cap).map_err(|_| too_big())?;
     file.take(len).read_to_end(&mut bytes)?;
     Ok(bytes)
+}
+
+/// A log file's header and one byte range of it (see [`read_range`]).
+pub(super) struct HeaderAndRange {
+    /// The file's first [`HEADER_LEN`] bytes.
+    pub(super) header: [u8; HEADER_LEN],
+    /// The bytes of the range asked for.
+    pub(super) bytes: Vec<u8>,
+}
+
+/// Reads the file header and the bytes `start..end` of the log file at
+/// `path`; `None` if the file is shorter than `end` or the range is empty,
+/// reversed or starts inside the header. Only a regular file is opened
+/// ([`open_regular`]). The range's length is checked against the file's
+/// real length before anything is reserved, and reserved fallibly.
+pub(super) fn read_range(
+    path: &Path,
+    start: u64,
+    end: u64,
+) -> Result<Option<HeaderAndRange>, Error> {
+    let mut file = open_regular(path, OpenOptions::new().read(true))?;
+    if start < HEADER_LEN as u64 || end <= start || file.metadata()?.len() < end {
+        return Ok(None);
+    }
+    let mut header = [0; HEADER_LEN];
+    file.read_exact(&mut header)?;
+    let Ok(len) = usize::try_from(end - start) else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    if bytes.try_reserve_exact(len).is_err() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            format!("a transaction of {len} bytes doesn't fit in memory"),
+        )
+        .into());
+    }
+    file.seek(SeekFrom::Start(start))?;
+    file.take(end - start).read_to_end(&mut bytes)?;
+    // The file shrank between the length check and the read.
+    Ok((bytes.len() == len).then_some(HeaderAndRange { header, bytes }))
 }
 
 /// Fsyncs the directory holding `path`, so a newly created file's directory

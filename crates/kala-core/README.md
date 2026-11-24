@@ -198,6 +198,14 @@ assert_eq!(world.format_id(greg), "CHARACTER#3");
   `View::edge` / `View::edge_id` see only edges defined up to that canon.
 - `kala_fixture::load_fixture`, `load_fixture_to` (the `kala-fixture` crate):
   build a world from YAML.
+- `World::chain_tip` and `log::chain_tip_holds`: the log's transaction
+  checksums are chained (format 6: each covers the one before, the first the
+  file header), so the last transaction a handle applied (`ChainTip`: its
+  byte range, tx and checksum) stands for its whole history. Re-reading that
+  one transaction tells whether the file still starts with what the handle
+  knows, or was cut and rewritten underneath it. Files of an older format
+  are refused (`Error::UnsupportedVersion`): dump with the older binary,
+  `kala transact --create` with this one.
 - `doctor`, `doctor_log`: the read-only integrity checker (`Report`,
   `Finding`, `Severity`).
 

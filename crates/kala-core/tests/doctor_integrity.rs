@@ -766,12 +766,12 @@ impl Crafted {
         match commit {
             Commit::Missing => {}
             Commit::Good => {
-                let c = commit_frame(&body, id, tx);
+                let c = commit_frame(common::link(&self.bytes), &body, id, tx);
                 body.extend(c);
                 id += 1;
             }
             Commit::BadChecksum => {
-                let mut c = commit_frame(&body, id, tx);
+                let mut c = commit_frame(common::link(&self.bytes), &body, id, tx);
                 let n = c.len();
                 c[n - 1] ^= 0x55;
                 body.extend(c);
@@ -1692,7 +1692,7 @@ fn a_commit_whose_tx_differs_from_its_begin_records_is_an_invalid_entry() {
     let (tx, first) = (c.next_tx, c.next_entry);
     let f = c.good_fact();
     let mut body = frame(f.0, first, &f.1);
-    let commit = commit_frame(&body, first + 1, tx + 50); // valid checksum, wrong tx
+    let commit = commit_frame(common::link(&c.bytes), &body, first + 1, tx + 50); // valid checksum, wrong tx
     body.extend(commit);
     c.bytes.extend(txn(tx, &body));
     let rep = c.report(&opts());

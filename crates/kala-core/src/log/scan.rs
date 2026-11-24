@@ -5,9 +5,10 @@
 
 use super::decode::parse_payload;
 use super::format::{BEGIN_COVERED, BEGIN_LEN, BEGIN_TAG, HEADER_LEN};
-use super::{EntryBody, LOG_FORMAT_VERSION, LOG_MAGIC, LogEntry, MAX_ENTRY_BYTES};
+use super::{ChainTip, EntryBody, LOG_FORMAT_VERSION, LOG_MAGIC, LogEntry, MAX_ENTRY_BYTES};
 use crate::error::Error;
 use crate::world::CutCause;
+use crate::world::TxId;
 
 /// The committed part of a log file, as found by [`scan`].
 pub(super) struct Scan {
@@ -19,6 +20,8 @@ pub(super) struct Scan {
     /// Why the bytes past `valid_len` aren't committed; `None` if there are
     /// none.
     pub(super) cause: Option<CutCause>,
+    /// The last committed transaction; `None` if there is none.
+    pub(super) tip: Option<ChainTip>,
 }
 
 /// Checks the header and returns the bytes after it.
@@ -56,12 +59,16 @@ fn next_frame(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
 /// Transactions are judged one at a time from just past the header, by the
 /// rules in the module docs ("Recovery"). The first one that is torn ends
 /// the valid prefix ([`Scan::valid_len`]); anything else that isn't a
-/// committed transaction is [`Error::Corrupt`].
+/// committed transaction is [`Error::Corrupt`]. The checksum chain is
+/// carried from the header through every transaction, so a transaction that
+/// doesn't continue the log before it is [`Error::Corrupt`] too.
 pub(super) fn scan(bytes: &[u8]) -> Result<Scan, Error> {
     let mut rest = check_header(bytes)?;
     let mut entries = Vec::new();
     let mut next_entry = 1u64;
     let mut next_tx = 0u64;
+    let mut link = super::header_checksum();
+    let mut tip = None;
     let cause = loop {
         let at = bytes.len() - rest.len();
         let (begin, after_begin) = match begin_step(rest) {
@@ -89,7 +96,7 @@ pub(super) fn scan(bytes: &[u8]) -> Result<Scan, Error> {
         let BodyStep::Body {
             verdict,
             rest: after_body,
-        } = body_step(&begin, after_begin)
+        } = body_step(&begin, after_begin, Some(link))
         else {
             break Some(CutCause::Torn);
         };
@@ -115,7 +122,16 @@ pub(super) fn scan(bytes: &[u8]) -> Result<Scan, Error> {
                 )));
             }
         }
-        // Rule 8: committed.
+        // Rule 8: committed. Its checksum (just verified against `link`)
+        // is the link the next transaction chains from.
+        link = commit_checksum(&txn).unwrap_or(link);
+        // In-memory buffer offsets always fit a u64.
+        tip = Some(ChainTip {
+            tx: TxId(begin.tx),
+            offset: at as u64,
+            end: (bytes.len() - after_body.len()) as u64,
+            checksum: link,
+        });
         next_entry += txn.len() as u64;
         next_tx += 1;
         entries.append(&mut txn);
@@ -125,7 +141,35 @@ pub(super) fn scan(bytes: &[u8]) -> Result<Scan, Error> {
         entries,
         valid_len: bytes.len() - rest.len(),
         cause,
+        tip,
     })
+}
+
+/// The checksum of the `Commit` that ends a parsed transaction's entries.
+pub(super) fn commit_checksum(txn: &[LogEntry]) -> Option<u32> {
+    match txn.last()?.body {
+        EntryBody::Commit { checksum, .. } => Some(checksum),
+        _ => None,
+    }
+}
+
+/// Whether `bytes` is exactly one committed transaction `tx` (a sound begin
+/// record, a body filling the rest and matching `body_crc`, valid frames)
+/// whose `Commit` carries `checksum`. The chain is not recomputed (the
+/// previous link isn't known here): the caller compares a checksum it
+/// recorded when it verified the whole chain.
+pub(super) fn is_committed_txn(bytes: &[u8], tx: u64, checksum: u32) -> bool {
+    let BeginStep::Begin(begin, after_begin) = begin_step(bytes) else {
+        return false;
+    };
+    let BodyStep::Body {
+        verdict: Ok(entries),
+        rest: [],
+    } = body_step(&begin, after_begin, None)
+    else {
+        return false;
+    };
+    begin.tx == tx && commit_checksum(&entries) == Some(checksum)
 }
 
 /// The first half of judging the transaction at the start of `rest`
@@ -192,7 +236,9 @@ pub(super) enum BodyFault {
     Damaged { later: Option<usize> },
     /// Rule 7: the body has no `Commit` (its frames end without one).
     NoCommit,
-    /// Rule 7: the `Commit` checksum doesn't match.
+    /// Rule 7: the `Commit` checksum isn't the chained checksum of this body
+    /// after the previous transaction: the body or the log before it is not
+    /// what the writer of this transaction saw.
     CommitChecksum,
     /// Rule 7: anything else; `frame` is the index of the offending frame.
     Invalid { frame: usize, why: String },
@@ -203,13 +249,24 @@ impl std::fmt::Display for BodyFault {
         match self {
             BodyFault::Damaged { .. } => f.write_str("body checksum mismatch"),
             BodyFault::NoCommit => f.write_str("no Commit"),
-            BodyFault::CommitChecksum => f.write_str("Commit checksum mismatch"),
+            BodyFault::CommitChecksum => f.write_str(
+                "Commit checksum mismatch (the transaction doesn't continue the log before it)",
+            ),
             BodyFault::Invalid { why, .. } => f.write_str(why),
         }
     }
 }
 
-pub(super) fn body_step<'a>(begin: &Begin, after_begin: &'a [u8]) -> BodyStep<'a> {
+/// `previous` is the link the transaction must chain from (the previous
+/// transaction's `Commit` checksum, or the header's for genesis); `None`
+/// where it isn't known (doctor after a transaction it couldn't read, a
+/// re-read of one transaction), and then the `Commit` checksum is not
+/// checked.
+pub(super) fn body_step<'a>(
+    begin: &Begin,
+    after_begin: &'a [u8],
+    previous: Option<u32>,
+) -> BodyStep<'a> {
     // The length is checked against the bytes left before it is used.
     let Some(body_len) = usize::try_from(begin.body_len)
         .ok()
@@ -225,7 +282,7 @@ pub(super) fn body_step<'a>(begin: &Begin, after_begin: &'a [u8]) -> BodyStep<'a
             later: later_begin(rest, begin.tx),
         })
     } else {
-        parse_body(body, begin.tx)
+        parse_body(body, begin.tx, previous)
     };
     BodyStep::Body { verdict, rest }
 }
@@ -274,10 +331,11 @@ impl Begin {
 }
 
 /// Parses a transaction body whose framing checked out: frames exactly
-/// filling it, exactly one `Commit`, last, for `tx`, with a matching
-/// checksum. Returns its entries, the `Commit` included. Entry IDs are not
+/// filling it, exactly one `Commit`, last, for `tx`, whose checksum is the
+/// chained checksum after `previous` (not checked if `None`). Returns its
+/// entries, the `Commit` included. Entry IDs are not
 /// checked here (see [`BodyStep`]).
-fn parse_body(body: &[u8], tx: u64) -> Result<Vec<LogEntry>, BodyFault> {
+fn parse_body(body: &[u8], tx: u64, previous: Option<u32>) -> Result<Vec<LogEntry>, BodyFault> {
     let mut entries = Vec::new();
     let mut rest = body;
     loop {
@@ -314,7 +372,8 @@ fn parse_body(body: &[u8], tx: u64) -> Result<Vec<LogEntry>, BodyFault> {
             // Covered: every byte of the body except the Commit's own
             // checksum field, its last 4 bytes (a parsed Commit frame is
             // 25 bytes, so the body is at least that long).
-            if crc32fast::hash(&body[..body.len() - 4]) != checksum {
+            let covered = &body[..body.len() - 4];
+            if previous.is_some_and(|p| super::chained_checksum(p, covered) != checksum) {
                 return Err(BodyFault::CommitChecksum);
             }
             entries.push(entry);

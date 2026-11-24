@@ -12,7 +12,7 @@ use super::fault::ArmedFaults;
 use super::file::{open_regular, read_log_file, read_to_len, sync_parent_dir};
 use super::format::HEADER_LEN;
 use super::scan::{Scan, scan};
-use super::{LOG_FORMAT_VERSION, LOG_MAGIC, LogEntry};
+use super::{ChainTip, LOG_FORMAT_VERSION, LOG_MAGIC, LogEntry};
 use crate::error::Error;
 use crate::world::{CutCause, RecoveryReport};
 
@@ -33,6 +33,10 @@ pub(crate) struct LogWriter {
     /// The file's length: just past the last committed transaction. A
     /// transaction whose fsync failed is cut back to it.
     len: u64,
+    /// The last committed transaction in the file: where it is and its
+    /// chained checksum. It moves only when an append has been fsynced, so
+    /// a failed append (cut back to `len`) leaves it where it was.
+    tip: Option<ChainTip>,
     /// Set by a failed append or fsync: the file may end in a torn
     /// transaction, so nothing more is appended until the world is reopened.
     failed: Option<Error>,
@@ -58,11 +62,13 @@ impl LogWriter {
         file.write_all(&buf)?;
         file.sync_data()?;
         sync_parent_dir(path)?;
+        // An in-memory buffer's length always fits a u64.
+        let len = buf.len() as u64;
         Ok(LogWriter {
             file,
             path: path.to_owned(),
-            // An in-memory buffer's length always fits a u64.
-            len: buf.len() as u64,
+            len,
+            tip: tip_of(genesis, HEADER_LEN as u64, len),
             failed: None,
             faults: ArmedFaults::default(),
         })
@@ -108,6 +114,7 @@ impl LogWriter {
             entries,
             valid_len,
             cause,
+            tip,
         } = scan(&bytes)?;
         if !cut_damaged && valid_len != bytes.len() && cause == Some(CutCause::Damaged) {
             return Err(Error::RecoveryRequired {
@@ -136,6 +143,7 @@ impl LogWriter {
                 file,
                 path: path.to_owned(),
                 len: valid_len as u64,
+                tip,
                 failed: None,
                 faults: ArmedFaults::default(),
             },
@@ -157,12 +165,13 @@ impl LogWriter {
     pub(crate) fn read_committed<T>(
         path: &Path,
         replay: impl FnOnce(&[LogEntry]) -> Result<T, Error>,
-    ) -> Result<(T, RecoveryReport), Error> {
+    ) -> Result<(T, RecoveryReport, Option<ChainTip>), Error> {
         let bytes = read_log_file(path)?;
         let Scan {
             entries,
             valid_len,
             cause,
+            tip,
         } = scan(&bytes)?;
         let replayed = replay(&entries)?;
         let mut report = RecoveryReport::default();
@@ -171,7 +180,12 @@ impl LogWriter {
             report.bytes_cut = (bytes.len() - valid_len) as u64;
             report.cause = cause;
         }
-        Ok((replayed, report))
+        Ok((replayed, report, tip))
+    }
+
+    /// The last committed transaction in the file (see [`ChainTip`]).
+    pub(crate) fn tip(&self) -> Option<ChainTip> {
+        self.tip
     }
 
     /// The path the log file was created or opened at.
@@ -229,9 +243,25 @@ impl LogWriter {
             return Err(err);
         }
         // An in-memory buffer's length always fits a u64.
-        self.len += buf.len() as u64;
+        let end = self.len + buf.len() as u64;
+        self.tip = tip_of(txn, self.len, end);
+        self.len = end;
         Ok(())
     }
+}
+
+/// The chain tip after `txn` was written at `offset..end` of the file.
+fn tip_of(txn: &EncodedTxn, offset: u64, end: u64) -> Option<ChainTip> {
+    let last = txn.entries.last()?;
+    let super::EntryBody::Commit { tx, checksum } = last.body else {
+        return None;
+    };
+    Some(ChainTip {
+        tx,
+        offset,
+        end,
+        checksum,
+    })
 }
 
 /// Takes the exclusive advisory lock on a log file without waiting:

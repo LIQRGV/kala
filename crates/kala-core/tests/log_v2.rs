@@ -263,8 +263,8 @@ fn every_txn_starts_with_a_documented_begin_record() {
     let (_d, path) = build();
     let b = bytes(&path);
     assert_eq!(&b[..8], b"KALALOG\0");
-    assert_eq!(&b[8..12], &5u32.to_le_bytes());
-    assert_eq!(LOG_FORMAT_VERSION, 5);
+    assert_eq!(&b[8..12], &6u32.to_le_bytes());
+    assert_eq!(LOG_FORMAT_VERSION, 6);
     let spans = common::spans(&b);
     assert_eq!(spans.len(), 5, "genesis + 4 txns");
     assert_eq!(
@@ -289,10 +289,12 @@ fn every_txn_starts_with_a_documented_begin_record() {
         assert_eq!(kind, 5);
         let commit_tx = u64::from_le_bytes(b[cs + 13..cs + 21].try_into().unwrap());
         assert_eq!(commit_tx, s.tx, "tx {i}: Commit tx == begin tx");
+        // ... and (format 6) is chained: it also covers the previous
+        // transaction's checksum, or the header's CRC for genesis.
         let stored = u32::from_le_bytes(b[ce - 4..ce].try_into().unwrap());
         assert_eq!(
             stored,
-            common::crc(&b[s.body_start..ce - 4]),
+            common::chained(common::link(&b[..s.start]), &b[s.body_start..ce - 4]),
             "tx {i}: commit checksum"
         );
         assert_eq!(
@@ -465,7 +467,7 @@ fn header_only_v2_file_has_no_genesis_and_is_corrupt_untouched_for_open() {
 fn torn_begin_fewer_than_25_bytes_is_cut_quarantined_and_reported() {
     let (_d, path) = build();
     let valid = bytes(&path);
-    let begin = common::begin(5, &common::commit_frame(&[], 99, 5));
+    let begin = common::begin(5, &common::commit_frame(common::link(&valid), &[], 99, 5));
     for n in 1..BEGIN_LEN {
         assert_torn(
             &path,
@@ -817,7 +819,9 @@ fn body_content_invalid_with_valid_crcs_is_corrupt() {
     let (_d, path) = build();
     let orig = bytes(&path);
     let (tx, first, prior, cid) = last_parts(&orig);
-    let commit = common::commit_frame(&prior, cid, tx);
+    // The link the last transaction chains from (format 6).
+    let prev = common::link(&orig[..common::spans(&orig).last().unwrap().start]);
+    let commit = common::commit_frame(prev, &prior, cid, tx);
     let good = [prior.clone(), commit.clone()].concat();
     // control: rebuilding the same txn is accepted (so failures below are
     // about the content, not about my reframing)
@@ -832,11 +836,19 @@ fn body_content_invalid_with_valid_crcs_is_corrupt() {
     cases.push(("no Commit", prior.clone()));
     cases.push((
         "Commit tx != begin tx",
-        [prior.clone(), common::commit_frame(&prior, cid, tx + 1)].concat(),
+        [
+            prior.clone(),
+            common::commit_frame(prev, &prior, cid, tx + 1),
+        ]
+        .concat(),
     ));
     cases.push((
         "Commit tx lower than begin tx",
-        [prior.clone(), common::commit_frame(&prior, cid, tx - 1)].concat(),
+        [
+            prior.clone(),
+            common::commit_frame(prev, &prior, cid, tx - 1),
+        ]
+        .concat(),
     ));
     cases.push((
         "trailing bytes after Commit",
@@ -848,7 +860,7 @@ fn body_content_invalid_with_valid_crcs_is_corrupt() {
     ));
     cases.push((
         "second Commit after the first",
-        [good.clone(), common::commit_frame(&good, cid + 1, tx)].concat(),
+        [good.clone(), common::commit_frame(prev, &good, cid + 1, tx)].concat(),
     ));
     cases.push((
         "Commit not last (a Fact frame after it)",
@@ -864,33 +876,41 @@ fn body_content_invalid_with_valid_crcs_is_corrupt() {
         let begin = common::begin(tx, &good);
         let mut over = begin.clone();
         over.extend_from_slice(&prior);
-        let c = common::commit_frame(&over, cid, tx);
+        let c = common::commit_frame(prev, &over, cid, tx);
         [prior.clone(), c].concat()
     }));
     cases.push((
         "entry ID gap before the Commit",
-        [prior.clone(), common::commit_frame(&prior, cid + 1, tx)].concat(),
+        [
+            prior.clone(),
+            common::commit_frame(prev, &prior, cid + 1, tx),
+        ]
+        .concat(),
     ));
     cases.push((
         "entry ID repeated at the Commit",
-        [prior.clone(), common::commit_frame(&prior, cid - 1, tx)].concat(),
+        [
+            prior.clone(),
+            common::commit_frame(prev, &prior, cid - 1, tx),
+        ]
+        .concat(),
     ));
     cases.push(("Commit alone with the wrong entry ID", {
-        [common::commit_frame(&[], first + 7, tx)].concat()
+        [common::commit_frame(prev, &[], first + 7, tx)].concat()
     }));
     cases.push(("whole txn shifted by one entry ID", {
         // first frame's entry ID bumped, checksum recomputed: sequence starts wrong
         let mut p = prior.clone();
         p[5..13].copy_from_slice(&(first + 1).to_le_bytes());
-        [p.clone(), common::commit_frame(&p, cid, tx)].concat()
+        [p.clone(), common::commit_frame(prev, &p, cid, tx)].concat()
     }));
     cases.push(("unparseable entry (unknown kind)", {
         let f = common::frame(0xEE, first, &[1, 2, 3]);
-        [f.clone(), common::commit_frame(&f, first + 1, tx)].concat()
+        [f.clone(), common::commit_frame(prev, &f, first + 1, tx)].concat()
     }));
     cases.push(("unparseable entry (truncated Fact body)", {
         let f = common::frame(4, first, &[1, 2, 3]);
-        [f.clone(), common::commit_frame(&f, first + 1, tx)].concat()
+        [f.clone(), common::commit_frame(prev, &f, first + 1, tx)].concat()
     }));
     cases.push((
         "frame length runs past the body",
@@ -919,7 +939,7 @@ fn body_content_invalid_in_the_first_txn_is_corrupt() {
     // genesis with the Commit tx changed to 1
     let bad = [
         prior.clone(),
-        common::commit_frame(&prior, fr.len() as u64, 1),
+        common::commit_frame(common::link(&orig[..s.start]), &prior, fr.len() as u64, 1),
     ]
     .concat();
     let mut file = orig[..s.start].to_vec();

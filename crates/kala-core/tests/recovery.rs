@@ -670,7 +670,12 @@ fn torn_tail_after_a_checksum_valid_but_replay_invalid_txn_is_corrupt() {
         fr[5..13].copy_from_slice(&(first_id + i as u64).to_le_bytes());
         body.extend_from_slice(&fr);
     }
-    let commit = commit_frame(&body, first_id + kept.len() as u64, tx);
+    let commit = commit_frame(
+        common::link(&d[..a]),
+        &body,
+        first_id + kept.len() as u64,
+        tx,
+    );
     let mut full_body = body.clone();
     full_body.extend_from_slice(&commit);
     let mut bad = d[..a].to_vec();
@@ -713,7 +718,7 @@ fn commit_only_txn_after_a_bad_checksum_txn_is_corrupt() {
     let n = d.len();
     d[n - 1] ^= 0x01; // last txn now has a bad checksum
     // a valid commit-only txn follows it
-    let extra = commit_frame(&[], last_entry + 1, last_tx + 1);
+    let extra = commit_frame(common::link(&d), &[], last_entry + 1, last_tx + 1);
     d.extend_from_slice(&common::txn(last_tx + 1, &extra));
     let p = scratch.path().join("c.kala");
     std::fs::write(&p, &d).unwrap();

@@ -1012,7 +1012,12 @@ impl Txn<'_> {
                 },
             },
         });
-        log::encode_txn(self.world.journal.next_entry(), self.tx, items)
+        log::encode_txn(
+            self.world.journal.next_entry(),
+            self.tx,
+            self.world.journal.chain_checksum(),
+            items,
+        )
     }
 }
 

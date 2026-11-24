@@ -585,7 +585,7 @@ fn schema_forms_cannot_write_the_system_world_even_after_rename() {
 }
 
 #[test]
-fn format_four_is_refused_with_recreation_guidance() {
+fn format_four_is_refused_with_dump_and_reload_guidance() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("old.kala");
     let mut bytes = kala_core::log::LOG_MAGIC.to_vec();
@@ -595,7 +595,10 @@ fn format_four_is_refused_with_recreation_guidance() {
     assert_eq!(code(&o), 3); // UnsupportedVersion is a store error (slice 5).
     let message = stderr(&o);
     assert!(
-        message.contains("older Kala") && message.contains("recreat"),
+        // Format 6 changed the advice from "recreate" to dump and reload.
+        message.contains("older Kala")
+            && message.contains("kala dump")
+            && message.contains("kala transact --create"),
         "{message}"
     );
     assert_eq!(fs::read(path).unwrap(), bytes);

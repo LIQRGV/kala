@@ -52,11 +52,13 @@ impl World {
         // The rebuild holds the same schema, IDs and entries; what is kept
         // from this World is what isn't derived from the log: the log file
         // and the write gate.
+        let tip = self.journal.chain_tip();
         let log = self.journal.detach_log();
         let gate = std::mem::take(&mut self.gate);
         *self = rebuilt;
-        if let Some(log) = log {
-            self.journal.attach_log(log);
+        match log {
+            Some(log) => self.journal.attach_log(log),
+            None => self.journal.set_read_tip(tip),
         }
         self.gate = gate;
     }

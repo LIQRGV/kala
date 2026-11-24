@@ -46,10 +46,17 @@ pub enum SystemError {
         /// The size of the damaged tail.
         bytes: u64,
     },
+    /// `system.kala` was written by an older Kala log format, which this
+    /// build doesn't read (there is no dual-format reading). The file is
+    /// left untouched.
+    OldFormat {
+        /// The file's log format version.
+        version: u32,
+    },
 }
 impl fmt::Display for SystemError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+        let text = match self {
             Self::InvalidAccount => {
                 "account must be USER@HOST with a nonempty ASCII user name of at most 64 bytes"
             }
@@ -74,7 +81,19 @@ impl fmt::Display for SystemError {
                 "the last transaction of the system world is damaged; writing would cut it \
                  to a quarantine file, so the recovery must be acknowledged"
             }
-        })
+            Self::OldFormat { version } => {
+                return write!(
+                    f,
+                    "the accounts database (system.kala) was written by an older Kala log format \
+                     (version {version}), which this build doesn't read. Dump the directory with \
+                     the older kala binary that wrote it (kala dump --all DIR -o BACKUP), then load \
+                     each dump into a new directory with this one (kala transact --create \
+                     NEW_DIR/system.kala BACKUP/system.dump.edn, and the same for every world). \
+                     The old files are left untouched"
+                );
+            }
+        };
+        f.write_str(text)
     }
 }
 impl std::error::Error for SystemError {}
@@ -82,6 +101,12 @@ fn store(error: kala_core::Error) -> SystemError {
     match error {
         kala_core::Error::WorldLocked => SystemError::Busy,
         kala_core::Error::RecoveryRequired { bytes } => SystemError::RecoveryRequired { bytes },
+        // Only the version number: nothing of the file's content.
+        kala_core::Error::UnsupportedVersion(version)
+            if version < kala_core::log::LOG_FORMAT_VERSION =>
+        {
+            SystemError::OldFormat { version }
+        }
         _ => SystemError::Store,
     }
 }

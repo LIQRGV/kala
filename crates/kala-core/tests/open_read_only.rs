@@ -413,11 +413,11 @@ fn a_foreign_header_is_bad_magic() {
 fn an_unknown_version_is_unsupported_version() {
     let (_d, p) = varrow_file();
     let mut b = bytes(&p);
-    b[8..12].copy_from_slice(&6u32.to_le_bytes());
+    b[8..12].copy_from_slice(&7u32.to_le_bytes());
     std::fs::write(&p, &b).unwrap();
     assert_eq!(
         World::open_read_only(&p).err(),
-        Some(Error::UnsupportedVersion(6))
+        Some(Error::UnsupportedVersion(7))
     );
     assert_eq!(bytes(&p), b);
 }

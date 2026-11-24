@@ -48,7 +48,12 @@ fn append(bytes: &mut Vec<u8>, entries: &[(u8, Vec<u8>)], next_id: u64, tx: u64)
     for (i, (kind, payload)) in entries.iter().enumerate() {
         body.extend_from_slice(&frame(*kind, next_id + i as u64, payload));
     }
-    body.extend_from_slice(&commit_frame(&body, next_id + entries.len() as u64, tx));
+    body.extend_from_slice(&commit_frame(
+        common::link(bytes),
+        &body,
+        next_id + entries.len() as u64,
+        tx,
+    ));
     bytes.extend_from_slice(&txn(tx, &body));
 }
 
@@ -92,12 +97,15 @@ fn version_four_is_refused_as_written_by_older_kala() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("v4.kala");
     std::fs::write(&path, common::header(4)).unwrap();
-    assert_eq!(LOG_FORMAT_VERSION, 5);
+    assert_eq!(LOG_FORMAT_VERSION, 6);
     let error = World::open_read_only(&path).unwrap_err();
     assert_eq!(error, Error::UnsupportedVersion(4));
     let message = error.to_string();
     assert!(
-        message.contains("older Kala") && message.contains("recreat"),
+        // Format 6 changed the advice from "recreate" to dump and reload.
+        message.contains("older Kala")
+            && message.contains("kala dump")
+            && message.contains("kala transact --create"),
         "{message}"
     );
 }
@@ -408,7 +416,12 @@ fn reseal_last_transaction(bytes: &mut Vec<u8>, commit_id: u64) {
     let frames = common::frame_spans(bytes, span);
     let commit_start = frames.last().unwrap().0;
     let mut body = bytes[span.body_start..commit_start].to_vec();
-    body.extend_from_slice(&commit_frame(&body, commit_id, span.tx));
+    body.extend_from_slice(&commit_frame(
+        common::link(&bytes[..span.start]),
+        &body,
+        commit_id,
+        span.tx,
+    ));
     common::replace_last_body(bytes, &body);
 }
 

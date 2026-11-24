@@ -3,7 +3,7 @@
 //! Everything else (ID tables, schema, indexes) is a copy rebuilt from it.
 //! Only committed transactions count; [`read_log`] returns exactly those.
 //!
-//! # Byte layout (format version 5)
+//! # Byte layout (format version 6)
 //!
 //! All integers are little-endian. A `str` is `u32 len | len bytes of UTF-8`.
 //!
@@ -113,19 +113,75 @@
 //! but refuse new asserts and retracts. Only verified migration copies may append
 //! plain facts for deprecated edge properties. Live validation and replay agree.
 //!
-//! **Versions.** Versions 1 through 4 are [`Error::UnsupportedVersion`]; worlds
-//! written by older Kala builds must be recreated (no migration before 1.0).
+//! **Versions.** Versions 1 through 5 are [`Error::UnsupportedVersion`]; there
+//! is no dual-format reading. A world written by an older Kala is carried
+//! across with that older binary's `kala dump WORLD -o world.dump.edn` and
+//! this binary's `kala transact --create NEW_WORLD world.dump.edn`, which
+//! reproduces the same entry IDs and tx numbers. The old file is never
+//! modified.
 //!
 //! **Transactions.** Every transaction is a begin record followed by its
 //! body. The begin record is framing, not a log entry: it has no entry ID
 //! and [`read_log`] never returns it. `begin_crc` is CRC32 (IEEE,
 //! `crc32fast`) over the record's first 21 bytes, `body_len` the byte length
 //! of the body and `body_crc` CRC32 over all of it. The body is the
-//! transaction's entries, the last one being its only `Commit`. The `Commit`
-//! checksum is CRC32 over every byte of the body before the `Commit` frame,
-//! plus the `Commit` frame's bytes up to (not including) the checksum field,
-//! i.e. its length prefix, kind, entry ID and tx; it doesn't cover the begin
-//! record. Entry IDs start at 1 and grow by one per entry across the whole
+//! transaction's entries, the last one being its only `Commit`.
+//!
+//! # The checksum chain (new in version 6)
+//!
+//! A transaction has three checksums. Two are **local** and say only "these
+//! bytes arrived whole": `begin_crc` (the begin record) and `body_crc` (the
+//! body). The third, the `Commit` checksum, is **chained**:
+//!
+//! ```text
+//! link(-1) = CRC32(file header, all 12 bytes)
+//! link(n)  = CRC32( link(n-1) as u32 LE
+//!                 | body of tx n up to, not including, its checksum field )
+//! Commit(n).checksum = link(n)
+//! ```
+//!
+//! The covered part of the body is every frame before the `Commit` plus the
+//! `Commit` frame's length prefix, kind, entry ID and tx; the begin record
+//! is not covered (it is derived from the body). So `link(n)` depends on the
+//! header and on every byte of every body up to tx n, and the genesis
+//! transaction chains from the header.
+//!
+//! Why the chain sits in the `Commit` and the local checksums stay local:
+//!
+//! - **Recovery is unchanged.** Torn and damaged are judged from `begin_crc`
+//!   and `body_crc` alone (rules 2, 3, 5, 6 below), which need no earlier
+//!   transaction. A chain mismatch is only ever seen on a body whose
+//!   `body_crc` is right, i.e. bytes that arrived exactly as some writer
+//!   sent them: that is never an interrupted append, so it is rule 7,
+//!   [`Error::Corrupt`], never a tail to cut.
+//! - **Replay checks every link.** The scan carries `link(n-1)` forward and
+//!   recomputes `link(n)` for each transaction. Replacing any transaction
+//!   but the last by other bytes, even a perfectly valid transaction of the
+//!   same length with the same tx and entry IDs, changes its link, and the
+//!   next transaction's stored `Commit` checksum no longer matches. (The
+//!   last transaction has no successor: replacing it gives another valid
+//!   log, which only a handle that had applied the original can notice.)
+//! - **One transaction proves the prefix.** A handle remembers a
+//!   [`ChainTip`]: where the last transaction it applied starts and ends,
+//!   its tx and `link(n)`. To learn whether the log it knows is still a
+//!   prefix of the file, it re-reads just those bytes ([`chain_tip_holds`]):
+//!   a sound begin record for that tx, a matching `body_crc`, and a `Commit`
+//!   carrying the remembered checksum. Any writer that rewrote an earlier
+//!   transaction had to write a different link there (replay would refuse
+//!   its log otherwise), and a link's four bytes feed the next link through
+//!   a CRC, which maps different 4-byte prefixes of otherwise equal input
+//!   to different results: the difference reaches every later `Commit`
+//!   whose own bytes are the same, including the tip's. The cost is the
+//!   size of one transaction, whatever the log's length.
+//!
+//! What it is not: authentication. CRC32 is 32 bits and anyone can compute
+//! it, so a program that edits the file on purpose can forge a chain, and
+//! two *different* histories agree on a link by accident with probability
+//! about 2^-32. The chain is for cooperating Kala writers (a recovery cut or
+//! an fsync-failure truncation followed by new commits, a file replaced by
+//! a restored copy) and for storage damage.
+//!
+//! **Numbering.** Entry IDs start at 1 and grow by one per entry across the whole
 //! log; tx numbers start at 0 (the genesis transaction holding the schema)
 //! and grow by one per transaction, and a `Commit`'s tx is its begin
 //! record's. A fact's tx is the tx of its transaction.
@@ -156,8 +212,10 @@
 //!    a frame declaring a payload longer than [`MAX_ENTRY_BYTES`] (checked
 //!    before whether it fits, so it is never taken for a short frame), an
 //!    unparseable entry, no `Commit`, more than one or not last, a
-//!    `Commit` tx other than the begin record's, a `Commit` checksum mismatch,
-//!    an entry ID out of sequence): [`Error::Corrupt`].
+//!    `Commit` tx other than the begin record's, a `Commit` checksum that
+//!    isn't the chained checksum of this body after the previous
+//!    transaction's (see "The checksum chain"), an entry ID out of
+//!    sequence): [`Error::Corrupt`].
 //! 8. Otherwise the transaction is committed, and the scan moves on.
 //!
 //! **Torn** and **damaged** both mean the valid prefix ends where that
@@ -204,7 +262,7 @@ pub(crate) use writer::LogWriter;
 pub const LOG_MAGIC: [u8; 8] = *b"KALALOG\0";
 
 /// The log format version this build writes and reads (header bytes 8..12).
-pub const LOG_FORMAT_VERSION: u32 = 5;
+pub const LOG_FORMAT_VERSION: u32 = 6;
 
 /// The longest entry payload a log frame may hold: 16 MiB. A write whose
 /// entry would be longer is refused before anything is written
@@ -320,7 +378,9 @@ pub enum EntryBody {
     Commit {
         /// The transaction's number.
         tx: TxId,
-        /// CRC32 of the transaction's bytes (see the module docs).
+        /// The chained checksum: CRC32 over the previous transaction's
+        /// `Commit` checksum and this transaction's bytes (see "The
+        /// checksum chain" in the module docs).
         checksum: u32,
     },
 }
@@ -339,7 +399,7 @@ pub struct LogEntry {
 ///
 /// Fails with [`Error::Io`] if the file can't be read, [`Error::BadMagic`]
 /// if it isn't a Kala log, [`Error::UnsupportedVersion`] for another format
-/// version (including versions 1 and 2: there is no migration), or
+/// version (every older one included: there is no migration), or
 /// [`Error::Corrupt`] for a truncated header or any damage the recovery
 /// rules in the module docs don't classify as a torn tail.
 ///
@@ -354,4 +414,62 @@ pub struct LogEntry {
 pub fn read_log(path: &Path) -> Result<Vec<LogEntry>, Error> {
     let bytes = read_log_file(path)?;
     Ok(scan::scan(&bytes)?.entries)
+}
+
+/// Where a log's checksum chain stands: the last committed transaction a
+/// handle has applied. Re-reading just that transaction
+/// ([`chain_tip_holds`]) tells whether the log the handle knows is still a
+/// prefix of the file (see "The checksum chain" in the module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainTip {
+    /// The transaction's number.
+    pub tx: TxId,
+    /// Byte offset of its begin record in the file.
+    pub offset: u64,
+    /// Byte offset just past its body: where the next transaction starts.
+    pub end: u64,
+    /// Its `Commit` checksum: the chained checksum of the whole log up to
+    /// and including this transaction.
+    pub checksum: u32,
+}
+
+/// Whether the log file at `path` still holds, at `tip.offset..tip.end`,
+/// the committed transaction `tip` describes: a sound begin record for
+/// `tip.tx` whose body fills exactly that range and matches its `body_crc`,
+/// ending in a `Commit` for `tip.tx` that carries `tip.checksum`. Because
+/// that checksum is chained, `true` means every byte before `tip.end` is
+/// what the handle that recorded `tip` applied (up to CRC32's strength; see
+/// the module docs). `false` means the file diverged: it is shorter, or
+/// those bytes are another transaction, or damaged.
+///
+/// Reads only that transaction, never the rest of the file, takes no lock
+/// and modifies nothing. Fails with [`Error::Io`] if the file can't be read
+/// (only a regular file is opened), or [`Error::BadMagic`] /
+/// [`Error::UnsupportedVersion`] / [`Error::Corrupt`] for a header that
+/// isn't this format's: then it isn't the same log at all.
+pub fn chain_tip_holds(path: &Path, tip: &ChainTip) -> Result<bool, Error> {
+    let Some(read) = file::read_range(path, tip.offset, tip.end)? else {
+        return Ok(false);
+    };
+    scan::check_header(&read.header)?;
+    Ok(scan::is_committed_txn(&read.bytes, tip.tx.0, tip.checksum))
+}
+
+/// The link the genesis transaction chains from: CRC32 of the whole file
+/// header (magic and format version).
+pub(crate) fn header_checksum() -> u32 {
+    let mut hash = crc32fast::Hasher::new();
+    hash.update(&LOG_MAGIC);
+    hash.update(&LOG_FORMAT_VERSION.to_le_bytes());
+    hash.finalize()
+}
+
+/// A transaction's chained checksum: CRC32 over the previous link (four
+/// little-endian bytes), then `covered`, the transaction's body up to its
+/// `Commit`'s checksum field.
+pub(crate) fn chained_checksum(previous: u32, covered: &[u8]) -> u32 {
+    let mut hash = crc32fast::Hasher::new();
+    hash.update(&previous.to_le_bytes());
+    hash.update(covered);
+    hash.finalize()
 }

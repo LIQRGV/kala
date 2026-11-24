@@ -789,7 +789,8 @@ fn append_txn(path: &Path, entries: &[(u8, Vec<u8>)]) {
         body.extend(common::frame(*kind, next_id, b));
         next_id += 1;
     }
-    let commit = common::commit_frame(&body, next_id, tx);
+    let previous = common::link(&std::fs::read(path).unwrap());
+    let commit = common::commit_frame(previous, &body, next_id, tx);
     body.extend(commit);
     let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
     use std::io::Write;

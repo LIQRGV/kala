@@ -255,7 +255,7 @@ fn damaged_txn_followed_by_a_valid_begin_record_at_the_next_offset_is_corrupt() 
     damage_body(&mut file, last);
     // A later, well-formed txn (tx 5, commit-only body is enough for framing).
     let entry = read_log(&path).unwrap().last().unwrap().id.0 + 1;
-    let body = commit_frame(&[], entry, last.tx + 1);
+    let body = commit_frame(common::link(&file), &[], entry, last.tx + 1);
     file.extend_from_slice(&txn(last.tx + 1, &body));
     std::fs::write(&path, &file).unwrap();
     assert_corrupt_untouched(&path);

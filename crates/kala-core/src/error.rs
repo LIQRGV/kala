@@ -365,7 +365,13 @@ impl fmt::Display for Error {
             Error::UnsupportedVersion(v) => {
                 write!(f, "unsupported log format version {v}")?;
                 if *v < crate::log::LOG_FORMAT_VERSION {
-                    f.write_str(": written by an older Kala; recreate this world")?;
+                    f.write_str(
+                        ": this file was written by an older Kala log format, which this \
+                         build doesn't read. Dump it with the older kala binary that wrote \
+                         it (kala dump WORLD -o world.dump.edn), then load the dump with \
+                         this one (kala transact --create NEW_WORLD world.dump.edn). The \
+                         old file is left untouched",
+                    )?;
                 }
                 Ok(())
             }

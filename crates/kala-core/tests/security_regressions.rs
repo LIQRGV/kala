@@ -643,7 +643,7 @@ fn own_txn_with_valid_begin_and_cut_short_body_is_cut_and_quarantined() {
     let (_d, path) = build();
     let l = last_entry_id(&path);
     let orig = std::fs::read(&path).unwrap();
-    let body = common::commit_frame(&[], l + 1, 4);
+    let body = common::commit_frame(common::link(&orig), &[], l + 1, 4);
     let full = common::txn(4, &body);
     for keep in 0..full.len() {
         // keep == 0..25: begin itself cut; 25..: begin + partial body

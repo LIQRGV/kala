@@ -258,7 +258,10 @@ impl World {
     /// but a regular file, such as a directory, FIFO or device, refused
     /// before any read), [`Error::BadMagic`] or
     /// [`Error::UnsupportedVersion`] for a foreign header, or
-    /// [`Error::Corrupt`] if the log has no committed genesis transaction or
+    /// [`Error::Corrupt`] if the log has no committed genesis transaction, a
+    /// transaction whose chained checksum doesn't continue the log before it
+    /// (an earlier transaction was replaced, even by a valid one; see "The
+    /// checksum chain" in [`crate::log`]), or
     /// a committed transaction that a live write could not have produced
     /// (an ID used before its `DEFINE`, a value of the wrong type, a no-op
     /// fact, an edge `DEFINE` with no assert of its triple in its
@@ -336,7 +339,8 @@ impl World {
     /// [`Error::UnsupportedVersion`] for a foreign header, or
     /// [`Error::Corrupt`] for any damage other than a torn or damaged tail.
     pub fn open_read_only(path: &Path) -> Result<World, Error> {
-        let (mut world, recovery) = LogWriter::read_committed(path, World::replay)?;
+        let (mut world, recovery, tip) = LogWriter::read_committed(path, World::replay)?;
+        world.journal.set_read_tip(tip);
         world.gate = WriteGate::read_only(recovery);
         Ok(world)
     }

@@ -33,8 +33,9 @@ The name means "time" in Sanskrit, Javanese and Indonesian.
   `kala doctor` reports it. Your draft can be inconsistent while you work it
   out.
 - **The log is the source of truth.** It is a single append-only file with
-  per-transaction checksums. Indexes are rebuilt from it, a crash mid-write is
-  recovered on open, and backup is copying the file.
+  chained per-transaction checksums (each covers the one before, so a
+  rewritten history is detected). Indexes are rebuilt from it, a crash
+  mid-write is recovered on open, and backup is copying the file.
 
 ## Build
 

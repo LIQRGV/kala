@@ -401,13 +401,20 @@ fn rewrite_genesis_ids(path: &Path, f: impl Fn(usize, usize, u64) -> u64) {
             let id = f(j, n, old);
             if j + 1 == n {
                 assert_eq!(*kind, 5);
-                body.extend(common::commit_frame(&body.clone(), id, s.tx));
+                body.extend(common::commit_frame(
+                    common::link(&out),
+                    &body.clone(),
+                    id,
+                    s.tx,
+                ));
             } else {
                 body.extend(common::frame(*kind, id, &src[start + 13..*end]));
             }
         }
         out.extend(common::txn(s.tx, &body));
     }
+    // Later transactions chain from the rewritten genesis (format 6).
+    common::rechain(&mut out, 1);
     std::fs::write(path, &out).unwrap();
 }
 

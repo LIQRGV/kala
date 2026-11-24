@@ -45,6 +45,9 @@ pub(super) struct Journal {
     /// The log file, for a file-backed world; `None` in memory. Visible to
     /// the module for the `test_hooks` (fault injection, rebuilds).
     pub(super) log: Option<LogWriter>,
+    /// For a world opened read-only (no log writer): the last committed
+    /// transaction of the file it was read from.
+    read_tip: Option<log::ChainTip>,
 }
 
 impl Journal {
@@ -55,6 +58,7 @@ impl Journal {
             chains: HashMap::new(),
             entries: Vec::new(),
             log: None,
+            read_tip: None,
         }
     }
 
@@ -79,6 +83,32 @@ impl Journal {
     pub(super) fn next_entry(&self) -> EntryId {
         // A Vec's length always fits a u64.
         EntryId(self.entries.len() as u64 + 1)
+    }
+
+    /// The link the next transaction chains from: the chained checksum of
+    /// the last committed transaction, or the header's before genesis (see
+    /// "The checksum chain" in [`crate::log`]). Taken from the kept entries,
+    /// which hold exactly what was committed: a failed append records
+    /// nothing, so the chain can't run ahead of the file.
+    pub(super) fn chain_checksum(&self) -> u32 {
+        match self.entries.last().map(|e| &e.body) {
+            Some(EntryBody::Commit { checksum, .. }) => *checksum,
+            _ => log::header_checksum(),
+        }
+    }
+
+    /// The last committed transaction of a file-backed world's log, as this
+    /// handle knows it; `None` in memory.
+    pub(super) fn chain_tip(&self) -> Option<log::ChainTip> {
+        match &self.log {
+            Some(log) => log.tip(),
+            None => self.read_tip,
+        }
+    }
+
+    /// Records the chain tip of the file a read-only world was read from.
+    pub(super) fn set_read_tip(&mut self, tip: Option<log::ChainTip>) {
+        self.read_tip = tip;
     }
 
     /// Keeps the entries of committed transaction `tx` (in log order, right
@@ -237,6 +267,15 @@ impl Journal {
     /// Appends one encoded transaction to the log file and fsyncs it; does
     /// nothing in memory.
     pub(super) fn append(&mut self, txn: &EncodedTxn) -> Result<(), Error> {
+        // The two views of the chain agree: the file's last committed
+        // transaction is the last one kept here.
+        debug_assert!(
+            self.log
+                .as_ref()
+                .and_then(LogWriter::tip)
+                .is_none_or(|tip| tip.checksum == self.chain_checksum()),
+            "invariant: a transaction is encoded to chain from the file's last one"
+        );
         match self.log.as_mut() {
             Some(log) => log.append(txn),
             None => Ok(()),

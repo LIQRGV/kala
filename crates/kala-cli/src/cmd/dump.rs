@@ -333,11 +333,14 @@ fn op_name(op: Op) -> &'static str {
     }
 }
 pub(super) fn open(path: &Path) -> Result<World, CliError> {
-    World::open_read_only(path).map_err(|e| {
-        CliError::core(
+    World::open_read_only(path).map_err(|e| match e {
+        // The message holds only the version number, and it is the one a
+        // reader needs here: "dump it" means with the older binary.
+        kala_core::Error::UnsupportedVersion(_) => CliError::at_path(path, &e),
+        _ => CliError::core(
             &e,
             "cannot read world: invalid log or unavailable file (content withheld)".into(),
-        )
+        ),
     })
 }
 pub(super) fn recovery(world: &World) {

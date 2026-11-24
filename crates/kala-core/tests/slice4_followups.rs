@@ -333,7 +333,12 @@ fn shift_entry_ids(path: &Path, delta: u64, upto: usize) {
             let id = u64::from_le_bytes(src[start + 5..start + 13].try_into().unwrap()) + shift;
             if j + 1 == fs.len() {
                 assert_eq!(*kind, 5, "last frame is the Commit");
-                body.extend(common::commit_frame(&body.clone(), id, s.tx));
+                body.extend(common::commit_frame(
+                    common::link(&out),
+                    &body.clone(),
+                    id,
+                    s.tx,
+                ));
             } else {
                 body.extend(common::frame(*kind, id, &src[start + 13..*end]));
             }
@@ -592,9 +597,9 @@ fn crafted_revised(revised_of: u64) -> (tempfile::TempDir, PathBuf, u64) {
         body.extend(frame(k, id, &p));
         id += 1;
     }
-    let c = commit_frame(&body, id, 4);
-    body.extend(c);
     let mut bytes = std::fs::read(&path).unwrap();
+    let c = commit_frame(common::link(&bytes), &body, id, 4);
+    body.extend(c);
     bytes.extend(txn(4, &body));
     std::fs::write(&path, &bytes).unwrap();
     (dir, path, first)

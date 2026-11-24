@@ -73,6 +73,8 @@ fn system_error(dir: &Path, e: SystemError) -> CliError {
         SystemError::NoSuchDirectory => {
             CliError::User(format!("{}: no such directory", escape::path(dir)))
         }
+        // A foreign log is a store error, as for any other world.
+        e @ SystemError::OldFormat { .. } => CliError::Store(e.to_string()),
         e => CliError::User(e.to_string()),
     }
 }

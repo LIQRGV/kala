@@ -473,9 +473,24 @@ count zero; entity creation and edge interning count in neither. Text adds
 `1 changed, 1 declared`, a pure declaration `0 changed, 1 declared`, and a
 fact-only write still prints `1 changed`. The write REPL uses the same reports.
 
-This release writes **log format 5**. Format-4 and older worlds are refused with
-an older-Kala message and must be recreated from their source fixtures/scripts.
-There is no old-file migration before 1.0. `kala info` reports the format version;
+This release writes **log format 6**: every transaction's checksum also covers
+the previous transaction's (the first chains from the file header), so a log in
+which an earlier transaction was replaced, even by a valid one of the same
+length, is refused as corrupt and reported by `kala doctor` as a
+`checksum_mismatch` at the first transaction that no longer continues the log.
+Format-5 and older worlds are refused by every command and by `kala serve` with
+an older-Kala message and are never modified; there is no dual-format reading.
+To carry one across, dump it with the older `kala` binary that wrote it and load
+the dump with this one, which reproduces the same entry IDs and tx numbers:
+
+```sh
+old-kala dump world.kala -o world.dump.edn
+kala transact --create new-world.kala world.dump.edn
+```
+
+For a server directory, `old-kala dump --all DIR -o BACKUP` and one
+`kala transact --create` per dump, `system.dump.edn` included (see below).
+`kala info` reports the format version;
 `kala log` includes schema revisions and world settings in operation order.
 In `kala log --json` a schema entry is `{"entry": N, "kind": "schema", "change":
 {...}}`, where `change` uses the write report's field names: `kind` is
