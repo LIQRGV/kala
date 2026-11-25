@@ -44,5 +44,6 @@ pub use value::{MAX_INDEXED_STRING_BYTES, Value, ValueError, ValueType, fold_for
 pub use world::{
     AttrStats, Change, CommitResult, Concurrency, Correction, CutCause, Direction, EntryInfo,
     Finalized, FinalizedOp, HeldValues, IdMap, IndexDump, MAX_READ_KEYS, Mark, MeteredView, Op,
-    RecoveryReport, TickMoved, TickOccupant, TxId, Txn, View, WorkMeter, World, WriteResult,
+    OwnedTxn, RecoveryReport, TickMoved, TickOccupant, TxId, Txn, View, WorkMeter, World,
+    WriteResult,
 };

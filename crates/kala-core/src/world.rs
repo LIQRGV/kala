@@ -64,6 +64,7 @@ mod journal;
 mod meter;
 mod migration;
 mod open;
+mod owned;
 mod schema_ops;
 mod sync;
 #[cfg(feature = "test-hooks")]
@@ -96,6 +97,7 @@ pub use index::IndexDump;
 pub(crate) use index::{Index, decode_e_row, decode_v_row, decode_vfold_row};
 pub use meter::{MeteredView, WorkMeter};
 pub(crate) use open::ReplayFault;
+pub use owned::OwnedTxn;
 use schema_ops::{OrderedEntry, SchemaSnapshot};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};

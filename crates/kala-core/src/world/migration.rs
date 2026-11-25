@@ -196,7 +196,7 @@ impl Txn<'_> {
                 points.insert((entity, change.tick, change.value.clone()), change);
             }
         }
-        for staged in &self.entries {
+        for staged in &self.s.entries {
             let (fact, mark) = staged.key_and_mark();
             if fact.attr != attr {
                 continue;
@@ -245,7 +245,7 @@ impl Txn<'_> {
         name: &str,
         options: MigrationOptions,
     ) -> Result<MigrationReport, Error> {
-        let recorded = self.track.then(|| options.clone());
+        let recorded = self.s.track.then(|| options.clone());
         self.recorded(
             |_| Call::Migrate {
                 name: name.to_owned(),
@@ -287,18 +287,20 @@ impl Txn<'_> {
             }
             report.skipped = conversion.invalid.len();
             // The marker authorizes only the exact copy sequence replay regenerates.
-            txn.order.push(OrderedEntry::Schema(SchemaEdit::Migration {
-                source,
-                def: def.clone(),
-                skip_unconvertible,
-            }));
+            txn.s
+                .order
+                .push(OrderedEntry::Schema(SchemaEdit::Migration {
+                    source,
+                    def: def.clone(),
+                    skip_unconvertible,
+                }));
             txn.retire_source(&m)?;
             txn.declare_replacement(&m)?;
-            let first_edge = txn.ids.edges.len();
+            let first_edge = txn.s.ids.edges.len();
             let edge_map = txn.copy_change_points(&m, history, conversion, &mut report)?;
             txn.copy_edge_properties(source, &edge_map, &mut report)?;
-            report.edges = txn.ids.edges.len() - first_edge;
-            txn.schema_changes.push(SchemaChange::Migration {
+            report.edges = txn.s.ids.edges.len() - first_edge;
+            txn.s.schema_changes.push(SchemaChange::Migration {
                 name: name.into(),
                 from: old.value_type,
                 to: def.value_type,
@@ -321,7 +323,7 @@ impl Txn<'_> {
         check_direction(m.def)?;
         if m.old.kind == Kind::State && m.def.kind == Kind::Event {
             let logged_retract = self.world.journal.has_retract_of(m.source);
-            let staged_retract = self.entries.iter().any(|e| {
+            let staged_retract = self.s.entries.iter().any(|e| {
                 let (f, mark) = e.key_and_mark();
                 f.attr == m.source && mark == Mark::Retract
             });
@@ -507,7 +509,7 @@ impl Txn<'_> {
             let old_edge = if let Value::Ref(other) = c.value {
                 self.world
                     .catalog
-                    .edge_of(&self.ids, entity, m.source, other)
+                    .edge_of(&self.s.ids, entity, m.source, other)
             } else {
                 None
             };
@@ -578,7 +580,7 @@ impl Txn<'_> {
         // Edge properties of deprecated attributes (e.g. `x@old` from an
         // earlier migration) are history too and must follow their edges.
         let fact = self.world.prepare_fact(
-            &self.ids,
+            &self.s.ids,
             FactRequest {
                 entity,
                 attr: name,
@@ -594,18 +596,20 @@ impl Txn<'_> {
             if let Some(edge) =
                 self.world
                     .catalog
-                    .prepare_edge(&self.ids, fact.entity, fact.attr, target)?
+                    .prepare_edge(&self.s.ids, fact.entity, fact.attr, target)?
             {
-                self.order.push(OrderedEntry::Edge(self.ids.edges.len()));
-                self.ids.push_edge(edge);
+                self.s
+                    .order
+                    .push(OrderedEntry::Edge(self.s.ids.edges.len()));
+                self.s.ids.push_edge(edge);
             }
             self.world
                 .catalog
-                .edge_of(&self.ids, fact.entity, fact.attr, target)
+                .edge_of(&self.s.ids, fact.entity, fact.attr, target)
         } else {
             None
         };
-        if has_key(&self.staged, &fact) {
+        if has_key(&self.s.staged, &fact) {
             return Err(Error::TxnKeyConflict {
                 entity,
                 attr: name.into(),
@@ -650,8 +654,8 @@ impl World {
         // others committed, so the write gate isn't asked and nothing is
         // recorded for a commit that never happens.
         let mut txn = self.begin_without_catch_up();
-        txn.replaying = true;
-        txn.track = false;
+        txn.s.replaying = true;
+        txn.s.track = false;
         txn.migrate_attribute(&name, options)?;
         let encoded = txn.encode_ordered()?;
         let expected_marker = EntryBody::Schema(SchemaEdit::Migration {

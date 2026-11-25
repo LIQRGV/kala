@@ -96,6 +96,34 @@ impl SchemaSnapshot {
             .iter()
             .any(|def| def.name == name || def.inverse.as_deref() == Some(name))
     }
+    /// Sets a transaction's provisional schema aside, for the time nobody
+    /// borrows the transaction ([`OwnedTxn`](super::OwnedTxn)): `catalog`,
+    /// which has the provisional schema applied, gets the committed schema
+    /// this snapshot holds, and the snapshot holds the provisional one until
+    /// [`SchemaSnapshot::resume`] swaps them back. The node types the
+    /// transaction declared go to `types`. Nothing is cloned.
+    pub(super) fn park(&mut self, catalog: &mut Catalog, types: &mut Vec<NodeType>) {
+        debug_assert!(types.is_empty(), "parked twice");
+        self.exchange(catalog);
+        *types = catalog.node_types.split_off(self.node_count);
+        catalog.rebuild_schema_names();
+    }
+    /// Undoes [`SchemaSnapshot::park`]: `catalog` has the transaction's
+    /// provisional schema again and this snapshot the committed one.
+    pub(super) fn resume(&mut self, catalog: &mut Catalog, types: &mut Vec<NodeType>) {
+        debug_assert_eq!(catalog.node_types.len(), self.node_count);
+        self.exchange(catalog);
+        catalog.node_types.append(types);
+        catalog.rebuild_schema_names();
+    }
+    /// Swaps everything [`SchemaSnapshot::restore`] restores, except the
+    /// node types, between this snapshot and `catalog`.
+    fn exchange(&mut self, catalog: &mut Catalog) {
+        std::mem::swap(&mut self.attributes, &mut catalog.attributes);
+        std::mem::swap(&mut self.history, &mut catalog.attribute_history);
+        std::mem::swap(&mut self.origins, &mut catalog.node_origins);
+        std::mem::swap(&mut self.settings, &mut catalog.settings);
+    }
     pub(super) fn restore(self, catalog: &mut Catalog) {
         catalog.attributes = self.attributes;
         catalog.attribute_history = self.history;
@@ -500,7 +528,7 @@ fn migrate_hint(name: &str) -> Error {
 
 impl Drop for Txn<'_> {
     fn drop(&mut self) {
-        if let Some(before) = self.schema_before.take() {
+        if let Some(before) = self.s.schema_before.take() {
             before.restore(&mut self.world.catalog);
         }
     }
@@ -516,16 +544,20 @@ impl Txn<'_> {
         if let SchemaEdit::Attribute { id, def } = &edit
             && let Some(old) = self.world.catalog.attributes.get(id.0 as usize)
             && structural_change(old, def)
-            && self.entries.iter().any(|e| e.key_and_mark().0.attr == *id)
+            && self
+                .s
+                .entries
+                .iter()
+                .any(|e| e.key_and_mark().0.attr == *id)
         {
             return Err(migrate_hint(&old.name));
         }
-        if self.schema_before.is_none() {
-            self.schema_before = Some(SchemaSnapshot::capture(&self.world.catalog));
+        if self.s.schema_before.is_none() {
+            self.s.schema_before = Some(SchemaSnapshot::capture(&self.world.catalog));
         }
-        self.world.apply_schema_edit(&edit, self.tx, migration)?;
-        self.order.push(OrderedEntry::Schema(edit));
-        self.schema_changes.push(report);
+        self.world.apply_schema_edit(&edit, self.s.tx, migration)?;
+        self.s.order.push(OrderedEntry::Schema(edit));
+        self.s.schema_changes.push(report);
         Ok(())
     }
     /// Shared write inference. An unknown retract in infer mode changes nothing
@@ -606,7 +638,7 @@ impl Txn<'_> {
     /// Schema actions staged so far, in operation order, excluding no-ops.
     /// Includes declarations inferred by writes and each migration action.
     pub fn schema_changes(&self) -> &[SchemaChange] {
-        &self.schema_changes
+        &self.s.schema_changes
     }
     /// The current staged definition, including earlier operations in this transaction.
     pub fn attribute(&self, name: &str) -> Option<&AttrDef> {
@@ -627,6 +659,7 @@ impl Txn<'_> {
     /// the handle conflicts with this transaction's commit.
     pub fn entity_by_handle(&self, name: &str) -> Option<EntityId> {
         let found = self
+            .s
             .ids
             .entity_by_handle(name)
             .or_else(|| self.world.entity_by_handle(name));
@@ -638,7 +671,10 @@ impl Txn<'_> {
     /// The entity's handle, including entities created earlier in this
     /// transaction (the reverse of [`Txn::entity_by_handle`]).
     pub fn handle_of(&self, id: EntityId) -> Option<&str> {
-        self.ids.handle_of(id).or_else(|| self.world.handle_of(id))
+        self.s
+            .ids
+            .handle_of(id)
+            .or_else(|| self.world.handle_of(id))
     }
     /// `CHARACTER#1`, `edge#9`, as [`World::format_id`] formats it, with
     /// node types this transaction declared.
@@ -750,7 +786,7 @@ impl Txn<'_> {
     }
     /// Declares or revises an attribute. Origin and deprecation are managed by the store.
     pub fn declare_attribute(&mut self, def: AttrDef) -> Result<(), Error> {
-        let recorded = self.track.then(|| def.clone());
+        let recorded = self.s.track.then(|| def.clone());
         self.recorded(
             |_| Call::DeclareAttribute(recorded.expect("recorded only when tracking")),
             |txn| txn.declare_attribute_op(def),
@@ -1141,17 +1177,17 @@ impl<'w> View<'w> {
 
 impl Txn<'_> {
     pub(super) fn encode_ordered(&self) -> Result<EncodedTxn, Error> {
-        let items = self.order.iter().map(|entry| match entry {
+        let items = self.s.order.iter().map(|entry| match entry {
             OrderedEntry::Schema(edit) => NewEntry::Schema(edit),
             OrderedEntry::Entity(i) => {
-                let d = &self.ids.defs[*i];
+                let d = &self.s.ids.defs[*i];
                 NewEntry::Entity {
                     id: d.id,
                     handle: d.handle.as_deref(),
                 }
             }
             OrderedEntry::Edge(i) => {
-                let d = &self.ids.edges[*i];
+                let d = &self.s.ids.edges[*i];
                 NewEntry::Edge {
                     id: d.id,
                     source: d.source,
@@ -1159,7 +1195,7 @@ impl Txn<'_> {
                     target: d.target,
                 }
             }
-            OrderedEntry::Fact(i) => match &self.entries[*i] {
+            OrderedEntry::Fact(i) => match &self.s.entries[*i] {
                 Staged::Fact(f) => NewEntry::Fact {
                     entity: f.entity,
                     attr: f.attr,
@@ -1190,7 +1226,7 @@ impl Txn<'_> {
         });
         log::encode_txn(
             self.world.journal.next_entry(),
-            self.tx,
+            self.s.tx,
             self.world.journal.chain_checksum(),
             items,
         )
