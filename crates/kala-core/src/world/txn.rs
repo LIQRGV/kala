@@ -356,11 +356,18 @@ impl Txn<'_> {
         if self.s.poisoned {
             return Err(Error::TransactionAborted);
         }
-        let resolved = self.world.catalog.resolve(&self.s.ids, entity, attr);
-        let (attr_id, def) = self.or_absent(attr, resolved)?;
+        let resolved = self
+            .world
+            .catalog
+            .resolve_neighbor_attr(attr, Direction::Out);
+        let (attr_id, direction) = self.or_absent(attr, resolved)?;
+        if !self.world.catalog.is_defined_staged(&self.s.ids, entity) {
+            return Err(Error::UnknownEntity(entity));
+        }
+        let def = &self.world.catalog.attributes[attr_id.0 as usize];
         // The read `[:set …]` decides from: a newer entry on this entity
         // and attribute invalidates it.
-        self.note_key(entity, attr_id, attr, true);
+        self.note_key(entity, attr_id, &def.name, direction.reads_out());
         let work = Work(Some(meter));
         let layers = [&self.world.indexes.e_index, &self.s.staged];
         let mut values = BTreeMap::new();
@@ -409,17 +416,19 @@ impl Txn<'_> {
                 keep(encoding);
             }
         };
-        let prefix = key::e_attr_prefix(entity, attr_id);
-        for index in layers {
-            index::for_each_history(
-                index,
-                &prefix,
-                |k| key::E_ATTR_PREFIX_LEN + key::e_value_bytes(k).map_or(0, |v| v.len()),
-                work,
-                &mut read,
-            );
+        if direction.reads_out() {
+            let prefix = key::e_attr_prefix(entity, attr_id);
+            for index in layers {
+                index::for_each_history(
+                    index,
+                    &prefix,
+                    |k| key::E_ATTR_PREFIX_LEN + key::e_value_bytes(k).map_or(0, |v| v.len()),
+                    work,
+                    &mut read,
+                );
+            }
         }
-        if self.world.catalog.is_bidirectional(attr_id) {
+        if direction.reads_in() || self.world.catalog.is_bidirectional(attr_id) {
             // Committed reverse histories identify partners. Judge their E keys
             // against both layers so staged retracts/corrections are visible.
             let mut reverse = |source: EntityId| {
@@ -754,6 +763,41 @@ impl Txn<'_> {
         tick: Option<Tick>,
     ) -> Result<WriteResult, Error> {
         self.write(entity, attr, &v, tick, Op::Retract, Precision::Exact)
+    }
+
+    /// Resolve the stored orientation of a relationship name, flipping endpoints
+    /// for an inverse name. An unknown name stays as written for schema inference.
+    pub fn relationship<'a>(
+        &'a self,
+        source: EntityId,
+        attr: &'a str,
+        target: EntityId,
+    ) -> (EntityId, &'a str, EntityId) {
+        if let Some(id) = self.world.catalog.inverse_by_name.get(attr) {
+            (
+                target,
+                &self.world.catalog.attributes[id.0 as usize].name,
+                source,
+            )
+        } else {
+            (source, attr, target)
+        }
+    }
+
+    /// Look up the stored triple for a committed or provisionally interned edge.
+    pub fn edge(&self, id: EdgeId) -> Option<(EntityId, String, EntityId)> {
+        if let Some(triple) = self.world.edge(id) {
+            return Some(triple);
+        }
+        let index = usize::try_from(id.seq().checked_sub(1)?)
+            .ok()?
+            .checked_sub(self.world.catalog.edges.len())?;
+        let edge = self.s.ids.edges.get(index)?;
+        Some((
+            edge.source,
+            self.world.catalog.attr_name(edge.attr)?.to_owned(),
+            edge.target,
+        ))
     }
 
     /// The edge interned for `(source, attr, target)`, as

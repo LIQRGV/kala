@@ -102,6 +102,21 @@ pub(super) fn for_each_history<M: OrderedKv>(
     work: Work<'_>,
     mut f: impl FnMut(&mut Vec<u8>),
 ) {
+    let _: Result<(), std::convert::Infallible> =
+        try_for_each_history(index, attr_prefix, history_end, work, |prefix| {
+            f(prefix);
+            Ok(())
+        });
+}
+
+/// Visit histories until the consumer rejects a value or the work meter stops.
+pub(super) fn try_for_each_history<M: OrderedKv, E>(
+    index: &M,
+    attr_prefix: &[u8],
+    history_end: impl Fn(&[u8]) -> usize,
+    work: Work<'_>,
+    mut f: impl FnMut(&mut Vec<u8>) -> Result<(), E>,
+) -> Result<(), E> {
     let mut from = Bound::Included(attr_prefix.to_vec());
     let mut prefix = Vec::new();
     while let Some((k, _)) = index.scan(as_slice(&from)).next() {
@@ -114,8 +129,9 @@ pub(super) fn for_each_history<M: OrderedKv>(
         prefix.clear();
         prefix.extend_from_slice(&k[..history_end(k)]);
         from = Bound::Excluded(key::past_value(&prefix));
-        f(&mut prefix);
+        f(&mut prefix)?;
     }
+    Ok(())
 }
 
 /// The tick of index key `k` whose history prefix is `prefix_len` bytes

@@ -171,7 +171,7 @@ pub fn stage_with(
     } else {
         usize::MAX
     };
-    let mut stager = Stager::new(tx, form.at.or(default), policy, limit)?;
+    let mut stager = Stager::for_form(tx, form.at.or(default), policy, limit)?;
     if let Some(mode) = form.concurrency {
         tx.set_concurrency(mode);
     }

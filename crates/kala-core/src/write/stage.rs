@@ -38,6 +38,8 @@ pub enum Failure {
     Limit,
     /// A statement used more primitives than its front end allows.
     OperationLimit(usize),
+    /// All rows together exceeded the statement value-byte allowance.
+    ValueBudget,
     /// The attribute holds more values at the tick than one `:set` reads.
     SetTooManyHeld {
         attr: String,
@@ -105,6 +107,7 @@ impl std::fmt::Display for WriteError {
                 "cannot set event :{}: events are never retracted; use [:correct …]",
                 crate::Echo(name)
             ),
+            Failure::ValueBudget => f.write_str("statement exceeds the 16 MiB value budget"),
             Failure::OperationLimit(limit) => {
                 write!(f, "statement exceeds the {limit}-primitive write limit")
             }
@@ -277,6 +280,7 @@ impl Effect {
 /// Tracks the effects, read work and budgets of one statement, including
 /// effects from earlier rows of a multi-row statement.
 pub struct Stager {
+    policy: WritePolicy,
     state: FormState,
     report: StagedWrite,
 }
@@ -298,7 +302,9 @@ impl Stager {
         }
         let entry_offset = tx.staged_entry_count();
         Ok(Self {
+            policy,
             state: FormState {
+                bounded_statement: true,
                 remaining: limit,
                 limit,
                 remaining_bytes: crate::MAX_ENTRY_BYTES,
@@ -317,17 +323,43 @@ impl Stager {
         })
     }
 
+    /// A text form with a bounded operation count before staging. Only its
+    /// replacement operations need an aggregate byte budget: a fact literal
+    /// from the source cannot expand across rows.
+    pub fn for_form(
+        tx: &mut Txn<'_>,
+        default: Option<Tick>,
+        policy: WritePolicy,
+        limit: usize,
+    ) -> Result<Self, WriteError> {
+        let mut stager = Self::new(tx, default, policy, limit)?;
+        stager.state.bounded_statement = false;
+        Ok(stager)
+    }
+
     fn apply(
         &mut self,
         tx: &mut Txn<'_>,
         kind: &'static str,
         action: impl FnOnce(&mut Txn<'_>, &mut FormState) -> Result<Effect, Failure>,
     ) -> Result<Effect, WriteError> {
+        if tx.is_system() && !self.policy.allow_system {
+            tx.abort();
+            return Err(WriteError {
+                operation: None,
+                cause: Failure::SystemWorld,
+            });
+        }
         let schema_before = tx.schema_changes().len();
         let first_operation = tx.operation_count();
         let position = self.report.ops.len() + 1;
         self.state.op_starts.push(tx.staged_entry_count());
-        let result = action(tx, &mut self.state).and_then(|effect| {
+        let result = if self.state.bounded_statement && self.state.remaining == 0 {
+            Err(self.state.operation_limit())
+        } else {
+            action(tx, &mut self.state)
+        }
+        .and_then(|effect| {
             let cost = effect.changed.max(1);
             self.state.remaining = self
                 .state
@@ -380,6 +412,9 @@ impl Stager {
         if_missing: bool,
     ) -> Result<(EntityId, bool), WriteError> {
         let staged = self.apply(tx, "create", |tx, state| {
+            if state.bounded_statement {
+                state.charge(node_type.len().saturating_add(handle.map_or(0, str::len)))?;
+            }
             stage_create(tx, node_type, handle, if_missing, state)
         })?;
         Ok((
@@ -405,6 +440,10 @@ impl Stager {
             Op::Retract => "retract",
         };
         self.apply(tx, kind, |tx, state| {
+            if state.bounded_statement {
+                state.charge(attr.len())?;
+                state.charge_value(&value)?;
+            }
             let tick = state.fact_tick(tx, at);
             let result = tx
                 .write_inferring(entity, attr, &value, Some(tick), op, precision)
@@ -436,6 +475,16 @@ impl Stager {
         .map(|_| ())
     }
 
+    /// Primitives still available to this statement before staging another row.
+    pub fn remaining_operations(&self) -> usize {
+        self.state.remaining
+    }
+
+    /// Key-work budget shared by replacement and node-deletion scans.
+    pub fn read_meter(&self) -> &crate::WorkMeter<'static> {
+        &self.state.read_meter
+    }
+
     /// The byte allowance available before resolving a front end's string literals.
     pub fn remaining_bytes(&self) -> usize {
         self.state.remaining_bytes
@@ -447,6 +496,7 @@ impl Stager {
     }
 }
 struct FormState {
+    bounded_statement: bool,
     remaining: usize,
     limit: usize,
     remaining_bytes: usize,
@@ -464,8 +514,40 @@ struct FormState {
     op_starts: Vec<usize>,
 }
 impl FormState {
+    fn charge(&mut self, bytes: usize) -> Result<(), Failure> {
+        self.remaining_bytes = self
+            .remaining_bytes
+            .checked_sub(bytes)
+            .ok_or_else(|| self.byte_limit())?;
+        Ok(())
+    }
+
+    fn byte_limit(&self) -> Failure {
+        if self.bounded_statement {
+            Failure::ValueBudget
+        } else {
+            Failure::Limit
+        }
+    }
+
+    fn charge_value(&mut self, value: &Value) -> Result<(), Failure> {
+        let size = match value {
+            Value::Str(s) => {
+                if s.len() > self.remaining_bytes {
+                    return Err(self.byte_limit());
+                }
+                s.len()
+                    .saturating_add(s.bytes().filter(|b| *b == 0).count())
+                    .saturating_add(3)
+            }
+            Value::Bool(_) => 2,
+            _ => 9,
+        };
+        self.charge(size)
+    }
+
     fn operation_limit(&self) -> Failure {
-        if self.limit == MAX_SET_VALUES {
+        if !self.bounded_statement {
             Failure::Limit
         } else {
             Failure::OperationLimit(self.limit)
@@ -533,36 +615,27 @@ fn stage_set(
     let tick = state.fact_tick(tx, at);
     let mut wanted = std::collections::BTreeMap::new();
     for v in values {
-        // Caller-built ASTs bypass the text parser: bound strings before cloning
-        // or encoding them. Account for NUL escaping in the stored encoding.
-        let size = match v {
-            Value::Str(s) => {
-                if s.len() > state.remaining_bytes {
-                    return Err(Failure::Limit);
-                }
-                s.len()
-                    .saturating_add(s.bytes().filter(|b| *b == 0).count())
-                    .saturating_add(3)
-            }
-            Value::Bool(_) => 2,
-            _ => 9,
-        };
-        if size > state.remaining_bytes {
-            return Err(Failure::Limit);
-        }
-        state.remaining_bytes -= size;
-
+        state.charge_value(v)?;
         let key = v
             .encode()
             .map_err(|e| Failure::Store(crate::Error::Value(e)))?;
         wanted.insert(key, v.clone());
     }
+    // A Cypher property can use the inverse spelling of a relationship. Its
+    // held values come from R and its primitives still use the stored name.
+    let inverse = if state.bounded_statement {
+        let base = tx.relationship(entity, attr, entity).1;
+        (base != attr).then(|| base.to_owned())
+    } else {
+        None
+    };
+    let stored_attr = inverse.as_deref().unwrap_or(attr);
     if let Some(v) = wanted.values().next() {
-        tx.infer_write_attribute(attr, v, Op::Assert)
+        tx.infer_write_attribute(stored_attr, v, Op::Assert)
             .map_err(Failure::Store)?;
     }
     let def = tx
-        .attribute(attr)
+        .attribute(stored_attr)
         .ok_or_else(|| Failure::EmptyUnknownAttribute(attr.to_owned()))?;
     if def.deprecated {
         return Err(Failure::Store(crate::Error::DeprecatedAttribute(
@@ -634,13 +707,25 @@ fn stage_set(
         .map(|v| (Op::Retract, v))
         .chain(wanted.into_values().map(|v| (Op::Assert, v)))
     {
+        let (subject, stored_value) = match (&inverse, &value) {
+            (Some(_), Value::Ref(source)) => (*source, Value::Ref(entity)),
+            _ => (entity, value.clone()),
+        };
         let result = match op {
-            Op::Assert => {
-                tx.assert_with_precision(entity, attr, value.clone(), Some(tick), precision)
-            }
-            Op::Retract => {
-                tx.retract_with_precision(entity, attr, value.clone(), Some(tick), precision)
-            }
+            Op::Assert => tx.assert_with_precision(
+                subject,
+                stored_attr,
+                stored_value.clone(),
+                Some(tick),
+                precision,
+            ),
+            Op::Retract => tx.retract_with_precision(
+                subject,
+                stored_attr,
+                stored_value.clone(),
+                Some(tick),
+                precision,
+            ),
         };
         match result {
             Ok(r) => changed += r.changed,
@@ -650,7 +735,13 @@ fn stage_set(
                 // transaction), the conflict is still the error to report,
                 // without the entry detail: a generic limit error would hide
                 // the real cause.
-                let found = match tx.entry_at_tick(entity, attr, &value, tick, &state.read_meter) {
+                let found = match tx.entry_at_tick(
+                    subject,
+                    stored_attr,
+                    &stored_value,
+                    tick,
+                    &state.read_meter,
+                ) {
                     Ok(found) => found,
                     Err(crate::Error::WorkInterrupted {
                         reason: crate::WorkInterruptReason::Limit,
