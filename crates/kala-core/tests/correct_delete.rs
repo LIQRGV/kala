@@ -1272,11 +1272,11 @@ fn script(w: &mut World, e: &Ents) -> Vec<EntryId> {
 }
 
 #[test]
-fn log_format_version_is_five_and_the_header_says_so() {
-    assert_eq!(LOG_FORMAT_VERSION, 5);
+fn log_format_version_is_six_and_the_header_says_so() {
+    assert_eq!(LOG_FORMAT_VERSION, 6);
     let (_d, path, _w, _e) = file();
     let b = std::fs::read(&path).unwrap();
-    assert_eq!(&b[8..12], &5u32.to_le_bytes());
+    assert_eq!(&b[8..12], &6u32.to_le_bytes());
 }
 
 #[test]

@@ -24,7 +24,9 @@ pub(crate) enum Message {
     Reset,
     Goodbye,
     Telemetry,
-    Unsupported,
+    Begin(Map),
+    Commit,
+    Rollback,
 }
 impl Message {
     pub fn parse(value: Value) -> Result<Self, Failure> {
@@ -68,10 +70,7 @@ impl Message {
             (0x0f, 0) => Self::Reset,
             (0x02, 0) => Self::Goodbye,
             (0x54, 1) if matches!(fields.next(), Some(Value::Integer(0..=3))) => Self::Telemetry,
-            (0x11, 1) => {
-                map(fields.next())?;
-                Self::Unsupported
-            }
+            (0x11, 1) => Self::Begin(map(fields.next())?),
             (0x66, 3) => {
                 let context = map(fields.next())?;
                 if context.values().any(|v| !matches!(v, Value::String(_))) {
@@ -92,7 +91,8 @@ impl Message {
                 let impersonate = impersonated(&extra)?;
                 Self::Route { db, impersonate }
             }
-            (0x12 | 0x13, 0) => Self::Unsupported,
+            (0x12, 0) => Self::Commit,
+            (0x13, 0) => Self::Rollback,
             _ => return Err(Failure::invalid()),
         };
         Ok(msg)

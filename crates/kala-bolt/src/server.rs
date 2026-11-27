@@ -1,11 +1,13 @@
 //! Loopback listener, bounded connection threads and cooperative shutdown.
 use crate::{
     auth::{Accounts, Authenticator, NoAuth, Plugin},
+    log::{LogLimit, logln},
     registry::{Registry, SystemDb},
     session,
+    transport::{Accepted, ListenAddr, Listener, ShutdownHandle, TlsReloader, Transport},
 };
 use std::io;
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{
     Arc,
@@ -17,8 +19,14 @@ use std::time::Duration;
 /// Listener settings. All durations and bounds must be nonzero.
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
-    /// Listen endpoint; port zero asks the OS for a free port.
-    pub listen: SocketAddr,
+    /// Ordered listen endpoints; TCP port zero asks the OS for a free port.
+    pub listen: Vec<ListenAddr>,
+    /// PEM certificate chain shared by all TLS listeners, leaf first.
+    pub tls_cert: Option<std::path::PathBuf>,
+    /// Unencrypted PEM private key matching the leaf certificate.
+    pub tls_key: Option<std::path::PathBuf>,
+    /// Filesystem permissions for Unix sockets.
+    pub unix_mode: u32,
     /// Public routing endpoint (HOST:PORT); otherwise the reached socket address.
     pub advertised_address: Option<String>,
     /// Default world name; inferred when exactly one world is registered.
@@ -35,13 +43,56 @@ pub struct ServerConfig {
     pub write_timeout: Duration,
     /// Largest incoming or outgoing message.
     pub max_message_bytes: usize,
+    /// Refuse writes before opening a world.
+    pub read_only: bool,
+    /// Let the server's writable handles acknowledge and cut a world's
+    /// damaged last transaction (to a quarantine file) by themselves, so
+    /// the world is writable again without an operator. Off by default:
+    /// the cut transaction may have been acknowledged to a client, and its
+    /// entry IDs and tx number are issued again, so a client holding an ID
+    /// from it could `correct` the wrong fact. Never applies to `system`;
+    /// ignored (with a startup note) when `read_only` is set.
+    pub acknowledge_recovery: bool,
+    /// Maximum open explicit write snapshots.
+    pub max_write_transactions: usize,
+    /// Maximum total lifetime of an explicit transaction.
+    pub tx_timeout: Duration,
+    /// Maximum idle time between transaction messages.
+    pub tx_idle_timeout: Duration,
+    /// Maximum wait for a writer or a causal bookmark.
+    pub busy_timeout: Duration,
     /// PackStream nesting limit (at most 32).
     pub max_depth: usize,
+    /// Test hook, compiled only with the crate's `test-hooks` feature (no
+    /// release build of the library or of `kala` has it): called by an
+    /// auto-commit Cypher write after its reading part ran off the writer
+    /// mutex and before it waits for the database's writer, so a test can
+    /// commit in between.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub after_statement_read: Option<Hook>,
+}
+/// A callback for `ServerConfig::after_statement_read`. Unwind-safe, so a
+/// configuration that carries one can still cross `catch_unwind`.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct Hook(
+    pub Arc<dyn Fn() + Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe>,
+);
+#[cfg(feature = "test-hooks")]
+impl std::fmt::Debug for Hook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Hook")
+    }
 }
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            listen: SocketAddr::from(([127, 0, 0, 1], 7687)),
+            listen: vec![ListenAddr::Tcp(SocketAddr::from(([127, 0, 0, 1], 7687)))],
+            tls_cert: None,
+            tls_key: None,
+            unix_mode: 0o600,
             advertised_address: None,
             default_db: None,
             insecure_allow_plaintext: false,
@@ -51,55 +102,104 @@ impl Default for ServerConfig {
             write_timeout: Duration::from_secs(10),
             max_message_bytes: 1 << 20,
             max_depth: 32,
+            read_only: false,
+            acknowledge_recovery: false,
+            max_write_transactions: 8,
+            tx_timeout: Duration::from_secs(60),
+            tx_idle_timeout: Duration::from_secs(30),
+            busy_timeout: Duration::from_secs(5),
+            #[cfg(feature = "test-hooks")]
+            after_statement_read: None,
         }
     }
 }
 /// A bound server; account authentication bootstraps the system world if absent.
 pub struct Server {
-    listener: TcpListener,
+    listeners: Vec<Listener>,
+    tls: Option<TlsReloader>,
+    wrapper: Option<Arc<TransportWrapper>>,
+    /// Per-socket setup of an accepted connection; tests inject failures.
+    prepare: fn(Accepted) -> io::Result<Box<dyn Transport>>,
     config: ServerConfig,
     registry: Arc<Registry>,
     auth: Arc<dyn Authenticator>,
 }
+/// Test hook: see [`Server::open_counts`].
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub struct OpenCounts(Arc<Registry>);
+#[cfg(feature = "test-hooks")]
+impl OpenCounts {
+    /// How often the shared read snapshot of `db` was replayed.
+    pub fn reader(&self, db: &str) -> usize {
+        self.0.opens(db).0
+    }
+    /// How often a writable handle of `db` was replayed.
+    pub fn writer(&self, db: &str) -> usize {
+        self.0.opens(db).1
+    }
+}
+/// How often a running server looks at its leaf certificate's end date again.
+const TLS_EXPIRY_RECHECK: Duration = Duration::from_secs(3600);
+
+type TransportWrapper = dyn Fn(Box<dyn Transport>) -> Box<dyn Transport> + Send + Sync;
+
 struct Client {
-    socket: TcpStream,
+    socket: Box<dyn ShutdownHandle>,
     thread: JoinHandle<()>,
 }
 impl Server {
     /// Bind a loopback-only, no-auth server and discover its databases.
     /// Never creates, opens or reads `system.kala`, and never serves the
-    /// `system` database; writes nothing to `directory`.
+    /// `system` database; writes no database files.
     pub fn bind(directory: impl AsRef<Path>, config: ServerConfig) -> io::Result<Self> {
+        let tls = Self::validate_listeners(&config)?;
         Self::require_loopback(&config)?;
-        Self::bind_inner(directory.as_ref(), config, Arc::new(NoAuth), SystemDb::Skip)
+        Self::bind_inner(
+            directory.as_ref(),
+            config,
+            tls,
+            Arc::new(NoAuth),
+            SystemDb::Skip,
+        )
     }
     /// Bind with persisted accounts, bootstrapping root@localhost when needed.
     pub fn bind_accounts(directory: impl AsRef<Path>, config: ServerConfig) -> io::Result<Self> {
-        if !config.listen.ip().is_loopback() && !config.insecure_allow_plaintext {
+        let tls = Self::validate_listeners(&config)?;
+        let exposed = config
+            .listen
+            .iter()
+            .find(|a| matches!(a, ListenAddr::Tcp(socket) if !socket.ip().is_loopback()));
+        if let Some(addr) = exposed
+            && !config.insecure_allow_plaintext
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "accounts require a loopback listen address unless --insecure-allow-plaintext is given",
+                format!(
+                    "non-loopback listener {addr} would send account passwords unencrypted: listen with bolt+s:// and --tls.cert/--tls.key, or pass --insecure-allow-plaintext to accept plaintext"
+                ),
             ));
         }
         if config.insecure_allow_plaintext {
-            eprintln!(
+            logln!(
                 "kala serve: WARNING: passwords travel unencrypted; --insecure-allow-plaintext is enabled"
             );
         }
         let directory = directory.as_ref();
         if crate::system::ensure(directory).map_err(io::Error::other)? {
-            eprintln!("kala serve: created system.kala with root@localhost");
+            logln!("kala serve: created system.kala with root@localhost");
         }
         for account in crate::system::list(directory).map_err(io::Error::other)? {
             if account.plugin == Plugin::Trust {
-                eprintln!(
+                logln!(
                     "kala serve: account {}@{} uses trust (no password)",
-                    account.user, account.host
+                    account.user,
+                    account.host
                 );
             }
         }
         let auth = Accounts::open(directory).map_err(io::Error::other)?;
-        Self::bind_inner(directory, config, Arc::new(auth), SystemDb::Serve)
+        Self::bind_inner(directory, config, tls, Arc::new(auth), SystemDb::Serve)
     }
     /// Supply an authenticator on a loopback-only listener.
     pub fn bind_with_auth(
@@ -107,11 +207,42 @@ impl Server {
         config: ServerConfig,
         auth: Arc<dyn Authenticator>,
     ) -> io::Result<Self> {
+        let tls = Self::validate_listeners(&config)?;
         Self::require_loopback(&config)?;
-        Self::bind_inner(directory.as_ref(), config, auth, SystemDb::Serve)
+        Self::bind_inner(directory.as_ref(), config, tls, auth, SystemDb::Serve)
+    }
+    fn validate_listeners(config: &ServerConfig) -> io::Result<Option<TlsReloader>> {
+        if config.listen.is_empty() || config.listen.len() > 16 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected 1 to 16 listeners",
+            ));
+        }
+        if config.unix_mode > 0o777 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Unix mode must be octal permissions 0000 through 0777",
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for addr in &config.listen {
+            addr.validate()
+                .map_err(|e| io::Error::new(e.kind(), format!("listener {addr}: {e}")))?;
+            if !seen.insert(addr) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("duplicate listen address: {addr}"),
+                ));
+            }
+        }
+        TlsReloader::configured(
+            &config.listen,
+            config.tls_cert.as_deref(),
+            config.tls_key.as_deref(),
+        )
     }
     fn require_loopback(config: &ServerConfig) -> io::Result<()> {
-        if !config.listen.ip().is_loopback() {
+        if config.listen.iter().any(|a| !a.is_loopback()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "no-auth server requires a loopback listen address",
@@ -122,6 +253,7 @@ impl Server {
     fn bind_inner(
         directory: &Path,
         config: ServerConfig,
+        tls: Option<TlsReloader>,
         auth: Arc<dyn Authenticator>,
         system: SystemDb,
     ) -> io::Result<Self> {
@@ -135,7 +267,10 @@ impl Server {
                 "advertised address must be HOST:PORT or [IPv6]:PORT",
             ));
         }
-        if config.max_connections == 0
+        if std::time::Instant::now()
+            .checked_add(config.busy_timeout)
+            .is_none()
+            || config.max_connections == 0
             || config.max_message_bytes == 0
             || config.max_depth == 0
             || config.max_depth > 32
@@ -143,6 +278,8 @@ impl Server {
                 config.handshake_timeout,
                 config.idle_timeout,
                 config.write_timeout,
+                config.tx_timeout,
+                config.tx_idle_timeout,
             ]
             .iter()
             .any(|d| d.is_zero() || std::time::Instant::now().checked_add(*d).is_none())
@@ -156,51 +293,104 @@ impl Server {
         if !directory.is_dir() {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no such directory"));
         }
-        let registry = Arc::new(Registry::open(
-            directory,
-            config.default_db.clone(),
-            system,
-        )?);
-        let listener = TcpListener::bind(config.listen)?;
-        listener.set_nonblocking(true)?;
+        if config.acknowledge_recovery && config.read_only {
+            logln!(
+                "kala serve: --acknowledge-recovery is ignored: a read-only server never writes, so it never cuts a damaged tail"
+            );
+        } else if config.acknowledge_recovery {
+            logln!(
+                "kala serve: WARNING: --acknowledge-recovery is on: a world's damaged last transaction is cut to a quarantine file without asking, and its entry IDs are issued again"
+            );
+        }
+        let registry = Arc::new(
+            Registry::open(directory, config.default_db.clone(), system)?
+                .acknowledging_recovery(config.acknowledge_recovery && !config.read_only),
+        );
+        let mut listeners = Vec::new();
+        for addr in &config.listen {
+            listeners.push(
+                Listener::bind(addr, config.unix_mode, tls.as_ref())
+                    .map_err(|e| io::Error::new(e.kind(), format!("listener {addr}: {e}")))?,
+            );
+        }
         Ok(Self {
-            listener,
+            listeners,
+            tls,
+            wrapper: None,
+            prepare: Accepted::into_transport,
             config,
             registry,
             auth,
         })
     }
-    /// The actual endpoint, after resolving port zero.
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.listener.local_addr()
+    /// Test hook: a counter of how often each kind of handle of a database
+    /// was replayed from its file, readable while the server runs.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn open_counts(&self) -> OpenCounts {
+        OpenCounts(Arc::clone(&self.registry))
+    }
+    /// A handle for reloading TLS files for future connections, if configured.
+    pub fn tls_reloader(&self) -> Option<TlsReloader> {
+        self.tls.clone()
+    }
+    /// Actual bound endpoints, in configuration order.
+    pub fn local_addrs(&self) -> io::Result<Vec<ListenAddr>> {
+        self.listeners.iter().map(Listener::local_addr).collect()
+    }
+    /// Wrap every accepted byte transport before running the shared session.
+    /// Wrappers must preserve deadlines and cancellation. The peer used for
+    /// account matching and the reached address are taken from the accepted
+    /// connection before it is wrapped, so a wrapper's own `peer` and
+    /// `local_addr` answers are never used.
+    pub fn with_transport_wrapper(
+        mut self,
+        wrapper: impl Fn(Box<dyn Transport>) -> Box<dyn Transport> + Send + Sync + 'static,
+    ) -> Self {
+        self.wrapper = Some(Arc::new(wrapper));
+        self
     }
     /// Accept until `shutdown` is set, then close sockets, cancel queries and
     /// join the bounded client threads. No detached connections survive return.
     pub fn run(self, shutdown: Arc<AtomicBool>) -> io::Result<()> {
         let mut clients = Clients::new();
         let mut accept_failed = LogLimit::new();
-        let result = loop {
+        let mut expiry_checked = std::time::Instant::now();
+        let result = 'accept: loop {
             clients.reap();
+            if let Some(tls) = &self.tls
+                && expiry_checked.elapsed() >= TLS_EXPIRY_RECHECK
+            {
+                expiry_checked = std::time::Instant::now();
+                tls.log_expiry();
+            }
             if shutdown.load(Ordering::Relaxed) {
                 break Ok(());
             }
-            match self.listener.accept() {
-                Ok((stream, _)) => self.admit(stream, &mut clients, &shutdown),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(5))
+            let mut accepted = false;
+            for listener in &self.listeners {
+                match listener.accept() {
+                    Ok(stream) => {
+                        accepted = true;
+                        self.admit(listener, stream, &mut clients, &shutdown);
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(e) if accept_error_is_fatal(&e) => break 'accept Err(e),
+                    Err(e) => {
+                        accept_failed.log(format_args!(
+                            "event=bolt_accept_failed error={:?}",
+                            e.kind()
+                        ));
+                        thread::sleep(Duration::from_millis(50));
+                    }
                 }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
-                Err(e) if accept_error_is_fatal(&e) => break Err(e),
-                Err(e) => {
-                    // A connection aborted before accept, EMFILE/ENFILE, a
-                    // network blip: drop it and keep serving (with a short
-                    // pause so fd exhaustion can't spin the loop).
-                    accept_failed.log(format_args!(
-                        "event=bolt_accept_failed error={:?}",
-                        e.kind()
-                    ));
-                    thread::sleep(Duration::from_millis(50));
-                }
+            }
+            if !accepted {
+                thread::sleep(Duration::from_millis(5));
             }
         };
         shutdown.store(true, Ordering::Relaxed);
@@ -209,23 +399,67 @@ impl Server {
     }
     /// Gives an accepted connection its session thread, or closes it: over
     /// the connection cap, or when its socket or thread can't be set up.
-    fn admit(&self, stream: TcpStream, clients: &mut Clients, shutdown: &Arc<AtomicBool>) {
+    /// Nothing that goes wrong with one connection reaches the accept loop.
+    fn admit(
+        &self,
+        listener: &Listener,
+        accepted: Accepted,
+        clients: &mut Clients,
+        shutdown: &Arc<AtomicBool>,
+    ) {
         if clients.active.len() >= self.config.max_connections {
-            let _ = stream.shutdown(Shutdown::Both);
+            accepted.close();
             clients.refused.log(format_args!(
                 "event=bolt_connection_refused reason=connection_cap"
             ));
             return;
         }
-        // The listener is non-blocking, and on macOS/BSD and
-        // Windows an accepted socket inherits that; sessions use
-        // blocking reads with timeouts. A failure on one socket
-        // (reset by the peer, fd pressure) drops that client
-        // only, never the server.
-        let prepared = stream
-            .set_nonblocking(false)
-            .and_then(|()| stream.set_nodelay(true))
-            .and_then(|()| stream.try_clone());
+        let stream = match (self.prepare)(accepted) {
+            Ok(stream) => stream,
+            Err(e) => {
+                // The failed socket was dropped (closed) with the error.
+                clients.dropped.log(format_args!(
+                    "event=bolt_connection_dropped error={:?}",
+                    e.kind()
+                ));
+                return;
+            }
+        };
+        // Who connected, and where, is asked of the real connection before
+        // any wrapper sees it: a wrapper frames bytes and must not be able to
+        // turn a TCP client into a `localhost` peer.
+        let origin = stream.peer().and_then(|peer| {
+            Ok(session::Origin {
+                peer,
+                reached: stream.local_addr()?,
+                tls: listener.is_tls(),
+            })
+        });
+        let origin = match origin {
+            Ok(origin) => origin,
+            Err(e) => {
+                clients.dropped.log(format_args!(
+                    "event=bolt_connection_dropped error={:?}",
+                    e.kind()
+                ));
+                return;
+            }
+        };
+        let stream = match &self.wrapper {
+            Some(wrap) => wrap(stream),
+            None => stream,
+        };
+        let stream = match listener.wrap(stream) {
+            Ok(stream) => stream,
+            Err(e) => {
+                clients.dropped.log(format_args!(
+                    "event=bolt_connection_dropped reason=tls_setup error={:?}",
+                    e.kind()
+                ));
+                return;
+            }
+        };
+        let prepared = stream.shutdown_handle();
         let socket = match prepared {
             Ok(s) => s,
             Err(e) => {
@@ -233,26 +467,29 @@ impl Server {
                     "event=bolt_connection_dropped error={:?}",
                     e.kind()
                 ));
-                let _ = stream.shutdown(Shutdown::Both);
+                if let Ok(handle) = stream.shutdown_handle() {
+                    let _ = handle.shutdown();
+                }
                 return;
             }
         };
         clients.next_id = clients.next_id.wrapping_add(1);
-        match self.spawn_session(stream, clients.next_id, shutdown) {
+        match self.spawn_session(stream, origin, clients.next_id, shutdown) {
             Ok(thread) => clients.active.push(Client { socket, thread }),
             Err(e) => {
                 clients.dropped.log(format_args!(
                     "event=bolt_connection_dropped error={:?}",
                     e.kind()
                 ));
-                let _ = socket.shutdown(Shutdown::Both);
+                let _ = socket.shutdown();
             }
         }
     }
     /// Starts the thread that serves one connection until it ends.
     fn spawn_session(
         &self,
-        stream: TcpStream,
+        mut stream: Box<dyn Transport>,
+        origin: session::Origin,
         id: u64,
         shutdown: &Arc<AtomicBool>,
     ) -> io::Result<JoinHandle<()>> {
@@ -263,15 +500,24 @@ impl Server {
         thread::Builder::new()
             .name(format!("bolt-{id}"))
             .spawn(move || {
-                eprintln!("event=bolt_connected connection_id={id}");
+                logln!("event=bolt_connected connection_id={id}");
                 let shared = session::Shared {
                     registry: &registry,
                     auth: auth.as_ref(),
                     config: &config,
                     stop: &stop,
                 };
-                let result = session::serve(stream, id, &shared);
-                eprintln!(
+                let result = session::serve(stream.as_mut(), origin, id, &shared);
+                // Framing reports EOF between Bolt messages as UnexpectedEof.
+                // Give a peer closing its stream first the same orderly reply.
+                if result
+                    .as_ref()
+                    .err()
+                    .is_none_or(|e| e.kind() == io::ErrorKind::UnexpectedEof)
+                {
+                    let _ = stream.finish(std::time::Instant::now() + config.write_timeout);
+                }
+                logln!(
                     "event=bolt_disconnected connection_id={id} reason={:?}",
                     result.err().map(|e| e.kind())
                 );
@@ -315,7 +561,7 @@ impl Clients {
     /// Closes every socket, then joins every thread.
     fn close(self) {
         for client in &self.active {
-            let _ = client.socket.shutdown(Shutdown::Both);
+            let _ = client.socket.shutdown();
         }
         for client in self.active {
             let _ = client.thread.join();
@@ -350,41 +596,6 @@ fn accept_error_is_fatal(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::InvalidInput
 }
 
-/// Coalesces a repeating log event: the first occurrence in each second is
-/// printed, later ones are counted and reported once with the next print,
-/// so a client looping connect/close can't flood stderr.
-struct LogLimit {
-    last: Option<std::time::Instant>,
-    suppressed: u64,
-}
-
-impl LogLimit {
-    const fn new() -> Self {
-        Self {
-            last: None,
-            suppressed: 0,
-        }
-    }
-
-    fn log(&mut self, line: std::fmt::Arguments<'_>) {
-        let now = std::time::Instant::now();
-        if self
-            .last
-            .is_some_and(|t| now.duration_since(t) < Duration::from_secs(1))
-        {
-            self.suppressed += 1;
-            return;
-        }
-        if self.suppressed > 0 {
-            eprintln!("{line} suppressed_since_last={}", self.suppressed);
-        } else {
-            eprintln!("{line}");
-        }
-        self.last = Some(now);
-        self.suppressed = 0;
-    }
-}
-
 fn valid_advertised_address(address: &str) -> bool {
     if address.len() > 1024 || address.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return false;
@@ -409,8 +620,68 @@ fn valid_advertised_address(address: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::accept_error_is_fatal;
-    use std::io::{Error, ErrorKind};
+    use super::{Server, ServerConfig, accept_error_is_fatal};
+    use crate::transport::{Accepted, ListenAddr, Transport};
+    use std::io::{Error, ErrorKind, Read, Write};
+    use std::net::TcpStream;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    static PREPARED: AtomicUsize = AtomicUsize::new(0);
+    /// The first accepted socket fails its setup the way a client that reset
+    /// right after connecting does on macOS: setsockopt returns EINVAL, which
+    /// `accept_error_is_fatal` treats as a broken listener.
+    fn first_setup_fails(accepted: Accepted) -> std::io::Result<Box<dyn Transport>> {
+        if PREPARED.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(Error::from_raw_os_error(22));
+        }
+        accepted.into_transport()
+    }
+
+    // PR #17 polish: per-socket setup is not an accept error. One client whose
+    // socket can't be set up is dropped; the server keeps accepting.
+    #[test]
+    fn a_failed_socket_setup_drops_only_that_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ServerConfig {
+            listen: vec![ListenAddr::Tcp("127.0.0.1:0".parse().unwrap())],
+            ..ServerConfig::default()
+        };
+        let mut server = Server::bind(dir.path(), config).unwrap();
+        server.prepare = first_setup_fails;
+        let ListenAddr::Tcp(addr) = server.local_addrs().unwrap()[0].clone() else {
+            panic!("TCP listener")
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || server.run(shutdown));
+        let connect = || {
+            let stream = TcpStream::connect(addr)?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            Ok::<_, Error>(stream)
+        };
+        // The unlucky client is closed without a byte.
+        let mut dropped = connect().unwrap();
+        let mut byte = [0; 1];
+        assert!(matches!(dropped.read(&mut byte), Ok(0) | Err(_)));
+        // The next client is served: the handshake answers Bolt 5.4.
+        let served = connect().and_then(|mut next| {
+            next.write_all(&[
+                0x60, 0x60, 0xb0, 0x17, 0, 0, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ])?;
+            let mut version = [0; 4];
+            next.read_exact(&mut version)?;
+            Ok(version)
+        });
+        stop.store(true, Ordering::SeqCst);
+        let result = worker.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "one client's setup failure stopped the server: {result:?}"
+        );
+        assert_eq!(served.unwrap(), [0, 0, 4, 5]);
+    }
 
     // PR #4 review round 1: per-connection accept failures never stop the
     // server; only a broken listener does.

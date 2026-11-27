@@ -46,10 +46,17 @@ pub enum SystemError {
         /// The size of the damaged tail.
         bytes: u64,
     },
+    /// `system.kala` was written by an older Kala log format, which this
+    /// build doesn't read (there is no dual-format reading). The file is
+    /// left untouched.
+    OldFormat {
+        /// The file's log format version.
+        version: u32,
+    },
 }
 impl fmt::Display for SystemError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+        let text = match self {
             Self::InvalidAccount => {
                 "account must be USER@HOST with a nonempty ASCII user name of at most 64 bytes"
             }
@@ -66,7 +73,7 @@ impl fmt::Display for SystemError {
             Self::LastAdmin => "cannot remove the last account with admin:*",
             Self::ReservedSystem => "system is reserved for accounts; use kala user",
             Self::InvalidSystem => "invalid or unsupported system world",
-            Self::Busy => "system world is open in another writer; retry the command",
+            Self::Busy => "system world is being written by another writer; retry the command",
             Self::Store => "system world could not be read or written",
             Self::Password => "password hashing failed",
             Self::NoSuchDirectory => "no such directory",
@@ -74,14 +81,35 @@ impl fmt::Display for SystemError {
                 "the last transaction of the system world is damaged; writing would cut it \
                  to a quarantine file, so the recovery must be acknowledged"
             }
-        })
+            Self::OldFormat { version } => {
+                return write!(
+                    f,
+                    "the accounts database (system.kala) was written by an older Kala log format \
+                     (version {version}), which this build doesn't read. Dump the directory with \
+                     the older kala binary that wrote it (kala dump --all DIR -o BACKUP), then load \
+                     each dump into a new directory with this one (kala transact --create \
+                     NEW_DIR/system.kala BACKUP/system.dump.edn, and the same for every world). \
+                     The old files are left untouched"
+                );
+            }
+        };
+        f.write_str(text)
     }
 }
 impl std::error::Error for SystemError {}
 fn store(error: kala_core::Error) -> SystemError {
     match error {
         kala_core::Error::WorldLocked => SystemError::Busy,
+        // Another account change was committed after this one read the
+        // accounts; nothing was written. `apply` runs the change again.
+        kala_core::Error::Conflict(_) => SystemError::Busy,
         kala_core::Error::RecoveryRequired { bytes } => SystemError::RecoveryRequired { bytes },
+        // Only the version number: nothing of the file's content.
+        kala_core::Error::UnsupportedVersion(version)
+            if version < kala_core::log::LOG_FORMAT_VERSION =>
+        {
+            SystemError::OldFormat { version }
+        }
         _ => SystemError::Store,
     }
 }
@@ -100,6 +128,8 @@ pub struct AccountSummary {
 #[derive(Debug)]
 pub(crate) struct Account {
     id: EntityId,
+    /// See [`Identity::generation`].
+    pub(crate) generation: i64,
     pub(crate) summary: AccountSummary,
     pub(crate) host: HostPattern,
     pub(crate) password: Option<Credentials>,
@@ -110,6 +140,7 @@ impl Account {
             principal: self.summary.user.clone(),
             host: self.summary.host.clone(),
             grants: self.summary.grants.clone(),
+            generation: self.generation,
         }
     }
 }
@@ -341,8 +372,22 @@ pub(crate) fn read_accounts(world: &World) -> Result<Vec<Account>, SystemError> 
             let (privilege, db) = grant.split_once(':').ok_or(SystemError::InvalidSystem)?;
             validate_grant(privilege, db)?;
         }
+        // The account's entity (and handle) is reused when a dropped
+        // account is added again, so the entity is not the account's
+        // identity over time. The tick of its current `user` fact is: a
+        // drop retracts the fact, an add asserts it at a new tick, and
+        // nothing else writes it.
+        let generation = world
+            .history(id, "user")
+            .map_err(store)?
+            .iter()
+            .filter(|change| change.op == kala_core::Op::Assert)
+            .map(|change| change.tick.0)
+            .max()
+            .ok_or(SystemError::InvalidSystem)?;
         accounts.push(Account {
             id,
+            generation,
             summary: AccountSummary {
                 user,
                 host,
@@ -501,85 +546,188 @@ pub struct Applied {
 }
 /// Apply one account change to `directory/system.kala` under its writer
 /// lock, creating the system world (never the directory) if it is absent.
+/// Waits for a lock another writer holds up to kala-core's default busy
+/// timeout (5 s); see [`apply_waiting`].
 pub fn apply(directory: impl AsRef<Path>, change: Change<'_>, recovery: Recovery) -> Applied {
+    apply_waiting(
+        directory,
+        change,
+        recovery,
+        kala_core::log::DEFAULT_BUSY_TIMEOUT,
+    )
+}
+/// [`apply`], waiting up to `busy_timeout` each time the system world's
+/// writer lock is held by another writer (opening it, and committing the
+/// change); zero means one attempt. Past it the result is
+/// [`SystemError::Busy`] and nothing was written.
+pub fn apply_waiting(
+    directory: impl AsRef<Path>,
+    change: Change<'_>,
+    recovery: Recovery,
+    busy_timeout: std::time::Duration,
+) -> Applied {
     let directory = directory.as_ref();
     let mut open = Open {
         recovery,
+        busy_timeout,
         recovered: None,
+        conflicted: false,
     };
-    let result = match change {
-        Change::Add { account, password } => add_inner(directory, account, password, &mut open),
-        Change::Set { account, password } => set_inner(directory, account, password, &mut open),
-        Change::Grant {
-            account,
-            privilege,
-            db,
-        } => change_grant(directory, account, privilege, db, true, &mut open),
-        Change::Revoke {
-            account,
-            privilege,
-            db,
-        } => change_grant(directory, account, privilege, db, false, &mut open),
-        Change::Drop { account } => drop_inner(directory, account, &mut open),
+    // Every change is decided from the accounts as read (does the account
+    // exist, is this the last admin, the next audit tick), so its
+    // transaction counts as having read all of them: if another change is
+    // committed first, kala-core refuses this one, having written nothing,
+    // and it is decided again from the accounts as they are now. Bounded:
+    // past it the caller sees `Busy` ("retry the command").
+    const CONFLICT_RETRIES: usize = 16;
+    // What a change needs that doesn't depend on the accounts as read is
+    // made once, before the first attempt: above all the password's hash
+    // (argon2 is slow on purpose, and its salt is random: every attempt
+    // writes this one hash). As before, a bad account name or password
+    // fails here, before the system world is opened or created.
+    let secret = match &change {
+        Change::Add { account, password } | Change::Set { account, password } => {
+            match Secret::new(account, *password) {
+                Ok(secret) => Some(secret),
+                Err(e) => {
+                    return Applied {
+                        recovered: None,
+                        result: Err(e),
+                    };
+                }
+            }
+        }
+        _ => None,
+    };
+    let mut attempt = 0;
+    let result = loop {
+        open.conflicted = false;
+        let result = match (&change, &secret) {
+            (Change::Add { .. }, Some(secret)) => add_inner(directory, secret, &mut open),
+            (Change::Set { .. }, Some(secret)) => set_inner(directory, secret, &mut open),
+            // `secret` is made for exactly these two changes, above.
+            (Change::Add { .. } | Change::Set { .. }, None) => Err(SystemError::InvalidSystem),
+            (
+                Change::Grant {
+                    account,
+                    privilege,
+                    db,
+                },
+                _,
+            ) => change_grant(directory, account, privilege, db, true, &mut open),
+            (
+                Change::Revoke {
+                    account,
+                    privilege,
+                    db,
+                },
+                _,
+            ) => change_grant(directory, account, privilege, db, false, &mut open),
+            (Change::Drop { account }, _) => drop_inner(directory, account, &mut open),
+        };
+        if open.conflicted && attempt < CONFLICT_RETRIES {
+            attempt += 1;
+            continue;
+        }
+        break result;
     };
     Applied {
         recovered: open.recovered,
         result,
     }
 }
+/// An account's new authentication, made once for all attempts of an add or
+/// a set: the parsed name, the plugin and the password's hash.
+struct Secret {
+    name: AccountName,
+    plugin: Plugin,
+    password: Option<Credentials>,
+}
+impl Secret {
+    fn new(account: &str, password: Option<&str>) -> Result<Secret, SystemError> {
+        let name = AccountName::parse(account)?;
+        let (plugin, password) = authentication(&name, password)?;
+        Ok(Secret {
+            name,
+            plugin,
+            password,
+        })
+    }
+}
 /// How [`writer`] may recover the log, and what it cut.
 struct Open {
     recovery: Recovery,
+    /// How long to wait for the writer lock (see [`apply_waiting`]).
+    busy_timeout: std::time::Duration,
     recovered: Option<kala_core::RecoveryReport>,
+    /// The last attempt lost to another account change committed while it
+    /// ran: nothing was written, and the change can be decided again.
+    conflicted: bool,
 }
-/// How often, and how far apart, [`open_writer`] retries a locked world.
-const LOCK_RETRIES: u32 = 20;
-const LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
-
-/// Opens the system world for writing, waiting briefly if it is locked.
-///
-/// The lock can outlive the handle that took it by a moment: a process
-/// spawning a child from another thread shares its open files with the child
-/// until the child execs, so a just-closed world (the one `ensure` created)
-/// can still look locked. A real second writer holds the lock for longer than
-/// the retries last, and is still reported as [`SystemError::Busy`].
-fn open_writer(path: &Path, recovery: Recovery) -> Result<World, SystemError> {
-    let mut attempt = 0;
-    loop {
-        let opened = match recovery {
-            Recovery::Refuse => World::open_refusing_damaged(path),
-            Recovery::Acknowledge => World::open(path),
-        };
-        match opened {
-            Err(kala_core::Error::WorldLocked) if attempt < LOCK_RETRIES => {
-                attempt += 1;
-                std::thread::sleep(LOCK_RETRY_DELAY);
-            }
-            other => return other.map_err(store),
-        }
+/// Begins the transaction of an account change that was decided from
+/// `world` as the caller just read it, writing at `tick`. The transaction
+/// counts as having read every account, so a change committed by another
+/// process before this one's commit is a conflict; and one that `begin`
+/// itself caught up with (after the caller's reads) is one too.
+fn begin<'w>(world: &'w mut World, tick: Tick, open: &mut Open) -> Result<Txn<'w>, SystemError> {
+    let read_at = world.latest_tx();
+    let mut txn = world.begin();
+    if txn.snapshot_tx() != read_at {
+        open.conflicted = true;
+        return Err(SystemError::Busy);
     }
+    txn.note_read_all();
+    txn.set_default_tick(tick);
+    Ok(txn)
+}
+/// Commits an account change begun with [`begin`].
+fn commit(txn: Txn<'_>, open: &mut Open) -> Result<kala_core::CommitResult, SystemError> {
+    #[cfg(test)]
+    tests::before_commit();
+    txn.commit().map_err(|e| {
+        open.conflicted = matches!(e, kala_core::Error::Conflict(_));
+        store(e)
+    })
+}
+/// Opens the system world for writing.
+///
+/// The open needs the writer lock, which another `kala user` command, or a
+/// process that just closed the world, may hold for a moment (a process
+/// spawning a child from another thread shares its open files with the
+/// child until the child execs). kala-core waits for it up to the busy
+/// timeout (5 s unless the caller chose another), which the opened world's
+/// commits wait too; a writer that holds it longer is reported as
+/// [`SystemError::Busy`].
+fn open_writer(path: &Path, open: &Open) -> Result<World, SystemError> {
+    match open.recovery {
+        Recovery::Refuse => World::open_refusing_damaged_waiting(path, open.busy_timeout),
+        Recovery::Acknowledge => World::open_waiting(path, open.busy_timeout),
+    }
+    .map_err(store)
 }
 fn writer(directory: &Path, open: &mut Open) -> Result<World, SystemError> {
     // `ensure` validates the committed prefix read-only, so a world that is
     // not a system world is refused before any recovery can cut its tail.
     ensure(directory)?;
     let path = directory.join("system.kala");
-    let mut world = open_writer(&path, open.recovery)?;
+    let mut world = open_writer(&path, open)?;
     let damaged = world.recovery().cause == Some(kala_core::CutCause::Damaged);
+    // Validated first: the open only reports a damaged tail and leaves it
+    // in the file, so a world that isn't a valid system world is refused
+    // with nothing cut.
+    validate(&world)?;
     if damaged {
         // Reachable only with `Recovery::Acknowledge`: the refusing open
-        // never cuts a damaged tail. Recorded before anything else can
-        // fail, because the tail is already gone from the log.
-        let report = world.recovery();
+        // fails on a damaged tail. The caller's acknowledgement licenses
+        // the cut, made now under the writer lock (quarantine file first),
+        // and recorded as soon as the tail is gone from the log.
+        world.acknowledge_recovery();
+        let report = world.cut_acknowledged_tail().map_err(store)?.clone();
         eprintln!(
             "event=system_recovery_acknowledged bytes_cut={}",
             report.bytes_cut
         );
-        open.recovered = Some(report.clone());
-    }
-    validate(&world)?;
-    if damaged {
-        world.acknowledge_recovery();
+        open.recovered = Some(report);
     }
     Ok(world)
 }
@@ -622,21 +770,22 @@ pub fn add(
 }
 fn add_inner(
     directory: &Path,
-    account: &str,
-    password: Option<&str>,
+    secret: &Secret,
     open: &mut Open,
 ) -> Result<WriteReport, SystemError> {
-    let name = AccountName::parse(account)?;
-    let (plugin, password) = authentication(&name, password)?;
+    let Secret {
+        name,
+        plugin,
+        password,
+    } = secret;
     let mut world = writer(directory, open)?;
-    if find(&read_accounts(&world)?, &name).is_some() {
+    if find(&read_accounts(&world)?, name).is_some() {
         return Err(SystemError::AccountExists);
     }
     let key = name.key();
     let previous = world.entity_by_handle(&key);
     let tick = next_tick(&world)?;
-    let mut txn = world.begin();
-    txn.set_default_tick(tick);
+    let mut txn = begin(&mut world, tick, open)?;
     // Reuse a dropped account's permanent handle, retaining its full history.
     let id = match previous {
         Some(id) => id,
@@ -654,7 +803,7 @@ fn add_inner(
         txn.assert(id, "password_hash", Value::Str(hash.expose().into()), None)
             .map_err(store)?;
     }
-    let committed = txn.commit().map_err(store)?;
+    let committed = commit(txn, open)?;
     eprintln!(
         "event=account_added user={} host={} plugin={plugin}",
         name.user, name.host
@@ -700,18 +849,19 @@ pub fn set(
 }
 fn set_inner(
     directory: &Path,
-    account: &str,
-    password: Option<&str>,
+    secret: &Secret,
     open: &mut Open,
 ) -> Result<WriteReport, SystemError> {
-    let name = AccountName::parse(account)?;
-    let (plugin, password) = authentication(&name, password)?;
+    let Secret {
+        name,
+        plugin,
+        password,
+    } = secret;
     let mut world = writer(directory, open)?;
     let accounts = read_accounts(&world)?;
-    let old = find(&accounts, &name).ok_or(SystemError::AccountNotFound)?;
+    let old = find(&accounts, name).ok_or(SystemError::AccountNotFound)?;
     let tick = next_tick(&world)?;
-    let mut txn = world.begin();
-    txn.set_default_tick(tick);
+    let mut txn = begin(&mut world, tick, open)?;
     replace(
         &mut txn,
         old.id,
@@ -726,7 +876,7 @@ fn set_inner(
         old.password.as_ref().map(Credentials::expose),
         password.as_ref().map(Credentials::expose),
     )?;
-    let committed = txn.commit().map_err(store)?;
+    let committed = commit(txn, open)?;
     eprintln!(
         "event=account_auth_changed user={} host={} plugin={plugin} changed={}",
         name.user, name.host, committed.changed
@@ -822,8 +972,7 @@ fn change_grant(
     if !add && grant == "admin:*" {
         guard_last_admin(&accounts, target)?;
     }
-    let mut txn = world.begin();
-    txn.set_default_tick(tick);
+    let mut txn = begin(&mut world, tick, open)?;
     if add {
         txn.assert(target.id, "grant", Value::Str(grant), None)
             .map_err(store)?;
@@ -831,7 +980,7 @@ fn change_grant(
         txn.retract(target.id, "grant", Value::Str(grant), None)
             .map_err(store)?;
     }
-    let committed = txn.commit().map_err(store)?;
+    let committed = commit(txn, open)?;
     eprintln!(
         "event=account_grant_changed user={} host={} privilege={privilege} db={db} granted={add}",
         name.user, name.host
@@ -864,15 +1013,14 @@ fn drop_inner(
         .map(|attr| strings(&world, target.id, attr).map(|v| (attr, v)))
         .collect::<Result<Vec<_>, _>>()?;
     let tick = next_tick(&world)?;
-    let mut txn = world.begin();
-    txn.set_default_tick(tick);
+    let mut txn = begin(&mut world, tick, open)?;
     for (attr, values) in values {
         for value in values {
             txn.retract(target.id, attr, Value::Str(value), None)
                 .map_err(store)?;
         }
     }
-    let committed = txn.commit().map_err(store)?;
+    let committed = commit(txn, open)?;
     eprintln!(
         "event=account_dropped user={} host={}",
         name.user, name.host
@@ -881,4 +1029,66 @@ fn drop_inner(
         changed: committed.changed,
         tick,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// Run once, right before this thread's next account change
+        /// commits: what another process could commit at that moment.
+        static BEFORE_COMMIT: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn before_commit() {
+        let hook = BEFORE_COMMIT.with(|hook| hook.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn hashed() -> usize {
+        crate::auth::HASHED.with(std::cell::Cell::get)
+    }
+
+    /// PR #20 review, item M: a change that loses to another account
+    /// change is decided again, but its password is hashed only once.
+    #[test]
+    fn a_password_is_hashed_once_however_often_the_change_is_decided_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = |account: &'static str| {
+            let directory = dir.path().to_owned();
+            BEFORE_COMMIT.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    // Trust on loopback: no password, so no hash of its own.
+                    add(&directory, account, None).unwrap();
+                }));
+            });
+        };
+        let before = hashed();
+        other("bob@localhost");
+        add(dir.path(), "alice@localhost", Some("correct horse")).unwrap();
+        assert_eq!(hashed() - before, 1, "add: decided twice, hashed once");
+        other("carol@localhost");
+        set(dir.path(), "alice@localhost", Some("battery staple")).unwrap();
+        assert_eq!(hashed() - before, 2, "set: decided twice, hashed once");
+        // Both racing changes and both of ours are there.
+        let names: Vec<String> = list(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|a| format!("{}@{}", a.user, a.host))
+            .collect();
+        for account in ["alice@localhost", "bob@localhost", "carol@localhost"] {
+            assert!(names.iter().any(|n| n == account), "{names:?}");
+        }
+        // Errors that need no world still come before anything is opened.
+        let fresh = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            add(fresh.path(), "dave@localhost", Some("")),
+            Err(SystemError::EmptyPassword)
+        ));
+        assert!(!fresh.path().join("system.kala").exists());
+    }
 }

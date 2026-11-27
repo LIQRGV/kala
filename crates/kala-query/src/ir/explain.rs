@@ -343,6 +343,12 @@ fn expr_text(e: &crate::Expr, world: &World, depth: usize, out: &mut String) {
             expr_text(e, world, depth + 1, out);
             out.push(')');
         }
+        Expr::ListIndex(list, index) => {
+            expr_text(list, world, depth + 1, out);
+            out.push('[');
+            expr_text(index, world, depth + 1, out);
+            out.push(']');
+        }
         Expr::Disjoint(a, b) => {
             out.push_str("disjoint(");
             expr_text(a, world, depth + 1, out);

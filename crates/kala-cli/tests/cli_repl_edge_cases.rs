@@ -15,10 +15,7 @@ fn repl(fx: &Fx, input: &[u8], flags: &[&str]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let write = child.stdin.take().unwrap().write_all(input);
-    if let Err(error) = write {
-        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
-    }
+    feed(&mut child, input);
     child.wait_with_output().unwrap()
 }
 
@@ -296,4 +293,28 @@ fn history_with_a_bad_complete_line_is_refused() {
     std::fs::write(&history, "\"ok\"\nnot json\n").unwrap();
     let o = repl(&fx, b".quit\n", &["--history", history.to_str().unwrap()]);
     assert_ne!(code(&o), 0);
+}
+
+/// The helpers that pipe input to `kala` must not fail a test because the
+/// child exited before reading it (a refused world, a usage error): the
+/// write then hits a closed pipe. This was a 1-in-150 flake of
+/// `cli_schema.rs::schema_forms_cannot_write_the_system_world_even_after_rename`;
+/// here the child is known to be gone before the write.
+#[test]
+fn feeding_a_child_that_already_exited_is_not_a_test_failure() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kala"))
+        .args(["repl", "/nonexistent/world.kala", "--write"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    feed(&mut child, b"[:assert :greg :age 1]\n.quit\n");
+    let o = child.wait_with_output().unwrap();
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
 }

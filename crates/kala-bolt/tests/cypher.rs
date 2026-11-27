@@ -181,7 +181,7 @@ transactions:
     Running::in_dir(
         dir,
         kala_bolt::ServerConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: vec!["127.0.0.1:0".parse().unwrap()],
             ..kala_bolt::ServerConfig::default()
         },
     )

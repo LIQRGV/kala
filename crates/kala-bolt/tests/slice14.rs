@@ -31,7 +31,7 @@ fn account_server() -> Running {
     system::add(dir.path(), "alice@localhost", None).unwrap();
     system::grant(dir.path(), "alice@localhost", "read", "varrow").unwrap();
     let config = ServerConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
+        listen: vec!["127.0.0.1:0".parse().unwrap()],
         default_db: Some("varrow".into()),
         ..ServerConfig::default()
     };

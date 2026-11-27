@@ -3,6 +3,12 @@ name = "kala-bolt"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Test-only observation points and hooks (how often a world was opened, a
+# callback between an auto-commit write's read and its stage); never enabled
+# by another crate.
+test-hooks = []
+
 [lints]
 workspace = true
 
@@ -14,7 +20,22 @@ kala-lang = { path = "../kala-lang" }
 # The `system` database: accounts, privileges and password verification.
 kala-system = { path = "../kala-system" }
 
+# Blocking TLS over the Bolt transport seam; ring avoids an aws-lc/cmake build.
+rustls = { version = "0.23.46", default-features = false, features = ["std", "ring", "tls12"] }
+
 [dev-dependencies]
+# Fresh self-signed certificates for the transport conformance suite.
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+# The crate's own tests use the test hooks.
+kala-bolt = { path = ".", features = ["test-hooks"] }
 kala-fixture = { path = "../kala-fixture" }
 tempfile = "3.27.0"
 proptest = "1.12.0"
+
+[target.'cfg(unix)'.dependencies]
+# Safe descriptor-relative filesystem operations and nonblocking stale probes.
+rustix = { version = "1.1.6", features = ["fs", "net", "process"] }
+# Platform sockaddr_un layout only; no unsafe calls.
+libc = "0.2"
+# Private staging directory (asked for mode 0700 at mkdir) for publishing a socket.
+tempfile = "3.27.0"

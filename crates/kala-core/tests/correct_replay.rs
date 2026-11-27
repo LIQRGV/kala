@@ -251,7 +251,12 @@ impl Log {
             ids.push(id);
             id += 1;
         }
-        body.extend(commit_frame(&body.clone(), id, self.next_tx));
+        body.extend(commit_frame(
+            common::link(&self.bytes),
+            &body.clone(),
+            id,
+            self.next_tx,
+        ));
         self.bytes.extend(txn(self.next_tx, &body));
         self.next_entry = id + 1;
         self.next_tx += 1;

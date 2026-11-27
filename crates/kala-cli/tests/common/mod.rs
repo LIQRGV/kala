@@ -173,6 +173,21 @@ use kala_fixture::{load_fixture, load_fixture_to};
 use serde_json::{Value as Json, json};
 use std::path::PathBuf;
 
+/// Writes `input` to the child's stdin and closes it. A child that has
+/// already exited (it refused its arguments or the world before reading)
+/// leaves a closed pipe: that is not the test's failure, since the
+/// assertions are on the exit status and output, so `BrokenPipe` is
+/// ignored. Any other write error panics.
+pub fn feed(child: &mut std::process::Child, input: &[u8]) {
+    use std::io::Write;
+    let mut stdin = child.stdin.take().expect("the child's stdin is piped");
+    match stdin.write_all(input) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => panic!("writing to the child's stdin: {e}"),
+    }
+}
+
 /// A world file on disk (for the binary) plus its in-memory twin (for the
 /// expected answers). Both come from the same fixture, so IDs and txs match.
 pub struct Fx {

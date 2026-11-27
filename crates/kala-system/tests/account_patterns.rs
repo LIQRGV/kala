@@ -95,6 +95,7 @@ fn write_only_is_not_read_and_system_always_needs_admin() {
             principal: "alice".into(),
             host: "localhost".into(),
             grants: grants.into_iter().map(str::to_owned).collect(),
+            generation: 0,
         };
         assert_eq!(
             identity.permits_read(db),
@@ -112,4 +113,68 @@ proptest! {
         let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
         prop_assert_eq!(pattern.matches(IpAddr::V4(Ipv4Addr::from(peer))),network & mask == peer & mask);
     }
+}
+
+#[test]
+fn a_dropped_and_recreated_account_is_not_the_account_an_identity_was_issued_for() {
+    use kala_system::{auth::current_identity, system};
+    let dir = tempfile::tempdir().unwrap();
+    system::ensure(dir.path()).unwrap();
+    let open = || kala_core::World::open_read_only(&dir.path().join("system.kala")).unwrap();
+    system::add(dir.path(), "alice@%", Some("old password")).unwrap();
+    system::grant(dir.path(), "alice@%", "read", "varrow").unwrap();
+    let issued = current_identity(
+        &open(),
+        &Identity {
+            principal: "alice".into(),
+            host: "%".into(),
+            grants: Vec::new(),
+            generation: account_generation(&open(), "alice@%"),
+        },
+    )
+    .unwrap()
+    .expect("the account exists");
+    assert_eq!(issued.grants, ["read:varrow"]);
+    assert_ne!(issued.generation, 0);
+    // A grant or password change on the SAME account keeps the identity
+    // current (its grants are re-read).
+    system::grant(dir.path(), "alice@%", "write", "varrow").unwrap();
+    system::set(dir.path(), "alice@%", Some("changed password")).unwrap();
+    let current = current_identity(&open(), &issued).unwrap().unwrap();
+    assert_eq!(current.generation, issued.generation);
+    assert_eq!(current.grants, ["read:varrow", "write:varrow"]);
+    // Dropped: gone.
+    system::drop_account(dir.path(), "alice@%").unwrap();
+    assert_eq!(current_identity(&open(), &issued).unwrap(), None);
+    // Re-created under the same name: another account. The old identity
+    // gets none of its grants.
+    system::add(dir.path(), "alice@%", Some("new password")).unwrap();
+    system::grant(dir.path(), "alice@%", "admin", "*").unwrap();
+    assert_eq!(current_identity(&open(), &issued).unwrap(), None);
+    assert_eq!(current_identity(&open(), &current).unwrap(), None);
+    let recreated = account_generation(&open(), "alice@%");
+    assert!(recreated > issued.generation);
+    // Other accounts are untouched by all of this.
+    let root = account_generation(&open(), "root@localhost");
+    assert_ne!(root, recreated);
+}
+
+/// The generation a login as `account` gets now.
+fn account_generation(world: &kala_core::World, account: &str) -> i64 {
+    let (user, host) = account.split_once('@').unwrap();
+    // An identity with the wrong generation is "not this account"; probe
+    // for the right one through the public API only.
+    let probe = |generation| Identity {
+        principal: user.into(),
+        host: host.into(),
+        grants: Vec::new(),
+        generation,
+    };
+    (0..=world.latest_tick().0)
+        .find(|g| {
+            kala_system::auth::current_identity(world, &probe(*g))
+                .unwrap()
+                .is_some()
+        })
+        .expect("the account exists")
 }

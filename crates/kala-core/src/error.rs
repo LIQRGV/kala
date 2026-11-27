@@ -49,6 +49,10 @@ pub enum Error {
     AttributeNotDefined { name: String, canon: crate::TxId },
     /// New writes to a deprecated attribute are forbidden.
     DeprecatedAttribute(String),
+    /// A transaction limited to schema additions
+    /// (`Txn::set_schema_additions_only`) tried to change this attribute,
+    /// node type or world setting, which the committed schema already has.
+    SchemaChangeNotPermitted(String),
     /// A bounded read stopped before producing an answer.
     WorkInterrupted {
         /// Whether the key bound or stop flag interrupted the read.
@@ -138,6 +142,14 @@ pub enum Error {
         /// The limit, [`MAX_ENTRY_BYTES`](crate::log::MAX_ENTRY_BYTES).
         max: usize,
     },
+    /// Deleting the node would leave an asserted relationship attached.
+    ConnectedEntity {
+        name: String,
+        handle: Option<String>,
+        tick: Tick,
+    },
+    /// Enumerating a node's state would exceed the statement's write allowance.
+    DeleteLimit,
     /// A retract of an event attribute. Events are never retracted in
     /// story time; un-canon one with a correction instead.
     RetractEvent(String),
@@ -160,6 +172,18 @@ pub enum Error {
     /// A correction names an entry whose revision chain is currently
     /// deleted: there is nothing left to correct. Holds the ID given.
     AlreadyDeleted(EntryId),
+    /// A transaction committing in weak mode corrected an entry whose
+    /// revision chain a newer transaction corrected meanwhile (replaced or
+    /// deleted): the correction was decided on a fact that is no longer
+    /// the current one, so it is refused instead of being stacked on top.
+    /// Nothing was written; look at the entry and correct it again. (In
+    /// optimistic mode the same race is an [`Error::Conflict`].)
+    AlreadyCorrected {
+        /// The entry as the caller named it.
+        entry: EntryId,
+        /// The chain's revision now.
+        rev: u32,
+    },
     /// The transaction already wrote an entry at this key `(entity,
     /// attribute, value, tick)`, and a transaction stores at most one entry
     /// per key (e.g. a correction of a chain it already corrected, or a
@@ -200,22 +224,31 @@ pub enum Error {
     UnsupportedVersion(u32),
     /// The log file is damaged in a way that isn't a torn tail.
     Corrupt(String),
-    /// The log file is already open in another [`World`](crate::World)
-    /// (in this process or another one): it holds the file's exclusive
-    /// lock. The lock is advisory, so it only keeps out other Kala worlds,
-    /// not other programs writing the file.
+    /// The log file's exclusive lock is held by another
+    /// [`World`](crate::World) handle (in this process or another one) and
+    /// stayed held for the whole busy timeout
+    /// ([`World::set_busy_timeout`](crate::World::set_busy_timeout)): a
+    /// commit, an open or a recovery cut is in progress there. Nothing was
+    /// written; trying again later is safe. The lock is advisory, so it
+    /// only keeps out other Kala worlds, not other programs writing the
+    /// file.
     WorldLocked,
-    /// [`World::open`](crate::World::open) cut a *damaged* tail off the log
+    /// [`World::open`](crate::World::open) found a *damaged* tail on the log
     /// (a committed-looking last transaction whose checksum fails; see
     /// [`CutCause::Damaged`](crate::CutCause::Damaged)), and nobody has
-    /// looked at it yet: the world reads normally but refuses every write
-    /// until [`World::acknowledge_recovery`](crate::World::acknowledge_recovery)
+    /// looked at it yet: the world reads normally (without that
+    /// transaction) but refuses every write until
+    /// [`World::acknowledge_recovery`](crate::World::acknowledge_recovery)
     /// is called, so new writes don't silently land on top of lost canon.
+    /// The damaged bytes are still in the file; the first commit after the
+    /// acknowledgement cuts them to a quarantine file.
     RecoveryUnacknowledged,
-    /// [`World::open_refusing_damaged`](crate::World::open_refusing_damaged)
-    /// found a *damaged* last transaction of `bytes` bytes and left the file
-    /// untouched; [`World::open`](crate::World::open) would cut it to a
-    /// quarantine file.
+    /// [`World::open_refusing_damaged`](crate::World::open_refusing_damaged),
+    /// or a commit holding the writer lock, found a *damaged* last
+    /// transaction of `bytes` bytes and left the file untouched. Cutting it
+    /// (to a quarantine file) takes an acknowledgement: after a refused
+    /// commit, [`World::acknowledge_recovery`](crate::World::acknowledge_recovery)
+    /// and commit again.
     RecoveryRequired {
         /// The size of the damaged tail.
         bytes: u64,
@@ -225,6 +258,214 @@ pub enum Error {
     /// (a no-op included) is refused and nothing is appended to the log.
     /// Open the world with [`World::open`](crate::World::open) to write.
     ReadOnly,
+    /// The log file is no longer the log this handle applied: it is shorter
+    /// than the handle's last transaction, that transaction's bytes no
+    /// longer carry the chained checksum the handle recorded, the header
+    /// changed, or the path now names another file. Another process cut a
+    /// tail this handle had applied (a recovery or an fsync-failure
+    /// truncation) and possibly wrote on, or the file was replaced. Found by
+    /// [`World::catch_up`](crate::World::catch_up) or a commit; from then on
+    /// the handle refuses every catch-up and every write with this error
+    /// (its reads keep answering from what it had applied, which the file
+    /// no longer backs). Reopen the world.
+    LogDiverged,
+    /// An optimistic commit found that a transaction committed after this
+    /// one began wrote something this one had read (or, for a transaction
+    /// marked [`Txn::set_ids_exposed`](crate::Txn::set_ids_exposed), that an
+    /// ID it handed out would change). Nothing was written and the handle
+    /// is caught up: begin a new transaction and run the same reads and
+    /// writes again; they then see the newer state. See [`Conflict`].
+    Conflict(Conflict),
+}
+
+/// Why an optimistic commit was refused ([`Error::Conflict`]): which read a
+/// newer commit invalidated. It names the key as the transaction recorded
+/// it, never what the newer commit wrote there.
+///
+/// A conflict is transient: nothing was written, and the same transaction
+/// run again on the caught-up world reads the new state. Match on
+/// [`Conflict::key`] (or [`ConflictKey::kind`] for a stable label).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Conflict {
+    /// The read that no longer holds.
+    pub key: ConflictKey,
+    /// Where in the transaction the read was made: the number of write
+    /// operations ([`Txn::operation_count`](crate::Txn::operation_count))
+    /// the transaction had made before it, so the read fed the operation
+    /// with this 0-based index (or a later one). For
+    /// [`ConflictKey::ExposedId`], the index of the operation that
+    /// allocated the ID.
+    pub operation: usize,
+    /// How many transactions were committed since this one began (or
+    /// since the older snapshot its reads were made on, see
+    /// `Txn::set_read_version`).
+    pub applied: usize,
+}
+
+/// The kind of read a [`Conflict`] names, with the key as the transaction
+/// gave it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConflictKey {
+    /// A change to an entity whose state or relationships were read.
+    Entity { entity: EntityId },
+    /// A read of an entity's attribute (`[:set …]`, `Txn::values_at`,
+    /// `Txn::note_read`): a newer entry is on that entity and attribute.
+    EntityAttribute {
+        /// The entity read.
+        entity: EntityId,
+        /// The attribute read, by its name now.
+        attr: String,
+    },
+    /// A reverse read ("who is in Varrow", `Txn::note_reverse_read`): a
+    /// newer entry has that target as its value under the attribute.
+    Reverse {
+        /// The target read.
+        target: EntityId,
+        /// The attribute read, by its name now.
+        attr: String,
+    },
+    /// A value lookup (`Txn::note_value_read`): a newer entry has that
+    /// attribute and value. The value isn't repeated here.
+    Value {
+        /// The attribute looked up, by its name now.
+        attr: String,
+    },
+    /// A read of a whole attribute (`Txn::note_read_attribute`, or a read
+    /// set past [`MAX_READ_KEYS`](crate::MAX_READ_KEYS) keys, which is kept
+    /// per attribute): a newer entry or schema change is on that attribute.
+    Attribute {
+        /// The attribute read, by its name now.
+        attr: String,
+    },
+    /// A scan of every entity of a node type (`Txn::note_type_scan`): a
+    /// newer commit created an entity of that type.
+    TypeScan {
+        /// The node type scanned.
+        node_type: String,
+    },
+    /// Type scans or handle reads of a read set past its bound: a newer
+    /// commit created an entity.
+    AnyDefine,
+    /// A handle that was free when read (find-or-create,
+    /// `Txn::entity_by_handle`): a newer commit created an entity with it.
+    Handle {
+        /// The handle read.
+        handle: String,
+    },
+    /// The entry (its revision chain) a correction read: a newer commit
+    /// corrected it.
+    Entry {
+        /// The entry named in the correction or read.
+        entry: EntryId,
+    },
+    /// A name that was undeclared when the transaction looked it up (an
+    /// attribute or node type): a newer commit declared it.
+    Undeclared {
+        /// The name looked up.
+        name: String,
+    },
+    /// `Txn::note_read_all`: any newer commit conflicts.
+    All,
+    /// The transaction was marked as having shown its provisional IDs
+    /// (`Txn::set_ids_exposed`), and this entity or edge ID would be
+    /// renumbered, or merged into one a newer commit defined.
+    ExposedId {
+        /// The provisional ID, as the transaction handed it out.
+        id: EntityId,
+    },
+}
+
+impl ConflictKey {
+    /// A stable label for the kind of key, for adapters that map conflicts
+    /// to their own codes.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ConflictKey::Entity { .. } => "entity",
+            ConflictKey::EntityAttribute { .. } => "entity-attribute",
+            ConflictKey::Reverse { .. } => "reverse",
+            ConflictKey::Value { .. } => "value",
+            ConflictKey::Attribute { .. } => "attribute",
+            ConflictKey::TypeScan { .. } => "type-scan",
+            ConflictKey::AnyDefine => "any-define",
+            ConflictKey::Handle { .. } => "handle",
+            ConflictKey::Entry { .. } => "entry",
+            ConflictKey::Undeclared { .. } => "undeclared",
+            ConflictKey::All => "all",
+            ConflictKey::ExposedId { .. } => "exposed-id",
+        }
+    }
+}
+
+impl fmt::Display for Conflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("conflict: ")?;
+        match &self.key {
+            ConflictKey::Entity { .. } => {
+                f.write_str("another transaction changed an entity this transaction read")?
+            }
+            ConflictKey::EntityAttribute { attr, .. } => write!(
+                f,
+                "another transaction wrote {} of an entity this transaction read",
+                Quoted(attr)
+            )?,
+            ConflictKey::Reverse { attr, .. } => write!(
+                f,
+                "another transaction wrote {} pointing at an entity this transaction read \
+                 the incoming relationships of",
+                Quoted(attr)
+            )?,
+            ConflictKey::Value { attr } => write!(
+                f,
+                "another transaction wrote a value of {} this transaction looked up",
+                Quoted(attr)
+            )?,
+            ConflictKey::Attribute { attr } => write!(
+                f,
+                "another transaction changed {}, which this transaction read",
+                Quoted(attr)
+            )?,
+            ConflictKey::TypeScan { node_type } => write!(
+                f,
+                "another transaction created a {} entity after this transaction scanned them",
+                Echo(node_type)
+            )?,
+            ConflictKey::AnyDefine => f.write_str(
+                "another transaction created an entity after this transaction scanned them",
+            )?,
+            ConflictKey::Handle { handle } => write!(
+                f,
+                "another transaction created the handle {}, which this transaction found free",
+                Quoted(handle)
+            )?,
+            ConflictKey::Entry { entry } => write!(
+                f,
+                "another transaction corrected entry#{}, which this transaction read",
+                entry.0
+            )?,
+            ConflictKey::Undeclared { name } => write!(
+                f,
+                "another transaction declared {}, which this transaction found undeclared",
+                Quoted(name)
+            )?,
+            ConflictKey::All => {
+                f.write_str("another transaction committed after this one read the world")?
+            }
+            ConflictKey::ExposedId { .. } => f.write_str(
+                "another transaction took an ID this transaction had already handed out",
+            )?,
+        }
+        let what = match self.key {
+            ConflictKey::ExposedId { .. } => "allocated by",
+            _ => "read before",
+        };
+        write!(
+            f,
+            " ({} newer transaction(s), {what} operation {}); nothing was written, \
+             run the transaction again",
+            self.applied,
+            self.operation.saturating_add(1)
+        )
+    }
 }
 
 impl fmt::Display for Error {
@@ -240,6 +481,11 @@ impl fmt::Display for Error {
             Error::DeprecatedAttribute(name) => write!(
                 f,
                 "attribute {} is deprecated; new writes are refused",
+                Quoted(name)
+            ),
+            Error::SchemaChangeNotPermitted(name) => write!(
+                f,
+                "{} already exists; this transaction may declare new names but not change it",
                 Quoted(name)
             ),
             Error::ExpectedScalarAttribute(name) => {
@@ -328,6 +574,18 @@ impl fmt::Display for Error {
                  {max}-byte limit",
                 Quoted(attr)
             ),
+            Error::ConnectedEntity { name, handle, tick } => {
+                write!(f, "cannot delete {}", Echo(name))?;
+                if let Some(h) = handle {
+                    write!(f, " ({})", Echo(h))?;
+                }
+                write!(
+                    f,
+                    ": it still has relationships at tick {}; use DETACH DELETE",
+                    tick.0
+                )
+            }
+            Error::DeleteLimit => f.write_str("DELETE exceeds the 10000-primitive write limit"),
             Error::RetractEvent(a) => write!(
                 f,
                 "attribute {} is an event and can't be retracted (use a correction)",
@@ -344,6 +602,12 @@ impl fmt::Display for Error {
             Error::AlreadyDeleted(id) => {
                 write!(f, "log entry#{} is already deleted by a correction", id.0)
             }
+            Error::AlreadyCorrected { entry, rev } => write!(
+                f,
+                "log entry#{} was already corrected by a newer transaction (now rev {rev}); \
+                 nothing was written",
+                entry.0
+            ),
             Error::TxnKeyConflict { entity, attr, tick } => write!(
                 f,
                 "the transaction already wrote an entry for {entity:?} {} at tick {}",
@@ -365,22 +629,38 @@ impl fmt::Display for Error {
             Error::UnsupportedVersion(v) => {
                 write!(f, "unsupported log format version {v}")?;
                 if *v < crate::log::LOG_FORMAT_VERSION {
-                    f.write_str(": written by an older Kala; recreate this world")?;
+                    f.write_str(
+                        ": this file was written by an older Kala log format, which this \
+                         build doesn't read. Dump it with the older kala binary that wrote \
+                         it (kala dump WORLD -o world.dump.edn), then load the dump with \
+                         this one (kala transact --create NEW_WORLD world.dump.edn). The \
+                         old file is left untouched",
+                    )?;
                 }
                 Ok(())
             }
             Error::Corrupt(why) => write!(f, "corrupt log: {why}"),
-            Error::WorldLocked => f.write_str("world is open elsewhere (its log file is locked)"),
+            Error::WorldLocked => f.write_str(
+                "world is locked by another writer (its log file's lock stayed held for the \
+                 whole busy timeout); nothing was written",
+            ),
             Error::RecoveryRequired { bytes } => write!(
                 f,
-                "the last transaction is damaged ({bytes} bytes); opening for writing \
-                 would cut it to a quarantine file"
+                "the last transaction is damaged ({bytes} bytes); writing needs an \
+                 acknowledgement (World::acknowledge_recovery), after which the next commit \
+                 cuts it to a quarantine file"
             ),
             Error::RecoveryUnacknowledged => f.write_str(
-                "opening the log cut off a damaged transaction; acknowledge the recovery \
-                 (World::acknowledge_recovery) before writing",
+                "the log ends in a damaged transaction, which opening it left out; \
+                 acknowledge the recovery (World::acknowledge_recovery) before writing: the \
+                 next commit then cuts it to a quarantine file",
             ),
             Error::ReadOnly => f.write_str("world is open read-only; writes are refused"),
+            Error::LogDiverged => f.write_str(
+                "the log file is no longer the log this world applied (it was cut, rewritten \
+                 or replaced by another process); reopen the world",
+            ),
+            Error::Conflict(conflict) => conflict.fmt(f),
         }
     }
 }

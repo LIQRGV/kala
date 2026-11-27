@@ -157,7 +157,7 @@ fn open_appended(entry: Vec<u8>) -> Result<World, Error> {
     let id = read_log(&path).unwrap().last().unwrap().id.0 + 1;
     let mut bytes = std::fs::read(&path).unwrap();
     let mut body = frame(9, id, &entry);
-    body.extend_from_slice(&commit_frame(&body, id + 1, 1));
+    body.extend_from_slice(&commit_frame(common::link(&bytes), &body, id + 1, 1));
     bytes.extend_from_slice(&txn(1, &body));
     std::fs::write(&path, bytes).unwrap();
     World::open_read_only(&path)
@@ -292,7 +292,12 @@ fn open_genesis(entries: Vec<(u8, Vec<u8>)>) -> Result<World, Error> {
     for (i, (kind, payload)) in entries.iter().enumerate() {
         body.extend_from_slice(&frame(*kind, i as u64 + 1, payload));
     }
-    body.extend_from_slice(&commit_frame(&body, entries.len() as u64 + 1, 0));
+    body.extend_from_slice(&commit_frame(
+        common::link(&bytes),
+        &body,
+        entries.len() as u64 + 1,
+        0,
+    ));
     bytes.extend_from_slice(&txn(0, &body));
     std::fs::write(&path, bytes).unwrap();
     World::open_read_only(&path)

@@ -1537,9 +1537,9 @@ fn genesis_file(attrs: &[Vec<u8>]) -> Vec<u8> {
     for (i, a) in attrs.iter().enumerate() {
         body.extend(common::frame(2, 2 + i as u64, a));
     }
-    let commit = common::commit_frame(&body, 2 + attrs.len() as u64, 0);
-    body.extend(commit);
     let mut file = common::header(kala_core::log::LOG_FORMAT_VERSION);
+    let commit = common::commit_frame(common::link(&file), &body, 2 + attrs.len() as u64, 0);
+    body.extend(commit);
     file.extend(common::txn(0, &body));
     file
 }

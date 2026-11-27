@@ -41,7 +41,7 @@ fn no_auth_server_never_serves_the_system_database_but_serves_the_others() {
     let server = Running::in_dir(
         dir,
         ServerConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: vec!["127.0.0.1:0".parse().unwrap()],
             ..ServerConfig::default()
         },
     );
@@ -67,7 +67,7 @@ fn no_auth_server_never_serves_the_system_database_but_serves_the_others() {
 fn bind_with_auth_no_auth_refuses_system_db_by_grants_even_when_present() {
     let dir = dir_with_real_system_world();
     let config = ServerConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
+        listen: vec!["127.0.0.1:0".parse().unwrap()],
         ..ServerConfig::default()
     };
     let server =
