@@ -139,6 +139,9 @@ impl OpenCounts {
         self.0.opens(db).1
     }
 }
+/// How often a running server looks at its leaf certificate's end date again.
+const TLS_EXPIRY_RECHECK: Duration = Duration::from_secs(3600);
+
 type TransportWrapper = dyn Fn(Box<dyn Transport>) -> Box<dyn Transport> + Send + Sync;
 
 struct Client {
@@ -352,8 +355,15 @@ impl Server {
     pub fn run(self, shutdown: Arc<AtomicBool>) -> io::Result<()> {
         let mut clients = Clients::new();
         let mut accept_failed = LogLimit::new();
+        let mut expiry_checked = std::time::Instant::now();
         let result = 'accept: loop {
             clients.reap();
+            if let Some(tls) = &self.tls
+                && expiry_checked.elapsed() >= TLS_EXPIRY_RECHECK
+            {
+                expiry_checked = std::time::Instant::now();
+                tls.log_expiry();
+            }
             if shutdown.load(Ordering::Relaxed) {
                 break Ok(());
             }

@@ -250,6 +250,26 @@ flight coalesce into one more run. On a server without TLS listeners SIGUSR1
 logs `event=bolt_tls_reload_ignored reason=no_tls_listener` and does nothing.
 SIGHUP, like SIGTERM and SIGINT, is the clean shutdown.
 
+The key file must give group and others no access (`mode & 077 == 0`, as ssh
+requires); a chain file that group or others can write is a warning. Validity
+dates are read by a small strict DER walk (`transport/tls/der.rs`), and only
+when the files are read, at startup and at reload: a leaf that expires during
+uptime is served until it is replaced. The accept loop re-checks the date once
+an hour and logs a warning while the leaf is within 14 days of its end or
+expired.
+
+A client whose handshake rustls rejects is sent the fatal alert (bounded by the
+handshake deadline and one second) before the close. Handshake failures are
+logged through one rate limiter (`suppressed_since_last=N`). The auth log line
+says `peer=tls` for these connections, `peer=tcp` for plaintext TCP and
+`peer=unix` for a Unix socket. A failed record write ends the stream: later
+writes and the close notification fail at once.
+
+The `ring` provider offers X25519 and the NIST curves only: there is no
+post-quantum hybrid key exchange (X25519MLKEM768 comes with `aws-lc-rs`, which
+needs cmake). `ring` compiles C and assembly, so building Kala needs a C
+compiler.
+
 Each non-loopback plaintext listener requires `--insecure-allow-plaintext`,
 including on a server that also serves TLS. The accepted TCP peer address
 determines account host matching. A remote TLS peer still needs a password
@@ -259,7 +279,11 @@ ROUTE and SHOW DATABASES return a bare host and port for TLS connections.
 The default is the endpoint reached by this connection. Routing drivers reuse
 the encryption scheme of their original URI, so any configured
 `--advertised-address` must also be reachable over TLS and covered by the
-server certificate when clients verify its identity.
+server certificate when clients verify its identity. A server has one
+advertised address: with a plaintext and a TLS listener together it is given to
+clients of both, so routing over the listener it does not belong to fails
+closed (a `neo4j://` client is sent to a TLS-only port, or a `neo4j+s://`
+client to a plaintext one; neither side falls back).
 
 ## Protocol
 

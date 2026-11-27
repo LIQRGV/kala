@@ -521,7 +521,7 @@ kala serve: listening on unix:///run/kala/bolt.sock
 
 A failed start serves nothing, prints no startup lines, and cleans up sockets
 created by earlier binds. Unix sockets are also removed on clean shutdown
-(SIGINT or SIGTERM), provided the path still names this server's inode.
+(SIGINT, SIGTERM or SIGHUP), provided the path still names this server's inode.
 
 `--advertised-address HOST:PORT` is the address routing drivers (`neo4j://`)
 and `SHOW DATABASES` are given. Without it they get the local address of each
@@ -536,15 +536,35 @@ and `ROUTE` requires `--advertised-address`; an explicit address is used by both
 Supply `--tls.cert FILE` and `--tls.key FILE` whenever you configure a
 `bolt+s://` listener. All TLS listeners use the same identity. Supply the PEM
 certificate chain with the leaf first, followed by any intermediates. The key
-must be an unencrypted PKCS#8, RSA PKCS#1 or EC SEC1 PEM file. Each file may be up to 1 MiB. On Unix,
-remove group and other read permissions with `chmod 600 key.pem`. Kala checks
-that the key matches the leaf and the leaf is currently valid. A warning on
-stderr reports expiry within 14 days.
+must be an unencrypted PKCS#8, RSA PKCS#1 or EC SEC1 PEM file. Each file may be
+up to 1 MiB. On Unix the key file must give group and others no access at all
+(read, write or execute): `chmod 600 key.pem` (or `400`). Anything else is
+refused at startup and at reload, naming the mode found. A certificate file
+that group or others can write is accepted with a warning. Kala checks that
+the key matches the leaf and that the leaf is currently valid, and warns on
+stderr when it expires within 14 days.
+
+Validity is checked when the files are read: at startup and at each reload. A
+leaf that expires while the server runs keeps being served until you replace
+the files and send SIGUSR1. The server looks at the date again once an hour and
+logs a warning while the leaf is within 14 days of its end or past it.
 
 With a certificate issued by a CA the driver trusts, connect to
 `bolt+s://HOST:PORT` or use `neo4j+s://HOST:PORT` for routing. Set the
 advertised host and port to an endpoint reachable over TLS, with a host name
 or IP address in the certificate SANs. Remote logins require a password account.
+
+There is one `--advertised-address` per server. With a plaintext listener and a
+TLS listener together, both hand out that same address, and a routing driver
+reuses the scheme it connected with: if the address is the TLS endpoint, a
+`neo4j://` client that arrived over the plaintext listener is sent to a port
+that only speaks TLS, and its routed connections fail (they never fall back to
+plaintext, or the other way round). Use direct `bolt://` / `bolt+s://` URIs on
+the listener the advertised address does not name.
+
+TLS uses rustls with the `ring` crypto provider: TLS 1.3 and 1.2, no
+post-quantum hybrid key exchange (X25519MLKEM768 needs the `aws-lc-rs`
+provider), and a C compiler is needed to build Kala.
 
 For a local self-signed development certificate, run these commands in a
 private directory. The server prints `kala serve: listening on bolt+s://127.0.0.1:7687`.
@@ -568,8 +588,10 @@ with GraphDatabase.driver("bolt+ssc://localhost:7687", auth=("root", "")) as dri
 
 The client-side `+ssc` scheme accepts a self-signed certificate without verifying
 the server’s identity. For rotation, replace both PEM files and send SIGUSR1 to
-the server process (`kill -USR1 <pid>`). It validates the new pair before swapping it in. Existing
-sessions continue, and a failed reload logs the error and keeps the old pair.
+the server process (`kill -USR1 <pid>`). It validates the new pair before
+swapping it in. Existing sessions continue, and a failed reload logs the error
+and keeps the old pair. SIGHUP is not a reload: it stops the server, like
+SIGTERM.
 
 ## Changing and inspecting the schema
 
