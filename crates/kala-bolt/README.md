@@ -435,7 +435,22 @@ Cypher and Datalog both stage native writes. A blind Cypher CREATE needs
 RETURN also need `read`. Admission checks the entire statement before opening
 a writer. Both languages use the same database, mode and privilege checks,
 with reduced diagnostics for a write-only identity. Pass an empty parameter
-map for Datalog writes. Cypher accepts parameters in both pipelines and updates.
+map for Datalog writes. Cypher accepts parameters in both pipelines and updates,
+converted with the kinds the statement gives them as for a read query (a handle
+string for a ref position names the entity; a wrong type is a TypeError before
+anything runs). `UNWIND … CREATE` has a reading part, so it needs `read` as well
+as `write`. `CREATE CONSTRAINT … IS :: TYPE` declares an attribute: `write` for a
+new one, `admin` to change an existing one, summary type `s`.
+
+An auto-commit Cypher write runs its reading part on the shared read snapshot
+(honoring bookmarks) before it takes the database's writer, so a heavy MATCH
+never blocks other writers. A commit that lands in between is a transient
+conflict only if it touched what the statement read. A tick-less write of a
+statement that read lands on the latest tick its reading part saw (the summary
+reports `latest_tick_moved` if another commit moved it). A `RETURN` that cannot
+be sent (message or result limits, deadline) is refused before the commit, with
+nothing written. A refused Cypher write logs `event=bolt_write_refused` with
+`reason=privilege|conflict|statement`, as a Datalog one does.
 
 ```python
 session.execute_write(lambda tx: tx.run(
@@ -569,6 +584,8 @@ fails transiently. Discarding the record does not expose that ID.
 | Query | read |
 | `[:assert …]`, `[:retract …]`, plain `[:create …]`, declarations (`[:attribute …]`, `[:node-type …]`, names a write declares by inference) | write |
 | `[:set …]`, `[:create … :if-missing]`, `[:correct …]` | read and write |
+| Cypher: `CREATE` with no reading part and no `RETURN`; a new `CREATE CONSTRAINT … IS :: TYPE` | write |
+| Cypher: anything with a reading part (`MATCH`, `UNWIND`, …), `SET`, `REMOVE`, `DELETE`, `MERGE`, `RETURN` | read and write |
 | `[:world-setting …]`, `[:rename …]`, `[:deprecate …]`, `[:cardinality …]`, `[:migrate …]` | admin (`admin:<db>` or `admin:*`) |
 | `[:attribute …]` or `[:node-type …]` that **changes** an attribute or node type the committed schema already has | admin (`admin:<db>` or `admin:*`) |
 | ROUTE | read or write |

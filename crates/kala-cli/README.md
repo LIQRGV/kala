@@ -840,6 +840,11 @@ tools, not for restoring history; this slice provides no JSON import.
 `kala transact --lang cypher WORLD FILE` commits each semicolon-delimited
 statement independently. Use `-` for standard input. On an error the CLI
 identifies the failing statement and how many earlier statements committed.
+The text report says `statement N` where a Datalog script says `form N` (the
+JSON field is `form` for both), and a created node is shown with its handle
+(`created CHARACTER#34 kael2`) for CREATE as for MERGE. A script may declare
+property types with `CREATE CONSTRAINT … IS :: TYPE;`. Scripts take no
+parameters; a string written to a ref attribute is a handle.
 `--dry-run` applies the script to a discarded copy. `--json`, `--concurrency`
 and `--busy-timeout` use the same reporting and transaction rules as Datalog.
 A `RETURN` clause adds a table to the write report. With `--json`, its

@@ -62,6 +62,10 @@ struct Returned {
 #[derive(Serialize)]
 pub struct Report {
     form: usize,
+    /// What the text output calls one input item: a Datalog "form" or a
+    /// Cypher "statement". The JSON field stays `form` for both.
+    #[serde(skip)]
+    item: &'static str,
     dry_run: bool,
     /// The committed transaction; `null` when the form changed nothing, so
     /// nothing was appended.
@@ -339,6 +343,7 @@ fn committed_report(w: &World, result: WriteReport) -> Report {
     };
     Report {
         form: 1,
+        item: "form",
         dry_run: false,
         returned: None,
         return_error: None,
@@ -390,7 +395,8 @@ pub fn render(report: &Report, json: bool) -> String {
     }
     let mut s = match report.tx {
         Some(tx) => format!(
-            "form {}: {}tx#{tx}: {}\n",
+            "{} {}: {}tx#{tx}: {}\n",
+            report.item,
             report.form,
             if report.dry_run {
                 "dry-run "
@@ -400,7 +406,8 @@ pub fn render(report: &Report, json: bool) -> String {
             counts(report.changed, report.declared)
         ),
         None => format!(
-            "form {}: {}: 0 changed\n",
+            "{} {}: {}: 0 changed\n",
+            report.item,
             report.form,
             if report.dry_run {
                 "dry-run, nothing to commit"
@@ -572,7 +579,22 @@ fn execute_cypher(
             Some(Returned { columns, rows })
         })
     };
-    let mut report = committed_report(world, staged.staged.complete(&result));
+    let written = staged.staged.complete(&result);
+    // A Cypher CREATE names its handle as MERGE does (a Datalog `:create`
+    // report keeps its shape).
+    let handles: Vec<_> = written
+        .ops
+        .iter()
+        .map(|op| {
+            op.entity
+                .and_then(|e| world.handle_of(e).map(str::to_owned))
+        })
+        .collect();
+    let mut report = committed_report(world, written);
+    report.item = "statement";
+    for (op, handle) in report.ops.iter_mut().zip(handles) {
+        op.handle = handle;
+    }
     match returned {
         Ok(rows) => report.returned = rows,
         // Save the write report even when a bounded post-commit read fails.
