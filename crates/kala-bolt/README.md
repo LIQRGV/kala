@@ -439,17 +439,58 @@ map for Datalog writes. Cypher accepts parameters in both pipelines and updates,
 converted with the kinds the statement gives them as for a read query (a handle
 string for a ref position names the entity; a wrong type is a TypeError before
 anything runs). `UNWIND … CREATE` has a reading part, so it needs `read` as well
-as `write`. `CREATE CONSTRAINT … IS :: TYPE` declares an attribute: `write` for a
-new one, `admin` to change an existing one, summary type `s`.
+as `write`.
 
-An auto-commit Cypher write runs its reading part on the shared read snapshot
-(honoring bookmarks) before it takes the database's writer, so a heavy MATCH
-never blocks other writers. A commit that lands in between is a transient
-conflict only if it touched what the statement read. A tick-less write of a
-statement that read lands on the latest tick its reading part saw (the summary
-reports `latest_tick_moved` if another commit moved it). A `RETURN` that cannot
-be sent (message or result limits, deadline) is refused before the commit, with
-nothing written. A refused Cypher write logs `event=bolt_write_refused` with
+**Type constraints.** `CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:Label)
+REQUIRE n.prop IS :: TYPE` declares attribute `prop` (`write`, summary type
+`s`), exactly as `[:attribute :prop :type]` does. A constraint only ever *adds*
+a declaration:
+
+- A label that is not a node type yet is declared as one, by the
+  schema-on-write rule (an inferred node type). **That is
+  permanent**: node types cannot be removed or renamed away, so check the
+  label's spelling. A strict world refuses it instead.
+- With `IF NOT EXISTS`, if `prop` is already an attribute — whatever its type
+  or other labels — the statement does nothing: no schema entry, no node type
+  for a new label, `declared: 0`.
+- Without it, the same type is a no-op (or confirms an inferred attribute as
+  declared). A different type is refused for every identity, `admin` included:
+  `attribute :prop already exists with type T; change it with // kala:datalog
+  [:attribute …] or [:migrate …]`. Changing a definition is done with those
+  Datalog forms (which need `admin`).
+
+**Where an auto-commit Cypher write reads.** A write never replays the log to
+get a snapshot; which handle its reading part runs on depends on the statement:
+
+| Statement | Reading part runs |
+| --- | --- |
+| Blind: only `CREATE` or a constraint, no `RETURN` | Nowhere to speak of (one empty row), compiled on the writer under the database's writer mutex |
+| Reads (`MATCH`, `UNWIND`, `SET`, `MERGE`, `RETURN`, …), default (optimistic) mode, and the cached reader snapshot is the current committed state | **Off the mutex**, on that snapshot, before the writer is taken: a heavy MATCH never blocks other writers |
+| Reads, but there is no current reader snapshot to be had without a replay; or weak mode | **Under the mutex**, on the writer |
+
+- The reader snapshot is "current" when a read query loaded it and nothing was
+  committed since, or when it is behind and unused: the write path then applies
+  just the log's tail to it (never a reload). It is not to be had when no read
+  query ever loaded one, while a query is still reading the stale one, or while
+  a reader is reloading; a bookmark the snapshot hasn't reached is waited for on
+  the writer.
+- Off the mutex, a commit that lands between the read and the stage is a
+  transient conflict only if it touched what the statement read, and a
+  tick-less write lands on the latest tick the reading part saw (the summary
+  reports `latest_tick_moved` if another commit moved it).
+- Under the mutex other writers wait, so the reading part has a tenth of a
+  query's step budget (1,000,000 steps), besides the 10,000 rows a statement
+  may write from and its deadline; over it the statement fails with `query
+  step limit exceeded` and nothing written. Staging has the full statement
+  budget on both paths.
+- Weak mode checks no reads, so it always reads the writer's own state: a
+  snapshot a commit may have overtaken would widen its lost-update window.
+
+A `RETURN` that cannot be sent (message or result limits, deadline) is refused
+before the commit, with nothing written. That check renders the answer from the
+staged transaction without recording reads: only what the statement itself read
+(its MATCH, the values a SET replaces) can conflict, not every property of a
+returned node. A refused Cypher write logs `event=bolt_write_refused` with
 `reason=privilege|conflict|statement`, as a Datalog one does.
 
 ```python
@@ -584,7 +625,7 @@ fails transiently. Discarding the record does not expose that ID.
 | Query | read |
 | `[:assert …]`, `[:retract …]`, plain `[:create …]`, declarations (`[:attribute …]`, `[:node-type …]`, names a write declares by inference) | write |
 | `[:set …]`, `[:create … :if-missing]`, `[:correct …]` | read and write |
-| Cypher: `CREATE` with no reading part and no `RETURN`; a new `CREATE CONSTRAINT … IS :: TYPE` | write |
+| Cypher: `CREATE` with no reading part and no `RETURN`; `CREATE CONSTRAINT … IS :: TYPE` (it only adds: see "Type constraints") | write |
 | Cypher: anything with a reading part (`MATCH`, `UNWIND`, …), `SET`, `REMOVE`, `DELETE`, `MERGE`, `RETURN` | read and write |
 | `[:world-setting …]`, `[:rename …]`, `[:deprecate …]`, `[:cardinality …]`, `[:migrate …]` | admin (`admin:<db>` or `admin:*`) |
 | `[:attribute …]` or `[:node-type …]` that **changes** an attribute or node type the committed schema already has | admin (`admin:<db>` or `admin:*`) |

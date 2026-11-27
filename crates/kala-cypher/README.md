@@ -294,13 +294,22 @@ CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:Label) REQUIRE n.prop IS :: INTE
 declares attribute `prop` exactly as `[:attribute :prop :i64]` does. The
 types are `INTEGER`/`INT` (i64), `FLOAT` (f64), `STRING` and
 `BOOLEAN`/`BOOL`; `IS TYPED TYPE` is accepted too. It is a statement of its
-own, needs only `write` over Bolt for a new attribute (`admin` to change an
-existing one) and its summary type is `s`. Differences from Neo4j: Kala
-attributes are not per label, so the declaration holds for every node type
-(the label must be a node type, or becomes one as schema-on-write declares
-it); the constraint name is accepted and ignored; declaring the same thing
-again is a no-op with or without `IF NOT EXISTS`. Uniqueness, existence,
-key and relationship constraints, `CREATE INDEX` and `DROP …` are refused.
+own, needs only `write` over Bolt and its summary type is `s`.
+
+A constraint only ever adds a declaration. With `IF NOT EXISTS`, a `prop`
+that is already an attribute (whatever its type or other labels) makes the
+statement a no-op: nothing is declared, not even a new label. Without it,
+the same type is a no-op and a different type is refused, for an
+administrator too (`attribute :prop already exists with type T; change it
+with // kala:datalog [:attribute …] or [:migrate …]`): an existing
+definition is changed with the Datalog forms.
+
+Differences from Neo4j: Kala attributes are not per label, so the
+declaration holds for every node type; the label must be a node type, or
+becomes one as schema-on-write declares it, **permanently** (a node type
+cannot be removed), so mind its spelling; the constraint name is accepted
+and ignored. Uniqueness, existence, key and relationship constraints,
+`CREATE INDEX` and `DROP …` are refused.
 
 A write without RETURN produces zero records. RETURN accepts bound variables,
 property access, literals and parameters. Auto-commit renders graph values
