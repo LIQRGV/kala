@@ -209,6 +209,7 @@ pub(super) struct TxnState {
     /// The world's latest tick when the transaction began: the tick of a
     /// write with no tick of its own and no transaction default.
     pub(super) base_tick: Tick,
+    pub(super) deadline: Option<std::time::Instant>,
     default_tick: Option<Tick>,
     /// The tx this transaction commits as. Fixed at begin: the `Txn` holds
     /// the world mutably, so no other commit can take it first.
@@ -258,6 +259,34 @@ pub(super) struct TxnState {
 }
 
 impl Txn<'_> {
+    /// Bound staging and the start of durable append by an absolute deadline.
+    /// Expiry returns `Error::WorkInterrupted` with `WorkInterruptReason::Stopped`.
+    /// The deadline survives reborrowing and commit finalization. It bounds the
+    /// writer-lock wait and is checked before append; an append already started
+    /// is completed durably and reported as success.
+    pub fn set_deadline(&mut self, deadline: std::time::Instant) {
+        self.s.deadline = Some(deadline);
+    }
+
+    /// The caller's deadline, if one was supplied.
+    pub fn deadline(&self) -> Option<std::time::Instant> {
+        self.s.deadline
+    }
+
+    pub(super) fn check_deadline(&self) -> Result<(), Error> {
+        if self
+            .s
+            .deadline
+            .is_some_and(|at| std::time::Instant::now() >= at)
+        {
+            Err(Error::WorkInterrupted {
+                reason: WorkInterruptReason::Stopped,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
     /// Find a handle of the requested type, or stage a new entity. The returned
     /// boolean says whether a definition was staged. Type mismatches poison the
     /// transaction just like ordinary duplicate-handle errors.
@@ -637,7 +666,9 @@ impl Txn<'_> {
         } else {
             self.world.writable()
         };
-        let res = gate.and_then(|()| f(self));
+        let res = gate
+            .and_then(|()| self.check_deadline())
+            .and_then(|()| f(self));
         self.s.poisoned = res.is_err();
         res
     }
@@ -1114,6 +1145,7 @@ impl Txn<'_> {
         if self.s.poisoned {
             return Err(Error::TransactionAborted);
         }
+        self.check_deadline()?;
         self.world.accepts_writes()?;
         if self.s.order.is_empty() {
             return Ok(CommitResult {
@@ -1135,16 +1167,27 @@ impl Txn<'_> {
         // included). `None` only in memory.
         let held = match self.s.held.take() {
             Some(held) => Some(held),
-            None => match self.world.lock_log()? {
-                Some(held) => {
-                    let applied = self.catch_up_under_lock(&held)?;
-                    if applied > 0 {
-                        return self.finalize(held, applied, warn);
-                    }
-                    Some(held)
+            None => {
+                let busy = self.world.busy_timeout();
+                if let Some(deadline) = self.s.deadline {
+                    self.world.set_busy_timeout(
+                        busy.min(deadline.saturating_duration_since(std::time::Instant::now())),
+                    );
                 }
-                None => None,
-            },
+                let locked = self.world.lock_log();
+                self.world.set_busy_timeout(busy);
+                self.check_deadline()?;
+                match locked? {
+                    Some(held) => {
+                        let applied = self.catch_up_under_lock(&held)?;
+                        if applied > 0 {
+                            return self.finalize(held, applied, warn);
+                        }
+                        Some(held)
+                    }
+                    None => None,
+                }
+            }
         };
         let encoded = self.encode_ordered()?;
         let scope = self.warning_scope(warn);
@@ -1154,6 +1197,7 @@ impl Txn<'_> {
             before.restore(&mut self.world.catalog);
         }
         let before = OverlapsBefore::capture(scope, self.world);
+        self.check_deadline()?;
         self.world.journal.append(held.as_ref(), &encoded)?;
         // Durable: other handles may commit while this one updates its
         // own copy.
@@ -1797,6 +1841,7 @@ impl World {
         let snapshot = Snapshot::of(&self.catalog);
         TxnState {
             base_tick,
+            deadline: None,
             default_tick: None,
             tx,
             staged: OrderedMap::new(),

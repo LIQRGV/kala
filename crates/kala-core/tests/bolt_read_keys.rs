@@ -95,3 +95,161 @@ fn weak_entity_definition_reads_do_not_conflict() {
         vec![Value::Str("pending".into())]
     );
 }
+
+#[test]
+fn expired_native_deadline_refuses_commit_without_appending() {
+    let (_dir, path, mut world, greg) = fixture();
+    let before = std::fs::read(&path).unwrap();
+    let mut tx = world.begin();
+    tx.assert(
+        greg,
+        "tag",
+        Value::Str("not committed".into()),
+        Some(Tick(0)),
+    )
+    .unwrap();
+    tx.set_deadline(std::time::Instant::now());
+    let result = tx.commit();
+    assert!(
+        matches!(
+            result,
+            Err(Error::WorkInterrupted {
+                reason: kala_core::WorkInterruptReason::Stopped
+            })
+        ),
+        "expired transaction must refuse its append: {result:?}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn expired_native_deadline_refuses_another_stage() {
+    let (_dir, path, mut world, greg) = fixture();
+    let before = std::fs::read(&path).unwrap();
+    let mut tx = world.begin();
+    tx.set_deadline(std::time::Instant::now());
+    let result = tx.assert(
+        greg,
+        "tag",
+        Value::Str("not staged".into()),
+        Some(Tick(i64::MIN)),
+    );
+    assert!(
+        matches!(
+            result,
+            Err(Error::WorkInterrupted {
+                reason: kala_core::WorkInterruptReason::Stopped
+            })
+        ),
+        "expired transaction must refuse staging: {result:?}"
+    );
+    drop(tx);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn owned_deadline_survives_reborrowing_and_refuses_commit() {
+    let (_dir, path, world, greg) = fixture();
+    let before = std::fs::read(&path).unwrap();
+    let mut owned = world.into_transaction();
+    owned
+        .with(|tx| {
+            tx.assert(
+                greg,
+                "tag",
+                Value::Str("not committed".into()),
+                Some(Tick(-1)),
+            )
+        })
+        .unwrap();
+    owned.with(|tx| tx.set_deadline(std::time::Instant::now()));
+    // A separate borrow must preserve the deadline set by the first message.
+    owned.with(|_| ());
+    let (_, result) = owned.commit();
+    assert!(
+        matches!(
+            result,
+            Err(Error::WorkInterrupted {
+                reason: kala_core::WorkInterruptReason::Stopped
+            })
+        ),
+        "owned transaction lost its deadline: {result:?}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn expired_deadline_survives_finalization_over_a_new_commit() {
+    let (_dir, path, mut first, greg) = fixture();
+    let mut other = World::open(&path).unwrap();
+    let mut tx = first.begin();
+    tx.assert(
+        greg,
+        "tag",
+        Value::Str("not committed".into()),
+        Some(Tick(0)),
+    )
+    .unwrap();
+    tx.set_deadline(std::time::Instant::now());
+    other
+        .assert(
+            greg,
+            "tag",
+            Value::Str("other".into()),
+            Some(Tick(i64::MAX)),
+        )
+        .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let result = tx.commit();
+    assert!(
+        matches!(
+            result,
+            Err(Error::WorkInterrupted {
+                reason: kala_core::WorkInterruptReason::Stopped
+            })
+        ),
+        "finalization must not reset an expired deadline: {result:?}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn expired_work_meter_stops_reads_and_remains_expired_after_reset() {
+    let (_dir, _path, mut world, greg) = fixture();
+    world
+        .assert(greg, "tag", Value::Str("visible".into()), Some(Tick(0)))
+        .unwrap();
+    for meter in [
+        kala_core::WorkMeter::new(),
+        kala_core::WorkMeter::bounded(100, None),
+    ] {
+        let meter = meter.with_deadline(Some(std::time::Instant::now()));
+        let result = meter.check();
+        assert!(
+            matches!(
+                result,
+                Err(Error::WorkInterrupted {
+                    reason: kala_core::WorkInterruptReason::Stopped
+                })
+            ),
+            "an expired meter must interrupt before delivering rows: {result:?}"
+        );
+        let view = world.at_canon(world.latest_tx()).metered(&meter);
+        assert!(matches!(
+            view.as_of(greg, "tag", Tick(0)),
+            Err(Error::WorkInterrupted {
+                reason: kala_core::WorkInterruptReason::Stopped
+            })
+        ));
+        meter.take();
+        assert!(
+            matches!(
+                meter.check(),
+                Err(Error::WorkInterrupted {
+                    reason: kala_core::WorkInterruptReason::Stopped
+                })
+            ),
+            "resetting work counters must not extend an expired deadline"
+        );
+    }
+}

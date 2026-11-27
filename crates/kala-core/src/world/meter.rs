@@ -16,6 +16,7 @@ pub struct WorkMeter<'a> {
     keys: AtomicU64,
     pub(super) limit: Option<AtomicU64>,
     stop: Option<&'a AtomicBool>,
+    deadline: Option<std::time::Instant>,
     interrupted: AtomicU8,
     // ID walks also need a bound when their prefix seeks find no keys.
     // Kept separate to preserve historical index-key accounting.
@@ -24,6 +25,12 @@ pub struct WorkMeter<'a> {
 }
 
 impl<'a> WorkMeter<'a> {
+    /// Stop reads at an absolute deadline, in addition to work/cancellation limits.
+    pub fn with_deadline(mut self, deadline: Option<std::time::Instant>) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
     /// An unbounded meter at zero.
     pub fn new() -> Self {
         Self::default()
@@ -77,6 +84,9 @@ impl<'a> WorkMeter<'a> {
         } else if self
             .stop
             .is_some_and(|flag| flag.load(AtomicOrdering::Relaxed))
+            || self
+                .deadline
+                .is_some_and(|at| std::time::Instant::now() >= at)
         {
             self.interrupted.store(2, AtomicOrdering::Relaxed);
             2
@@ -93,7 +103,7 @@ impl<'a> WorkMeter<'a> {
     }
 
     fn count(&self, count: &AtomicU64, n: u64, limit: Option<u64>) -> bool {
-        if self.limit.is_none() && self.stop.is_none() {
+        if self.limit.is_none() && self.stop.is_none() && self.deadline.is_none() {
             count.fetch_add(n, AtomicOrdering::Relaxed);
             return true;
         }
@@ -131,8 +141,10 @@ impl Work<'_> {
 
     #[inline]
     pub(super) fn id(self) -> bool {
-        self.0
-            .is_none_or(|m| m.limit.is_none() && m.stop.is_none() || m.count(&m.ids, 1, m.id_limit))
+        self.0.is_none_or(|m| {
+            m.limit.is_none() && m.stop.is_none() && m.deadline.is_none()
+                || m.count(&m.ids, 1, m.id_limit)
+        })
     }
 
     pub(super) fn finish<T>(self, answer: Result<T, Error>) -> Result<T, Error> {

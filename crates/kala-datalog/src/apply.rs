@@ -443,7 +443,8 @@ fn stage_form(
     let state = FormState {
         remaining: crate::MAX_WRITE_OPS,
         remaining_bytes: kala_core::MAX_ENTRY_BYTES,
-        read_meter: kala_core::WorkMeter::bounded(MAX_SET_READ_KEYS, None),
+        read_meter: kala_core::WorkMeter::bounded(MAX_SET_READ_KEYS, None)
+            .with_deadline(tx.deadline()),
         form_tick: form.at.or(default),
         fallback: tx.report_tick(form.at.or(default)),
         entry_offset: tx.staged_entry_count(),

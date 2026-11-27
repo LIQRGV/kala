@@ -124,14 +124,23 @@ struct Conversion {
 
 impl Conversion {
     /// Converts every change point of `history` to `def`'s value type.
-    fn of(history: &[(EntityId, Change)], def: &AttrDef) -> Conversion {
+    fn of(
+        history: &[(EntityId, Change)],
+        def: &AttrDef,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Conversion, Error> {
+        let meter = WorkMeter::new().with_deadline(deadline);
         let converted: Vec<_> = history
             .iter()
-            .map(|(_, c)| convert(&c.value, def))
-            .collect();
+            .map(|(_, c)| {
+                meter.check()?;
+                Ok(convert(&c.value, def))
+            })
+            .collect::<Result<_, Error>>()?;
         let mut originals: HashMap<(EntityId, Value), Value> = HashMap::new();
         let mut collisions = HashSet::new();
         for ((entity, c), new) in history.iter().zip(&converted) {
+            meter.check()?;
             if let Some(new) = new {
                 let key = (*entity, new.clone());
                 if let Some(previous) = originals.insert(key.clone(), c.value.clone())
@@ -151,11 +160,12 @@ impl Conversion {
                 .then_some(i)
             })
             .collect();
-        Conversion {
+        meter.check()?;
+        Ok(Conversion {
             converted,
             collisions,
             invalid,
-        }
+        })
     }
 }
 
@@ -169,23 +179,26 @@ impl Txn<'_> {
         }
     }
     /// Current history including earlier staged writes, in canonical orientation.
-    fn copy_history(&self, attr: AttrId) -> Vec<(EntityId, Change)> {
+    fn copy_history(&self, attr: AttrId) -> Result<Vec<(EntityId, Change)>, Error> {
         self.copy_history_subjects(attr, None)
     }
     fn copy_history_subjects(
         &self,
         attr: AttrId,
         subjects: Option<&[EntityId]>,
-    ) -> Vec<(EntityId, Change)> {
+    ) -> Result<Vec<(EntityId, Change)>, Error> {
+        let meter = WorkMeter::new().with_deadline(self.deadline());
         let mut points = BTreeMap::new();
         let mutual = self.world.catalog.is_bidirectional(attr);
-        let view = self.world.at_canon(self.world.latest_tx());
+        let view = self.world.at_canon(self.world.latest_tx()).metered(&meter);
         let ids: Box<dyn Iterator<Item = EntityId> + '_> = match subjects {
             Some(ids) => Box::new(ids.iter().copied()),
             None => Box::new(self.world.catalog.defined_ids()),
         };
         for entity in ids {
-            for change in view.changes(entity, attr) {
+            meter.check()?;
+            for change in view.view.changes(entity, attr) {
+                meter.check()?;
                 if subjects.is_none()
                     && mutual
                     && let Value::Ref(target) = change.value
@@ -197,6 +210,7 @@ impl Txn<'_> {
             }
         }
         for staged in &self.s.entries {
+            meter.check()?;
             let (fact, mark) = staged.key_and_mark();
             if fact.attr != attr {
                 continue;
@@ -236,7 +250,8 @@ impl Txn<'_> {
                 }
             }
         }
-        points.into_iter().map(|((e, _, _), c)| (e, c)).collect()
+        meter.check()?;
+        Ok(points.into_iter().map(|((e, _, _), c)| (e, c)).collect())
     }
     /// Copies every current change point into a new attribute, preserving ticks,
     /// precision, redundant assertions, and edge properties. Errors abort the txn.
@@ -279,9 +294,9 @@ impl Txn<'_> {
                 def: &def,
             };
             txn.check_migration(&m)?;
-            let history = txn.copy_history(source);
+            let history = txn.copy_history(source)?;
             txn.check_no_pairs_both_ways(&m, &history)?;
-            let conversion = Conversion::of(&history, &def);
+            let conversion = Conversion::of(&history, &def, txn.deadline())?;
             if !conversion.invalid.is_empty() && !skip_unconvertible {
                 return Err(txn.unconvertible(&m, &history, &conversion.invalid));
             }
@@ -349,21 +364,20 @@ impl Txn<'_> {
         {
             return Ok(());
         }
-        let pairs: HashSet<_> = history
-            .iter()
-            .filter_map(|(e, c)| {
-                if let Value::Ref(t) = c.value {
-                    Some((*e, t))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let mut both: Vec<_> = pairs
-            .iter()
-            .filter(|(a, b)| a < b && pairs.contains(&(*b, *a)))
-            .copied()
-            .collect();
+        let mut pairs = HashSet::new();
+        for (entity, change) in history {
+            self.check_deadline()?;
+            if let Value::Ref(target) = change.value {
+                pairs.insert((*entity, target));
+            }
+        }
+        let mut both = Vec::new();
+        for (a, b) in &pairs {
+            self.check_deadline()?;
+            if a < b && pairs.contains(&(*b, *a)) {
+                both.push((*a, *b));
+            }
+        }
         both.sort_unstable();
         if both.is_empty() {
             return Ok(());
@@ -553,7 +567,7 @@ impl Txn<'_> {
             if attr == source {
                 continue;
             }
-            let properties: Vec<_> = self.copy_history_subjects(attr, Some(&subjects));
+            let properties: Vec<_> = self.copy_history_subjects(attr, Some(&subjects))?;
             for (entity, c) in properties {
                 for edge in &edge_map[&entity
                     .as_edge()
@@ -577,6 +591,7 @@ impl Txn<'_> {
         value: &Value,
         c: &Change,
     ) -> Result<Option<EdgeId>, Error> {
+        self.check_deadline()?;
         // Edge properties of deprecated attributes (e.g. `x@old` from an
         // earlier migration) are history too and must follow their edges.
         let fact = self.world.prepare_fact(

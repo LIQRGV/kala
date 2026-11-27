@@ -1180,7 +1180,9 @@ impl<'w> Txn<'w> {
         // triple this transaction interned is a newer commit's.
         let committed_edges = self.world.catalog.edges.len() as u64;
 
+        let deadline = self.s.deadline;
         let mut fresh = self.world.begin_without_catch_up();
+        fresh.s.deadline = deadline;
         fresh.s.held = Some(held);
         fresh.s.track = false;
         fresh.s.base_tick = base_tick;
@@ -1190,6 +1192,7 @@ impl<'w> Txn<'w> {
         let mut ids = IdMap::default();
         let mut outcomes = Vec::with_capacity(ops.len());
         for (index, recorded) in ops.iter().enumerate() {
+            fresh.check_deadline()?;
             let translate = |id: EntityId| map.get(&id).copied().unwrap_or(id);
             let value_of = |v: &Value| match v {
                 Value::Ref(id) => Value::Ref(translate(*id)),
