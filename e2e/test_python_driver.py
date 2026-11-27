@@ -654,6 +654,66 @@ class WriteDriverTests(unittest.TestCase):
             self.assertEqual(sorted(j.result(timeout=20) for j in jobs), [1, 2])
         self.assertGreaterEqual(sum(attempts), 3)
 
+    def test_cypher_write_parameters_take_the_kinds_of_the_reading_part(self):
+        with self.driver().session(database="annex") as session:
+            # A handle string for a ref-typed position finds the same rows as a read.
+            found = session.execute_read(lambda tx: [r[0] for r in tx.run(
+                "MATCH (c:CHARACTER {located_in:$place}) AT TICK 700 RETURN c.kala_handle",
+                place="ashford")])
+            self.assertIn("greg", found)
+            summary = session.run(
+                "MATCH (c:CHARACTER {located_in:$place}) SET c.checked_in = true AT TICK 700",
+                place="ashford").consume()
+            self.assertEqual(summary.counters.properties_set, len(found))
+            self.assertEqual(session.execute_read(lambda tx: tx.run(
+                "MATCH (c {kala_handle:'greg'}) AT TICK 700 RETURN c.checked_in").single()[0]), True)
+            # A handle string written to a ref attribute resolves to the entity.
+            session.execute_write(lambda tx: tx.run(
+                "MATCH (c {kala_handle:'wren'}) SET c.located_in = $place AT TICK 8500",
+                place="varrow").consume())
+            self.assertEqual(session.run(
+                "MATCH (c {kala_handle:'wren'})-[:located_in]->(p) AT TICK 8500 "
+                "RETURN p.kala_handle").single()[0], "varrow")
+            for query, params, code in [
+                ("MATCH (c:CHARACTER {located_in:$place}) SET c.checked_in = true", {"place": 5},
+                 "Neo.ClientError.Statement.TypeError"),
+                ("MATCH (c {kala_handle:'wren'}) SET c.located_in = $place AT TICK 8501",
+                 {"place": "no-such-place"}, None),
+            ]:
+                with self.assertRaises(ClientError) as error:
+                    session.run(query, params).consume()
+                if code:
+                    self.assertEqual(error.exception.code, code)
+                else:
+                    self.assertIn("unknown entity `no-such-place`", error.exception.message)
+
+    def test_refused_cypher_writes_are_logged_without_text_or_values(self):
+        private_value = "cypher-log-private-value-551907"
+
+        def refusals():
+            with open(os.path.join(self.directory, "server.stderr"), encoding="utf-8") as captured:
+                output = captured.read()
+            self.assertNotIn(private_value, output)
+            return [line for line in output.splitlines() if "event=bolt_write_refused " in line]
+
+        for user, query, reason in [
+            # Needs `read` as well as `write`: refused when the statement is admitted.
+            ("write-only", "MATCH (n {kala_handle:'greg'}) SET n.note = $v", "privilege"),
+            ("writer", "MATCH (n {kala_handle:'greg'}) SET n.kala_handle = $v", "statement"),
+        ]:
+            with self.subTest(reason=reason):
+                before = len(refusals())
+                with self.driver(user).session(database="varrow") as session:
+                    with self.assertRaises(ClientError):
+                        session.run(query, v=private_value).consume()
+                new = refusals()[before:]
+                self.assertTrue(any(f"reason={reason}" in line for line in new), new)
+                for line in new:
+                    for key in ["connection_id=", "db=", "user=", "reason="]:
+                        self.assertIn(key, line)
+                    self.assertNotIn("MATCH", line)
+                    self.assertNotIn("kala_handle", line)
+
     def test_cypher_correction_hint_can_be_used_on_the_same_connection(self):
         with self.driver().session(database="annex") as session:
             result = session.run("CREATE (:CHARACTER {kala_handle:'cypher_correction', "

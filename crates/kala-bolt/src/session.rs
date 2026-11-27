@@ -786,7 +786,8 @@ impl Session<'_> {
             }
             kala_lang::Statement::CypherWrite(statement) => {
                 let held = self.allow_write_run(&name, &options)?;
-                self.cypher_run(&name, &statement, params, text.len(), &options, held, stop)?
+                self.cypher_run(&name, &statement, params, text.len(), &options, held, stop)
+                    .inspect_err(|failure| self.log_refused(&name, refusal_reason(failure)))?
             }
             kala_lang::Statement::Writes => {
                 let read = self.allow_write_run(&name, &options)?.read;
@@ -798,18 +799,7 @@ impl Session<'_> {
                 }
                 let source = source?;
                 self.write_run(&name, &source.text, &options, read)
-                    .inspect_err(|failure| {
-                        self.log_refused(
-                            &name,
-                            if failure.code == crate::error::FORBIDDEN {
-                                "privilege"
-                            } else if failure.code.starts_with("Neo.TransientError") {
-                                "conflict"
-                            } else {
-                                "statement"
-                            },
-                        );
-                    })?
+                    .inspect_err(|failure| self.log_refused(&name, refusal_reason(failure)))?
             }
             kala_lang::Statement::Server(statement) => {
                 if self
@@ -1409,6 +1399,17 @@ impl Session<'_> {
         } else {
             Ok(success([("has_more", Value::Bool(true))]))
         }
+    }
+}
+/// The `reason=` of a refused write's log line: never the statement's text
+/// or values, only which kind of refusal it was.
+fn refusal_reason(failure: &Failure) -> &'static str {
+    if failure.code == crate::error::FORBIDDEN {
+        "privilege"
+    } else if failure.code.starts_with("Neo.TransientError") {
+        "conflict"
+    } else {
+        "statement"
     }
 }
 fn elapsed(start: Instant) -> i64 {
