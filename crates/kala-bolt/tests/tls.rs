@@ -278,6 +278,12 @@ fn a_rejected_handshake_sends_its_fatal_alert_before_the_close() {
         );
         assert!(start.elapsed() < Duration::from_secs(3), "{name}");
     }
+    // Bytes that are not TLS get no alert. A plaintext Bolt driver would
+    // read the 7-byte alert record as the 4-byte Bolt version reply and
+    // report "unsupported protocol version" instead of a failed connection.
+    let mut socket = server.connect();
+    socket.write_all(&BOLT).unwrap();
+    assert_eq!(reply_before_close(socket, 64), [0_u8; 0]);
     // The server keeps serving.
     logon(tls::stream(server.dir.path(), server.connect())).success();
 }

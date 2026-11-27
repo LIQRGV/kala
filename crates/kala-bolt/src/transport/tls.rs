@@ -116,7 +116,16 @@ impl Tls {
         // rustls queued a fatal alert saying why (protocol_version,
         // handshake_failure, bad_record_mac, ...). Give it one bounded,
         // best-effort flush so the peer sees more than a bare close.
-        let _ = self.send_records(deadline.min(Instant::now() + ALERT_FLUSH));
+        //
+        // Not when the handshake bytes were not TLS at all: that peer is
+        // most likely a plaintext Bolt driver (`bolt://` against a `bolt+s://`
+        // port), which would read the alert record as the server's Bolt
+        // version reply and report an unsupported protocol version instead
+        // of a failed connection.
+        let not_tls = self.conn.is_handshaking() && matches!(e, rustls::Error::InvalidMessage(_));
+        if !not_tls {
+            let _ = self.send_records(deadline.min(Instant::now() + ALERT_FLUSH));
+        }
         self.broken = true;
         // Only static protocol classes may reach logs, never SNI or peer data.
         use rustls::Error::*;

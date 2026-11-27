@@ -259,7 +259,9 @@ an hour and logs a warning while the leaf is within 14 days of its end or
 expired.
 
 A client whose handshake rustls rejects is sent the fatal alert (bounded by the
-handshake deadline and one second) before the close. Handshake failures are
+handshake deadline and one second) before the close. Bytes that are not TLS at
+all get a bare close instead: a plaintext Bolt driver would read the alert
+record as the Bolt version reply. Handshake failures are
 logged through one rate limiter (`suppressed_since_last=N`). The auth log line
 says `peer=tls` for these connections, `peer=tcp` for plaintext TCP and
 `peer=unix` for a Unix socket. A failed record write ends the stream: later
