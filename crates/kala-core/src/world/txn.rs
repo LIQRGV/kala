@@ -265,6 +265,8 @@ pub(super) struct TxnState {
     pub(super) unknown_settings: bool,
     /// A read was made under [`Concurrency::Weak`], which records none.
     pub(super) unrecorded_reads: Cell<bool>,
+    /// Inside [`Txn::without_read_recording`]: reads record nothing.
+    pub(super) reads_muted: Cell<bool>,
     /// A replay regenerating what a committed transaction staged (a
     /// migration's copy): nothing of it is written, so the world's write
     /// gate (read-only, unacknowledged recovery, failed log) isn't asked.
@@ -1957,6 +1959,7 @@ impl World {
             additions_only: false,
             unknown_settings: false,
             unrecorded_reads: Cell::new(false),
+            reads_muted: Cell::new(false),
             replaying: false,
         }
     }

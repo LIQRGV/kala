@@ -613,3 +613,60 @@ fn a_weak_mode_statement_reads_on_the_writer_not_on_the_cached_snapshot() {
     assert_eq!(off_mutex.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!((counts.reader("varrow"), counts.writer("varrow")), (1, 1));
 }
+
+// ---- Second review, 2: the RETURN preview records no reads ----
+
+#[test]
+fn the_return_preview_does_not_make_unrelated_commits_conflict() {
+    for (other, conflicts) in [
+        // Another property of the returned node: the statement never read
+        // it (the preview only measures the answer), so it is free.
+        (
+            "MATCH (g {kala_handle:'greg'}) SET g.name = 'Gregor' AT TICK 900",
+            false,
+        ),
+        // What the SET itself read (the value it replaces) still conflicts.
+        (
+            "MATCH (g {kala_handle:'greg'}) SET g.hp = 1 AT TICK 900",
+            true,
+        ),
+    ] {
+        let (hook, reached, go) = gate();
+        let server = server_with(|config| config.after_statement_read = Some(hook));
+        let mut first = Client::ready(&server);
+        let mut second = Client::ready(&server);
+        write(&mut second, DECLARE_HP, map(&[]));
+        warm(&mut second);
+        first.send(
+            0x10,
+            vec![
+                string("MATCH (g {kala_handle:'greg'}) SET g.hp = 2 AT TICK 901 RETURN g"),
+                map(&[]),
+                map(&[]),
+            ],
+        );
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        write(&mut second, other, map(&[]));
+        let before = log_bytes(&server);
+        go.send(()).unwrap();
+        if conflicts {
+            first.failure("Neo.TransientError.Transaction.DeadlockDetected");
+            assert!(log_bytes(&server) == before, "{other}");
+        } else {
+            first.success();
+            let (rows, summary) = first.pull(-1);
+            assert_eq!(changed(&summary), 1, "{summary:?}");
+            // The answer is the committed state, the other commit included.
+            let Value::Structure(0x4e, node) = &rows[0][0] else {
+                panic!("{rows:?}")
+            };
+            let Value::Map(properties) = &node[2] else {
+                panic!("{node:?}")
+            };
+            assert_eq!(properties["hp"], Value::Integer(2), "{properties:?}");
+            assert_eq!(properties["name"], string("Gregor"), "{properties:?}");
+        }
+    }
+}

@@ -246,7 +246,8 @@ pub(crate) struct RenderOptions<'a> {
     system: bool,
     result_bytes: usize,
     /// A size check before a commit: nothing is sent, so nothing is read on
-    /// the client's behalf and no read is recorded on the transaction.
+    /// the client's behalf and no read at all is recorded on the
+    /// transaction (`Txn::without_read_recording`).
     preview: bool,
 }
 impl<'a> RenderOptions<'a> {
@@ -275,13 +276,35 @@ pub(crate) fn render(
     mut reads: crate::reads::Reads,
     options: RenderOptions<'_>,
 ) -> Result<Output, Failure> {
+    if options.preview
+        && let RenderWorld::Staged(tx) = world
+    {
+        // Rendering reads every property of a returned node or edge
+        // (`Txn::values_at`). In a preview nobody is shown them and the
+        // real answer is rendered again from the committed world, so none
+        // of it is a read a later commit could invalidate.
+        let options = RenderOptions {
+            preview: false,
+            ..options
+        };
+        return tx.without_read_recording(|tx| {
+            render(
+                RenderWorld::Staged(tx),
+                fields,
+                records,
+                tick,
+                reads,
+                options,
+            )
+        });
+    }
     let RenderOptions {
         stop,
         max_message,
         max_depth,
         system,
         result_bytes,
-        preview,
+        preview: _,
     } = options;
     let limits = Limits {
         max_bytes: result_bytes,
@@ -309,9 +332,7 @@ pub(crate) fn render(
             // Graph-value enrichment reads properties beyond those explicitly named.
             visit_ids(&datum, &mut |id| {
                 reads.rendered(id);
-                if let Graph::Staged(tx) = &view
-                    && !preview
-                {
+                if let Graph::Staged(tx) = &view {
                     tx.note_read_entity(id);
                     provisional |= tx.is_provisional(id);
                 }

@@ -1042,12 +1042,36 @@ impl Txn<'_> {
         }
     }
 
+    /// Runs `f` with read recording off: whatever `f` reads through this
+    /// transaction ([`Txn::values_at`], the `note_*` reads, a name found
+    /// undeclared) is not added to the read set, so no newer commit
+    /// conflicts with it, and under [`Concurrency::Weak`] it doesn't count
+    /// as an unrecorded read either. Reads made before and after are
+    /// recorded as always.
+    ///
+    /// Only for a look at the staged state that **nothing depends on**:
+    /// neither what the transaction goes on to write nor anything shown to
+    /// its client before the commit. A server uses it to measure, before an
+    /// auto-commit write is appended, the answer it will render again from
+    /// the committed world afterwards. Using it for a read that decides a
+    /// write gives up serializability for that read.
+    pub fn without_read_recording<R>(&self, f: impl FnOnce(&Self) -> R) -> R {
+        struct Restore<'a>(&'a std::cell::Cell<bool>, bool);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.1);
+            }
+        }
+        let _restore = Restore(&self.s.reads_muted, self.s.reads_muted.replace(true));
+        f(self)
+    }
+
     /// The read set, if this transaction records reads: optimistic, on a
     /// world other handles can write. Every read asks here, so a read made
     /// under [`Concurrency::Weak`] is remembered as one that went
     /// unrecorded (see [`Txn::set_concurrency`]).
     fn reads(&self) -> Option<RefMut<'_, ReadSet>> {
-        if !self.s.track {
+        if !self.s.track || self.s.reads_muted.get() {
             return None;
         }
         if self.s.concurrency == Concurrency::Weak {
