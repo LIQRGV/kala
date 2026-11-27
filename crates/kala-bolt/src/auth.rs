@@ -47,6 +47,7 @@ impl Authenticator for NoAuth {
             principal: String::new(),
             host: String::new(),
             grants: vec!["read:*".into()],
+            generation: 0,
         })
     }
 }

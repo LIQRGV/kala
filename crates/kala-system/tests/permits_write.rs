@@ -35,6 +35,7 @@ fn permits_write_truth_table_keeps_read_and_write_independent() {
             principal: "author".into(),
             host: "localhost".into(),
             grants: grants.into_iter().map(str::to_owned).collect(),
+            generation: 0,
         };
         assert_eq!(
             identity.permits_write(db),

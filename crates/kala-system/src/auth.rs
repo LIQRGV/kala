@@ -80,8 +80,18 @@ pub struct Identity {
     pub principal: String,
     /// The host selector that won account selection.
     pub host: String,
-    /// Captured grants; changes apply on the next login.
+    /// Captured grants; a server may re-read them for the same account
+    /// ([`current_identity`]).
     pub grants: Vec<String>,
+    /// Which account of that name this identity was issued for: the tick,
+    /// in the system world's own logical time, at which the account was
+    /// created (`kala user add`). Every account change takes a new tick, so
+    /// an account that was dropped and created again under the same
+    /// `user@host` has another generation: it is another account, and an
+    /// identity issued for the old one gets nothing of it. Changing an
+    /// account's password or grants keeps its generation. 0 for an
+    /// identity that isn't a stored account (`--auth none`).
+    pub generation: i64,
 }
 impl Identity {
     /// Whether this identity may write the named database (separate from
@@ -459,8 +469,13 @@ impl AccountVerifier {
     }
 }
 /// The identity of the account `identity` was issued for, as a system-world
-/// snapshot holds it now: the same user and host selector with its current
-/// grants, or `None` if that account no longer exists. No credentials are
+/// snapshot holds it now: the same user, host selector and
+/// [generation](Identity::generation) with its current grants, or `None` if
+/// that account no longer exists. An account dropped and created again
+/// under the same name is **not** that account (another generation): a
+/// connection authenticated with the old account's credentials must not
+/// pick up the new one's grants. A password change on the same account
+/// keeps it (password changes apply at the next login). No credentials are
 /// involved: this re-reads what an already authenticated connection may do,
 /// it never authenticates one.
 pub fn current_identity(
@@ -469,7 +484,11 @@ pub fn current_identity(
 ) -> Result<Option<Identity>, SystemError> {
     Ok(system::read_accounts(system_world)?
         .iter()
-        .find(|a| a.summary.user == identity.principal && a.summary.host == identity.host)
+        .find(|a| {
+            a.summary.user == identity.principal
+                && a.summary.host == identity.host
+                && a.generation == identity.generation
+        })
         .map(system::Account::identity))
 }
 #[cfg(test)]

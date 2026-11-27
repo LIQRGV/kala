@@ -500,6 +500,7 @@ fn backup_grants_never_cover_the_accounts_database() {
         principal: "bob".into(),
         host: "%".into(),
         grants: grants.iter().map(|g| (*g).to_owned()).collect(),
+        generation: 0,
     };
     let wildcard = id(&["backup:*"]);
     assert!(wildcard.permits_backup("varrow"));
