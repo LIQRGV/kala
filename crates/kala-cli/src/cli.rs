@@ -443,6 +443,9 @@ pub struct QueryArgs {
 // `kala transact`.
 #[derive(Debug, Args)]
 pub struct TransactArgs {
+    /// Language of the transaction file. A Cypher file has one transaction per statement.
+    #[arg(long, default_value = "datalog", value_parser = crate::cmd::language::NAMES, conflicts_with = "create")]
+    pub lang: String,
     /// Replay a dump into a new world, preserving its genesis.
     #[arg(long, conflicts_with_all = ["dry_run", "acknowledge_recovery"])]
     pub create: bool,

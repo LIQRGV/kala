@@ -630,6 +630,8 @@ impl Session<'_> {
             forms: Vec::new(),
             bytes: 0,
             queried: false,
+            mode_set: false,
+            cypher_forms: Vec::new(),
             server_statement: false,
             pending: crate::reads::Reads::default(),
             begun: None,
@@ -688,6 +690,9 @@ impl Session<'_> {
                 })
                 .collect();
             summary.add(&world, &result, &completed, read);
+            for index in transaction.cypher_forms {
+                summary.operations(index + 1, &completed[index].ops);
+            }
             Ok(Value::Structure(
                 0x70,
                 vec![Value::Map(summary.metadata(
@@ -764,20 +769,26 @@ impl Session<'_> {
         self.summary = None;
         self.run_type = "r";
         let output = match statement {
-            kala_lang::Statement::Writes => {
-                // An explicit transaction's grants were refreshed at BEGIN.
-                if self.transaction.is_none() {
-                    self.refresh_grants()?;
+            kala_lang::Statement::Concurrency(mode) => {
+                self.allow_write_run(&name, &options)?;
+                let tx = self.transaction.as_mut().ok_or_else(|| Failure::new(INVALID,
+                    "use BEGIN metadata or put SET CONCURRENCY_MODE first in an explicit transaction"))?;
+                if tx.mode_set || tx.queried || tx.server_statement || !tx.forms.is_empty() {
+                    return Err(Failure::new(
+                        INVALID,
+                        "concurrency is allowed only in the first statement of a transaction",
+                    ));
                 }
-                let read = self
-                    .identity
-                    .as_ref()
-                    .is_some_and(|id| id.permits_read(&name));
-                let mode = self
-                    .transaction
-                    .as_ref()
-                    .map_or(options.read_only, |tx| tx.read_only);
-                self.write_allowed(&name, mode)?;
+                tx.concurrency = mode;
+                tx.mode_set = true;
+                query::Output::empty()
+            }
+            kala_lang::Statement::CypherWrite(statement) => {
+                let held = self.allow_write_run(&name, &options)?;
+                self.cypher_run(&name, &statement, params, text.len(), &options, held, stop)?
+            }
+            kala_lang::Statement::Writes => {
+                let read = self.allow_write_run(&name, &options)?.read;
                 if !params.is_empty() {
                     return Err(Failure::new(
                         INVALID,
@@ -870,27 +881,7 @@ impl Session<'_> {
                         self.config.max_depth,
                         tx.deadline,
                     )?;
-                    match &mut tx.snapshot {
-                        // The query read the COMMITTED world, but its read
-                        // keys are recorded by name on the transaction,
-                        // whose schema is provisional: after a rename or a
-                        // new declaration a name can mean another attribute
-                        // there (or only there). Once the transaction has
-                        // edited the schema, a query counts as having read
-                        // everything instead of being recorded under the
-                        // wrong attribute.
-                        Snapshot::Write(owned, _) => owned.with(|t| {
-                            if t.schema_changes().is_empty() {
-                                output.reads.note(t);
-                            } else {
-                                t.note_read_all();
-                            }
-                        }),
-                        // Kept for the writable handle, if one ever opens.
-                        Snapshot::Read(_) if !tx.read_only => tx.pending.merge(&output.reads),
-                        Snapshot::Read(_) => {}
-                    }
-                    tx.queried = true;
+                    tx.record(&output.reads);
                     output
                 } else {
                     let world = self.registry.at_least(
@@ -938,13 +929,19 @@ impl Session<'_> {
             ("qid", Value::Integer(0)),
         ]))
     }
-    fn write_run(
+    fn allow_write_run(
         &mut self,
         db: &str,
-        text: &str,
         options: &Options,
-        read: bool,
-    ) -> Result<query::Output, Failure> {
+    ) -> Result<write::Privileges, Failure> {
+        if self.transaction.is_none() {
+            self.refresh_grants()?;
+        }
+        let mode = self
+            .transaction
+            .as_ref()
+            .map_or(options.read_only, |tx| tx.read_only);
+        self.write_allowed(db, mode)?;
         if self.config.max_message_bytes < 1024 || self.config.max_depth < 8 {
             return Err(Failure::new(
                 INVALID,
@@ -961,6 +958,126 @@ impl Session<'_> {
                 "server statements and writes cannot share a transaction",
             ));
         }
+        let identity = self.identity.as_ref().ok_or_else(Failure::invalid)?;
+        Ok(write::Privileges {
+            read: identity.permits_read(db),
+            admin: identity.permits_admin(db),
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn cypher_run(
+        &mut self,
+        db: &str,
+        statement: &kala_lang::write::WriteStatement,
+        given: &Map,
+        text_len: usize,
+        options: &Options,
+        held: write::Privileges,
+        flag: &AtomicBool,
+    ) -> Result<query::Output, Failure> {
+        use kala_lang::write::{prepare_statement, stage_statement};
+        let fields = statement.fields();
+        let rw = statement.has_reading_part() || !fields.is_empty();
+        let prior = self.transaction.as_ref().map_or(0, |tx| tx.forms.len());
+        write::admit_needs(statement.requires_read(), false, false, prior, held)?;
+        let deadline = self
+            .transaction
+            .as_ref()
+            .map_or(self.started + options.timeout, |tx| tx.deadline);
+        let stop = query::Stop { flag, deadline };
+        let max = self.config.max_message_bytes;
+        let depth = self.config.max_depth;
+        let prepare = |world: &kala_core::World| {
+            let names = statement
+                .parameters()
+                .into_iter()
+                .map(|n| (n, kala_query::ParamKind::Scalar))
+                .collect::<Vec<_>>();
+            let params = query::parameters(world, &names, given, true)?;
+            let run = kala_query::RunOptions::default()
+                .with_cancel(flag)
+                .with_deadline(deadline);
+            let input = query::until(deadline, |_| {
+                prepare_statement(world, statement, &params, run)
+                    .map_err(|e| write::statement_error(e, held.read))
+            })?;
+            let reads = crate::reads::Reads::plan(&input.prepared.plan, world);
+            Ok::<_, Failure>((params, input, reads))
+        };
+        if let Some(tx) = &mut self.transaction {
+            let account = self
+                .identity
+                .as_ref()
+                .map(|id| format!("{}@{}", id.principal, id.host))
+                .ok_or_else(Failure::invalid)?;
+            let param_size =
+                crate::packstream::encode_with_limits(&Value::Map(given.clone()), max, depth)
+                    .map_err(|_| Failure::new(INVALID, "parameter limit exceeded"))?
+                    .len();
+            tx.bytes = tx.bytes.saturating_add(text_len).saturating_add(param_size);
+            if tx.bytes > write::MAX_STAGED_BYTES {
+                return Err(Failure::new(
+                    INVALID,
+                    "transaction exceeds the staged-text byte limit",
+                ));
+            }
+            let (params, input, reads) = prepare(tx.world())?;
+            if statement.requires_read() {
+                tx.record(&reads);
+            }
+            let owned = tx.writer(self.registry, self.config, &account, held.admin)?;
+            let (output, staged) = owned.with(|t| {
+                let result = stage_statement(t, statement, input, &params)
+                    .map_err(|e| write::statement_error(e, held.read))?;
+                let output = query::render(
+                    query::RenderWorld::Staged(t),
+                    fields,
+                    result.rows,
+                    result.tick,
+                    Default::default(),
+                    stop,
+                    max,
+                    depth,
+                    false,
+                )?;
+                Ok::<_, Failure>((output, result.staged))
+            })?;
+            self.run_type = if rw { "rw" } else { "w" };
+            tx.cypher_forms.push(tx.forms.len());
+            tx.forms.push(staged);
+            Ok(output)
+        } else {
+            let (output, summary) = self.registry.write(db, self.config.busy_timeout.min(options.timeout), options.bookmark, |world| {
+                let mut tx = world.begin();
+                tx.set_concurrency(options.concurrency);
+                tx.set_schema_additions_only(!held.admin);
+                tx.set_deadline(deadline);
+                let (params, input, reads) = prepare(tx.base_world())?;
+                reads.note(&tx);
+                let staged = stage_statement(&mut tx, statement, input, &params).map_err(|e| write::statement_error(e, held.read))?;
+                let result = tx.commit().map_err(|e| write::commit_error(world, e, std::slice::from_ref(&staged.staged), held.read))?;
+                self.log_commit(db, &result, 1);
+                let after_commit = || Failure::new(crate::error::STORE, format!("write completed at tx {} (bookmark kala:{db}:{}); RETURN could not be rendered", result.tx.0, result.tx.0));
+                let rows = staged.committed_rows(world, &result.ids).map_err(|_| after_commit())?;
+                let output = query::render(query::RenderWorld::Snapshot(world, result.tx), fields, rows, staged.tick, Default::default(), stop, max, depth, false).map_err(|_| after_commit())?;
+                let ops = staged.staged.clone().complete(&result).ops;
+                let form = StagedWrite { ops, ..staged.staged };
+                let mut summary = write::Summary::new(max);
+                summary.add(world, &result, std::slice::from_ref(&form), held.read);
+                summary.operations(1, &form.ops);
+                Ok((output, summary.metadata(db, rw, max, depth)))
+            })?;
+            self.summary = Some(summary);
+            Ok(output)
+        }
+    }
+    fn write_run(
+        &mut self,
+        db: &str,
+        text: &str,
+        options: &Options,
+        read: bool,
+    ) -> Result<query::Output, Failure> {
         let forms = kala_lang::write::write_forms(text).map_err(write::parse_error)?;
         // Every form of the RUN is parsed and admitted (its privileges and
         // its place in the transaction) before a writable handle is opened
@@ -997,7 +1114,11 @@ impl Session<'_> {
                     Failure::new(INVALID, "transaction exceeds the staged-text byte limit")
                 })?;
             for (index, form) in forms.iter().enumerate() {
-                write::admit(form, tx.forms.len() + index, held)?;
+                write::admit(
+                    form,
+                    tx.forms.len() + index + usize::from(tx.mode_set),
+                    held,
+                )?;
             }
             let mut data = false;
             for (index, form) in forms.iter().enumerate() {

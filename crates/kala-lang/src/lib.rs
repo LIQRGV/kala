@@ -70,6 +70,10 @@ pub enum Statement {
     Server(Box<ServerStatement>),
     /// One or more Datalog transaction forms, parsed incrementally by `write_forms`.
     Writes,
+    /// A parsed statement over the shared write primitives.
+    CypherWrite(Box<write::WriteStatement>),
+    /// A transaction mode directive, admitted before opening a writer.
+    Concurrency(kala_core::Concurrency),
 }
 
 /// Classifies prefix-stripped text through its selected front-end.
@@ -89,10 +93,21 @@ pub fn classify(
                 message: e.to_string(),
             });
     }
-    if let Some(statement) = front_end.prepare_server(text, refuse)? {
-        return Ok(Statement::Server(Box::new(statement)));
+    match kala_cypher::parse_statement(text).map_err(cypher_error)? {
+        kala_cypher::ast::Statement::Write(statement) => {
+            if statement.attributes().iter().any(|a| refuse(a)) {
+                return Err(LangError::refused());
+            }
+            Ok(Statement::CypherWrite(Box::new(statement)))
+        }
+        kala_cypher::ast::Statement::Concurrency(mode) => Ok(Statement::Concurrency(mode)),
+        kala_cypher::ast::Statement::Read(query) => {
+            Ok(match Cypher::server(text, &query, refuse)? {
+                Some(statement) => Statement::Server(Box::new(statement)),
+                None => Statement::Query,
+            })
+        }
     }
-    Ok(Statement::Query)
 }
 
 /// A query language Kala parses: parse, refuse attributes in the AST, compile.
@@ -162,14 +177,13 @@ impl FrontEnd for Datalog {
 /// Cypher: `$name` parameters, which may also be NULL or lists.
 pub struct Cypher;
 
-impl FrontEnd for Cypher {
-    fn prepare_server(
-        &self,
+impl Cypher {
+    fn server(
         text: &str,
+        query: &kala_cypher::ast::Query,
         refuse: &dyn Fn(&str) -> bool,
     ) -> Result<Option<ServerStatement>, LangError> {
         use kala_cypher::ast::Clause;
-        let query = kala_cypher::parse(text).map_err(cypher_error)?;
         let Some(request) = query.server_request().cloned() else {
             return Ok(None);
         };
@@ -194,10 +208,20 @@ impl FrontEnd for Cypher {
             kind: ErrorKind::Type,
             message: "could not initialize metadata schema".into(),
         })?;
-        let prepared = kala_cypher::prepare_parsed(&empty, text, &query).map_err(cypher_error)?;
+        let prepared = kala_cypher::prepare_parsed(&empty, text, query).map_err(cypher_error)?;
         Ok(Some(ServerStatement { request, prepared }))
     }
+}
 
+impl FrontEnd for Cypher {
+    fn prepare_server(
+        &self,
+        text: &str,
+        refuse: &dyn Fn(&str) -> bool,
+    ) -> Result<Option<ServerStatement>, LangError> {
+        let query = kala_cypher::parse(text).map_err(cypher_error)?;
+        Self::server(text, &query, refuse)
+    }
     fn name(&self) -> &'static str {
         "cypher"
     }
@@ -354,6 +378,11 @@ pub mod write {
     }
     pub use kala_core::Concurrency;
     pub use kala_core::write::{StagedWrite, WriteOperation, WriteReport};
+    pub use kala_cypher::write::{
+        WriteError as StatementError, execute_in as execute_statement,
+        prepare as prepare_statement, stage as stage_statement,
+    };
+    pub use kala_cypher::{ast::WriteStatement, statements};
     pub use kala_datalog::apply::{
         Failure, Occupant, OccupiedBy, SameTick, WriteError, WritePolicy, commit, execute,
         execute_in, execute_with, stage, stage_with,

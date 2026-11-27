@@ -134,6 +134,9 @@ pub(crate) struct Transaction {
     pub forms: Vec<StagedWrite>,
     pub bytes: usize,
     pub queried: bool,
+    pub mode_set: bool,
+    /// Indexes into forms for which the per-operation report goes in the summary.
+    pub cypher_forms: Vec<usize>,
     pub server_statement: bool,
     /// What the queries run so far depend on, kept until the writable
     /// handle exists to record it on.
@@ -161,6 +164,21 @@ impl Transaction {
             (None, Snapshot::Read(w)) => w,
             (None, Snapshot::Write(tx, _)) => tx.world(),
         }
+    }
+    /// Attach dependencies before opening a writer or directly to a live transaction.
+    pub fn record(&mut self, reads: &Reads) {
+        match &mut self.snapshot {
+            Snapshot::Write(owned, _) => owned.with(|tx| {
+                if tx.schema_changes().is_empty() {
+                    reads.note(tx);
+                } else {
+                    tx.note_read_all();
+                }
+            }),
+            Snapshot::Read(_) if !self.read_only => self.pending.merge(reads),
+            _ => {}
+        }
+        self.queried = true;
     }
     /// The transaction's writable handle, if it has written.
     pub fn written(&mut self) -> Option<&mut OwnedTxn> {
@@ -229,9 +247,16 @@ impl Transaction {
             let moved = owned.snapshot_tx() != pinned;
             // The pending keys are names: exact only if every name means
             // on the handle what it meant on the BEGIN snapshot.
-            let same_schema = !moved || {
+            let stable_names = !moved || {
                 let now = owned.world();
-                begun.attributes().eq(now.attributes()) && begun.node_types().eq(now.node_types())
+                // Attribute IDs are append-only. New names can be recorded
+                // on the newer handle: reading the new attribute conflicts
+                // with its declaration in the tail since BEGIN. A rename or
+                // redefinition can change the meaning of an older ID.
+                begun
+                    .attributes()
+                    .eq(now.attributes().take(begun.attributes().count()))
+                    && self.pending.same_type_names(&begun, now)
             };
             owned.with(|tx| {
                 tx.set_concurrency(self.concurrency);
@@ -239,7 +264,7 @@ impl Transaction {
                 tx.set_schema_additions_only(!admin);
                 tx.set_start_tick(begun.latest_tick());
                 if self.queried {
-                    if same_schema {
+                    if stable_names {
                         self.pending.note(tx);
                     } else {
                         tx.note_read_all();

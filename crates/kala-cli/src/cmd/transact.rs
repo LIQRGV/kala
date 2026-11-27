@@ -179,6 +179,9 @@ fn conflict_err(w: &World, op: Option<(usize, &'static str)>, conflict: &Conflic
         None => "this transaction".to_string(),
     };
     let what = match &conflict.key {
+        ConflictKey::Entity { entity: id } => {
+            format!("read {}, which another transaction changed", entity(*id))
+        }
         ConflictKey::EntityAttribute { entity: e, attr: a } => format!(
             "read {} {}, which another transaction changed",
             entity(*e),
@@ -446,12 +449,71 @@ pub fn render(report: &Report, json: bool) -> String {
     s
 }
 
+enum Input<'a> {
+    Form(WriteTxn),
+    Statement(&'a str),
+}
+impl Input<'_> {
+    fn execute(self, world: &mut World, mode: Concurrency) -> Result<Report, CliError> {
+        use kala_lang::write::{StatementError, execute_statement};
+        match self {
+            Self::Form(form) => execute(world, &form, None, mode),
+            Self::Statement(text) => {
+                let statement = match kala_lang::classify(
+                    &kala_lang::Cypher,
+                    text,
+                    &kala_lang::refuse_nothing,
+                )
+                .map_err(|e| user(e.to_string()))?
+                {
+                    kala_lang::Statement::CypherWrite(statement) => statement,
+                    kala_lang::Statement::Concurrency(_) => {
+                        return Err(user(
+                            "use --concurrency for a transaction file, or put SET CONCURRENCY_MODE first in an explicit Bolt transaction",
+                        ));
+                    }
+                    _ => {
+                        return Err(user(
+                            "expected a write statement; use kala query --lang cypher for a read query",
+                        ));
+                    }
+                };
+                match execute_statement(
+                    world,
+                    &statement,
+                    &kala_query::QueryParams::new(),
+                    Default::default(),
+                    mode,
+                ) {
+                    Ok(report) => Ok(committed_report(world, report)),
+                    Err(e @ StatementError::Stage(_)) if matches!(&e, StatementError::Stage(err) if matches!(err.cause, kala_lang::write::Failure::SetEvent(_))) => Err(user(e.to_string())),
+                    Err(StatementError::Stage(e)) => committed(world, Err(e)),
+                    Err(StatementError::Store(e)) => Err(core_err(e)),
+                    Err(e) => Err(user(e.to_string())),
+                }
+            }
+        }
+    }
+}
+
 pub fn run(args: &TransactArgs) -> Result<Done, CliError> {
     let (dry_run, json) = (args.dry_run, args.json);
     let text = read_input(&args.input)?;
     let mode = crate::cli::concurrency(&args.concurrency);
     let mut w = open_target(args)?;
-    let forms = kala_datalog::write_forms(&text).map_err(|e| user(e.to_string()))?;
+    let cypher = args.lang == "cypher";
+    let forms: Box<dyn Iterator<Item = Result<Input<'_>, CliError>> + '_> = if cypher {
+        Box::new(
+            kala_lang::write::statements(&text)
+                .map(|s| s.map(Input::Statement).map_err(|e| user(e.to_string()))),
+        )
+    } else {
+        Box::new(
+            kala_datalog::write_forms(&text)
+                .map_err(|e| user(e.to_string()))?
+                .map(|f| f.map(Input::Form).map_err(|e| user(e.to_string()))),
+        )
+    };
     // A dry run previews every form on one discarded copy, so later forms
     // see earlier ones exactly as a real run would.
     let mut preview = if dry_run {
@@ -461,23 +523,23 @@ pub fn run(args: &TransactArgs) -> Result<Done, CliError> {
     };
     let mut count = 0;
     for (i, form) in forms.enumerate() {
-        let action = || -> Result<Report, CliError> {
-            let form = form.map_err(|e| user(e.to_string()))?;
-            match &mut preview {
-                Some(copy) => execute(copy, &form, None, mode),
-                None => execute(&mut w, &form, None, mode),
-            }
-        };
-        let mut report = match action() {
-            Ok(report) => report,
-            Err(e) => {
-                let e = form_failed(i + 1, count, dry_run, e);
-                if let (true, CliError::Conflict(conflict)) = (json, &e) {
-                    print(&conflict_json(i + 1, count, conflict))?;
+        let mut report =
+            match form.and_then(|input| input.execute(preview.as_mut().unwrap_or(&mut w), mode)) {
+                Ok(report) => report,
+                Err(e) => {
+                    let e = item_failed(
+                        if cypher { "statement" } else { "form" },
+                        i + 1,
+                        count,
+                        dry_run,
+                        e,
+                    );
+                    if let (true, CliError::Conflict(conflict)) = (json, &e) {
+                        print(&conflict_json(i + 1, count, conflict))?;
+                    }
+                    return Err(e);
                 }
-                return Err(e);
-            }
-        };
+            };
         report.form = i + 1;
         report.dry_run = dry_run;
         print(&render(&report, json))?;
@@ -538,16 +600,20 @@ fn open_target(args: &TransactArgs) -> Result<World, CliError> {
 /// exit 3, a conflict exit 4). A conflict's "run it again" is about this
 /// form: when forms before it were committed, the message says where to
 /// start again, since running the whole file would apply those twice.
+#[cfg(test)]
 fn form_failed(form: usize, count: usize, dry_run: bool, e: CliError) -> CliError {
+    item_failed("form", form, count, dry_run, e)
+}
+fn item_failed(item: &str, form: usize, count: usize, dry_run: bool, e: CliError) -> CliError {
     let rerun = match &e {
         CliError::Conflict(_) if count > 0 && !dry_run => format!(
-            " (run form {form} and those after it: the {count} before it are already committed)"
+            " (run {item} {form} and those after it: the {count} before it are already committed)"
         ),
         _ => String::new(),
     };
     e.map_message(|message| {
         format!(
-            "form {form} failed; {count} prior forms {}: {message}{rerun}",
+            "{item} {form} failed; {count} prior {item}s {}: {message}{rerun}",
             if dry_run {
                 "previewed (nothing committed)"
             } else {

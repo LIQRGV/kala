@@ -133,3 +133,137 @@ impl Query {
         })
     }
 }
+
+/// A complete statement classified by its parsed clauses.
+#[derive(Clone, Debug)]
+pub enum Statement {
+    Read(Query),
+    Write(WriteStatement),
+    Concurrency(kala_core::Concurrency),
+}
+
+/// An update compiled after its reading pipeline has produced a bounded set of bindings.
+#[derive(Clone, Debug)]
+pub struct WriteStatement {
+    pub(crate) read: Query,
+    pub(crate) writes: Vec<Update>,
+    pub(crate) tick: Option<Term>,
+    pub(crate) returns: Vec<Item>,
+    pub(crate) params: Vec<String>,
+}
+
+/// One SET or REMOVE item. A missing expression retracts all values of the property.
+#[derive(Clone, Debug)]
+pub(crate) enum Assignment {
+    Property(String, String, Option<Expr<String>>),
+    Label(String, String, bool),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum Update {
+    Create(Vec<Path>),
+    Merge {
+        path: Path,
+        created: Vec<Assignment>,
+        matched: Vec<Assignment>,
+    },
+    Assign(Vec<Assignment>),
+    Delete {
+        names: Vec<String>,
+        detach: bool,
+    },
+}
+
+impl Update {
+    fn paths(&self) -> &[Path] {
+        match self {
+            Self::Create(paths) => paths,
+            Self::Merge { path, .. } => std::slice::from_ref(path),
+            _ => &[],
+        }
+    }
+    fn assignments(&self) -> impl Iterator<Item = &Assignment> {
+        let (a, b): (&[Assignment], &[Assignment]) = match self {
+            Self::Assign(items) => (items, &[]),
+            Self::Merge {
+                created, matched, ..
+            } => (created, matched),
+            _ => (&[], &[]),
+        };
+        a.iter().chain(b)
+    }
+}
+
+impl WriteStatement {
+    /// True if any part of the complete statement needs read permission.
+    pub fn requires_read(&self) -> bool {
+        self.has_reading_part()
+            || !self.returns.is_empty()
+            || self.writes.iter().any(|w| !matches!(w, Update::Create(_)))
+            || self.write_expressions().iter().any(|expr| {
+                let mut props = vec![];
+                expr.attributes(&mut props);
+                !props.is_empty()
+            })
+    }
+    /// Whether the statement begins with a reading pipeline.
+    pub fn has_reading_part(&self) -> bool {
+        !self.read.clauses.is_empty()
+    }
+    /// Names of the projected RETURN columns, in authored order.
+    pub fn fields(&self) -> Vec<String> {
+        self.returns.iter().map(|i| i.name.clone()).collect()
+    }
+    /// All attribute names in read, write, conditional update and RETURN positions.
+    pub fn attributes(&self) -> Vec<&str> {
+        let mut names = self.read.attributes();
+        for update in &self.writes {
+            for path in update.paths() {
+                for node in &path.nodes {
+                    names.extend(node.props.iter().map(|(key, _)| key.as_str()));
+                }
+                for edge in &path.edges {
+                    names.push(edge.kind.as_str());
+                    names.extend(edge.props.iter().map(|(key, _)| key.as_str()));
+                }
+            }
+            for item in update.assignments() {
+                match item {
+                    Assignment::Property(_, key, _) => names.push(key.as_str()),
+                    Assignment::Label(..) => names.push("label"),
+                }
+            }
+        }
+        for e in self
+            .write_expressions()
+            .into_iter()
+            .chain(self.returns.iter().map(|i| &i.expr))
+        {
+            e.attributes(&mut names);
+        }
+        names
+    }
+    pub(crate) fn write_expressions(&self) -> Vec<&Expr<String>> {
+        let mut exprs = vec![];
+        for update in &self.writes {
+            for path in update.paths() {
+                for n in &path.nodes {
+                    exprs.extend(n.props.iter().map(|(_, e)| e));
+                }
+                for r in &path.edges {
+                    exprs.extend(r.props.iter().map(|(_, e)| e));
+                }
+            }
+            for a in update.assignments() {
+                if let Assignment::Property(_, _, Some(e)) = a {
+                    exprs.push(e);
+                }
+            }
+        }
+        exprs
+    }
+    /// Parameter names from every clause, in lexical order with repetitions removed.
+    pub fn parameters(&self) -> Vec<String> {
+        self.params.clone()
+    }
+}

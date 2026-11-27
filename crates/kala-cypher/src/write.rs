@@ -1,0 +1,756 @@
+//! Materialize the reading pipeline on its snapshot, then drive the shared
+//! primitive stager once for each ordered binding. RETURN projections keep
+//! their origins so auto-commit can resolve them against the final world.
+use crate::{CypherError, ast::*};
+use kala_core::{
+    Cardinality, Concurrency, EntityId, IdMap, Op, Precision, Tick, Txn, Value, WorkMeter, World,
+    write::{
+        StagedWrite, WriteReport,
+        stage::{self as native, Stager},
+    },
+};
+use kala_query::{
+    Datum, Expr, ParameterInput, ParameterValue, Prepared, QueryError, ResultSet, RunOptions, Term,
+};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
+
+/// Maximum number of input rows that can drive an update.
+pub const MAX_WRITE_ROWS: usize = 10_000;
+/// Maximum number of primitives (including no-ops) in one statement.
+pub const MAX_WRITE_PRIMITIVES: usize = 10_000;
+
+/// Preserve store and query failures for typed protocol error mapping.
+#[derive(Debug)]
+pub enum WriteError {
+    Syntax(CypherError),
+    Query(QueryError),
+    Store(kala_core::Error),
+    Stage(native::WriteError),
+    Invalid(String),
+}
+impl fmt::Display for WriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Syntax(e) => e.fmt(f),
+            Self::Query(e) => e.fmt(f),
+            Self::Store(e) => e.fmt(f),
+            Self::Stage(e) if matches!(e.cause, native::Failure::SetEvent(_)) => {
+                write!(f, "{e} in Datalog (// kala:datalog)")
+            }
+            Self::Stage(e) => e.fmt(f),
+            Self::Invalid(s) => f.write_str(s),
+        }
+    }
+}
+impl std::error::Error for WriteError {}
+impl From<CypherError> for WriteError {
+    fn from(e: CypherError) -> Self {
+        Self::Syntax(e)
+    }
+}
+impl From<QueryError> for WriteError {
+    fn from(e: QueryError) -> Self {
+        Self::Query(e)
+    }
+}
+impl From<kala_core::Error> for WriteError {
+    fn from(e: kala_core::Error) -> Self {
+        Self::Store(e)
+    }
+}
+impl From<native::WriteError> for WriteError {
+    fn from(e: native::WriteError) -> Self {
+        Self::Stage(e)
+    }
+}
+
+fn invalid(s: &str) -> WriteError {
+    WriteError::Invalid(s.into())
+}
+type Result<T> = std::result::Result<T, WriteError>;
+type Row = BTreeMap<String, Datum>;
+
+/// A snapshot's complete input. Its plan supplies dependency keys even when
+/// its result is empty.
+pub struct WriteInput<'a> {
+    pub prepared: Prepared,
+    result: ResultSet,
+    property_columns: BTreeMap<(String, String), usize>,
+    tick: Option<Tick>,
+    options: RunOptions<'a>,
+    bytes: usize,
+    steps: u64,
+}
+
+/// Produce one row for a bare write or materialize a MATCH/WITH/UNWIND query
+/// through the same compiled operators as an ordinary read query.
+pub fn prepare<'a>(
+    world: &World,
+    stmt: &WriteStatement,
+    params: &dyn ParameterInput,
+    options: RunOptions<'a>,
+) -> Result<WriteInput<'a>> {
+    if world.is_system() {
+        return Err(native::WriteError {
+            operation: None,
+            cause: native::Failure::SystemWorld,
+        }
+        .into());
+    }
+    for name in &stmt.params {
+        if !params.contains_key(name) {
+            return Err(QueryError::MissingParam(name.clone()).into());
+        }
+    }
+    let tick = match &stmt.tick {
+        None => None,
+        Some(Term::Const(Value::I64(t))) => Some(Tick(*t)),
+        Some(Term::Param(p)) => match params.get(p) {
+            Some(Value::I64(t)) => Some(Tick(*t)),
+            _ => {
+                return Err(QueryError::ParamType {
+                    name: p.clone(),
+                    expected: "an integer tick".into(),
+                }
+                .into());
+            }
+        },
+        _ => return Err(invalid("integer tick required")),
+    };
+    let mut read = stmt.read.clone();
+    let mut props = BTreeMap::new();
+    let bound: std::collections::BTreeSet<_> = read.items.iter().map(|i| i.name.clone()).collect();
+    let mut expressions = stmt.write_expressions();
+    let mut serial = 0;
+    while let Some(e) = expressions.pop() {
+        match e {
+            Expr::Property { entity, key, .. } if bound.contains(entity) => {
+                let pair = (entity.clone(), key.clone());
+                if props.contains_key(&pair) {
+                    continue;
+                }
+                loop {
+                    serial += 1;
+                    let col = format!("\0write-property{serial}");
+                    if !bound.contains(&col) {
+                        read.items.push(Item {
+                            name: col.clone(),
+                            expr: e.clone(),
+                        });
+                        props.insert(pair, props.len());
+                        break;
+                    }
+                }
+            }
+            Expr::List(xs) => expressions.extend(xs),
+            _ => {}
+        }
+    }
+    // Keep an occurrence for a pipeline that exposes no named variables.
+    if read.items.is_empty() {
+        read.items.push(Item {
+            name: String::new(),
+            expr: Expr::Value(Value::Bool(true)),
+        });
+    }
+    let prepared = crate::compile::compile(world, "", &read)?;
+    let (result, usage) = kala_query::run_with(world, &prepared.plan, params, options)?;
+    if result.rows.len() > MAX_WRITE_ROWS {
+        return Err(invalid("statement exceeds the 10000-row write limit"));
+    }
+    Ok(WriteInput {
+        prepared,
+        result,
+        property_columns: props,
+        tick,
+        options,
+        bytes: usage.peak_bytes,
+        steps: usage.steps,
+    })
+}
+
+/// A staged write and its explicit-transaction projection. Nodes and
+/// relationships are identity values; the adapter renders the graph objects.
+pub struct WriteResult {
+    pub staged: StagedWrite,
+    pub rows: Vec<Vec<Datum>>,
+    pub tick: Tick,
+    properties: Vec<(usize, usize, EntityId, String)>,
+    limits: kala_query::Limits,
+    deadline: Option<std::time::Instant>,
+}
+
+fn shape(mut values: Vec<Value>, many: bool) -> Datum {
+    match values.len() {
+        0 => Datum::Null,
+        1 if !many => Datum::Value(values.remove(0)),
+        _ => {
+            values.sort();
+            Datum::List(values.into_iter().map(Datum::Value).collect())
+        }
+    }
+}
+
+impl WriteResult {
+    /// Re-evaluate property cells against the committed world, and resolve
+    /// provisional identities before graph objects are rendered.
+    pub fn committed_rows(&self, world: &World, ids: &IdMap) -> Result<Vec<Vec<Datum>>> {
+        fn remap(d: &mut Datum, ids: &IdMap) {
+            match d {
+                Datum::Value(Value::Ref(id)) => *id = ids.resolve(*id),
+                Datum::List(xs) => {
+                    for d in xs {
+                        remap(d, ids);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut rows = self.rows.clone();
+        let meter = WorkMeter::bounded(self.limits.max_steps, None).with_deadline(self.deadline);
+        let schema = world.at_canon(world.latest_tx());
+        let view = schema.metered(&meter);
+        let mut memory = 0usize;
+        for row in &mut rows {
+            meter.check()?;
+            for d in row {
+                memory = memory.saturating_add(datum_bytes(d));
+                remap(d, ids);
+            }
+        }
+        for (r, c, id, key) in &self.properties {
+            meter.check()?;
+            let entity = ids.resolve(*id);
+            rows[*r][*c] = if key == "kala_handle" {
+                world
+                    .handle_of(entity)
+                    .map(|h| Datum::Value(Value::Str(h.into())))
+                    .unwrap_or(Datum::Null)
+            } else if let Ok((def, inverse)) = schema.resolve_attribute(key) {
+                let many = if inverse {
+                    def.reverse_cardinality == Some(Cardinality::Many)
+                } else {
+                    def.cardinality == Cardinality::Many
+                };
+                let vals = if def.value_type == kala_core::ValueType::Ref {
+                    // Each retained neighbor requires an examined index key. Cap
+                    // the scan before it builds a result larger than the budget.
+                    let remaining = self.limits.max_bytes.saturating_sub(memory);
+                    meter.set_max_keys(
+                        self.limits.max_steps.min(
+                            meter
+                                .keys()
+                                .saturating_add((remaining / std::mem::size_of::<Datum>()) as u64),
+                        ),
+                    );
+                    let neighbors =
+                        view.neighbors(entity, key, kala_core::Direction::Out, self.tick)?;
+                    memory = memory.saturating_add(
+                        neighbors.len().saturating_mul(std::mem::size_of::<Datum>()),
+                    );
+                    meter.set_max_keys(self.limits.max_steps);
+                    neighbors
+                        .into_iter()
+                        .map(|(id, _)| Value::Ref(id))
+                        .collect()
+                } else {
+                    let mut vals = vec![];
+                    view.visit_non_ref_values(entity, key, self.tick, |v| {
+                        memory = memory.saturating_add(value_bytes(&v));
+                        if memory > self.limits.max_bytes {
+                            return Err(kala_core::Error::WorkInterrupted {
+                                reason: kala_core::WorkInterruptReason::Limit,
+                            });
+                        }
+                        vals.push(v);
+                        Ok(())
+                    })?;
+                    vals
+                };
+                shape(vals, many)
+            } else {
+                Datum::Null
+            };
+        }
+        Ok(rows)
+    }
+}
+
+/// Apply once per input row. Any staging error poisons the caller's entire
+/// transaction; a prefix of a failed statement cannot be committed.
+pub fn stage(
+    tx: &mut Txn<'_>,
+    stmt: &WriteStatement,
+    input: WriteInput<'_>,
+    params: &dyn ParameterInput,
+) -> Result<WriteResult> {
+    let result = apply(tx, stmt, input, params);
+    if result.is_err() {
+        tx.abort();
+    }
+    result
+}
+
+fn apply(
+    tx: &mut Txn<'_>,
+    stmt: &WriteStatement,
+    input: WriteInput<'_>,
+    params: &dyn ParameterInput,
+) -> Result<WriteResult> {
+    let deadline = input
+        .options
+        .deadline
+        .into_iter()
+        .chain(tx.deadline())
+        .min();
+    let tick = tx.report_tick(input.tick);
+    let stager = Stager::new(tx, input.tick, Default::default(), MAX_WRITE_PRIMITIVES)?;
+    let mut writer = Writer {
+        tx,
+        stager,
+        params,
+        tick,
+        cols: &input.property_columns,
+        snapshot: Vec::new(),
+        touched: BTreeMap::new(),
+        meter: WorkMeter::bounded(
+            input.options.limits.max_steps.saturating_sub(input.steps),
+            input.options.cancel,
+        )
+        .with_deadline(deadline),
+        bytes: input.options.limits.max_bytes.saturating_sub(input.bytes),
+        steps: input.options.limits.max_steps.saturating_sub(input.steps),
+        limits: input.options.limits,
+    };
+    let mut rows = Vec::new();
+    let mut properties = Vec::new();
+    for mut data in input.result.rows {
+        writer.snapshot = data.split_off(data.len() - input.property_columns.len());
+        writer.step()?;
+        let mut row: Row = input
+            .result
+            .columns
+            .iter()
+            .map(|v| v.0.clone())
+            .zip(data)
+            .collect();
+        for clause in &stmt.writes {
+            writer.step()?;
+            match clause {
+                Update::Create(paths) => {
+                    for p in paths {
+                        writer.path(p, false, &mut row)?;
+                    }
+                }
+                Update::Merge {
+                    path,
+                    created,
+                    matched,
+                } => {
+                    let new = writer.path(path, true, &mut row)?;
+                    writer.assign(if new { created } else { matched }, &row)?;
+                }
+                Update::Assign(assign) => writer.assign(assign, &row)?,
+                Update::Delete { names, detach } => {
+                    for n in names {
+                        writer.delete(n, *detach, &row)?;
+                    }
+                }
+            }
+        }
+        if !stmt.returns.is_empty() {
+            let mut cells = Vec::with_capacity(stmt.returns.len());
+            for (col, item) in stmt.returns.iter().enumerate() {
+                if let Expr::Property { entity, key, .. } = &item.expr
+                    && let Some(Datum::Value(Value::Ref(id))) = row.get(entity)
+                {
+                    writer.charge(
+                        key.len() + std::mem::size_of::<(usize, usize, EntityId, String)>(),
+                    )?;
+                    properties.push((rows.len(), col, *id, key.clone()));
+                }
+                let d = writer.eval(&item.expr, &row, true)?;
+                cells.push(d);
+            }
+            rows.push(cells);
+        }
+    }
+    writer.meter.check()?;
+    Ok(WriteResult {
+        staged: writer.stager.finish(),
+        rows,
+        tick,
+        properties,
+        limits: input.options.limits,
+        deadline,
+    })
+}
+
+struct Writer<'a, 't> {
+    tx: &'a mut Txn<'t>,
+    stager: Stager,
+    params: &'a dyn ParameterInput,
+    tick: Tick,
+    cols: &'a BTreeMap<(String, String), usize>,
+    snapshot: Vec<Datum>,
+    touched: BTreeMap<EntityId, BTreeSet<String>>,
+    meter: WorkMeter<'a>,
+    bytes: usize,
+    steps: u64,
+    limits: kala_query::Limits,
+}
+impl Writer<'_, '_> {
+    fn step(&mut self) -> Result<()> {
+        self.meter.check()?;
+        self.steps = self.steps.checked_sub(1).ok_or(QueryError::StepBudget {
+            limit: self.limits.max_steps,
+        })?;
+        let native_reads = self.stager.read_meter();
+        native_reads.set_max_keys(
+            native::MAX_SET_READ_KEYS.min(self.steps.saturating_sub(self.meter.keys())),
+        );
+        self.meter
+            .set_max_keys(self.steps.saturating_sub(native_reads.keys()));
+        if self.meter.keys().saturating_add(native_reads.keys()) > self.steps {
+            return Err(QueryError::StepBudget {
+                limit: self.limits.max_steps,
+            }
+            .into());
+        }
+        Ok(())
+    }
+    fn charge(&mut self, bytes: usize) -> Result<()> {
+        self.bytes = self
+            .bytes
+            .checked_sub(bytes)
+            .ok_or(QueryError::MemoryBudget {
+                limit: self.limits.max_bytes,
+            })?;
+        Ok(())
+    }
+    fn eval(&mut self, e: &Expr<String>, row: &Row, returned: bool) -> Result<Datum> {
+        self.step()?;
+        let borrowed = match e {
+            Expr::Var(n) => Some(
+                row.get(n)
+                    .ok_or_else(|| invalid("unbound write variable"))?,
+            ),
+            Expr::Property { entity, key, .. } => {
+                let id = match row.get(entity) {
+                    Some(Datum::Value(Value::Ref(id))) => *id,
+                    Some(Datum::Null) => return Ok(Datum::Null),
+                    _ => return Err(invalid("property requires a node or relationship")),
+                };
+                if !returned
+                    && !self
+                        .touched
+                        .get(&id)
+                        .is_some_and(|attrs| attrs.contains(key))
+                    && let Some(col) = self.cols.get(&(entity.clone(), key.clone()))
+                {
+                    let col = *col;
+                    self.charge(datum_bytes(&self.snapshot[col]))?;
+                    return Ok(self.snapshot[col].clone());
+                } else {
+                    return self.property(id, key);
+                }
+            }
+            Expr::Null => return Ok(Datum::Null),
+            Expr::Value(v) => {
+                self.charge(value_bytes(v))?;
+                return Ok(Datum::Value(v.clone()));
+            }
+            Expr::Param(p) => match self
+                .params
+                .binding(p)
+                .ok_or_else(|| QueryError::MissingParam(p.clone()))?
+            {
+                ParameterValue::Scalar(v) => {
+                    self.charge(value_bytes(v))?;
+                    return Ok(Datum::Value(v.clone()));
+                }
+                ParameterValue::Datum(d) => Some(d),
+            },
+            Expr::List(xs) => {
+                return xs
+                    .iter()
+                    .map(|e| self.eval(e, row, returned))
+                    .collect::<Result<Vec<_>>>()
+                    .map(Datum::List);
+            }
+            _ => return Err(invalid("unsupported expression in write")),
+        };
+        let d = borrowed.ok_or_else(|| invalid("missing value"))?;
+        self.charge(datum_bytes(d))?;
+        Ok(d.clone())
+    }
+    fn property(&mut self, id: EntityId, key: &str) -> Result<Datum> {
+        if key == "kala_handle" {
+            return Ok(self
+                .tx
+                .handle_of(id)
+                .map(|h| Datum::Value(Value::Str(h.into())))
+                .unwrap_or(Datum::Null));
+        }
+        let Some(cardinality) = self.tx.property_cardinality(key) else {
+            return Ok(Datum::Null);
+        };
+        let many = cardinality == Cardinality::Many;
+        let held = self.tx.values_at(
+            id,
+            key,
+            self.tick,
+            MAX_WRITE_PRIMITIVES,
+            self.bytes,
+            &self.meter,
+        )?;
+        if held.more {
+            return Err(invalid(
+                "property value exceeds the write statement value limit",
+            ));
+        }
+        let d = shape(held.values, many);
+        self.charge(datum_bytes(&d))?;
+        Ok(d)
+    }
+    fn fact(&mut self, id: EntityId, key: &str, value: Value, op: Op) -> Result<usize> {
+        self.step()?;
+        if !self.cols.is_empty() {
+            self.touched.entry(id).or_default().insert(key.to_owned());
+            if let Value::Ref(to) = &value
+                && let Some(def) = self.tx.attribute(key)
+            {
+                if def.direction == Some(kala_core::RefDirection::Bidirectional) {
+                    self.touched.entry(*to).or_default().insert(key.to_owned());
+                } else if let Some(inverse) = &def.inverse {
+                    self.touched.entry(*to).or_default().insert(inverse.clone());
+                }
+            }
+        }
+        Ok(self
+            .stager
+            .fact(self.tx, id, key, value, op, None, Precision::Exact)?)
+    }
+    fn assign(&mut self, items: &[Assignment], row: &Row) -> Result<()> {
+        for item in items {
+            self.step()?;
+            match item {
+                Assignment::Label(var, label, assert) => {
+                    let id = reference(row.get(var))?;
+                    if id.is_edge() {
+                        return Err(invalid("labels apply only to nodes"));
+                    }
+                    self.fact(
+                        id,
+                        "label",
+                        Value::Str(label.clone()),
+                        if *assert { Op::Assert } else { Op::Retract },
+                    )?;
+                }
+                Assignment::Property(var, key, expr) => {
+                    if key == "kala_handle" {
+                        return Err(invalid("kala_handle is permanent"));
+                    }
+                    let id = reference(row.get(var))?;
+                    let wanted = if let Some(e) = expr {
+                        values(self.eval(e, row, false)?)?
+                    } else {
+                        vec![]
+                    };
+                    self.stager
+                        .set(self.tx, id, key, &wanted, None, Precision::Exact)?;
+                    if !self.cols.is_empty() {
+                        self.touched.entry(id).or_default().insert(key.clone());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    fn path(&mut self, path: &Path, merge: bool, row: &mut Row) -> Result<bool> {
+        let mut nodes = vec![];
+        let mut changed = false;
+        for node in &path.nodes {
+            self.step()?;
+            if node.labels.is_empty() {
+                let id = reference(node.name.as_ref().and_then(|n| row.get(n)))?;
+                if id.is_edge() {
+                    return Err(invalid("relationship endpoints must be nodes"));
+                }
+                nodes.push(id);
+                continue;
+            }
+            let handle = if let Some((_, e)) = node.props.iter().find(|(k, _)| k == "kala_handle") {
+                match self.eval(e, row, false)? {
+                    Datum::Value(Value::Str(s)) => Some(s),
+                    _ => return Err(invalid("kala_handle requires a string")),
+                }
+            } else {
+                None
+            };
+            let (id, created) =
+                self.stager
+                    .create(self.tx, &node.labels[0], handle.as_deref(), merge)?;
+            changed = created;
+            if let Some(n) = &node.name {
+                row.insert(n.clone(), Datum::Value(Value::Ref(id)));
+            }
+            for l in &node.labels[1..] {
+                self.fact(id, "label", Value::Str(l.clone()), Op::Assert)?;
+            }
+            self.properties(id, &node.props, row, true)?;
+            nodes.push(id);
+        }
+        for (i, edge) in path.edges.iter().enumerate() {
+            let (a, b) = if edge.direction == kala_query::Orientation::In {
+                (nodes[i + 1], nodes[i])
+            } else {
+                (nodes[i], nodes[i + 1])
+            };
+            let (src, kind, tgt) = self.tx.relationship(a, &edge.kind, b);
+            let kind = kind.to_owned();
+            // A conditional MERGE branch depends on whether the edge was held.
+            if merge && self.tx.attribute(&kind).is_some() {
+                self.tx.note_read(src, &kind)?;
+            }
+            changed = self.fact(src, &kind, Value::Ref(tgt), Op::Assert)? != 0;
+            if edge.name.is_some() || !edge.props.is_empty() {
+                let id = EntityId::from(
+                    self.tx
+                        .edge_id(src, &kind, tgt)
+                        .ok_or_else(|| invalid("assert did not resolve an edge"))?,
+                );
+                if let Some(n) = &edge.name {
+                    row.insert(n.clone(), Datum::Value(Value::Ref(id)));
+                }
+                self.properties(id, &edge.props, row, false)?;
+            }
+        }
+        Ok(changed)
+    }
+    fn properties(
+        &mut self,
+        id: EntityId,
+        props: &[(String, Expr<String>)],
+        row: &Row,
+        node: bool,
+    ) -> Result<()> {
+        for (key, e) in props {
+            if node && key == "kala_handle" {
+                continue;
+            }
+            for v in values(self.eval(e, row, false)?)? {
+                self.fact(id, key, v, Op::Assert)?;
+            }
+        }
+        Ok(())
+    }
+    fn delete(&mut self, name: &str, detach: bool, row: &Row) -> Result<()> {
+        self.step()?;
+        if row.get(name) == Some(&Datum::Null) {
+            return Ok(());
+        }
+        let id = reference(row.get(name))?;
+        if let Some(edge) = id.as_edge() {
+            if detach {
+                return Err(invalid("DETACH DELETE applies only to nodes"));
+            }
+            let (src, attr, tgt) = self
+                .tx
+                .edge(edge)
+                .ok_or_else(|| invalid("unknown relationship"))?;
+            self.fact(src, &attr, Value::Ref(tgt), Op::Retract)?;
+        } else {
+            let facts = self.tx.delete_facts(
+                id,
+                self.tick,
+                detach,
+                self.stager.remaining_operations(),
+                self.stager.read_meter(),
+            )?;
+            for (s, k, v) in facts {
+                self.fact(s, &k, v, Op::Retract)?;
+            }
+        }
+        Ok(())
+    }
+}
+fn reference(value: Option<&Datum>) -> Result<EntityId> {
+    match value {
+        Some(Datum::Value(Value::Ref(e))) => Ok(*e),
+        _ => Err(invalid("write requires a bound node or relationship")),
+    }
+}
+fn value_bytes(v: &Value) -> usize {
+    std::mem::size_of::<Datum>()
+        + match v {
+            Value::Str(s) => s.len(),
+            _ => 0,
+        }
+}
+fn datum_bytes(d: &Datum) -> usize {
+    fn size(d: &Datum, depth: usize) -> usize {
+        if depth >= crate::MAX_DEPTH {
+            return usize::MAX;
+        }
+        match d {
+            Datum::Value(v) => value_bytes(v),
+            Datum::List(xs) => xs.iter().fold(std::mem::size_of::<Datum>(), |n, d| {
+                n.saturating_add(size(d, depth + 1))
+            }),
+            Datum::Path(p) => std::mem::size_of::<Datum>() + p.nodes().len() * 24,
+            _ => std::mem::size_of::<Datum>(),
+        }
+    }
+    size(d, 0)
+}
+fn values(d: Datum) -> Result<Vec<Value>> {
+    match d {
+        Datum::Null => Ok(vec![]),
+        Datum::Value(v) => Ok(vec![v]),
+        Datum::List(xs) => xs
+            .into_iter()
+            .map(|x| {
+                if let Datum::Value(v) = x {
+                    Ok(v)
+                } else {
+                    Err(invalid("property lists must contain stored scalar values"))
+                }
+            })
+            .collect(),
+        _ => Err(invalid("property requires a stored value or list")),
+    }
+}
+
+/// Execute one statement on the native transaction path.
+pub fn execute(
+    world: &mut World,
+    stmt: &WriteStatement,
+    params: &dyn ParameterInput,
+    options: RunOptions<'_>,
+) -> Result<WriteReport> {
+    execute_in(world, stmt, params, options, Concurrency::default())
+}
+
+/// Execute using the caller's concurrency policy. Reads and writes share
+/// the snapshot acquired by begin, including a catch-up to another writer.
+pub fn execute_in(
+    world: &mut World,
+    stmt: &WriteStatement,
+    params: &dyn ParameterInput,
+    options: RunOptions<'_>,
+    mode: Concurrency,
+) -> Result<WriteReport> {
+    let mut tx = world.begin();
+    tx.set_concurrency(mode);
+    if let Some(at) = options.deadline {
+        tx.set_deadline(at);
+    }
+    let input = prepare(tx.base_world(), stmt, params, options)?;
+    kala_query::reads::Reads::plan(&input.prepared.plan, tx.base_world()).note(&tx);
+    let staged = stage(&mut tx, stmt, input, params)?.staged;
+    Ok(native::commit(tx, staged)?)
+}

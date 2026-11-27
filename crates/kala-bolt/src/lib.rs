@@ -25,4 +25,4 @@ mod metadata;
 mod transaction;
 mod write;
 
-mod reads;
+use kala_query::reads;

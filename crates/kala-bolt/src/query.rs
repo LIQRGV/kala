@@ -17,6 +17,17 @@ pub(crate) struct Output {
     pub exposes: VecDeque<bool>,
     pub reads: crate::reads::Reads,
 }
+impl Output {
+    pub fn empty() -> Self {
+        Self {
+            fields: vec![],
+            rows: VecDeque::new(),
+            encoded_bytes: 0,
+            exposes: VecDeque::new(),
+            reads: Default::default(),
+        }
+    }
+}
 /// Prepares and runs a query. `stop` (server shutdown) and `deadline` (the
 /// request's or its transaction's) both end it early; past the deadline the
 /// answer is the timeout failure.
@@ -145,9 +156,104 @@ fn execute(
     )
     .map(|(rs, _)| rs)
     .map_err(query_error)?;
+    let reads = crate::reads::Reads::plan(&prepared.plan, world);
+    render(
+        RenderWorld::Snapshot(world, result.canon),
+        result.columns.into_iter().map(|v| v.0).collect(),
+        result.rows,
+        result.tick,
+        reads,
+        stop,
+        max_message,
+        max_depth,
+        system,
+    )
+}
+
+/// A returned graph value can be read from a pinned canon or from an explicit
+/// transaction's staged state. Neither view changes what MATCH can see.
+pub(crate) enum RenderWorld<'a> {
+    Snapshot(&'a World, kala_core::TxId),
+    Staged(&'a kala_core::Txn<'a>),
+}
+enum Graph<'a> {
+    Snapshot(MeteredView<'a>),
+    Staged(&'a kala_core::Txn<'a>),
+}
+impl Graph<'_> {
+    fn attributes(&self) -> Box<dyn Iterator<Item = &kala_core::AttrDef> + '_> {
+        match self {
+            Self::Snapshot(v) => Box::new(v.attributes()),
+            Self::Staged(t) => Box::new(t.attributes()),
+        }
+    }
+    fn format_id(&self, id: EntityId) -> String {
+        match self {
+            Self::Snapshot(v) => v.world().format_id(id),
+            Self::Staged(t) => t.format_id(id),
+        }
+    }
+    fn handle_of(&self, id: EntityId) -> Option<&str> {
+        match self {
+            Self::Snapshot(v) => v.world().handle_of(id),
+            Self::Staged(t) => t.handle_of(id),
+        }
+    }
+    fn edge(&self, id: kala_core::EdgeId) -> Option<(EntityId, String, EntityId)> {
+        match self {
+            Self::Snapshot(v) => v.edge(id),
+            Self::Staged(t) => t.edge(id),
+        }
+    }
+    fn values(
+        &self,
+        id: EntityId,
+        name: &str,
+        tick: Tick,
+        meter: &WorkMeter<'_>,
+        visit: impl FnMut(CoreValue) -> Result<(), kala_core::Error>,
+    ) -> Result<(), kala_core::Error> {
+        match self {
+            Self::Snapshot(v) => v.visit_non_ref_values(id, name, tick, visit),
+            Self::Staged(t) => {
+                let held = t.values_at(
+                    id,
+                    name,
+                    tick,
+                    crate::write::MAX_STAGED_BYTES / 64,
+                    crate::write::MAX_STAGED_BYTES,
+                    meter,
+                )?;
+                if held.more {
+                    return Err(kala_core::Error::WorkInterrupted {
+                        reason: kala_core::WorkInterruptReason::Limit,
+                    });
+                }
+                held.values.into_iter().try_for_each(visit)
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render(
+    world: RenderWorld<'_>,
+    fields: Vec<String>,
+    records: Vec<Vec<Datum>>,
+    tick: Tick,
+    mut reads: crate::reads::Reads,
+    stop: Stop<'_>,
+    max_message: usize,
+    max_depth: usize,
+    system: bool,
+) -> Result<Output, Failure> {
+    let limits = Limits::default();
     let meter =
         WorkMeter::bounded(limits.max_steps, Some(stop.flag)).with_deadline(Some(stop.deadline));
-    let view = world.at_canon(result.canon).metered(&meter);
+    let view = match world {
+        RenderWorld::Snapshot(w, canon) => Graph::Snapshot(w.at_canon(canon).metered(&meter)),
+        RenderWorld::Staged(t) => Graph::Staged(t),
+    };
     let mut budget = Budget {
         bytes: 0,
         steps: 0,
@@ -155,17 +261,23 @@ fn execute(
         system,
     };
     let mut rows = VecDeque::new();
-    let mut reads = crate::reads::Reads::plan(&prepared.plan, world);
-    for row in result.rows {
+    let mut exposes = VecDeque::new();
+    for row in records {
+        let mut provisional = false;
         budget.step(&meter)?;
         let mut values = Vec::new();
         for datum in row {
             // Graph-value enrichment reads properties beyond those explicitly named.
-            if graph_value(&datum) {
-                reads.all = true;
-            }
-            values.push(datum_value(datum, &view, result.tick, &meter, &mut budget)?);
+            visit_ids(&datum, &mut |id| {
+                reads.rendered(id);
+                if let Graph::Staged(tx) = &view {
+                    tx.note_read_entity(id);
+                    provisional |= tx.is_provisional(id);
+                }
+            });
+            values.push(datum_value(datum, &view, tick, &meter, &mut budget)?);
         }
+        exposes.push_back(provisional);
         let record = Value::Structure(0x71, vec![Value::List(values)]);
         let bytes =
             packstream::encode_with_limits(&record, max_message, max_depth).map_err(|_| {
@@ -175,10 +287,10 @@ fn execute(
         rows.push_back(bytes);
     }
     Ok(Output {
-        fields: result.columns.into_iter().map(|v| v.0).collect(),
+        fields,
         encoded_bytes: rows.iter().map(Vec::len).sum(),
         rows,
-        exposes: VecDeque::new(),
+        exposes,
         reads,
     })
 }
@@ -189,7 +301,7 @@ pub(crate) fn protected() -> Failure {
         "queries on the system database may not read the protected attribute password_hash",
     )
 }
-fn parameters(
+pub(crate) fn parameters(
     world: &World,
     kinds: &[(String, ParamKind)],
     given: &Map,
@@ -278,7 +390,7 @@ fn parameter_value(
     };
     Ok(Datum::Value(value))
 }
-fn query_error(error: QueryError) -> Failure {
+pub(crate) fn query_error(error: QueryError) -> Failure {
     match error {
         QueryError::Core(e) => core_error(e),
         QueryError::RowLimit { .. } => Failure::new(EXECUTION, "query row limit exceeded"),
@@ -344,7 +456,7 @@ impl Budget {
 }
 fn datum_value(
     d: Datum,
-    view: &MeteredView<'_>,
+    view: &Graph<'_>,
     tick: Tick,
     meter: &WorkMeter<'_>,
     budget: &mut Budget,
@@ -402,7 +514,7 @@ fn scalar(value: CoreValue, budget: &mut Budget) -> Result<Value, Failure> {
 }
 fn properties(
     id: EntityId,
-    view: &MeteredView<'_>,
+    view: &Graph<'_>,
     tick: Tick,
     meter: &WorkMeter<'_>,
     budget: &mut Budget,
@@ -415,7 +527,7 @@ fn properties(
         }
         let mut values = Vec::new();
         let mut failure = None;
-        view.visit_non_ref_values(id, &attr.name, tick, |value| {
+        view.values(id, &attr.name, tick, meter, |value| {
             let n = 64
                 + match &value {
                     CoreValue::Str(s) => s.len(),
@@ -465,14 +577,14 @@ fn properties(
         props.insert(attr.name.clone(), value);
     }
     // The reserved prefix keeps the permanent handle separate from user facts.
-    if let Some(handle) = view.world().handle_of(id) {
+    if let Some(handle) = view.handle_of(id) {
         props.insert("kala_handle".into(), budget.string(handle.into())?);
     }
     Ok(props)
 }
 fn entity_value(
     id: EntityId,
-    view: &MeteredView<'_>,
+    view: &Graph<'_>,
     tick: Tick,
     meter: &WorkMeter<'_>,
     budget: &mut Budget,
@@ -480,7 +592,7 @@ fn entity_value(
     budget.step(meter)?;
     budget.charge(1024)?;
     let props = properties(id, view, tick, meter, budget)?;
-    let world = view.world();
+    let world = view;
     let element_id = budget.string(world.format_id(id))?;
     if let Some(edge) = id.as_edge() {
         let (source, attr, target) = view
@@ -531,7 +643,7 @@ fn entity_value(
 /// Bolt 5 Path: deduplicated graph values and signed stored-direction indices.
 fn path_value(
     path: &kala_query::PathValue,
-    view: &MeteredView<'_>,
+    view: &Graph<'_>,
     tick: Tick,
     meter: &WorkMeter<'_>,
     budget: &mut Budget,
@@ -586,7 +698,7 @@ fn path_value(
                     Value::Integer(entity.raw() as i64),
                     budget.string(kind)?,
                     Value::Map(properties(entity, view, tick, meter, budget)?),
-                    budget.string(view.world().format_id(entity))?,
+                    budget.string(view.format_id(entity))?,
                 ],
             ));
             index
@@ -601,11 +713,23 @@ fn path_value(
     ))
 }
 
-fn graph_value(datum: &Datum) -> bool {
+fn visit_ids(datum: &Datum, visit: &mut impl FnMut(EntityId)) {
     match datum {
-        Datum::Value(CoreValue::Ref(_)) | Datum::Path(_) => true,
-        Datum::List(values) => values.iter().any(graph_value),
-        _ => false,
+        Datum::Value(CoreValue::Ref(id)) => visit(*id),
+        Datum::Path(path) => {
+            for id in path.nodes() {
+                visit(*id);
+            }
+            for id in path.edges() {
+                visit((*id).into());
+            }
+        }
+        Datum::List(values) => {
+            for value in values {
+                visit_ids(value, visit);
+            }
+        }
+        _ => {}
     }
 }
 

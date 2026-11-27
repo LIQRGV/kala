@@ -6,7 +6,7 @@ use crate::{
 };
 use kala_core::Value;
 use kala_query::{BagFn, CmpOp, Expr, Orientation, Term, TickSource};
-pub(crate) fn parse(text: &str) -> Result<Query, CypherError> {
+pub(crate) fn parse(text: &str) -> Result<Statement, CypherError> {
     let mut p = Parser {
         text,
         tokens: lex::lex(text)?,
@@ -102,7 +102,7 @@ impl Parser<'_> {
         }
     }
     /// `MATCH … [MATCH …] RETURN … [ORDER BY …] [SKIP n] [LIMIT n] [;]`.
-    fn query(&mut self) -> Result<Query, CypherError> {
+    fn query(&mut self) -> Result<Statement, CypherError> {
         let mut clauses = Vec::new();
         let mut canon_seen = false;
         loop {
@@ -131,6 +131,26 @@ impl Parser<'_> {
             } else {
                 break;
             }
+        }
+        let pipeline_tick = if !clauses.is_empty() && self.kw("AT") {
+            self.need_kw("TICK")?;
+            Some(self.integer(false)?)
+        } else {
+            None
+        };
+        if self.is_kw("CREATE")
+            || self.is_kw("MERGE")
+            || self.is_kw("SET")
+            || self.is_kw("REMOVE")
+            || self.is_kw("DELETE")
+            || self.is_kw("DETACH")
+        {
+            return self.updates(clauses, canon_seen, pipeline_tick);
+        }
+        if pipeline_tick.is_some() {
+            return Err(
+                self.err("AT TICK at the end of a reading pipeline requires a write clause")
+            );
         }
         if clauses.is_empty() {
             return Err(self.unsupported("MATCH, OPTIONAL MATCH, WITH, UNWIND or a procedure"));
@@ -162,10 +182,13 @@ impl Parser<'_> {
         if !matches!(self.token().kind, Kind::End) {
             return Err(self.unsupported("end of query"));
         }
-        Ok(q)
+        Ok(Statement::Read(q))
     }
     fn source(&mut self, show: bool, canon_seen: &mut bool) -> Result<Source, CypherError> {
         use kala_query::{DatabaseSelection, RowSource, ServerRequest};
+        if !show && matches!(self.token().kind, Kind::Symbol("{")) {
+            return Err(self.err("CALL subqueries are not supported yet"));
+        }
         let source = if show {
             let selection = if self.kw("DATABASES") {
                 DatabaseSelection::All
@@ -866,3 +889,5 @@ pub(crate) fn has_aggregate(e: &Expr<String>) -> bool {
         _ => false,
     }
 }
+
+mod writes;
