@@ -18,6 +18,10 @@ pub trait Transport: Send {
     /// Read some bytes before the deadline; zero denotes EOF.
     fn read_until(&mut self, bytes: &mut [u8], deadline: Instant) -> io::Result<usize>;
     /// Write some bytes before the deadline; partial writes are supported.
+    /// An error other than `Interrupted` leaves the stream unusable for
+    /// writing: some of the bytes may already be on their way (or, in a
+    /// wrapper, buffered), so the caller must not write again or `finish`
+    /// expecting an orderly close. Callers close the connection.
     fn write_until(&mut self, bytes: &[u8], deadline: Instant) -> io::Result<usize>;
     /// Complete an orderly close before the deadline. Raw sockets need no trailer.
     fn finish(&mut self, _deadline: Instant) -> io::Result<()> {

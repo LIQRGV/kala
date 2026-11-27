@@ -5,6 +5,7 @@ use rustls::{
 };
 use std::io::{Read, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 struct Fragments {
@@ -84,14 +85,108 @@ fn fragmented(
     stall: io::ErrorKind,
     deadline: Instant,
 ) -> Tls {
-    Tls {
+    wrap(
         conn,
-        inner: Box::new(Fragments {
+        Fragments {
             incoming: io::Cursor::new(incoming),
             deadline,
             stall,
-        }),
+        },
+    )
+}
+
+fn wrap(conn: ServerConnection, inner: impl Transport + 'static) -> Tls {
+    Tls {
+        conn,
+        inner: Box::new(inner),
+        broken: false,
     }
+}
+
+/// Counts writes; accepts them whole or fails each one.
+struct Writes {
+    calls: Arc<AtomicUsize>,
+    fail: Option<io::ErrorKind>,
+}
+
+impl Transport for Writes {
+    fn read_until(&mut self, _: &mut [u8], _: Instant) -> io::Result<usize> {
+        Err(io::ErrorKind::TimedOut.into())
+    }
+    fn write_until(&mut self, bytes: &[u8], _: Instant) -> io::Result<usize> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        match self.fail {
+            Some(kind) => Err(kind.into()),
+            None => Ok(bytes.len()),
+        }
+    }
+    fn shutdown_handle(&self) -> io::Result<Box<dyn ShutdownHandle>> {
+        unreachable!()
+    }
+    fn peer(&self) -> io::Result<Peer> {
+        unreachable!()
+    }
+    fn local_addr(&self) -> io::Result<ListenAddr> {
+        unreachable!()
+    }
+}
+
+fn established() -> ServerConnection {
+    let (mut server, mut client) = connections();
+    pipe_tls(&mut client, &mut server);
+    server
+}
+
+// PR #23 polish: a write error can come after rustls took the plaintext, so
+// part of a frame may sit in its buffer. Nothing later may flush that stale
+// part or wait on the peer a second time.
+#[test]
+fn a_failed_write_breaks_the_stream_for_later_writes_and_finish() {
+    for kind in [io::ErrorKind::TimedOut, io::ErrorKind::BrokenPipe] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut tls = wrap(
+            established(),
+            Writes {
+                calls: calls.clone(),
+                fail: Some(kind),
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert_eq!(
+            tls.write_until(b"half a frame", deadline)
+                .unwrap_err()
+                .kind(),
+            kind
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(tls.write_until(b"the rest", deadline).is_err());
+        assert!(tls.finish(deadline).is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a broken stream was written to again"
+        );
+    }
+}
+
+// One Bolt message is one `write_until` on the wrapper, so one TLS record
+// and one write below it: chunk headers are not separate records.
+#[test]
+fn one_small_bolt_message_is_one_record_and_one_inner_write() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut tls = wrap(
+        established(),
+        Writes {
+            calls: calls.clone(),
+            fail: None,
+        },
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    // SUCCESS {}
+    crate::chunk::write_message(&mut tls, &[0xb1, 0x70, 0xa0], deadline).unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    tls.finish(deadline).unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 #[test]

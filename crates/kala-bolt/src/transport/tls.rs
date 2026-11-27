@@ -16,6 +16,10 @@ const ALERT_FLUSH: Duration = Duration::from_secs(1);
 pub(super) struct Tls {
     inner: Box<dyn Transport>,
     conn: ServerConnection,
+    /// Set by a failed write or a protocol error. rustls may still hold part
+    /// of a frame (or an alert) that was not sent; nothing later may flush
+    /// that stale tail or wait on the peer again.
+    broken: bool,
 }
 
 /// rustls pulls/pushes ciphertext through std I/O. Every partial operation
@@ -56,10 +60,32 @@ impl Tls {
     pub(super) fn new(inner: Box<dyn Transport>, config: Arc<ServerConfig>) -> io::Result<Self> {
         let mut conn = ServerConnection::new(config).map_err(io::Error::other)?;
         conn.set_buffer_limit(Some(64 * 1024));
-        Ok(Self { inner, conn })
+        Ok(Self {
+            inner,
+            conn,
+            broken: false,
+        })
     }
 
+    fn usable(&self) -> io::Result<()> {
+        if self.broken {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the TLS stream failed earlier",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Write every pending record; a failure ends the stream for writing.
     fn send_records(&mut self, deadline: Instant) -> io::Result<()> {
+        self.usable()?;
+        let result = self.write_records(deadline);
+        self.broken |= result.is_err();
+        result
+    }
+
+    fn write_records(&mut self, deadline: Instant) -> io::Result<()> {
         let mut writer = RecordIo {
             inner: self.inner.as_mut(),
             deadline,
@@ -87,6 +113,7 @@ impl Tls {
         // handshake_failure, bad_record_mac, ...). Give it one bounded,
         // best-effort flush so the peer sees more than a bare close.
         let _ = self.send_records(deadline.min(Instant::now() + ALERT_FLUSH));
+        self.broken = true;
         // Only static protocol classes may reach logs, never SNI or peer data.
         use rustls::Error::*;
         let class = match e {
@@ -159,6 +186,7 @@ impl Transport for Tls {
     }
     fn write_until(&mut self, bytes: &[u8], deadline: Instant) -> io::Result<usize> {
         remaining(deadline)?;
+        self.usable()?;
         self.handshake(deadline)?;
         let n = self.conn.writer().write(bytes)?;
         self.send_records(deadline)?;
@@ -168,6 +196,7 @@ impl Transport for Tls {
         if self.conn.is_handshaking() {
             return Ok(());
         }
+        self.usable()?;
         self.conn.send_close_notify();
         self.send_records(deadline)?;
         self.inner.finish(deadline)
