@@ -21,6 +21,8 @@ pub fn run(args: &ServeArgs) -> Result<String, CliError> {
     let config = ServerConfig {
         listen: addresses.clone(),
         unix_mode: args.unix_mode,
+        tls_cert: args.tls_cert.clone(),
+        tls_key: args.tls_key.clone(),
         advertised_address: args.advertised_address.clone(),
         default_db: args.default_db.clone(),
         insecure_allow_plaintext: args.insecure_allow_plaintext,
@@ -39,9 +41,9 @@ pub fn run(args: &ServeArgs) -> Result<String, CliError> {
     // Never create the directory, in either auth mode.
     super::user::require_directory(dir)?;
     let stop = Arc::new(AtomicBool::new(false));
-    // Before the server starts any thread: see `stop_on_termination`.
+    // Block before binding so every thread inherits the mask.
     #[cfg(unix)]
-    stop_on_termination(&stop)?;
+    let signals = serve_signals()?;
     let server = if args.auth == "accounts" {
         Server::bind_accounts(dir, config)
     } else {
@@ -55,6 +57,8 @@ pub fn run(args: &ServeArgs) -> Result<String, CliError> {
         Server::bind(dir, config)
     }
     .map_err(server_error)?;
+    #[cfg(unix)]
+    handle_signals(signals, &stop, server.tls_reloader())?;
     for addr in &addresses {
         if !addr.is_loopback() && args.advertised_address.is_none() {
             eprintln!(
@@ -75,38 +79,48 @@ pub fn run(args: &ServeArgs) -> Result<String, CliError> {
     server.run(stop).map_err(server_error)?;
     Ok(String::new())
 }
-/// Makes SIGTERM and SIGHUP stop the server the way Ctrl-C does: `systemctl
-/// stop` and `docker stop` send SIGTERM, and a default-disposition death
-/// would skip the drain and leave Unix socket files behind.
-///
-/// The two signals are blocked in the calling thread and a dedicated thread
-/// waits for them with sigwait. Threads inherit the mask of the thread that
-/// starts them, so this must run before any other thread exists: afterwards
-/// only the waiting thread ever receives them. No signal handler is
-/// installed, and SIGINT stays with `ctrlc`.
+/// Block in the main thread and use sigwait, keeping filesystem operations
+/// outside signal handlers. SIGINT stays with ctrlc.
 #[cfg(unix)]
-fn stop_on_termination(stop: &Arc<AtomicBool>) -> Result<(), CliError> {
+fn serve_signals() -> Result<nix::sys::signal::SigSet, CliError> {
     use nix::sys::signal::{SigSet, Signal};
-    let failed = |e: &dyn std::fmt::Display| {
-        CliError::Store(format!("installing serve termination handling: {e}"))
-    };
     let mut signals = SigSet::empty();
     signals.add(Signal::SIGTERM);
     signals.add(Signal::SIGHUP);
-    signals.thread_block().map_err(|e| failed(&e))?;
+    signals
+        .thread_block()
+        .map_err(|e| CliError::Store(format!("blocking serve signals: {e}")))?;
+    Ok(signals)
+}
+
+#[cfg(unix)]
+fn handle_signals(
+    signals: nix::sys::signal::SigSet,
+    stop: &Arc<AtomicBool>,
+    tls: Option<kala_bolt::transport::TlsReloader>,
+) -> Result<(), CliError> {
+    use nix::sys::signal::Signal;
     let stop = Arc::clone(stop);
     std::thread::Builder::new()
         .name("serve-signals".into())
         .spawn(move || {
             loop {
                 match signals.wait() {
+                    Ok(Signal::SIGHUP) => {
+                        if let Some(tls) = &tls {
+                            match tls.reload() {
+                                Ok(()) => eprintln!("event=bolt_tls_reloaded"),
+                                Err(e) => eprintln!("event=bolt_tls_reload_failed error={e}"),
+                            }
+                        }
+                    }
                     Ok(_) => stop.store(true, Ordering::Relaxed),
                     Err(nix::errno::Errno::EINTR) => {}
                     Err(_) => return,
                 }
             }
         })
-        .map_err(|e| failed(&e))?;
+        .map_err(|e| CliError::Store(format!("installing serve termination handling: {e}")))?;
     Ok(())
 }
 /// Parse only octal permission bits, never special file-mode flags.

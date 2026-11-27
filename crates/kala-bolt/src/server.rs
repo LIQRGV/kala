@@ -3,7 +3,7 @@ use crate::{
     auth::{Accounts, Authenticator, NoAuth, Plugin},
     registry::{Registry, SystemDb},
     session,
-    transport::{Accepted, ListenAddr, Listener, ShutdownHandle, Transport},
+    transport::{Accepted, ListenAddr, Listener, ShutdownHandle, TlsReloader, Transport},
 };
 use std::io;
 use std::net::SocketAddr;
@@ -20,6 +20,10 @@ use std::time::Duration;
 pub struct ServerConfig {
     /// Ordered listen endpoints; TCP port zero asks the OS for a free port.
     pub listen: Vec<ListenAddr>,
+    /// PEM certificate chain shared by all TLS listeners, leaf first.
+    pub tls_cert: Option<std::path::PathBuf>,
+    /// Unencrypted PEM private key matching the leaf certificate.
+    pub tls_key: Option<std::path::PathBuf>,
     /// Filesystem permissions for Unix sockets.
     pub unix_mode: u32,
     /// Public routing endpoint (HOST:PORT); otherwise the reached socket address.
@@ -85,6 +89,8 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen: vec![ListenAddr::Tcp(SocketAddr::from(([127, 0, 0, 1], 7687)))],
+            tls_cert: None,
+            tls_key: None,
             unix_mode: 0o600,
             advertised_address: None,
             default_db: None,
@@ -109,6 +115,7 @@ impl Default for ServerConfig {
 /// A bound server; account authentication bootstraps the system world if absent.
 pub struct Server {
     listeners: Vec<Listener>,
+    tls: Option<TlsReloader>,
     wrapper: Option<Arc<TransportWrapper>>,
     /// Per-socket setup of an accepted connection; tests inject failures.
     prepare: fn(Accepted) -> io::Result<Box<dyn Transport>>,
@@ -149,7 +156,12 @@ impl Server {
     /// Bind with persisted accounts, bootstrapping root@localhost when needed.
     pub fn bind_accounts(directory: impl AsRef<Path>, config: ServerConfig) -> io::Result<Self> {
         Self::validate_listeners(&config)?;
-        if config.listen.iter().any(|a| !a.is_loopback()) && !config.insecure_allow_plaintext {
+        if config
+            .listen
+            .iter()
+            .any(|a| matches!(a, ListenAddr::Tcp(socket) if !socket.ip().is_loopback()))
+            && !config.insecure_allow_plaintext
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "accounts require a loopback listen address unless --insecure-allow-plaintext is given",
@@ -271,6 +283,11 @@ impl Server {
                 "kala serve: WARNING: --acknowledge-recovery is on: a world's damaged last transaction is cut to a quarantine file without asking, and its entry IDs are issued again"
             );
         }
+        let tls = TlsReloader::configured(
+            &config.listen,
+            config.tls_cert.as_deref(),
+            config.tls_key.as_deref(),
+        )?;
         let registry = Arc::new(
             Registry::open(directory, config.default_db.clone(), system)?
                 .acknowledging_recovery(config.acknowledge_recovery && !config.read_only),
@@ -278,12 +295,13 @@ impl Server {
         let mut listeners = Vec::new();
         for addr in &config.listen {
             listeners.push(
-                Listener::bind(addr, config.unix_mode)
+                Listener::bind(addr, config.unix_mode, tls.as_ref())
                     .map_err(|e| io::Error::new(e.kind(), format!("listener {addr}: {e}")))?,
             );
         }
         Ok(Self {
             listeners,
+            tls,
             wrapper: None,
             prepare: Accepted::into_transport,
             config,
@@ -297,6 +315,10 @@ impl Server {
     #[doc(hidden)]
     pub fn open_counts(&self) -> OpenCounts {
         OpenCounts(Arc::clone(&self.registry))
+    }
+    /// A handle for reloading TLS files for future connections, if configured.
+    pub fn tls_reloader(&self) -> Option<TlsReloader> {
+        self.tls.clone()
     }
     /// Actual bound endpoints, in configuration order.
     pub fn local_addrs(&self) -> io::Result<Vec<ListenAddr>> {
@@ -329,7 +351,7 @@ impl Server {
                 match listener.accept() {
                     Ok(stream) => {
                         accepted = true;
-                        self.admit(stream, &mut clients, &shutdown);
+                        self.admit(listener, stream, &mut clients, &shutdown);
                     }
                     Err(e)
                         if matches!(
@@ -357,7 +379,13 @@ impl Server {
     /// Gives an accepted connection its session thread, or closes it: over
     /// the connection cap, or when its socket or thread can't be set up.
     /// Nothing that goes wrong with one connection reaches the accept loop.
-    fn admit(&self, accepted: Accepted, clients: &mut Clients, shutdown: &Arc<AtomicBool>) {
+    fn admit(
+        &self,
+        listener: &Listener,
+        accepted: Accepted,
+        clients: &mut Clients,
+        shutdown: &Arc<AtomicBool>,
+    ) {
         if clients.active.len() >= self.config.max_connections {
             accepted.close();
             clients.refused.log(format_args!(
@@ -399,6 +427,16 @@ impl Server {
             Some(wrap) => wrap(stream),
             None => stream,
         };
+        let stream = match listener.wrap(stream) {
+            Ok(stream) => stream,
+            Err(e) => {
+                clients.dropped.log(format_args!(
+                    "event=bolt_connection_dropped reason=tls_setup error={:?}",
+                    e.kind()
+                ));
+                return;
+            }
+        };
         let prepared = stream.shutdown_handle();
         let socket = match prepared {
             Ok(s) => s,
@@ -428,7 +466,7 @@ impl Server {
     /// Starts the thread that serves one connection until it ends.
     fn spawn_session(
         &self,
-        stream: Box<dyn Transport>,
+        mut stream: Box<dyn Transport>,
         origin: session::Origin,
         id: u64,
         shutdown: &Arc<AtomicBool>,
@@ -447,7 +485,10 @@ impl Server {
                     config: &config,
                     stop: &stop,
                 };
-                let result = session::serve(stream, origin, id, &shared);
+                let result = session::serve(stream.as_mut(), origin, id, &shared);
+                if result.is_ok() {
+                    let _ = stream.finish(std::time::Instant::now() + config.write_timeout);
+                }
                 eprintln!(
                     "event=bolt_disconnected connection_id={id} reason={:?}",
                     result.err().map(|e| e.kind())

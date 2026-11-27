@@ -208,9 +208,15 @@ pub struct SchemaArgs {
 pub struct ServeArgs {
     /// Directory containing <database>.kala world files.
     pub dir: PathBuf,
-    /// Repeatable: IP:port, bolt://HOST:port, or unix:///absolute/path (no DNS).
+    /// Repeatable: IP:port, bolt://HOST:port, bolt+s://HOST:port, or unix:///absolute/path (no DNS).
     #[arg(long, default_value = "127.0.0.1:7687")]
     pub listen: Vec<String>,
+    /// PEM certificate chain for every bolt+s:// listener, leaf first.
+    #[arg(long = "tls.cert", value_name = "FILE")]
+    pub tls_cert: Option<PathBuf>,
+    /// Unencrypted PEM private key for that certificate.
+    #[arg(long = "tls.key", value_name = "FILE")]
+    pub tls_key: Option<PathBuf>,
     /// Unix socket permissions in octal; other-write requires an explicit mode.
     #[arg(long = "unix.mode", default_value = "0600", value_parser = crate::cmd::serve::unix_mode)]
     pub unix_mode: u32,

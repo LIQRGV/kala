@@ -85,18 +85,14 @@ pub(crate) struct Origin {
     pub reached: crate::transport::ListenAddr,
 }
 pub(crate) fn serve(
-    mut stream: Box<dyn Transport>,
+    stream: &mut dyn Transport,
     origin: Origin,
     id: u64,
     shared: &Shared<'_>,
 ) -> io::Result<()> {
     let config = shared.config;
     let Origin { peer, reached } = origin;
-    let Some(minor) = handshake::negotiate(
-        stream.as_mut(),
-        config.handshake_timeout,
-        config.write_timeout,
-    )?
+    let Some(minor) = handshake::negotiate(stream, config.handshake_timeout, config.write_timeout)?
     else {
         return Ok(());
     };
@@ -125,7 +121,7 @@ pub(crate) fn serve(
         grants_seen: None,
     };
     loop {
-        let Some(message) = session.receive(stream.as_mut())? else {
+        let Some(message) = session.receive(stream)? else {
             return Ok(());
         };
         let deadline = Instant::now() + config.write_timeout;
@@ -142,15 +138,15 @@ pub(crate) fn serve(
                 message
             };
         if session.state == State::Failed && !matches!(message, Ok(Message::Reset)) {
-            session.send(stream.as_mut(), &Value::Structure(0x7e, vec![]), deadline)?;
+            session.send(stream, &Value::Structure(0x7e, vec![]), deadline)?;
             continue;
         }
         let result = match message {
-            Ok(msg) => session.handle(stream.as_mut(), msg, shared.stop),
+            Ok(msg) => session.handle(stream, msg, shared.stop),
             Err(e) => Err(RequestError::Client(e)),
         };
         if let Err(error) = result
-            && session.fail(stream.as_mut(), error)?.is_break()
+            && session.fail(stream, error)?.is_break()
         {
             return Ok(());
         }

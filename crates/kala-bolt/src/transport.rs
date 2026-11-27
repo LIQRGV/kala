@@ -19,6 +19,10 @@ pub trait Transport: Send {
     fn read_until(&mut self, bytes: &mut [u8], deadline: Instant) -> io::Result<usize>;
     /// Write some bytes before the deadline; partial writes are supported.
     fn write_until(&mut self, bytes: &[u8], deadline: Instant) -> io::Result<usize>;
+    /// Complete an orderly close before the deadline. Raw sockets need no trailer.
+    fn finish(&mut self, _deadline: Instant) -> io::Result<()> {
+        Ok(())
+    }
     /// Obtain an independent handle that interrupts blocked I/O.
     fn shutdown_handle(&self) -> io::Result<Box<dyn ShutdownHandle>>;
     /// The peer identity used for account matching. The server asks the
@@ -64,16 +68,29 @@ impl Transport for Tcp {
 
 pub(crate) enum Listener {
     Tcp(TcpListener),
+    Tls(TcpListener, TlsReloader),
     #[cfg(unix)]
     Unix(Box<unix::BoundUnix>),
 }
 impl Listener {
-    pub(crate) fn bind(addr: &ListenAddr, mode: u32) -> io::Result<Self> {
+    pub(crate) fn bind(
+        addr: &ListenAddr,
+        mode: u32,
+        tls: Option<&TlsReloader>,
+    ) -> io::Result<Self> {
         match addr {
-            ListenAddr::Tcp(addr) => {
-                let listener = TcpListener::bind(addr)?;
+            ListenAddr::Tcp(socket) | ListenAddr::Tls(socket) => {
+                let listener = TcpListener::bind(socket)?;
                 listener.set_nonblocking(true)?;
-                Ok(Self::Tcp(listener))
+                if matches!(addr, ListenAddr::Tls(_)) {
+                    Ok(Self::Tls(
+                        listener,
+                        tls.ok_or_else(|| invalid("missing TLS configuration"))?
+                            .clone(),
+                    ))
+                } else {
+                    Ok(Self::Tcp(listener))
+                }
             }
             ListenAddr::Unix(path) => {
                 #[cfg(unix)]
@@ -91,8 +108,16 @@ impl Listener {
     pub(crate) fn local_addr(&self) -> io::Result<ListenAddr> {
         match self {
             Self::Tcp(listener) => Ok(ListenAddr::Tcp(listener.local_addr()?)),
+            Self::Tls(listener, _) => Ok(ListenAddr::Tls(listener.local_addr()?)),
             #[cfg(unix)]
             Self::Unix(listener) => Ok(ListenAddr::Unix(listener.path.clone())),
+        }
+    }
+    /// Install this listener's encryption after admission and metadata capture.
+    pub(crate) fn wrap(&self, stream: Box<dyn Transport>) -> io::Result<Box<dyn Transport>> {
+        match self {
+            Self::Tls(_, identity) => Ok(Box::new(tls::Tls::new(stream, identity.current())?)),
+            _ => Ok(stream),
         }
     }
     /// Take one pending connection, untouched. An error here is about the
@@ -100,7 +125,7 @@ impl Listener {
     /// setup is `Accepted::into_transport`, which fails per connection.
     pub(crate) fn accept(&self) -> io::Result<Accepted> {
         match self {
-            Self::Tcp(listener) => Ok(Accepted::Tcp(listener.accept()?.0)),
+            Self::Tcp(listener) | Self::Tls(listener, _) => Ok(Accepted::Tcp(listener.accept()?.0)),
             #[cfg(unix)]
             Self::Unix(listener) => listener.accept(),
         }
@@ -138,14 +163,18 @@ impl Accepted {
     }
 }
 
+mod tls;
 #[cfg(unix)]
 mod unix;
+pub use tls::TlsReloader;
 
 /// A configured or bound Bolt endpoint.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ListenAddr {
     /// Bolt over TCP.
     Tcp(SocketAddr),
+    /// Bolt over TLS over TCP.
+    Tls(SocketAddr),
     /// Bolt over a filesystem Unix socket.
     Unix(std::path::PathBuf),
 }
@@ -153,6 +182,7 @@ impl std::fmt::Display for ListenAddr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Tcp(a) => a.fmt(f),
+            Self::Tls(a) => write!(f, "bolt+s://{a}"),
             Self::Unix(p) => write!(f, "unix://{}", p.display()),
         }
     }
@@ -161,7 +191,7 @@ impl ListenAddr {
     /// Whether the listener is restricted to the local machine.
     pub fn is_loopback(&self) -> bool {
         match self {
-            Self::Tcp(a) => a.ip().is_loopback(),
+            Self::Tcp(a) | Self::Tls(a) => a.ip().is_loopback(),
             Self::Unix(_) => true,
         }
     }
@@ -169,8 +199,14 @@ impl ListenAddr {
 impl std::str::FromStr for ListenAddr {
     type Err = io::Error;
     fn from_str(value: &str) -> io::Result<Self> {
-        let value = match value.split_once("://") {
-            Some(("bolt", address)) => address,
+        let (address, tls) = match value.split_once("://") {
+            Some(("bolt", address)) => (address, false),
+            Some(("bolt+s", address)) => (address, true),
+            Some(("bolt+ssc", _)) => {
+                return Err(invalid(
+                    "listen with bolt+s:// and connect with bolt+ssc:// to accept a self-signed certificate",
+                ));
+            }
             Some(("unix", path)) => {
                 let addr = Self::Unix(path.into());
                 addr.validate()?;
@@ -178,20 +214,24 @@ impl std::str::FromStr for ListenAddr {
             }
             Some(("neo4j", _)) => return Err(invalid("neo4j:// is not a listen address")),
             Some((scheme, _)) => return Err(invalid(format!("{scheme}:// is not supported yet"))),
-            None => value,
+            None => (value, false),
         };
-        let addr = if let Some(port) = value.strip_prefix("localhost:") {
+        let addr = if let Some(port) = address.strip_prefix("localhost:") {
             SocketAddr::from((
                 [127, 0, 0, 1],
                 port.parse::<u16>()
                     .map_err(|_| invalid("invalid listen port"))?,
             ))
         } else {
-            value.parse().map_err(|_| {
+            address.parse().map_err(|_| {
                 invalid("listen address must be IP:PORT, [IPv6]:PORT or localhost:PORT (no DNS)")
             })?
         };
-        Ok(Self::Tcp(addr))
+        Ok(if tls {
+            Self::Tls(addr)
+        } else {
+            Self::Tcp(addr)
+        })
     }
 }
 
