@@ -1,5 +1,6 @@
 //! Language dispatch and bounded result enrichment at the pinned tick and canon.
 use crate::error::{EXECUTION, FORBIDDEN, Failure, MISSING, TYPE};
+use crate::log::logln;
 use crate::message::Map;
 use crate::packstream::{self, Value};
 use kala_core::{
@@ -64,7 +65,7 @@ fn run_inner(
     if prepared.plan.attribute_names().into_iter().any(secret) {
         return Err(protected());
     }
-    eprintln!(
+    logln!(
         "event=query_prepared language={} columns={} parameters={}",
         front_end.name(),
         prepared.plan.find.len(),

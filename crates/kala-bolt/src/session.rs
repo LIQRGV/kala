@@ -1,4 +1,5 @@
 //! One connection's Bolt state. Authentication failures are terminal.
+use crate::log::logln;
 use crate::transport::Peer;
 use crate::{
     auth::{AuthToken, Authenticator, Credentials, Identity},
@@ -53,6 +54,8 @@ struct Session<'a> {
     config: &'a ServerConfig,
     id: u64,
     peer: Peer,
+    /// The connection arrived over TLS (for the auth log only).
+    tls: bool,
     advertised_address: String,
     output: Option<query::Output>,
     db: String,
@@ -83,24 +86,22 @@ pub(crate) struct Origin {
     pub peer: Peer,
     /// The reached endpoint, advertised when no address is configured.
     pub reached: crate::transport::ListenAddr,
+    /// Whether the listener that accepted it wraps connections in TLS.
+    pub tls: bool,
 }
 pub(crate) fn serve(
-    mut stream: Box<dyn Transport>,
+    stream: &mut dyn Transport,
     origin: Origin,
     id: u64,
     shared: &Shared<'_>,
 ) -> io::Result<()> {
     let config = shared.config;
-    let Origin { peer, reached } = origin;
-    let Some(minor) = handshake::negotiate(
-        stream.as_mut(),
-        config.handshake_timeout,
-        config.write_timeout,
-    )?
+    let Origin { peer, reached, tls } = origin;
+    let Some(minor) = handshake::negotiate(stream, config.handshake_timeout, config.write_timeout)?
     else {
         return Ok(());
     };
-    eprintln!("event=bolt_negotiated connection_id={id} version=5.{minor}");
+    logln!("event=bolt_negotiated connection_id={id} version=5.{minor}");
     let mut session = Session {
         state: State::Connected,
         minor,
@@ -111,6 +112,7 @@ pub(crate) fn serve(
         config,
         id,
         peer,
+        tls,
         advertised_address: config
             .advertised_address
             .clone()
@@ -125,7 +127,7 @@ pub(crate) fn serve(
         grants_seen: None,
     };
     loop {
-        let Some(message) = session.receive(stream.as_mut())? else {
+        let Some(message) = session.receive(stream)? else {
             return Ok(());
         };
         let deadline = Instant::now() + config.write_timeout;
@@ -142,15 +144,15 @@ pub(crate) fn serve(
                 message
             };
         if session.state == State::Failed && !matches!(message, Ok(Message::Reset)) {
-            session.send(stream.as_mut(), &Value::Structure(0x7e, vec![]), deadline)?;
+            session.send(stream, &Value::Structure(0x7e, vec![]), deadline)?;
             continue;
         }
         let result = match message {
-            Ok(msg) => session.handle(stream.as_mut(), msg, shared.stop),
+            Ok(msg) => session.handle(stream, msg, shared.stop),
             Err(e) => Err(RequestError::Client(e)),
         };
         if let Err(error) = result
-            && session.fail(stream.as_mut(), error)?.is_break()
+            && session.fail(stream, error)?.is_break()
         {
             return Ok(());
         }
@@ -226,9 +228,10 @@ impl Session<'_> {
             RequestError::Transport(error) => return Err(error),
             RequestError::Client(failure) => failure,
         };
-        eprintln!(
+        logln!(
             "event=bolt_request_failed connection_id={} code={}",
-            self.id, failure.code
+            self.id,
+            failure.code
         );
         self.output = None;
         self.transaction = None;
@@ -296,10 +299,11 @@ impl Session<'_> {
         // A Unix peer has no IP; `-` rather than a host name that could be
         // mistaken for a loopback TCP client.
         let (client_ip, transport) = match self.peer {
+            Peer::Ip(ip) if self.tls => (ip.to_string(), "tls"),
             Peer::Ip(ip) => (ip.to_string(), "tcp"),
             Peer::Local => ("-".to_owned(), "unix"),
         };
-        eprintln!(
+        logln!(
             "event=bolt_authenticated connection_id={} user={:?} client_ip={client_ip} peer={transport}",
             self.id,
             crate::error::escape(&identity.principal),
@@ -474,7 +478,7 @@ impl Session<'_> {
                 )
             })
             .collect();
-        eprintln!("event=bolt_route connection_id={} db={db}", self.id);
+        logln!("event=bolt_route connection_id={} db={db}", self.id);
         Ok(success([(
             "rt",
             Value::Map(
@@ -565,7 +569,7 @@ impl Session<'_> {
         }
     }
     fn log_refused(&self, db: &str, reason: &str) {
-        eprintln!(
+        logln!(
             "event=bolt_write_refused connection_id={} db={:?} user={:?} reason={reason}",
             self.id,
             crate::error::escape(db),
@@ -576,7 +580,7 @@ impl Session<'_> {
     }
     fn log_commit(&self, db: &str, result: &kala_core::CommitResult, forms: usize) {
         if result.committed {
-            eprintln!(
+            logln!(
                 "event=bolt_write_committed connection_id={} db={} user={:?} tx={} forms={forms} changed={}",
                 self.id,
                 crate::error::escape(db),
@@ -858,7 +862,7 @@ impl Session<'_> {
                         "read privilege is required",
                     ));
                 }
-                eprintln!(
+                logln!(
                     "event=bolt_query_started connection_id={} db={name}",
                     self.id
                 );
@@ -890,7 +894,7 @@ impl Session<'_> {
                         self.started + options.timeout,
                     )?
                 };
-                eprintln!(
+                logln!(
                     "event=bolt_query_completed connection_id={} rows={}",
                     self.id,
                     output.rows.len()

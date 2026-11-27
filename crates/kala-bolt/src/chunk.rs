@@ -88,14 +88,100 @@ pub(crate) fn read_message_expiring(
         read(stream, &mut bytes[start..])?;
     }
 }
+/// Frame one message (chunk headers, bodies, the terminator) and write it as
+/// one buffer: one syscall on a socket and, over TLS, records that don't
+/// follow chunk boundaries. Chunking is framing, not flow control, so nothing
+/// is gained by handing the transport three pieces per message.
 pub(crate) fn write_message(
     stream: &mut dyn Transport,
     bytes: &[u8],
     deadline: Instant,
 ) -> io::Result<()> {
-    for chunk in bytes.chunks(u16::MAX as usize) {
-        write_all_until(stream, &(chunk.len() as u16).to_be_bytes(), deadline)?;
-        write_all_until(stream, chunk, deadline)?;
+    const CHUNK: usize = u16::MAX as usize;
+    let mut framed = Vec::with_capacity(bytes.len() + 2 * bytes.len().div_ceil(CHUNK) + 2);
+    for chunk in bytes.chunks(CHUNK) {
+        framed.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+        framed.extend_from_slice(chunk);
     }
-    write_all_until(stream, &[0; 2], deadline)
+    framed.extend_from_slice(&[0; 2]);
+    write_all_until(stream, &framed, deadline)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_message;
+    use crate::transport::{ListenAddr, Peer, ShutdownHandle, Transport};
+    use std::io;
+    use std::time::{Duration, Instant};
+
+    /// Records each write; accepts at most `step` bytes of it.
+    struct Sink {
+        writes: Vec<Vec<u8>>,
+        step: usize,
+    }
+    impl Transport for Sink {
+        fn read_until(&mut self, _: &mut [u8], _: Instant) -> io::Result<usize> {
+            unreachable!()
+        }
+        fn write_until(&mut self, bytes: &[u8], _: Instant) -> io::Result<usize> {
+            let n = bytes.len().min(self.step);
+            self.writes.push(bytes[..n].to_vec());
+            Ok(n)
+        }
+        fn shutdown_handle(&self) -> io::Result<Box<dyn ShutdownHandle>> {
+            unreachable!()
+        }
+        fn peer(&self) -> io::Result<Peer> {
+            unreachable!()
+        }
+        fn local_addr(&self) -> io::Result<ListenAddr> {
+            unreachable!()
+        }
+    }
+
+    fn written(message: &[u8], step: usize) -> Vec<Vec<u8>> {
+        let mut sink = Sink {
+            writes: vec![],
+            step,
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        write_message(&mut sink, message, deadline).unwrap();
+        sink.writes
+    }
+
+    /// Chunk headers, bodies and the terminator, as the wire has them.
+    fn framed(message: &[u8]) -> Vec<u8> {
+        let mut out = vec![];
+        for chunk in message.chunks(65_535) {
+            out.extend((chunk.len() as u16).to_be_bytes());
+            out.extend(chunk);
+        }
+        out.extend([0, 0]);
+        out
+    }
+
+    // PR #23 polish: header, body and terminator used to be three writes
+    // (three syscalls on TCP, three records over TLS).
+    #[test]
+    fn a_message_is_framed_into_one_write() {
+        let small = [0xb1, 0x70, 0xa0];
+        assert_eq!(written(&small, usize::MAX), [framed(&small)]);
+        assert_eq!(framed(&small), [0, 3, 0xb1, 0x70, 0xa0, 0, 0]);
+        // Exactly one full chunk, one byte more, and several chunks.
+        for len in [65_535, 65_536, 200_000] {
+            let message: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let writes = written(&message, usize::MAX);
+            assert_eq!(writes.len(), 1, "{len}");
+            assert_eq!(writes[0], framed(&message), "{len}");
+        }
+        assert_eq!(framed(&[7; 65_536]).len(), 65_536 + 2 + 2 + 2);
+    }
+
+    #[test]
+    fn partial_writes_still_deliver_the_whole_frame_in_order() {
+        let message: Vec<u8> = (0..70_000).map(|i| (i * 7) as u8).collect();
+        let writes = written(&message, 4096);
+        assert!(writes.len() > 17);
+        assert_eq!(writes.concat(), framed(&message));
+    }
 }

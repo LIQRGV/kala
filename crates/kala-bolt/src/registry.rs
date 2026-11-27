@@ -1,5 +1,6 @@
 //! Immutable database names and lazily cached, committed read-only snapshots.
 use crate::error::{DATABASE, Failure, escape};
+use crate::log::logln;
 use kala_core::World;
 use std::collections::BTreeMap;
 use std::io;
@@ -196,7 +197,7 @@ impl Registry {
             && report.cause == Some(CutCause::Damaged)
             && let Some(quarantine) = &report.quarantine
         {
-            eprintln!(
+            logln!(
                 "event=recovery_acknowledged db={name} bytes={} quarantine={}",
                 report.bytes_cut,
                 escape(&quarantine.file_name().unwrap_or_default().to_string_lossy()),
@@ -448,7 +449,7 @@ impl Registry {
             let db = text.strip_suffix(".kala");
             if system == SystemDb::Skip && db == Some("system") {
                 // Decided by name only, before any metadata or content is read.
-                eprintln!(
+                logln!(
                     "kala serve: skipping system.kala: the system database is never served without account authentication"
                 );
             } else if entry.file_type()?.is_file()
@@ -466,7 +467,7 @@ impl Registry {
                     },
                 );
             } else {
-                eprintln!("event=bolt_database_skipped name={:?}", escape(&text));
+                logln!("event=bolt_database_skipped name={:?}", escape(&text));
             }
         }
         if default.as_ref().is_some_and(|d| !databases.contains_key(d)) {
@@ -560,7 +561,7 @@ impl Registry {
         if crate::system::is_system(&world) != (name == "system") {
             return Err(Failure::store("reserved system database marker mismatch"));
         }
-        eprintln!(
+        logln!(
             "event=bolt_database_loaded db={name} canon={}",
             world.latest_tx().0
         );

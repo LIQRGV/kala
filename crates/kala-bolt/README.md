@@ -19,11 +19,10 @@ kala serve worlds --listen 127.0.0.1:7687 --auth accounts \
 Port 0 selects a free port, reported by a stdout startup line for each listener
 `kala serve: listening on <address>`. Other diagnostics use structured stderr
 lines; neither queries, parameters nor credentials are logged. `localhost`
-resolves to `127.0.0.1`; `127.0.0.0/8` and `::1` are accepted. Other listen
-addresses require accounts and `--insecure-allow-plaintext`; `--auth none`
-always requires loopback. Setting the shutdown flag closes every listener and
+resolves to `127.0.0.1`; `127.0.0.0/8` and `::1` are accepted. Remote TCP listeners require accounts and either TLS or an explicit
+`--insecure-allow-plaintext`. Local TCP and Unix listeners also support `--auth none`. Setting the shutdown flag closes every listener and
 client socket, cancels queries and joins connection threads; `kala serve` sets
-it on SIGINT or SIGTERM (and SIGHUP), so `systemctl stop` and `docker stop`
+it on SIGINT or SIGTERM, so `systemctl stop` and `docker stop`
 shut down cleanly and remove Unix socket files.
 
 A single discovered user database is the implicit default (`system` is excluded). With multiple databases,
@@ -47,10 +46,10 @@ not supported yet. See the [Cypher subset](../kala-cypher/README.md).
 ## Transports and multiple listeners
 
 A transport carries the same Bolt bytes with absolute read/write deadlines,
-peer identity, a reached address, and an independent shutdown handle. TCP and
+peer identity, a reached address, and an independent shutdown handle. TCP, TLS and
 Unix streams use one session implementation, including authentication, message
-size/depth bounds and failure/RESET behavior. TLS and WebSocket are planned as
-wrappers of this seam. `Transport` requires no raw descriptor, and
+size/depth bounds and failure/RESET behavior. A blocking rustls wrapper encrypts the stream before
+the first Bolt handshake byte. `Transport` requires no raw descriptor, and
 `Server::with_transport_wrapper` can decorate accepted streams; conformance
 also runs through a wrapper that splits every read and write into single bytes.
 The peer used for account matching and the reached address are read from the
@@ -61,7 +60,7 @@ accepting.
 
 `ServerConfig::listen` is a list of `ListenAddr` values; `Server::local_addrs()`
 returns every actual bound endpoint in order. `--listen` accepts bare
-`IP:PORT`, `[IPv6]:PORT`, `localhost:PORT`, the same forms after `bolt://`, and
+`IP:PORT`, `[IPv6]:PORT`, `localhost:PORT`, the same forms after `bolt://` or `bolt+s://`, and
 (on Unix) `unix:///absolute/path`. DNS is never used. The default remains
 `127.0.0.1:7687`. Up to 16 distinct listeners share one `--max-connections` cap.
 All listeners bind before any startup line is printed; a failed bind closes
@@ -130,7 +129,7 @@ Regular files and symlinks at the socket path are refused without deletion.
 Clean shutdown removes only the socket inode this listener created; if the
 parent directory's permissions were loosened meanwhile it logs
 `event=bolt_socket_cleanup_failed` and leaves the socket, which a later start
-reclaims. `kala serve` runs this cleanup on SIGINT, SIGTERM and SIGHUP; only an
+reclaims. `kala serve` runs this cleanup on SIGINT and SIGTERM; only an
 uncatchable kill (SIGKILL, power loss) leaves the two files behind.
 
 **Who may connect.** `--unix.mode` is the access control of a Unix listener.
@@ -155,8 +154,8 @@ permissions are the access boundary, not peer-credential authentication. Some
 Unix systems do not enforce socket write permissions, so restrict the directory
 as well. IP-only custom authenticators retain their existing API and refuse
 local peers unless they implement `authenticate_peer`. Unix listeners count as
-local for `--auth none` and need no plaintext opt-in; every non-loopback TCP
-listener still requires accounts and `--insecure-allow-plaintext`.
+local for `--auth none` and need no plaintext opt-in; every non-loopback plaintext TCP
+listener requires accounts and `--insecure-allow-plaintext`.
 
 With no `--advertised-address`, Unix `SHOW DATABASES` reports `unix:///path`,
 and `ROUTE` fails with `routing over a Unix socket needs --advertised-address`.
@@ -231,9 +230,62 @@ of its login (or of its last BEGIN or write) until LOGOFF or disconnect. `kala u
 command and works while the server is running. The last `admin:*` account cannot
 be dropped or have that grant revoked.
 
-TLS is not implemented. Non-loopback account listeners need the explicit
-`--insecure-allow-plaintext` opt-in, which prints a warning that passwords travel
-unencrypted. This opt-in never permits `--auth none` on a non-loopback address.
+### TLS for remote accounts
+
+Use `bolt+s://` on the server. The wrapper negotiates TLS 1.3 or 1.2 with the
+ring provider and uses the server certificate for authentication. It requests
+no client certificate, negotiates no ALPN protocol, and disables early data
+and session resumption. A TLS connection takes a slot from the shared cap
+before the handshake. The TLS and Bolt handshakes share the handshake
+deadline. Partial records and blocked writes use the caller’s absolute deadline.
+Outgoing buffering is capped at 64 KiB per connection. An orderly Bolt close
+sends a best-effort TLS close notification within the write timeout.
+
+On startup Kala checks the PEM chain, leaf validity, matching private key and
+Unix key permissions before binding. SIGUSR1 repeats those checks and installs
+the new pair for future connections. Failed reloads log one error and preserve
+the active identity. Existing connections keep their original session. The
+reload runs off the signal thread, and signals that arrive while one is in
+flight coalesce into one more run. On a server without TLS listeners SIGUSR1
+logs `event=bolt_tls_reload_ignored reason=no_tls_listener` and does nothing.
+SIGHUP, like SIGTERM and SIGINT, is the clean shutdown.
+
+The key file must give group and others no access (`mode & 077 == 0`, as ssh
+requires); a chain file that group or others can write is a warning. Validity
+dates are read by a small strict DER walk (`transport/tls/der.rs`), and only
+when the files are read, at startup and at reload: a leaf that expires during
+uptime is served until it is replaced. The accept loop re-checks the date once
+an hour and logs a warning while the leaf is within 14 days of its end or
+expired.
+
+A client whose handshake rustls rejects is sent the fatal alert (bounded by the
+handshake deadline and one second) before the close. Bytes that are not TLS at
+all get a bare close instead: a plaintext Bolt driver would read the alert
+record as the Bolt version reply. Handshake failures are
+logged through one rate limiter (`suppressed_since_last=N`). The auth log line
+says `peer=tls` for these connections, `peer=tcp` for plaintext TCP and
+`peer=unix` for a Unix socket. A failed record write ends the stream: later
+writes and the close notification fail at once.
+
+The `ring` provider offers X25519 and the NIST curves only: there is no
+post-quantum hybrid key exchange (X25519MLKEM768 comes with `aws-lc-rs`, which
+needs cmake). `ring` compiles C and assembly, so building Kala needs a C
+compiler.
+
+Each non-loopback plaintext listener requires `--insecure-allow-plaintext`,
+including on a server that also serves TLS. The accepted TCP peer address
+determines account host matching. A remote TLS peer still needs a password
+account, and only local listeners support `--auth none`.
+
+ROUTE and SHOW DATABASES return a bare host and port for TLS connections.
+The default is the endpoint reached by this connection. Routing drivers reuse
+the encryption scheme of their original URI, so any configured
+`--advertised-address` must also be reachable over TLS and covered by the
+server certificate when clients verify its identity. A server has one
+advertised address: with a plaintext and a TLS listener together it is given to
+clients of both, so routing over the listener it does not belong to fails
+closed (a `neo4j://` client is sent to a TLS-only port, or a `neo4j+s://`
+client to a plaintext one; neither side falls back).
 
 ## Protocol
 
@@ -426,7 +478,7 @@ both forms. HELLO's
 **Neo4j Browser and other web-page clients are not supported yet.** They need
 Bolt over WebSocket, UNION ALL, `dbms.showCurrentUser()`, `dbms.clientConfig()`,
 and SHOW PROCEDURES/FUNCTIONS. Those belong to a later slice; the current
-transports are TCP and Unix sockets.
+transports are TCP, TLS over TCP and Unix sockets.
 
 ## Writing and transactions
 

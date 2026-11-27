@@ -20,7 +20,12 @@ kala-lang = { path = "../kala-lang" }
 # The `system` database: accounts, privileges and password verification.
 kala-system = { path = "../kala-system" }
 
+# Blocking TLS over the Bolt transport seam; ring avoids an aws-lc/cmake build.
+rustls = { version = "0.23.46", default-features = false, features = ["std", "ring", "tls12"] }
+
 [dev-dependencies]
+# Fresh self-signed certificates for the transport conformance suite.
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
 # The crate's own tests use the test hooks.
 kala-bolt = { path = ".", features = ["test-hooks"] }
 kala-fixture = { path = "../kala-fixture" }

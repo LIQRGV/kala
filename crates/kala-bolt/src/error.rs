@@ -1,4 +1,5 @@
 //! Wire errors and terminal-safe server diagnostics.
+use crate::log::logln;
 use crate::packstream::Value;
 use std::fmt::Write;
 pub(crate) const INVALID: &str = "Neo.ClientError.Request.Invalid";
@@ -47,7 +48,7 @@ impl Failure {
         )
     }
     pub fn store(e: impl std::fmt::Display) -> Self {
-        eprintln!("event=bolt_store_error detail={:?}", escape(&e.to_string()));
+        logln!("event=bolt_store_error detail={:?}", escape(&e.to_string()));
         Self::new(STORE, "the world could not be read")
     }
 }

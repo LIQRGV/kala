@@ -1,9 +1,10 @@
 //! Loopback listener, bounded connection threads and cooperative shutdown.
 use crate::{
     auth::{Accounts, Authenticator, NoAuth, Plugin},
+    log::{LogLimit, logln},
     registry::{Registry, SystemDb},
     session,
-    transport::{Accepted, ListenAddr, Listener, ShutdownHandle, Transport},
+    transport::{Accepted, ListenAddr, Listener, ShutdownHandle, TlsReloader, Transport},
 };
 use std::io;
 use std::net::SocketAddr;
@@ -20,6 +21,10 @@ use std::time::Duration;
 pub struct ServerConfig {
     /// Ordered listen endpoints; TCP port zero asks the OS for a free port.
     pub listen: Vec<ListenAddr>,
+    /// PEM certificate chain shared by all TLS listeners, leaf first.
+    pub tls_cert: Option<std::path::PathBuf>,
+    /// Unencrypted PEM private key matching the leaf certificate.
+    pub tls_key: Option<std::path::PathBuf>,
     /// Filesystem permissions for Unix sockets.
     pub unix_mode: u32,
     /// Public routing endpoint (HOST:PORT); otherwise the reached socket address.
@@ -85,6 +90,8 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen: vec![ListenAddr::Tcp(SocketAddr::from(([127, 0, 0, 1], 7687)))],
+            tls_cert: None,
+            tls_key: None,
             unix_mode: 0o600,
             advertised_address: None,
             default_db: None,
@@ -109,6 +116,7 @@ impl Default for ServerConfig {
 /// A bound server; account authentication bootstraps the system world if absent.
 pub struct Server {
     listeners: Vec<Listener>,
+    tls: Option<TlsReloader>,
     wrapper: Option<Arc<TransportWrapper>>,
     /// Per-socket setup of an accepted connection; tests inject failures.
     prepare: fn(Accepted) -> io::Result<Box<dyn Transport>>,
@@ -131,6 +139,9 @@ impl OpenCounts {
         self.0.opens(db).1
     }
 }
+/// How often a running server looks at its leaf certificate's end date again.
+const TLS_EXPIRY_RECHECK: Duration = Duration::from_secs(3600);
+
 type TransportWrapper = dyn Fn(Box<dyn Transport>) -> Box<dyn Transport> + Send + Sync;
 
 struct Client {
@@ -142,38 +153,53 @@ impl Server {
     /// Never creates, opens or reads `system.kala`, and never serves the
     /// `system` database; writes no database files.
     pub fn bind(directory: impl AsRef<Path>, config: ServerConfig) -> io::Result<Self> {
-        Self::validate_listeners(&config)?;
+        let tls = Self::validate_listeners(&config)?;
         Self::require_loopback(&config)?;
-        Self::bind_inner(directory.as_ref(), config, Arc::new(NoAuth), SystemDb::Skip)
+        Self::bind_inner(
+            directory.as_ref(),
+            config,
+            tls,
+            Arc::new(NoAuth),
+            SystemDb::Skip,
+        )
     }
     /// Bind with persisted accounts, bootstrapping root@localhost when needed.
     pub fn bind_accounts(directory: impl AsRef<Path>, config: ServerConfig) -> io::Result<Self> {
-        Self::validate_listeners(&config)?;
-        if config.listen.iter().any(|a| !a.is_loopback()) && !config.insecure_allow_plaintext {
+        let tls = Self::validate_listeners(&config)?;
+        let exposed = config
+            .listen
+            .iter()
+            .find(|a| matches!(a, ListenAddr::Tcp(socket) if !socket.ip().is_loopback()));
+        if let Some(addr) = exposed
+            && !config.insecure_allow_plaintext
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "accounts require a loopback listen address unless --insecure-allow-plaintext is given",
+                format!(
+                    "non-loopback listener {addr} would send account passwords unencrypted: listen with bolt+s:// and --tls.cert/--tls.key, or pass --insecure-allow-plaintext to accept plaintext"
+                ),
             ));
         }
         if config.insecure_allow_plaintext {
-            eprintln!(
+            logln!(
                 "kala serve: WARNING: passwords travel unencrypted; --insecure-allow-plaintext is enabled"
             );
         }
         let directory = directory.as_ref();
         if crate::system::ensure(directory).map_err(io::Error::other)? {
-            eprintln!("kala serve: created system.kala with root@localhost");
+            logln!("kala serve: created system.kala with root@localhost");
         }
         for account in crate::system::list(directory).map_err(io::Error::other)? {
             if account.plugin == Plugin::Trust {
-                eprintln!(
+                logln!(
                     "kala serve: account {}@{} uses trust (no password)",
-                    account.user, account.host
+                    account.user,
+                    account.host
                 );
             }
         }
         let auth = Accounts::open(directory).map_err(io::Error::other)?;
-        Self::bind_inner(directory, config, Arc::new(auth), SystemDb::Serve)
+        Self::bind_inner(directory, config, tls, Arc::new(auth), SystemDb::Serve)
     }
     /// Supply an authenticator on a loopback-only listener.
     pub fn bind_with_auth(
@@ -181,11 +207,11 @@ impl Server {
         config: ServerConfig,
         auth: Arc<dyn Authenticator>,
     ) -> io::Result<Self> {
-        Self::validate_listeners(&config)?;
+        let tls = Self::validate_listeners(&config)?;
         Self::require_loopback(&config)?;
-        Self::bind_inner(directory.as_ref(), config, auth, SystemDb::Serve)
+        Self::bind_inner(directory.as_ref(), config, tls, auth, SystemDb::Serve)
     }
-    fn validate_listeners(config: &ServerConfig) -> io::Result<()> {
+    fn validate_listeners(config: &ServerConfig) -> io::Result<Option<TlsReloader>> {
         if config.listen.is_empty() || config.listen.len() > 16 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -209,7 +235,11 @@ impl Server {
                 ));
             }
         }
-        Ok(())
+        TlsReloader::configured(
+            &config.listen,
+            config.tls_cert.as_deref(),
+            config.tls_key.as_deref(),
+        )
     }
     fn require_loopback(config: &ServerConfig) -> io::Result<()> {
         if config.listen.iter().any(|a| !a.is_loopback()) {
@@ -223,6 +253,7 @@ impl Server {
     fn bind_inner(
         directory: &Path,
         config: ServerConfig,
+        tls: Option<TlsReloader>,
         auth: Arc<dyn Authenticator>,
         system: SystemDb,
     ) -> io::Result<Self> {
@@ -263,11 +294,11 @@ impl Server {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no such directory"));
         }
         if config.acknowledge_recovery && config.read_only {
-            eprintln!(
+            logln!(
                 "kala serve: --acknowledge-recovery is ignored: a read-only server never writes, so it never cuts a damaged tail"
             );
         } else if config.acknowledge_recovery {
-            eprintln!(
+            logln!(
                 "kala serve: WARNING: --acknowledge-recovery is on: a world's damaged last transaction is cut to a quarantine file without asking, and its entry IDs are issued again"
             );
         }
@@ -278,12 +309,13 @@ impl Server {
         let mut listeners = Vec::new();
         for addr in &config.listen {
             listeners.push(
-                Listener::bind(addr, config.unix_mode)
+                Listener::bind(addr, config.unix_mode, tls.as_ref())
                     .map_err(|e| io::Error::new(e.kind(), format!("listener {addr}: {e}")))?,
             );
         }
         Ok(Self {
             listeners,
+            tls,
             wrapper: None,
             prepare: Accepted::into_transport,
             config,
@@ -297,6 +329,10 @@ impl Server {
     #[doc(hidden)]
     pub fn open_counts(&self) -> OpenCounts {
         OpenCounts(Arc::clone(&self.registry))
+    }
+    /// A handle for reloading TLS files for future connections, if configured.
+    pub fn tls_reloader(&self) -> Option<TlsReloader> {
+        self.tls.clone()
     }
     /// Actual bound endpoints, in configuration order.
     pub fn local_addrs(&self) -> io::Result<Vec<ListenAddr>> {
@@ -319,8 +355,15 @@ impl Server {
     pub fn run(self, shutdown: Arc<AtomicBool>) -> io::Result<()> {
         let mut clients = Clients::new();
         let mut accept_failed = LogLimit::new();
+        let mut expiry_checked = std::time::Instant::now();
         let result = 'accept: loop {
             clients.reap();
+            if let Some(tls) = &self.tls
+                && expiry_checked.elapsed() >= TLS_EXPIRY_RECHECK
+            {
+                expiry_checked = std::time::Instant::now();
+                tls.log_expiry();
+            }
             if shutdown.load(Ordering::Relaxed) {
                 break Ok(());
             }
@@ -329,7 +372,7 @@ impl Server {
                 match listener.accept() {
                     Ok(stream) => {
                         accepted = true;
-                        self.admit(stream, &mut clients, &shutdown);
+                        self.admit(listener, stream, &mut clients, &shutdown);
                     }
                     Err(e)
                         if matches!(
@@ -357,7 +400,13 @@ impl Server {
     /// Gives an accepted connection its session thread, or closes it: over
     /// the connection cap, or when its socket or thread can't be set up.
     /// Nothing that goes wrong with one connection reaches the accept loop.
-    fn admit(&self, accepted: Accepted, clients: &mut Clients, shutdown: &Arc<AtomicBool>) {
+    fn admit(
+        &self,
+        listener: &Listener,
+        accepted: Accepted,
+        clients: &mut Clients,
+        shutdown: &Arc<AtomicBool>,
+    ) {
         if clients.active.len() >= self.config.max_connections {
             accepted.close();
             clients.refused.log(format_args!(
@@ -383,6 +432,7 @@ impl Server {
             Ok(session::Origin {
                 peer,
                 reached: stream.local_addr()?,
+                tls: listener.is_tls(),
             })
         });
         let origin = match origin {
@@ -398,6 +448,16 @@ impl Server {
         let stream = match &self.wrapper {
             Some(wrap) => wrap(stream),
             None => stream,
+        };
+        let stream = match listener.wrap(stream) {
+            Ok(stream) => stream,
+            Err(e) => {
+                clients.dropped.log(format_args!(
+                    "event=bolt_connection_dropped reason=tls_setup error={:?}",
+                    e.kind()
+                ));
+                return;
+            }
         };
         let prepared = stream.shutdown_handle();
         let socket = match prepared {
@@ -428,7 +488,7 @@ impl Server {
     /// Starts the thread that serves one connection until it ends.
     fn spawn_session(
         &self,
-        stream: Box<dyn Transport>,
+        mut stream: Box<dyn Transport>,
         origin: session::Origin,
         id: u64,
         shutdown: &Arc<AtomicBool>,
@@ -440,15 +500,24 @@ impl Server {
         thread::Builder::new()
             .name(format!("bolt-{id}"))
             .spawn(move || {
-                eprintln!("event=bolt_connected connection_id={id}");
+                logln!("event=bolt_connected connection_id={id}");
                 let shared = session::Shared {
                     registry: &registry,
                     auth: auth.as_ref(),
                     config: &config,
                     stop: &stop,
                 };
-                let result = session::serve(stream, origin, id, &shared);
-                eprintln!(
+                let result = session::serve(stream.as_mut(), origin, id, &shared);
+                // Framing reports EOF between Bolt messages as UnexpectedEof.
+                // Give a peer closing its stream first the same orderly reply.
+                if result
+                    .as_ref()
+                    .err()
+                    .is_none_or(|e| e.kind() == io::ErrorKind::UnexpectedEof)
+                {
+                    let _ = stream.finish(std::time::Instant::now() + config.write_timeout);
+                }
+                logln!(
                     "event=bolt_disconnected connection_id={id} reason={:?}",
                     result.err().map(|e| e.kind())
                 );
@@ -525,41 +594,6 @@ fn accept_error_is_fatal(e: &io::Error) -> bool {
         return BROKEN.contains(&errno);
     }
     e.kind() == io::ErrorKind::InvalidInput
-}
-
-/// Coalesces a repeating log event: the first occurrence in each second is
-/// printed, later ones are counted and reported once with the next print,
-/// so a client looping connect/close can't flood stderr.
-struct LogLimit {
-    last: Option<std::time::Instant>,
-    suppressed: u64,
-}
-
-impl LogLimit {
-    const fn new() -> Self {
-        Self {
-            last: None,
-            suppressed: 0,
-        }
-    }
-
-    fn log(&mut self, line: std::fmt::Arguments<'_>) {
-        let now = std::time::Instant::now();
-        if self
-            .last
-            .is_some_and(|t| now.duration_since(t) < Duration::from_secs(1))
-        {
-            self.suppressed += 1;
-            return;
-        }
-        if self.suppressed > 0 {
-            eprintln!("{line} suppressed_since_last={}", self.suppressed);
-        } else {
-            eprintln!("{line}");
-        }
-        self.last = Some(now);
-        self.suppressed = 0;
-    }
 }
 
 fn valid_advertised_address(address: &str) -> bool {

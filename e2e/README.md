@@ -6,6 +6,15 @@ Varrow world, starts `kala serve` on port zero, runs stdlib `unittest`, and stop
 the server and removes the world even when a test fails. Requires Python 3 with
 venv, pip, Bash, and Cargo. `cargo test` never runs Python or accesses pip.
 
+The TLS tests (`test_tls_driver.py`: `bolt+ssc://`, `bolt+s://` with a test CA,
+`neo4j+ssc://` routing, certificate rotation with SIGUSR1) need certificates
+that `run.sh` generates with `openssl` (1.1.1 or 3.x). Without `openssl`, or
+when generation fails, the script prints why (with openssl's own output) and
+**skips** those tests; the run still passes. Set `KALA_E2E_REQUIRE_TLS=1` to
+make that skip a failure. A Bolt or TLS review must run
+`KALA_E2E_REQUIRE_TLS=1 ./e2e/run.sh` and check that no test is reported as
+skipped.
+
 The tests cover connectivity, no-auth/basic tokens, native Node and Relationship
 hydration, temporal properties, scalar/history/interval values, parameters and
 error codes, default/unknown databases, session reuse after failure, explicit
