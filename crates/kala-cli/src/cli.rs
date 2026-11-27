@@ -231,9 +231,15 @@ pub struct ServeArgs {
     /// Seconds allowed to receive a complete message.
     #[arg(long, default_value_t = 600)]
     pub idle_timeout: u64,
-    /// Refuse every write and BEGIN in write mode.
+    /// Refuse every write (transactions may still read).
     #[arg(long)]
     pub read_only: bool,
+    /// Let the server cut a world's damaged last transaction to a quarantine
+    /// file by itself and go on writing, instead of refusing writes until an
+    /// operator runs a write command with this flag. Entry IDs of a cut
+    /// transaction are issued again. Never applies to `system`.
+    #[arg(long)]
+    pub acknowledge_recovery: bool,
     /// Maximum open explicit write transactions (default: 8).
     #[arg(long)]
     pub max_write_transactions: Option<usize>,

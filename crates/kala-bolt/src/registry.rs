@@ -98,6 +98,8 @@ pub(crate) struct Registry {
     databases: BTreeMap<String, Database>,
     default: Option<String>,
     write_transactions: Arc<Mutex<WriteSlots>>,
+    /// `kala serve --acknowledge-recovery`: see [`Registry::recover`].
+    acknowledge_recovery: bool,
 }
 /// How many explicit transactions hold a private writable handle: in total
 /// and per account.
@@ -143,6 +145,65 @@ impl Registry {
             db.writer_opens.load(Ordering::Relaxed),
         )
     }
+    /// Whether this registry's writable handles cut a damaged tail by
+    /// themselves (`kala serve --acknowledge-recovery`); off unless set.
+    pub fn acknowledging_recovery(mut self, on: bool) -> Self {
+        self.acknowledge_recovery = on;
+        self
+    }
+    /// With `--acknowledge-recovery`: if `world` (a writable handle of
+    /// `name`) has met a damaged last transaction, acknowledges it and cuts
+    /// it to a quarantine file under the writer lock, as an operator's
+    /// `kala transact --acknowledge-recovery` would, and logs one line per
+    /// cut. Without the flag this does nothing: the handle keeps refusing
+    /// writes and the bytes stay in the file.
+    ///
+    /// Called when a handle is opened (the open reports a damaged tail) and
+    /// before each use of the cached handle (a tail that appeared since:
+    /// the file is then longer than the log the handle has applied; that
+    /// costs one `stat`, and only then is the lock taken to look). A torn
+    /// tail needs none of this: a commit cuts it by itself. `system` never
+    /// gets here: no writable handle of it is ever opened.
+    fn recover(&self, name: &str, world: &mut World) -> Result<(), Failure> {
+        use kala_core::{CutCause, Error};
+        if !self.acknowledge_recovery {
+            return Ok(());
+        }
+        let reported = {
+            let report = world.recovery();
+            report.cause == Some(CutCause::Damaged) && report.quarantine.is_none()
+        };
+        let unapplied = world.chain_tip().is_some_and(|tip| {
+            std::fs::metadata(&self.databases[name].path).map_or(true, |m| m.len() > tip.end)
+        });
+        if !reported && !unapplied {
+            return Ok(());
+        }
+        let mut acknowledged = false;
+        let report = loop {
+            match world.cut_acknowledged_tail() {
+                Ok(report) => break report.clone(),
+                Err(Error::RecoveryRequired { .. } | Error::RecoveryUnacknowledged)
+                    if !acknowledged =>
+                {
+                    world.acknowledge_recovery();
+                    acknowledged = true;
+                }
+                Err(error) => return Err(crate::write::store_error(error, true)),
+            }
+        };
+        if acknowledged
+            && report.cause == Some(CutCause::Damaged)
+            && let Some(quarantine) = &report.quarantine
+        {
+            eprintln!(
+                "event=recovery_acknowledged db={name} bytes={} quarantine={}",
+                report.bytes_cut,
+                escape(&quarantine.file_name().unwrap_or_default().to_string_lossy()),
+            );
+        }
+        Ok(())
+    }
     /// Runs `f` on the database's cached writable handle, caught up with
     /// the file and holding at least tx `at_least` (a bookmark; 0 for none).
     ///
@@ -177,6 +238,10 @@ impl Registry {
             if let Err(error) = world.catch_up() {
                 *cached = None;
                 return Err(crate::write::store_error(error, true));
+            }
+            if let Err(failure) = self.recover(name, world) {
+                *cached = None;
+                return Err(failure);
             }
             if world.latest_tx().0 >= at_least {
                 break cached;
@@ -239,7 +304,7 @@ impl Registry {
         self.databases[name]
             .writer_opens
             .fetch_add(1, Ordering::Relaxed);
-        let world =
+        let mut world =
             World::open_waiting(path, busy).map_err(|e| crate::write::store_error(e, true))?;
         if crate::system::is_system(&world) {
             return Err(Failure::new(
@@ -247,6 +312,7 @@ impl Registry {
                 "the system database is written only with kala user",
             ));
         }
+        self.recover(name, &mut world)?;
         Ok(world)
     }
     /// What the `system` database's file looks like now, or `None` when
@@ -345,6 +411,7 @@ impl Registry {
             databases,
             default,
             write_transactions: Arc::default(),
+            acknowledge_recovery: false,
         })
     }
     /// Resolve the name before loading a world, so authorization precedes I/O.

@@ -27,6 +27,7 @@ pub fn run(args: &ServeArgs) -> Result<String, CliError> {
         max_connections: args.max_connections,
         idle_timeout: Duration::from_secs(args.idle_timeout),
         read_only: args.read_only,
+        acknowledge_recovery: args.acknowledge_recovery,
         max_write_transactions: args
             .max_write_transactions
             .unwrap_or(defaults.max_write_transactions),

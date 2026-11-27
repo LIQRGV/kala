@@ -40,6 +40,14 @@ pub struct ServerConfig {
     pub max_message_bytes: usize,
     /// Refuse writes before opening a world.
     pub read_only: bool,
+    /// Let the server's writable handles acknowledge and cut a world's
+    /// damaged last transaction (to a quarantine file) by themselves, so
+    /// the world is writable again without an operator. Off by default:
+    /// the cut transaction may have been acknowledged to a client, and its
+    /// entry IDs and tx number are issued again, so a client holding an ID
+    /// from it could `correct` the wrong fact. Never applies to `system`;
+    /// ignored (with a startup note) when `read_only` is set.
+    pub acknowledge_recovery: bool,
     /// Maximum open explicit write snapshots.
     pub max_write_transactions: usize,
     /// Maximum total lifetime of an explicit transaction.
@@ -66,6 +74,7 @@ impl Default for ServerConfig {
             max_message_bytes: 1 << 20,
             max_depth: 32,
             read_only: false,
+            acknowledge_recovery: false,
             max_write_transactions: 8,
             tx_timeout: Duration::from_secs(60),
             tx_idle_timeout: Duration::from_secs(30),
@@ -229,11 +238,19 @@ impl Server {
         if !directory.is_dir() {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no such directory"));
         }
-        let registry = Arc::new(Registry::open(
-            directory,
-            config.default_db.clone(),
-            system,
-        )?);
+        if config.acknowledge_recovery && config.read_only {
+            eprintln!(
+                "kala serve: --acknowledge-recovery is ignored: a read-only server never writes, so it never cuts a damaged tail"
+            );
+        } else if config.acknowledge_recovery {
+            eprintln!(
+                "kala serve: WARNING: --acknowledge-recovery is on: a world's damaged last transaction is cut to a quarantine file without asking, and its entry IDs are issued again"
+            );
+        }
+        let registry = Arc::new(
+            Registry::open(directory, config.default_db.clone(), system)?
+                .acknowledging_recovery(config.acknowledge_recovery && !config.read_only),
+        );
         let mut listeners = Vec::new();
         for addr in &config.listen {
             listeners.push(
