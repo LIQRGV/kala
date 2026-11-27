@@ -1,0 +1,649 @@
+#[path = "common/client.rs"]
+mod client;
+mod common;
+
+use client::{Client, map, string};
+use common::{Running, VARROW};
+use kala_bolt::packstream::Value;
+use kala_bolt::{Server, ServerConfig};
+use kala_core::{Tick, World};
+
+fn writable_server() -> Running {
+    socket_server(false, false)
+}
+
+fn socket_server(accounts: bool, read_only: bool) -> Running {
+    configured_server(
+        accounts,
+        read_only,
+        ServerConfig::default().max_message_bytes,
+    )
+}
+
+fn configured_server(accounts: bool, read_only: bool, max_message_bytes: usize) -> Running {
+    let dir = tempfile::tempdir().unwrap();
+    drop(kala_fixture::load_fixture_to(VARROW, &dir.path().join("varrow.kala")).unwrap());
+    if accounts {
+        for (user, privilege) in [("reader", "read"), ("writer", "write")] {
+            let account = format!("{user}@localhost");
+            kala_system::system::add(dir.path(), &account, None).unwrap();
+            kala_system::system::grant(dir.path(), &account, privilege, "varrow").unwrap();
+        }
+    }
+    let config = ServerConfig {
+        read_only,
+        max_message_bytes,
+        listen: vec!["127.0.0.1:0".parse().unwrap()],
+        default_db: Some("varrow".into()),
+        ..ServerConfig::default()
+    };
+    let server = Server::bind_accounts(dir.path(), config).unwrap();
+    Running::from_server(dir, server)
+}
+
+fn world(server: &Running) -> World {
+    World::open_read_only(&server.dir.path().join("varrow.kala")).unwrap()
+}
+
+fn begin(client: &mut Client) {
+    client.send(0x11, vec![map(&[("db", string("varrow"))])]);
+    client.success();
+}
+
+#[test]
+fn set_through_a_transaction_commits_one_tx() {
+    let server = writable_server();
+    let before = world(&server).latest_tx();
+    let mut client = Client::ready(&server);
+    begin(&mut client);
+    let run = client.run(
+        "MATCH (c {kala_handle: $h}) SET c.hp = $hp AT TICK $t",
+        map(&[
+            ("h", string("greg")),
+            ("hp", Value::Integer(29)),
+            ("t", Value::Integer(700)),
+        ]),
+        map(&[]),
+    );
+    assert_eq!(run.get("fields"), Some(&Value::List(vec![])));
+    assert!(client.pull(-1).0.is_empty());
+    assert_eq!(world(&server).latest_tx(), before);
+    client.send(0x12, vec![]);
+    client.success();
+    let committed = world(&server);
+    assert_eq!(committed.latest_tx().0, before.0 + 1);
+    let greg = committed.entity_by_handle("greg").unwrap();
+    assert_eq!(
+        committed.as_of(greg, "hp", Tick(700)).unwrap(),
+        [kala_core::Value::I64(29)]
+    );
+}
+
+fn login(server: &Running, name: &str) -> Client {
+    let mut client = Client::connected(server, 4);
+    client.hello();
+    client.success();
+    client.send(
+        0x6a,
+        vec![map(&[
+            ("scheme", string("basic")),
+            ("principal", string(name)),
+            ("credentials", string("")),
+        ])],
+    );
+    client.success();
+    client
+}
+
+const FORBIDDEN: &str = "Neo.ClientError.Security.Forbidden";
+const CONFLICT: &str = "Neo.TransientError.Transaction.DeadlockDetected";
+
+fn failure(client: &mut Client, query: &str, params: Value, extra: Value) -> (String, String) {
+    client.send(0x10, vec![string(query), params, extra]);
+    let m = client::metadata(client.recv(), 0x7f);
+    let Value::String(code) = &m["code"] else {
+        panic!("{m:?}")
+    };
+    let Value::String(message) = &m["message"] else {
+        panic!("{m:?}")
+    };
+    client.reset();
+    (code.clone(), message.clone())
+}
+
+fn commit(client: &mut Client) {
+    client.send(0x12, vec![]);
+    client.success();
+}
+
+#[test]
+fn cypher_privileges_are_checked_for_the_whole_statement() {
+    let server = socket_server(true, false);
+    let mut writer = login(&server, "writer");
+    writer.run_empty("CREATE (:T {kala_handle:'blind', x:1})");
+    let (rows, summary) = writer.pull(-1);
+    assert!(rows.is_empty());
+    assert_eq!(summary["type"], string("w"));
+
+    let mut reader = login(&server, "reader");
+    let (code, reason) = failure(&mut reader, "CREATE (:T)", map(&[]), map(&[]));
+    assert_eq!(code, FORBIDDEN);
+    assert!(reason.contains("write"), "{reason}");
+    let original = std::fs::read(server.dir.path().join("varrow.kala")).unwrap();
+    for query in [
+        "MATCH (n) CREATE (:T)",
+        "CREATE (n:T) SET n.x = 1",
+        "CREATE (n:T) REMOVE n.x",
+        "CREATE (n:T) DELETE n",
+        "CREATE (n:T) DETACH DELETE n",
+        "CREATE (n:T) MERGE (m:T {kala_handle:'blind'})",
+        "CREATE (n:T) RETURN n",
+        "MERGE (n:T {kala_handle:'blind'})",
+    ] {
+        for explicit in [false, true] {
+            if explicit {
+                begin(&mut writer);
+            }
+            let (code, reason) = failure(&mut writer, query, map(&[]), map(&[]));
+            assert_eq!(code, FORBIDDEN, "{query}: {reason}");
+            assert!(reason.contains("read"), "{query}: {reason}");
+        }
+    }
+    assert!(std::fs::read(server.dir.path().join("varrow.kala")).unwrap() == original);
+}
+
+#[test]
+fn system_refuses_every_write_position() {
+    let server = socket_server(true, false);
+    let data = server.dir.path().join("system.kala");
+    let original = std::fs::read(&data).unwrap();
+    let mut admin = login(&server, "root");
+    for query in [
+        "CREATE (:ACCOUNT)",
+        "CREATE (:ACCOUNT {password_hash:'example'})",
+        "MATCH (a) SET a.password_hash = 'example'",
+        "MATCH (a) SET a += {password_hash: 'example'}",
+        "MATCH (a) REMOVE a.password_hash",
+        "MERGE (a:ACCOUNT {kala_handle:'new'}) ON CREATE SET a.password_hash = 'example'",
+        "MERGE (a:ACCOUNT {kala_handle:'root'}) ON MATCH SET a.password_hash = 'example'",
+        "MATCH (a {password_hash:'example'}) DELETE a",
+        "CREATE (a:ACCOUNT) RETURN a.password_hash",
+    ] {
+        let (code, reason) = failure(
+            &mut admin,
+            query,
+            map(&[]),
+            map(&[("db", string("system"))]),
+        );
+        assert_eq!(code, FORBIDDEN, "{query}: {reason}");
+    }
+    assert!(std::fs::read(data).unwrap() == original);
+}
+
+#[test]
+fn read_only_modes_and_anonymous_server_refuse_blind_create() {
+    let server = writable_server();
+    let mut admin = Client::ready(&server);
+    let query = "CREATE (:T {kala_handle:'blocked'})";
+    let (code, _) = failure(&mut admin, query, map(&[]), map(&[("mode", string("r"))]));
+    assert_eq!(
+        code,
+        "Neo.ClientError.Transaction.ForbiddenDueToTransactionType"
+    );
+    admin.send(0x11, vec![map(&[("mode", string("r"))])]);
+    admin.success();
+    let (code, _) = failure(&mut admin, query, map(&[]), map(&[]));
+    assert_eq!(
+        code,
+        "Neo.ClientError.Transaction.ForbiddenDueToTransactionType"
+    );
+
+    for server in [socket_server(true, true), Running::start()] {
+        let mut client = Client::ready(&server);
+        let (code, _) = failure(
+            &mut client,
+            query,
+            map(&[]),
+            map(&[("db", string("varrow"))]),
+        );
+        assert_eq!(code, FORBIDDEN);
+        assert!(world(&server).entity_by_handle("blocked").is_none());
+    }
+}
+
+#[test]
+fn returning_greg_tracks_changes_to_greg_only() {
+    for (who, should_conflict) in [("mara", false), ("greg", true)] {
+        let server = writable_server();
+        let mut first = Client::ready(&server);
+        let mut other = Client::ready(&server);
+        begin(&mut first);
+        assert_eq!(
+            first.query("MATCH (n {kala_handle:'greg'}) RETURN n").len(),
+            1
+        );
+        other.query(&format!(
+            "// kala:datalog\n[:assert :{who} :title \"new\" :at 800]"
+        ));
+        first.query("// kala:datalog\n[:assert :wren :alias \"Written\" :at 801]");
+        first.send(0x12, vec![]);
+        if should_conflict {
+            first.failure(CONFLICT);
+        } else {
+            first.success();
+        }
+    }
+}
+
+#[test]
+fn undeclared_property_read_tracks_the_absence_of_its_name() {
+    for (attribute, should_conflict) in [("unrelated", false), ("promoted", true)] {
+        let server = writable_server();
+        let mut first = Client::ready(&server);
+        let mut other = Client::ready(&server);
+        begin(&mut first);
+        assert_eq!(
+            first.query("MATCH (n {kala_handle:'greg'}) RETURN n.promoted"),
+            vec![vec![Value::Null]]
+        );
+        other.query(&format!(
+            "// kala:datalog\n[:assert :mara :{attribute} true :at 802]"
+        ));
+        first.query("// kala:datalog\n[:assert :wren :alias \"Written\" :at 803]");
+        first.send(0x12, vec![]);
+        if should_conflict {
+            first.failure(CONFLICT);
+        } else {
+            first.success();
+        }
+    }
+}
+
+#[test]
+fn cypher_optimistic_and_weak_transactions() {
+    for weak in [false, true] {
+        let server = writable_server();
+        let mut first = Client::ready(&server);
+        let mut second = Client::ready(&server);
+        first.query("// kala:datalog\n[:assert :greg :points 0 :at 800]");
+        begin(&mut first);
+        begin(&mut second);
+        if weak {
+            assert!(second.query("SET CONCURRENCY_MODE = 'weak'").is_empty());
+        }
+        first.query("MATCH (n {kala_handle:'greg'}) SET n.points = 1 AT TICK 801");
+        second.query("MATCH (n {kala_handle:'greg'}) SET n.points = 2 AT TICK 802");
+        commit(&mut first);
+        second.send(0x12, vec![]);
+        if weak {
+            second.success();
+        } else {
+            second.failure(CONFLICT);
+        }
+    }
+    let server = writable_server();
+    let mut client = Client::ready(&server);
+    let (_, msg) = failure(
+        &mut client,
+        "SET CONCURRENCY_MODE = 'weak'",
+        map(&[]),
+        map(&[]),
+    );
+    assert!(
+        msg.to_lowercase().contains("begin") || msg.contains("transaction"),
+        "{msg}"
+    );
+    begin(&mut client);
+    client.query("MATCH (n {kala_handle:'greg'}) RETURN n.name");
+    let (_, msg) = failure(
+        &mut client,
+        "SET CONCURRENCY_MODE = 'optimistic'",
+        map(&[]),
+        map(&[]),
+    );
+    assert!(msg.contains("first"), "{msg}");
+}
+
+#[test]
+fn an_empty_match_still_conflicts_with_an_insert_into_its_type() {
+    let server = writable_server();
+    let mut a = Client::ready(&server);
+    let mut b = Client::ready(&server);
+    a.query("// kala:datalog\n[:node-type :VISITOR]");
+    begin(&mut a);
+    a.query("MATCH (v:VISITOR) CREATE (:T)");
+    b.query("CREATE (:VISITOR)");
+    a.query("CREATE (:T)");
+    a.send(0x12, vec![]);
+    a.failure(CONFLICT);
+}
+
+#[test]
+fn write_work_limits_name_the_limit_and_roll_back_every_row() {
+    let server = writable_server();
+    let before = world(&server).latest_tx();
+    let mut client = Client::ready(&server);
+    for (query, count, detail) in [
+        ("UNWIND $rows AS i CREATE (:VISITOR)", 10001, "row"),
+        (
+            "UNWIND $rows AS i CREATE (:VISITOR {score:i})",
+            5001,
+            "primitive",
+        ),
+    ] {
+        let rows = Value::List((0..count).map(Value::Integer).collect());
+        let (_, message) = failure(&mut client, query, map(&[("rows", rows)]), map(&[]));
+        assert!(
+            message.replace(',', "").contains("10000") && message.to_lowercase().contains(detail),
+            "{message}"
+        );
+        assert_eq!(
+            world(&server).latest_tx(),
+            before,
+            "partial append on {detail} limit"
+        );
+    }
+}
+
+#[test]
+fn set_by_type_touches_all_fixture_characters_in_one_commit() {
+    let server = writable_server();
+    let mut client = Client::ready(&server);
+    let before = world(&server).latest_tx();
+    client.run_empty("MATCH (c:CHARACTER) SET c.checked = true AT TICK 700");
+    let (records, summary) = client.pull(-1);
+    assert!(records.is_empty());
+    assert_eq!(summary["type"], string("rw"));
+    let Value::Map(kala) = &summary["kala"] else {
+        panic!("{summary:?}")
+    };
+    assert_eq!(kala["changed"], Value::Integer(33));
+    assert_eq!(world(&server).latest_tx().0, before.0 + 1);
+}
+
+#[test]
+fn detach_delete_retracts_both_directions_but_preserves_identity_history_and_events() {
+    let server = writable_server();
+    let mut client = Client::ready(&server);
+    let before = world(&server).latest_tx();
+    let (_, msg) = failure(
+        &mut client,
+        "MATCH (n {kala_handle:'edwin'}) DELETE n AT TICK 710",
+        map(&[]),
+        map(&[]),
+    );
+    assert!(
+        msg.contains("relationships") && msg.contains("710") && msg.contains("DETACH DELETE"),
+        "{msg}"
+    );
+    assert_eq!(world(&server).latest_tx(), before);
+    client.query("MATCH (n {kala_handle:'edwin'}) DETACH DELETE n AT TICK 710");
+    let after = world(&server);
+    let edwin = after.entity_by_handle("edwin").unwrap();
+    let eldoria = after.entity_by_handle("eldoria").unwrap();
+    let sword = after.entity_by_handle("sword").unwrap();
+    assert!(after.as_of(edwin, "name", Tick(710)).unwrap().is_empty());
+    assert!(!after.as_of(edwin, "name", Tick(709)).unwrap().is_empty());
+    assert!(
+        after
+            .as_of(edwin, "located_in", Tick(710))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        after
+            .as_of(eldoria, "ruled_by", Tick(710))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        after.as_of(edwin, "bought", Tick(710)).unwrap(),
+        [kala_core::Value::Ref(sword)]
+    );
+    assert!(
+        client
+            .query("OPTIONAL MATCH (n {kala_handle:'absent'}) DELETE n AT TICK 710")
+            .is_empty()
+    );
+    assert_eq!(world(&server).latest_tx(), after.latest_tx());
+}
+
+#[test]
+fn auto_commit_and_explicit_return_report_node_identity_and_properties() {
+    let server = writable_server();
+    let mut client = Client::ready(&server);
+    let run = client.run_empty("CREATE (n:CHARACTER:Guide {kala_handle:'guide',name:'Guide'}) AT TICK 800 RETURN n, n.name AS name");
+    assert_eq!(
+        run["fields"],
+        Value::List(vec![string("n"), string("name")])
+    );
+    let (rows, summary) = client.pull(-1);
+    assert_eq!(summary["type"], string("rw"));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][1], string("Guide"));
+    let Value::Structure(0x4e, node) = &rows[0][0] else {
+        panic!("{rows:?}")
+    };
+    let Value::List(labels) = &node[1] else {
+        panic!("{node:?}")
+    };
+    assert!(labels.contains(&string("CHARACTER")) && labels.contains(&string("Guide")));
+    let Value::Map(properties) = &node[2] else {
+        panic!("{node:?}")
+    };
+    assert_eq!(properties["name"], string("Guide"));
+    let canonical = client.query("MATCH (n {kala_handle:'guide'}) RETURN n");
+    assert_eq!(canonical[0][0], rows[0][0]);
+
+    for expose in [false, true] {
+        let mut a = Client::ready(&server);
+        let mut b = Client::ready(&server);
+        begin(&mut a);
+        begin(&mut b);
+        assert!(a.query("CREATE (:CHARACTER)").is_empty());
+        let query = if expose {
+            "CREATE (n:CHARACTER) RETURN n"
+        } else {
+            "CREATE (:CHARACTER)"
+        };
+        let rows = b.query(query);
+        if expose {
+            let Value::Structure(0x4e, n) = &rows[0][0] else {
+                panic!("{rows:?}")
+            };
+            assert_eq!(n[1], Value::List(vec![string("CHARACTER")]));
+        }
+        commit(&mut a);
+        b.send(0x12, vec![]);
+        if expose {
+            b.failure(CONFLICT);
+        } else {
+            b.success();
+        }
+    }
+}
+
+#[test]
+fn row_order_conditional_merge_and_conflicting_handles() {
+    let server = writable_server();
+    let mut client = Client::ready(&server);
+    let query = "UNWIND ['one','one','two'] AS h MERGE (n:CHARACTER {kala_handle:h}) ON CREATE SET n.name='Created' ON MATCH SET n.disguised=true AT TICK 810 RETURN h";
+    assert_eq!(
+        client.query(query),
+        vec![
+            vec![string("one")],
+            vec![string("one")],
+            vec![string("two")]
+        ]
+    );
+    let check = |key: &str| format!("MATCH (n {{kala_handle:'{key}'}}) RETURN n.name, n.disguised");
+    assert_eq!(
+        client.query(&check("one")),
+        vec![vec![string("Created"), Value::Bool(true)]]
+    );
+    assert_eq!(
+        client.query(&check("two")),
+        vec![vec![string("Created"), Value::Null]]
+    );
+    let original = world(&server).latest_tx();
+    let (_, msg) = failure(
+        &mut client,
+        "MERGE (n:PLACE {kala_handle:'one'})",
+        map(&[]),
+        map(&[]),
+    );
+    assert!(msg.contains("CHARACTER") && msg.contains("one"), "{msg}");
+    assert_eq!(world(&server).latest_tx(), original);
+}
+
+#[test]
+fn event_and_handle_replacements_are_refused() {
+    let server = writable_server();
+    let before = world(&server).latest_tx();
+    let mut client = Client::ready(&server);
+    for item in [
+        "SET n.bought = null",
+        "REMOVE n.bought",
+        "SET n.kala_handle = 'renamed'",
+        "REMOVE n.kala_handle",
+    ] {
+        let (_, msg) = failure(
+            &mut client,
+            &format!("MATCH (n {{kala_handle:'edwin'}}) {item} AT TICK 901"),
+            map(&[]),
+            map(&[]),
+        );
+        if item.contains("bought") {
+            assert!(msg.contains("event") && msg.contains("[:correct"), "{msg}");
+        } else {
+            assert!(msg.to_lowercase().contains("handle"), "{msg}");
+        }
+        assert_eq!(world(&server).latest_tx(), before);
+    }
+}
+
+#[test]
+fn the_read_tick_and_write_tick_can_differ() {
+    let server = writable_server();
+    let mut client = Client::ready(&server);
+    client.query("MATCH (g {kala_handle:'greg'})-[:located_in]->(v {kala_handle:'varrow'}) AT TICK 225 SET g.stationed = true AT TICK 720");
+    let w = world(&server);
+    let greg = w.entity_by_handle("greg").unwrap();
+    assert_eq!(
+        w.as_of(greg, "stationed", Tick(720)).unwrap(),
+        [kala_core::Value::Bool(true)]
+    );
+    assert!(w.as_of(greg, "stationed", Tick(225)).unwrap().is_empty());
+}
+
+#[test]
+fn a_relationship_returned_from_an_explicit_write_includes_staged_properties() {
+    let server = writable_server();
+    let mut client = Client::ready(&server);
+    begin(&mut client);
+    let rows = client.query("MATCH (g {kala_handle:'greg'}), (m {kala_handle:'mara'}) CREATE (g)-[r:present {disguised:true}]->(m) AT TICK 900 RETURN r, r.disguised");
+    let Value::Structure(0x52, fields) = &rows[0][0] else {
+        panic!("{rows:?}")
+    };
+    assert_eq!(fields[3], string("present"));
+    let Value::Map(properties) = &fields[4] else {
+        panic!("{fields:?}")
+    };
+    assert_eq!(properties["disguised"], Value::Bool(true));
+    assert_eq!(rows[0][1], Value::Bool(true));
+    // Ordinary queries still read BEGIN's snapshot until COMMIT.
+    let read = "MATCH (g {kala_handle:'greg'})-[r:present]->(m {kala_handle:'mara'}) AT TICK 900 RETURN r, r.disguised";
+    assert!(client.query(read).is_empty());
+    commit(&mut client);
+    assert_eq!(client.query(read), rows);
+}
+
+#[test]
+fn budgets_bound_cypher_operation_details_without_losing_totals() {
+    let server = configured_server(false, false, 2048);
+    let mut client = Client::ready(&server);
+    let values = Value::List((0..48).map(Value::Integer).collect());
+    client.run(
+        "UNWIND $values AS v CREATE (:CHARACTER {hp:v}) AT TICK 903",
+        map(&[("values", values)]),
+        map(&[]),
+    );
+    let (records, summary) = client.pull(-1);
+    assert!(records.is_empty());
+    let Value::Map(kala) = &summary["kala"] else {
+        panic!("{summary:?}")
+    };
+    let Value::List(ops) = &kala["ops"] else {
+        panic!("{kala:?}")
+    };
+    let Value::Integer(omitted) = kala["ops_omitted"] else {
+        panic!("{kala:?}")
+    };
+    assert!(omitted > 0);
+    assert_eq!(ops.len() as i64 + omitted, 96);
+    assert_eq!(kala["changed"], Value::Integer(48));
+    for op in ops {
+        let Value::Map(detail) = op else {
+            panic!("{op:?}")
+        };
+        assert_eq!(detail["tick"], Value::Integer(903));
+        assert!(matches!(detail["entries"], Value::List(_)));
+    }
+}
+
+#[test]
+fn supplied_parameters_have_cypher_value_semantics_and_missing_values_roll_back() {
+    let server = writable_server();
+    let before = world(&server).latest_tx();
+    let mut client = Client::ready(&server);
+    let create =
+        "CREATE (n:CHARACTER {kala_handle:$h,alias:$names,name:$absent}) AT TICK $t RETURN n.alias";
+    let base = [
+        ("h", string("params")),
+        ("names", Value::List(vec![string("One"), string("Two")])),
+        ("absent", Value::Null),
+    ];
+    let (_, msg) = failure(&mut client, create, map(&base), map(&[]));
+    assert!(
+        msg.contains("t") && msg.to_lowercase().contains("param"),
+        "{msg}"
+    );
+    let mut params = base.to_vec();
+    params.push(("t", string("tomorrow")));
+    let (code, msg) = failure(&mut client, create, map(&params), map(&[]));
+    assert_eq!(code, "Neo.ClientError.Statement.TypeError", "{msg}");
+    assert_eq!(world(&server).latest_tx(), before);
+    *params.last_mut().unwrap() = ("t", Value::Integer(-9));
+    client.run(create, map(&params), map(&[]));
+    assert_eq!(
+        client.pull(-1).0,
+        vec![vec![Value::List(vec![string("One"), string("Two")])]]
+    );
+    let w = world(&server);
+    let n = w.entity_by_handle("params").unwrap();
+    assert!(w.as_of(n, "name", Tick(-9)).unwrap().is_empty());
+    assert!(w.as_of(n, "alias", Tick(-10)).unwrap().is_empty());
+}
+
+#[test]
+fn a_stale_reader_whose_set_is_now_a_noop_still_conflicts() {
+    let server = writable_server();
+    let mut reader = Client::ready(&server);
+    let mut writer = Client::ready(&server);
+    writer.query("// kala:datalog\n[:assert :greg :points 0 :at 950]");
+    begin(&mut reader);
+    let values = reader.query("// kala:datalog\n[:find ?p :where [:greg :points ?p]]");
+    assert_eq!(values, vec![vec![Value::Integer(0)]]);
+    let update = "// kala:datalog\n[:set :greg :points 1 :at 951]";
+    writer.query(update);
+    let after_write = world(&server).latest_tx();
+    let rows = reader.query(update);
+    assert_eq!(
+        rows[0][4],
+        Value::Integer(0),
+        "the lazy writer already sees 1"
+    );
+    reader.send(0x12, vec![]);
+    reader.failure(CONFLICT);
+    assert_eq!(world(&server).latest_tx(), after_write);
+}

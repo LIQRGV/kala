@@ -537,6 +537,120 @@ class WriteDriverTests(unittest.TestCase):
         with driver.session(database="varrow", default_access_mode=neo4j.READ_ACCESS) as session:
             return [r[0] for r in session.run(PREFIX + "[:find ?a :where [:greg :alias ?a]]")]
 
+    def test_cypher_managed_writes_bookmarks_and_summary_counters(self):
+        driver = self.driver(routing=True)
+        with driver.session(database="annex") as session:
+            def read(query, **params):
+                return session.execute_read(lambda tx: [r[0] for r in tx.run(query, **params)])
+
+            session.execute_write(lambda tx: tx.run(
+                "CREATE (n:CHARACTER:Scout {kala_handle:$h,name:$name}) AT TICK 8100",
+                h="driver_cypher", name="Aster").consume())
+            self.assertTrue(session.last_bookmarks().raw_values)
+            match = "MATCH (n {kala_handle:'driver_cypher'})"
+            self.assertEqual(read(match + " AT TICK 8100 RETURN n.name"), ["Aster"])
+            records, summary, _ = driver.execute_query(
+                match + " SET n.name = $name AT TICK 8101", name="Captain", database_="annex")
+            self.assertEqual(records, [])
+            self.assertEqual(summary.query_type, "rw")
+            self.assertEqual(read(match + " AT TICK 8101 RETURN n.name"), ["Captain"])
+
+            # Auto-commit has final identities and committed properties before records.
+            result = session.run("CREATE (m:CHARACTER:Scout {kala_handle:'driver_cypher_peer', "
+                                 "name:'Peer'}) AT TICK 8101 RETURN m")
+            node = result.single()[0]
+            self.assertIsInstance(node, Node)
+            self.assertEqual(node.labels, {"CHARACTER", "Scout"})
+            self.assertEqual(node["name"], "Peer")
+            counters = result.consume().counters
+            self.assertEqual(counters.nodes_created, 1)
+            self.assertEqual(counters.labels_added, 1)
+            self.assertGreaterEqual(counters.properties_set, 1)
+
+            edge = ("MATCH (a {kala_handle:'driver_cypher'}), "
+                    "(b {kala_handle:'driver_cypher_peer'}) MERGE (a)-[r:present]->(b) "
+                    "ON CREATE SET r.since = 1 AT TICK 8102")
+            for i in range(2):
+                summary = session.run(edge).consume()
+                self.assertEqual(summary.counters.relationships_created, 1 if i == 0 else 0)
+                if i == 1:
+                    self.assertEqual(summary.metadata["kala"]["changed"], 0)
+            self.assertEqual(read(match + "-[r:present]->(m) AT TICK 8102 RETURN r.since"), [1])
+            session.execute_write(lambda tx: tx.run(match + " DETACH DELETE n AT TICK 8103").consume())
+            self.assertEqual(read(match + " AT TICK 8103 RETURN n.name"), [None])
+            self.assertEqual(read(match + "-[r:present]->(m) AT TICK 8103 RETURN m"), [])
+            self.assertEqual(read(match + " AT TICK 8102 RETURN n.name"), ["Captain"])
+
+    def test_cypher_bulk_unwind_merge_is_idempotent(self):
+        handles = ["driver_bulk_a", "driver_bulk_b", "driver_bulk_c"]
+        create = ("UNWIND $handles AS h CREATE (:CHARACTER {kala_handle:h, name:h}) "
+                  "AT TICK 8200")
+        merge = ("UNWIND $handles AS h MERGE (n:CHARACTER {kala_handle:h}) "
+                 "ON CREATE SET n.name = h AT TICK 8200")
+        with self.driver().session(database="annex") as session:
+            session.execute_write(lambda tx: tx.run(create, handles=handles).consume())
+            def names():
+                return session.execute_read(lambda tx: [r[0] for r in tx.run(
+                    "UNWIND $handles AS h MATCH (n {kala_handle:h}) RETURN n.name ORDER BY n.name",
+                    handles=handles)])
+            self.assertEqual(names(), handles)
+            for _ in range(2):
+                summary = session.run(merge, handles=handles).consume()
+                self.assertEqual(summary.metadata["kala"]["changed"], 0)
+            self.assertEqual(names(), handles)
+
+    def test_cypher_execute_write_retries_conflicting_set(self):
+        driver = self.driver()
+        match = "MATCH (n {kala_handle:'driver_cypher_counter'})"
+        with driver.session(database="annex") as session:
+            session.run("CREATE (:CHARACTER {kala_handle:'driver_cypher_counter', points:0}) "
+                        "AT TICK 8300").consume()
+        attempts = [0, 0]
+        gate = threading.Barrier(2, timeout=10)
+
+        def increment(worker):
+            with driver.session(database="annex") as session:
+                def work(tx):
+                    attempts[worker] += 1
+                    value = tx.run(match + " RETURN n.points").single()[0]
+                    if attempts[worker] == 1:
+                        gate.wait()
+                    tx.run(match + " SET n.points = $value AT TICK $tick",
+                           value=value + 1, tick=8301 + value).consume()
+                    return value + 1
+                return session.execute_write(work)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            jobs = [pool.submit(increment, i) for i in range(2)]
+            self.assertEqual(sorted(j.result(timeout=20) for j in jobs), [1, 2])
+        self.assertGreaterEqual(sum(attempts), 3)
+
+    def test_cypher_correction_hint_can_be_used_on_the_same_connection(self):
+        with self.driver().session(database="annex") as session:
+            result = session.run("CREATE (:CHARACTER {kala_handle:'cypher_correction', "
+                                 "name:'Original'}) AT TICK 8400")
+            entry, = result.consume().metadata["kala"]["entries"]
+            match = "MATCH (n {kala_handle:'cypher_correction'})"
+            change = match + " SET n.name = 'Revised' AT TICK 8400"
+            with self.assertRaises(ClientError) as error:
+                session.run(change).consume()
+            self.assertIn(f"entry#{entry}", error.exception.message)
+            self.assertIn(f"[:correct {entry}", error.exception.message)
+            session.run(PREFIX + f'[:correct {entry} :replace :value "Revised"]').consume()
+            self.assertEqual(session.run(match + " RETURN n.name").single()[0], "Revised")
+
+    def test_cypher_driver_forbidden_for_write_only_match_and_system(self):
+        for user, db, query in [
+            ("write-only", "varrow", "MATCH (n {kala_handle:'greg'}) SET n.x = 1"),
+            ("root", "system", "CREATE (:ACCOUNT)"),
+        ]:
+            with self.subTest(user=user, database=db), self.driver(user).session(database=db) as session:
+                with self.assertRaises(ClientError) as error:
+                    session.execute_write(lambda tx: tx.run(query).consume())
+                self.assertEqual(error.exception.code, "Neo.ClientError.Security.Forbidden")
+                if user == "write-only":
+                    self.assertIn("read", error.exception.message)
+
     def test_autocommit_records_summary_and_second_connection_visibility(self):
         with self.driver().session(database="varrow") as session:
             result = session.run(PREFIX + '[:assert :greg :alias "Driver auto commit" :at 300]')
