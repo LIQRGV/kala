@@ -54,6 +54,8 @@ struct Session<'a> {
     config: &'a ServerConfig,
     id: u64,
     peer: Peer,
+    /// The connection arrived over TLS (for the auth log only).
+    tls: bool,
     advertised_address: String,
     output: Option<query::Output>,
     db: String,
@@ -84,6 +86,8 @@ pub(crate) struct Origin {
     pub peer: Peer,
     /// The reached endpoint, advertised when no address is configured.
     pub reached: crate::transport::ListenAddr,
+    /// Whether the listener that accepted it wraps connections in TLS.
+    pub tls: bool,
 }
 pub(crate) fn serve(
     stream: &mut dyn Transport,
@@ -92,7 +96,7 @@ pub(crate) fn serve(
     shared: &Shared<'_>,
 ) -> io::Result<()> {
     let config = shared.config;
-    let Origin { peer, reached } = origin;
+    let Origin { peer, reached, tls } = origin;
     let Some(minor) = handshake::negotiate(stream, config.handshake_timeout, config.write_timeout)?
     else {
         return Ok(());
@@ -108,6 +112,7 @@ pub(crate) fn serve(
         config,
         id,
         peer,
+        tls,
         advertised_address: config
             .advertised_address
             .clone()
@@ -294,6 +299,7 @@ impl Session<'_> {
         // A Unix peer has no IP; `-` rather than a host name that could be
         // mistaken for a loopback TCP client.
         let (client_ip, transport) = match self.peer {
+            Peer::Ip(ip) if self.tls => (ip.to_string(), "tls"),
             Peer::Ip(ip) => (ip.to_string(), "tcp"),
             Peer::Local => ("-".to_owned(), "unix"),
         };

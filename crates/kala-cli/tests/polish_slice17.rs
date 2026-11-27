@@ -239,3 +239,113 @@ fn a_server_whose_stderr_is_gone_keeps_serving_and_still_stops_on_sigterm() {
     assert!(status.success(), "SIGTERM returned {status:?}");
     assert!(!path.exists(), "socket file survived SIGTERM");
 }
+
+// The auth log named a TLS connection `peer=tcp`, like a plaintext one: an
+// operator could not tell from the log which logins crossed the network
+// encrypted.
+#[test]
+fn the_auth_log_says_which_connections_came_over_tls() {
+    let dir = short_dir();
+    let cert = install_pair(dir.path());
+    let mut options = vec!["--auth".to_owned(), "none".to_owned()];
+    options.extend(tls_flags(dir.path()));
+    let options: Vec<&str> = options.iter().map(String::as_str).collect();
+    let listeners = ["bolt+s://127.0.0.1:0", "127.0.0.1:0"];
+    let mut serving = Serving::start(dir.path(), &listeners, &options);
+    let mut encrypted = connect(&serving.addresses[0], &[&cert]);
+    log_on(&mut encrypted);
+    let mut plain = TcpStream::connect(&serving.addresses[1]).unwrap();
+    plain
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    log_on(&mut plain);
+    assert!(serving.signal("-INT").success());
+    let stderr = serving.stderr();
+    for line in [
+        "event=bolt_authenticated connection_id=1 user=\"\" client_ip=127.0.0.1 peer=tls",
+        "event=bolt_authenticated connection_id=2 user=\"\" client_ip=127.0.0.1 peer=tcp",
+    ] {
+        assert!(stderr.contains(line), "{stderr}");
+    }
+}
+
+// The refusal of a non-loopback plaintext listener names the fix first
+// (TLS) and the plaintext flag as the explicit opt-out.
+#[test]
+fn a_non_loopback_plaintext_listener_is_told_about_tls_first() {
+    let dir = short_dir();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_kala"))
+        .arg("serve")
+        .arg(dir.path())
+        .args(["--listen", "0.0.0.0:0"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "kala: error: non-loopback listener 0.0.0.0:0 would send account passwords unencrypted: \
+         listen with bolt+s:// and --tls.cert/--tls.key, or pass --insecure-allow-plaintext to accept plaintext\n"
+    );
+    assert!(!dir.path().join("system.kala").exists());
+}
+
+// A client looping failed handshakes (a scanner, a plaintext driver in a
+// retry loop) must not write one log line per attempt.
+#[test]
+fn tls_handshake_failures_are_rate_limited_in_the_log() {
+    use std::io::Write;
+    let dir = short_dir();
+    let cert = install_pair(dir.path());
+    let mut options = vec!["--auth".to_owned(), "none".to_owned()];
+    options.extend(tls_flags(dir.path()));
+    let options: Vec<&str> = options.iter().map(String::as_str).collect();
+    let mut serving = Serving::start(dir.path(), &["bolt+s://127.0.0.1:0"], &options);
+    let address = serving.addresses[0].strip_prefix("bolt+s://").unwrap();
+    const ATTEMPTS: usize = 40;
+    for _ in 0..ATTEMPTS {
+        // Plaintext Bolt magic on the TLS port.
+        let mut socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        socket
+            .write_all(&[0x60, 0x60, 0xb0, 0x17, 0, 0, 4, 5])
+            .unwrap();
+        let _ = socket.read_to_end(&mut vec![]);
+    }
+    // After the limiter's second has passed, the next failure is printed
+    // with the count of those it swallowed.
+    std::thread::sleep(Duration::from_millis(1100));
+    let mut socket = TcpStream::connect(address).unwrap();
+    socket
+        .write_all(&[0x60, 0x60, 0xb0, 0x17, 0, 0, 4, 5])
+        .unwrap();
+    let _ = socket.read_to_end(&mut vec![]);
+    let stderr = serving.await_stderr("suppressed_since_last=");
+    // A good client still gets in.
+    log_on(&mut connect(&serving.addresses[0], &[&cert]));
+    assert!(serving.signal("-TERM").success());
+    let stderr_end = serving.stderr();
+    let lines: Vec<&str> = stderr_end
+        .lines()
+        .filter(|l| l.contains("event=bolt_connection_dropped reason=tls_handshake"))
+        .collect();
+    assert!(
+        (2..=6).contains(&lines.len()),
+        "{} lines for {} failures: {stderr}",
+        lines.len(),
+        ATTEMPTS + 1
+    );
+    assert!(lines[0].ends_with("class=invalid_message"), "{}", lines[0]);
+    let suppressed: usize = lines
+        .iter()
+        .filter_map(|l| {
+            l.split_once("suppressed_since_last=")?
+                .1
+                .parse::<usize>()
+                .ok()
+        })
+        .sum();
+    assert_eq!(lines.len() + suppressed, ATTEMPTS + 1, "{stderr_end}");
+}

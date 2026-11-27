@@ -163,15 +163,18 @@ impl Server {
     /// Bind with persisted accounts, bootstrapping root@localhost when needed.
     pub fn bind_accounts(directory: impl AsRef<Path>, config: ServerConfig) -> io::Result<Self> {
         let tls = Self::validate_listeners(&config)?;
-        if config
+        let exposed = config
             .listen
             .iter()
-            .any(|a| matches!(a, ListenAddr::Tcp(socket) if !socket.ip().is_loopback()))
+            .find(|a| matches!(a, ListenAddr::Tcp(socket) if !socket.ip().is_loopback()));
+        if let Some(addr) = exposed
             && !config.insecure_allow_plaintext
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "accounts require a loopback listen address unless --insecure-allow-plaintext is given",
+                format!(
+                    "non-loopback listener {addr} would send account passwords unencrypted: listen with bolt+s:// and --tls.cert/--tls.key, or pass --insecure-allow-plaintext to accept plaintext"
+                ),
             ));
         }
         if config.insecure_allow_plaintext {
@@ -419,6 +422,7 @@ impl Server {
             Ok(session::Origin {
                 peer,
                 reached: stream.local_addr()?,
+                tls: listener.is_tls(),
             })
         });
         let origin = match origin {

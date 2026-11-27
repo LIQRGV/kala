@@ -1,9 +1,9 @@
 //! Blocking TLS on a deadline-aware byte transport.
 use super::{ListenAddr, Peer, ShutdownHandle, Transport, remaining};
-use crate::log::logln;
+use crate::log::LogLimit;
 use rustls::{ServerConfig, ServerConnection};
 use std::io::{self, Read, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod config;
@@ -12,6 +12,10 @@ pub use config::TlsReloader;
 
 /// The longest a rejected peer is waited on to take its fatal alert.
 const ALERT_FLUSH: Duration = Duration::from_secs(1);
+
+/// One limiter for every connection: handshake failures are what a scanner
+/// or a plaintext client in a retry loop produces, as fast as it can connect.
+static HANDSHAKE_FAILED: Mutex<LogLimit> = Mutex::new(LogLimit::new());
 
 pub(super) struct Tls {
     inner: Box<dyn Transport>,
@@ -148,14 +152,17 @@ impl Tls {
         if let Err(error) = &result {
             // Underlying I/O errors can contain arbitrary strings. Only our
             // own rustls protocol classes and the I/O kind are safe to log.
-            logln!(
-                "event=bolt_connection_dropped reason=tls_handshake error={:?} class={}",
-                error.kind(),
-                error
-                    .get_ref()
-                    .and_then(|e| e.downcast_ref::<TlsClass>())
-                    .map_or("io", |c| c.0)
-            );
+            HANDSHAKE_FAILED
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .log(format_args!(
+                    "event=bolt_connection_dropped reason=tls_handshake error={:?} class={}",
+                    error.kind(),
+                    error
+                        .get_ref()
+                        .and_then(|e| e.downcast_ref::<TlsClass>())
+                        .map_or("io", |c| c.0)
+                ));
         }
         result
     }

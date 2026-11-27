@@ -117,6 +117,9 @@ impl Listener {
             Self::Unix(listener) => Ok(ListenAddr::Unix(listener.path.clone())),
         }
     }
+    pub(crate) fn is_tls(&self) -> bool {
+        matches!(self, Self::Tls(..))
+    }
     /// Install this listener's encryption after admission and metadata capture.
     pub(crate) fn wrap(&self, stream: Box<dyn Transport>) -> io::Result<Box<dyn Transport>> {
         match self {
