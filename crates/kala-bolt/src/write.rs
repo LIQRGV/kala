@@ -19,6 +19,14 @@ const CONSTRAINT: &str = "Neo.ClientError.Schema.ConstraintValidationFailed";
 pub(crate) const MAX_FORMS: usize = 256;
 pub(crate) const MAX_STAGED_BYTES: usize = 16 * 1024 * 1024;
 
+/// Charge retained statement data across the entire explicit transaction.
+pub(crate) fn charge(total: &mut usize, bytes: usize) -> Result<(), Failure> {
+    *total = total
+        .checked_add(bytes)
+        .filter(|n| *n <= MAX_STAGED_BYTES)
+        .ok_or_else(|| Failure::new(INVALID, "transaction exceeds the 16 MiB staged byte limit"))?;
+    Ok(())
+}
 const REDUCED: &str = "write failed; details require read privilege";
 /// A write refused by a store rule: something about the data it met (a
 /// handle that exists or doesn't, a value that is held, a declared type, a

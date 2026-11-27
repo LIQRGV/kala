@@ -77,12 +77,44 @@ type Row = BTreeMap<String, Datum>;
 /// its result is empty.
 pub struct WriteInput<'a> {
     pub prepared: Prepared,
+    reads: kala_query::reads::Reads,
+    defined_names: Vec<bool>,
+    depends_on_snapshot: bool,
     result: ResultSet,
     property_columns: BTreeMap<(String, String), usize>,
     tick: Option<Tick>,
     options: RunOptions<'a>,
     bytes: usize,
     steps: u64,
+}
+
+impl WriteInput<'_> {
+    /// Snapshot dependencies for a server that opens a writable handle lazily.
+    /// Staging also records them, so all callers get optimistic validation.
+    pub fn reads(&self) -> &kala_query::reads::Reads {
+        &self.reads
+    }
+
+    fn note_reads(&self, tx: &mut Txn<'_>) -> Result<()> {
+        if !self.depends_on_snapshot {
+            return Ok(());
+        }
+        if tx.snapshot_tx() < self.result.canon {
+            return Err(invalid(
+                "write input was read on a newer snapshot than this transaction",
+            ));
+        }
+        let moved = tx.snapshot_tx() != self.result.canon;
+        if !tx.schema_changes().is_empty()
+            || (moved && self.defined_names != self.reads.defined_names(tx.base_world()))
+        {
+            tx.note_read_all();
+        } else {
+            self.reads.note(tx);
+        }
+        tx.set_read_version(self.result.canon);
+        Ok(())
+    }
 }
 
 /// Produce one row for a bare write or materialize a MATCH/WITH/UNWIND query
@@ -161,8 +193,13 @@ pub fn prepare<'a>(
     if result.rows.len() > MAX_WRITE_ROWS {
         return Err(invalid("statement exceeds the 10000-row write limit"));
     }
+    let reads = kala_query::reads::Reads::plan(&prepared.plan, world);
+    let defined_names = reads.defined_names(world);
     Ok(WriteInput {
         prepared,
+        reads,
+        defined_names,
+        depends_on_snapshot: stmt.requires_read(),
         result,
         property_columns: props,
         tick,
@@ -175,11 +212,14 @@ pub fn prepare<'a>(
 /// A staged write and its explicit-transaction projection. Nodes and
 /// relationships are identity values; the adapter renders the graph objects.
 pub struct WriteResult {
+    /// Estimated expanded write state to charge across RUNs until commit/rollback.
+    pub retained_bytes: usize,
     pub staged: StagedWrite,
     pub rows: Vec<Vec<Datum>>,
     pub tick: Tick,
     properties: Vec<(usize, usize, EntityId, String)>,
     limits: kala_query::Limits,
+    render_bytes: usize,
     deadline: Option<std::time::Instant>,
 }
 
@@ -197,7 +237,7 @@ fn shape(mut values: Vec<Value>, many: bool) -> Datum {
 impl WriteResult {
     /// Re-evaluate property cells against the committed world, and resolve
     /// provisional identities before graph objects are rendered.
-    pub fn committed_rows(&self, world: &World, ids: &IdMap) -> Result<Vec<Vec<Datum>>> {
+    pub fn committed_rows(&mut self, world: &World, ids: &IdMap) -> Result<Vec<Vec<Datum>>> {
         fn remap(d: &mut Datum, ids: &IdMap) {
             match d {
                 Datum::Value(Value::Ref(id)) => *id = ids.resolve(*id),
@@ -209,27 +249,46 @@ impl WriteResult {
                 _ => {}
             }
         }
-        let mut rows = self.rows.clone();
+        let mut rows = std::mem::take(&mut self.rows);
+        // Staging already charged the source rows and property metadata. Keep that
+        // charge while replacements are allocated, including an old cell's payload.
+        let budget = std::cell::Cell::new(self.render_bytes);
+        let reserve = |bytes: usize| {
+            budget.set(
+                budget
+                    .get()
+                    .checked_sub(bytes)
+                    .ok_or(QueryError::MemoryBudget {
+                        limit: self.limits.max_bytes,
+                    })?,
+            );
+            Ok::<(), QueryError>(())
+        };
         let meter = WorkMeter::bounded(self.limits.max_steps, None).with_deadline(self.deadline);
         let schema = world.at_canon(world.latest_tx());
         let view = schema.metered(&meter);
-        let mut memory = 0usize;
+
         for row in &mut rows {
             meter.check()?;
             for d in row {
-                memory = memory.saturating_add(datum_bytes(d));
                 remap(d, ids);
             }
         }
-        for (r, c, id, key) in &self.properties {
+        for (r, c, id, key) in std::mem::take(&mut self.properties) {
             meter.check()?;
-            let entity = ids.resolve(*id);
-            rows[*r][*c] = if key == "kala_handle" {
-                world
-                    .handle_of(entity)
-                    .map(|h| Datum::Value(Value::Str(h.into())))
-                    .unwrap_or(Datum::Null)
-            } else if let Ok((def, inverse)) = schema.resolve_attribute(key) {
+            let entity = ids.resolve(id);
+            let cell = rows
+                .get_mut(r)
+                .and_then(|row| row.get_mut(c))
+                .ok_or_else(|| invalid("RETURN projection was modified before rendering"))?;
+            *cell = if key == "kala_handle" {
+                if let Some(handle) = world.handle_of(entity) {
+                    reserve(handle.len())?;
+                    Datum::Value(Value::Str(handle.to_owned()))
+                } else {
+                    Datum::Null
+                }
+            } else if let Ok((def, inverse)) = schema.resolve_attribute(&key) {
                 let many = if inverse {
                     def.reverse_cardinality == Some(Cardinality::Many)
                 } else {
@@ -238,19 +297,18 @@ impl WriteResult {
                 let vals = if def.value_type == kala_core::ValueType::Ref {
                     // Each retained neighbor requires an examined index key. Cap
                     // the scan before it builds a result larger than the budget.
-                    let remaining = self.limits.max_bytes.saturating_sub(memory);
+                    let per_value = std::mem::size_of::<(EntityId, kala_core::EdgeId)>()
+                        + std::mem::size_of::<Value>()
+                        + std::mem::size_of::<Datum>();
+                    let cap = budget.get() / per_value;
                     meter.set_max_keys(
-                        self.limits.max_steps.min(
-                            meter
-                                .keys()
-                                .saturating_add((remaining / std::mem::size_of::<Datum>()) as u64),
-                        ),
+                        self.limits
+                            .max_steps
+                            .min(meter.keys().saturating_add(cap as u64)),
                     );
                     let neighbors =
-                        view.neighbors(entity, key, kala_core::Direction::Out, self.tick)?;
-                    memory = memory.saturating_add(
-                        neighbors.len().saturating_mul(std::mem::size_of::<Datum>()),
-                    );
+                        view.neighbors(entity, &key, kala_core::Direction::Out, self.tick)?;
+                    reserve(neighbors.len().saturating_mul(per_value))?;
                     meter.set_max_keys(self.limits.max_steps);
                     neighbors
                         .into_iter()
@@ -258,16 +316,25 @@ impl WriteResult {
                         .collect()
                 } else {
                     let mut vals = vec![];
-                    view.visit_non_ref_values(entity, key, self.tick, |v| {
-                        memory = memory.saturating_add(value_bytes(&v));
-                        if memory > self.limits.max_bytes {
-                            return Err(kala_core::Error::WorkInterrupted {
-                                reason: kala_core::WorkInterruptReason::Limit,
-                            });
-                        }
-                        vals.push(v);
-                        Ok(())
-                    })?;
+                    view.visit_non_ref_values_charged(
+                        entity,
+                        &key,
+                        self.tick,
+                        |encoded| {
+                            reserve(encoded.saturating_add(
+                                std::mem::size_of::<Value>() + std::mem::size_of::<Datum>(),
+                            ))
+                            .map_err(|_| {
+                                kala_core::Error::WorkInterrupted {
+                                    reason: kala_core::WorkInterruptReason::Limit,
+                                }
+                            })
+                        },
+                        |v| {
+                            vals.push(v);
+                            Ok(())
+                        },
+                    )?;
                     vals
                 };
                 shape(vals, many)
@@ -306,6 +373,7 @@ fn apply(
         .into_iter()
         .chain(tx.deadline())
         .min();
+    input.note_reads(tx)?;
     let tick = tx.report_tick(input.tick);
     let stager = Stager::new(tx, input.tick, Default::default(), MAX_WRITE_PRIMITIVES)?;
     let mut writer = Writer {
@@ -362,6 +430,13 @@ fn apply(
             }
         }
         if !stmt.returns.is_empty() {
+            writer.charge(
+                std::mem::size_of::<Vec<Datum>>()
+                    + stmt
+                        .returns
+                        .len()
+                        .saturating_mul(std::mem::size_of::<Datum>()),
+            )?;
             let mut cells = Vec::with_capacity(stmt.returns.len());
             for (col, item) in stmt.returns.iter().enumerate() {
                 if let Expr::Property { entity, key, .. } = &item.expr
@@ -380,11 +455,13 @@ fn apply(
     }
     writer.meter.check()?;
     Ok(WriteResult {
+        retained_bytes: writer.stager.retained_bytes(),
         staged: writer.stager.finish(),
         rows,
         tick,
         properties,
         limits: input.options.limits,
+        render_bytes: writer.bytes,
         deadline,
     })
 }
@@ -489,6 +566,9 @@ impl Writer<'_, '_> {
     }
     fn property(&mut self, id: EntityId, key: &str) -> Result<Datum> {
         if key == "kala_handle" {
+            if let Some(len) = self.tx.handle_of(id).map(str::len) {
+                self.charge(len)?;
+            }
             return Ok(self
                 .tx
                 .handle_of(id)
@@ -750,7 +830,6 @@ pub fn execute_in(
         tx.set_deadline(at);
     }
     let input = prepare(tx.base_world(), stmt, params, options)?;
-    kala_query::reads::Reads::plan(&input.prepared.plan, tx.base_world()).note(&tx);
     let staged = stage(&mut tx, stmt, input, params)?.staged;
     Ok(native::commit(tx, staged)?)
 }

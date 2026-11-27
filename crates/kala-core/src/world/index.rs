@@ -679,7 +679,7 @@ impl World {
     /// reference, a plain encoding on one that is) or names a reference the
     /// table lacks: only reachable by tampering, so readers skip such keys
     /// (doctor reports them).
-    fn e_part_encoding<'a>(&'a self, attr: AttrId, part: &'a [u8]) -> Option<&'a [u8]> {
+    pub(super) fn e_part_encoding<'a>(&'a self, attr: AttrId, part: &'a [u8]) -> Option<&'a [u8]> {
         match (
             self.catalog.keys_by_ref(attr),
             ValueRef::from_key_bytes(part),

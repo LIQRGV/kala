@@ -105,6 +105,23 @@ impl Reads {
             self.types.clear();
         }
     }
+    /// Schema visibility for this plan's attribute and label names. Keep these
+    /// bits with materialized rows when a writer may open on a later snapshot.
+    /// If a name disappears or becomes defined, recording its new lookup alone
+    /// can lose the dependency on the old name or on an absent node type.
+    pub fn defined_names(&self, world: &World) -> Vec<bool> {
+        let view = world.at_canon(world.latest_tx());
+        self.attributes
+            .iter()
+            .map(|name| view.resolve_attribute(name).is_ok())
+            .chain(
+                self.types
+                    .iter()
+                    .map(|name| world.node_types().any(|ty| ty == name)),
+            )
+            .collect()
+    }
+
     /// A newly declared node type can change a label predicate on an older
     /// snapshot even before an entity of that type exists.
     pub fn same_type_names(&self, from: &World, to: &World) -> bool {
@@ -114,7 +131,7 @@ impl Reads {
     }
     /// Adds another query's dependencies to these. A transaction that has
     /// not written yet keeps one merged set for all its queries; past
-    /// [`MAX_PENDING`] names it is coarsened to "everything", so the set
+    /// the pending-key bound it is coarsened to "everything", so the set
     /// stays small however many queries a long transaction runs.
     pub fn merge(&mut self, other: &Self) {
         self.all |= other.all;

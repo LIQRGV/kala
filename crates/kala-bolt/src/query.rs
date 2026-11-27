@@ -163,10 +163,13 @@ fn execute(
         result.rows,
         result.tick,
         reads,
-        stop,
-        max_message,
-        max_depth,
-        system,
+        RenderOptions {
+            stop,
+            max_message,
+            max_depth,
+            system,
+            result_bytes: limits.max_bytes,
+        },
     )
 }
 
@@ -235,19 +238,43 @@ impl Graph<'_> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(crate) struct RenderOptions<'a> {
+    stop: Stop<'a>,
+    max_message: usize,
+    max_depth: usize,
+    system: bool,
+    result_bytes: usize,
+}
+impl<'a> RenderOptions<'a> {
+    pub fn write(stop: Stop<'a>, max_message: usize, max_depth: usize) -> Self {
+        Self {
+            stop,
+            max_message,
+            max_depth,
+            system: false,
+            result_bytes: crate::write::MAX_STAGED_BYTES,
+        }
+    }
+}
 pub(crate) fn render(
     world: RenderWorld<'_>,
     fields: Vec<String>,
     records: Vec<Vec<Datum>>,
     tick: Tick,
     mut reads: crate::reads::Reads,
-    stop: Stop<'_>,
-    max_message: usize,
-    max_depth: usize,
-    system: bool,
+    options: RenderOptions<'_>,
 ) -> Result<Output, Failure> {
-    let limits = Limits::default();
+    let RenderOptions {
+        stop,
+        max_message,
+        max_depth,
+        system,
+        result_bytes,
+    } = options;
+    let limits = Limits {
+        max_bytes: result_bytes,
+        ..Limits::default()
+    };
     let meter =
         WorkMeter::bounded(limits.max_steps, Some(stop.flag)).with_deadline(Some(stop.deadline));
     let view = match world {

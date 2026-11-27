@@ -134,6 +134,8 @@ pub(crate) struct Transaction {
     pub forms: Vec<StagedWrite>,
     pub bytes: usize,
     pub queried: bool,
+    /// The summary type includes reads for a query, a read pipeline or RETURN.
+    pub summary_reads: bool,
     pub mode_set: bool,
     /// Indexes into forms for which the per-operation report goes in the summary.
     pub cypher_forms: Vec<usize>,
@@ -166,7 +168,7 @@ impl Transaction {
         }
     }
     /// Attach dependencies before opening a writer or directly to a live transaction.
-    pub fn record(&mut self, reads: &Reads) {
+    pub fn record(&mut self, reads: &Reads, include_in_summary: bool) {
         match &mut self.snapshot {
             Snapshot::Write(owned, _) => owned.with(|tx| {
                 if tx.schema_changes().is_empty() {
@@ -179,6 +181,7 @@ impl Transaction {
             _ => {}
         }
         self.queried = true;
+        self.summary_reads |= include_in_summary;
     }
     /// The transaction's writable handle, if it has written.
     pub fn written(&mut self) -> Option<&mut OwnedTxn> {

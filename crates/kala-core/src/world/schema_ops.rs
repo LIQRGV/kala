@@ -134,8 +134,6 @@ impl SchemaSnapshot {
     }
 }
 
-/// The schema half of the catalog: validating and applying schema edits.
-/// Live edits and replay both go through [`Catalog::apply_schema_edit`].
 /// Scalar attributes infer one value, except node labels, which are a set.
 /// Restore accepts the original label-one default used by older dumps/logs.
 fn inferred_cardinality(name: &str, ty: ValueType, stored: Option<Cardinality>) -> Cardinality {
@@ -148,6 +146,8 @@ fn inferred_cardinality(name: &str, ty: ValueType, stored: Option<Cardinality>) 
     }
 }
 
+/// The schema half of the catalog. Live edits and replay both go through
+/// [`Catalog::apply_schema_edit`].
 impl Catalog {
     /// Rebuilds the name tables (attributes, inverses, node types) from the
     /// definitions, after an edit or a restore changed them.

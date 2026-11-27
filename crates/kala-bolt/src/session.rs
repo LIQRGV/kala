@@ -630,6 +630,7 @@ impl Session<'_> {
             forms: Vec::new(),
             bytes: 0,
             queried: false,
+            summary_reads: false,
             mode_set: false,
             cypher_forms: Vec::new(),
             server_statement: false,
@@ -697,7 +698,7 @@ impl Session<'_> {
                 0x70,
                 vec![Value::Map(summary.metadata(
                     &db,
-                    transaction.queried,
+                    transaction.summary_reads,
                     self.config.max_message_bytes,
                     self.config.max_depth,
                 ))],
@@ -881,7 +882,7 @@ impl Session<'_> {
                         self.config.max_depth,
                         tx.deadline,
                     )?;
-                    tx.record(&output.reads);
+                    tx.record(&output.reads, true);
                     output
                 } else {
                     let world = self.registry.at_least(
@@ -987,6 +988,18 @@ impl Session<'_> {
         let stop = query::Stop { flag, deadline };
         let max = self.config.max_message_bytes;
         let depth = self.config.max_depth;
+        // RUN publishes its field names before PULL. Verify that response
+        // fits before we append anything, even for a long quoted alias.
+        let header = success([
+            (
+                "fields",
+                Value::List(fields.iter().cloned().map(Value::String).collect()),
+            ),
+            ("t_first", Value::Integer(i64::MAX)),
+            ("qid", Value::Integer(0)),
+        ]);
+        crate::packstream::encode_with_limits(&header, max, depth)
+            .map_err(|_| Failure::new(INVALID, "RETURN column names exceed the message limit"))?;
         let prepare = |world: &kala_core::World| {
             let names = statement
                 .parameters()
@@ -1001,8 +1014,7 @@ impl Session<'_> {
                 prepare_statement(world, statement, &params, run)
                     .map_err(|e| write::statement_error(e, held.read))
             })?;
-            let reads = crate::reads::Reads::plan(&input.prepared.plan, world);
-            Ok::<_, Failure>((params, input, reads))
+            Ok::<_, Failure>((params, input))
         };
         if let Some(tx) = &mut self.transaction {
             let account = self
@@ -1014,19 +1026,13 @@ impl Session<'_> {
                 crate::packstream::encode_with_limits(&Value::Map(given.clone()), max, depth)
                     .map_err(|_| Failure::new(INVALID, "parameter limit exceeded"))?
                     .len();
-            tx.bytes = tx.bytes.saturating_add(text_len).saturating_add(param_size);
-            if tx.bytes > write::MAX_STAGED_BYTES {
-                return Err(Failure::new(
-                    INVALID,
-                    "transaction exceeds the staged-text byte limit",
-                ));
-            }
-            let (params, input, reads) = prepare(tx.world())?;
+            write::charge(&mut tx.bytes, text_len.saturating_add(param_size))?;
+            let (params, input) = prepare(tx.world())?;
             if statement.requires_read() {
-                tx.record(&reads);
+                tx.record(input.reads(), rw);
             }
             let owned = tx.writer(self.registry, self.config, &account, held.admin)?;
-            let (output, staged) = owned.with(|t| {
+            let (output, staged, retained_bytes) = owned.with(|t| {
                 let result = stage_statement(t, statement, input, &params)
                     .map_err(|e| write::statement_error(e, held.read))?;
                 let output = query::render(
@@ -1035,38 +1041,48 @@ impl Session<'_> {
                     result.rows,
                     result.tick,
                     Default::default(),
-                    stop,
-                    max,
-                    depth,
-                    false,
+                    query::RenderOptions::write(stop, max, depth),
                 )?;
-                Ok::<_, Failure>((output, result.staged))
+                Ok::<_, Failure>((output, result.staged, result.retained_bytes))
             })?;
+            write::charge(&mut tx.bytes, retained_bytes)?;
             self.run_type = if rw { "rw" } else { "w" };
             tx.cypher_forms.push(tx.forms.len());
             tx.forms.push(staged);
             Ok(output)
         } else {
-            let (output, summary) = self.registry.write(db, self.config.busy_timeout.min(options.timeout), options.bookmark, |world| {
-                let mut tx = world.begin();
-                tx.set_concurrency(options.concurrency);
-                tx.set_schema_additions_only(!held.admin);
-                tx.set_deadline(deadline);
-                let (params, input, reads) = prepare(tx.base_world())?;
-                reads.note(&tx);
-                let staged = stage_statement(&mut tx, statement, input, &params).map_err(|e| write::statement_error(e, held.read))?;
-                let result = tx.commit().map_err(|e| write::commit_error(world, e, std::slice::from_ref(&staged.staged), held.read))?;
-                self.log_commit(db, &result, 1);
-                let after_commit = || Failure::new(crate::error::STORE, format!("write completed at tx {} (bookmark kala:{db}:{}); RETURN could not be rendered", result.tx.0, result.tx.0));
-                let rows = staged.committed_rows(world, &result.ids).map_err(|_| after_commit())?;
-                let output = query::render(query::RenderWorld::Snapshot(world, result.tx), fields, rows, staged.tick, Default::default(), stop, max, depth, false).map_err(|_| after_commit())?;
-                let ops = staged.staged.clone().complete(&result).ops;
-                let form = StagedWrite { ops, ..staged.staged };
-                let mut summary = write::Summary::new(max);
-                summary.add(world, &result, std::slice::from_ref(&form), held.read);
-                summary.operations(1, &form.ops);
-                Ok((output, summary.metadata(db, rw, max, depth)))
-            })?;
+            let (output, summary) = self.registry.write(
+                db, self.config.busy_timeout.min(options.timeout), options.bookmark,
+                |world| {
+                    let mut tx = world.begin();
+                    tx.set_concurrency(options.concurrency);
+                    tx.set_schema_additions_only(!held.admin);
+                    tx.set_deadline(deadline);
+                    let (params, input) = prepare(tx.base_world())?;
+                    let mut staged = stage_statement(&mut tx, statement, input, &params)
+                        .map_err(|e| write::statement_error(e, held.read))?;
+                    let result = tx.commit().map_err(|e| {
+                        write::commit_error(world, e, std::slice::from_ref(&staged.staged), held.read)
+                    })?;
+                    self.log_commit(db, &result, 1);
+                    let outcome = if result.committed { "write committed" } else { "write completed without changes" };
+                    let after_commit = || Failure::new(
+                        crate::error::STORE,
+                        format!("{outcome} at tx {} (bookmark kala:{db}:{}); RETURN could not be rendered", result.tx.0, result.tx.0),
+                    );
+                    let rows = staged.committed_rows(world, &result.ids).map_err(|_| after_commit())?;
+                    let output = query::render(
+                        query::RenderWorld::Snapshot(world, result.tx), fields, rows,
+                        staged.tick, Default::default(), query::RenderOptions::write(stop, max, depth),
+                    ).map_err(|_| after_commit())?;
+                    let ops = staged.staged.clone().complete(&result).ops;
+                    let form = StagedWrite { ops, ..staged.staged };
+                    let mut summary = write::Summary::new(max);
+                    summary.add(world, &result, std::slice::from_ref(&form), held.read);
+                    summary.operations(1, &form.ops);
+                    Ok((output, summary.metadata(db, rw, max, depth)))
+                },
+            )?;
             self.summary = Some(summary);
             Ok(output)
         }
@@ -1143,7 +1159,7 @@ impl Session<'_> {
                 })?;
                 tx.forms.push(staged);
             }
-            self.run_type = if tx.queried {
+            self.run_type = if tx.summary_reads {
                 "rw"
             } else if data {
                 "w"

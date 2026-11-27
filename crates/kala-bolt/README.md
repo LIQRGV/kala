@@ -536,12 +536,10 @@ the transaction's **first write form**, on the world as it is then:
   newer; what they read is checked from BEGIN's snapshot as well, so they can
   conflict but never slip through.)
 
-Two cases are checked more coarsely, as "read everything as of BEGIN" (any
-commit since then conflicts): a transaction whose queries read more than 256
-distinct attribute and node-type names before its first write, and one that
-queried before another transaction **changed the schema** (the read keys are
-names, and a name may mean another attribute afterwards). Weak mode skips
-all of these checks.
+An accumulated read set exceeding 256 attributes, node types and rendered
+identities falls back to checking every commit since BEGIN. Resolving the
+same names across a schema rewrite can also require this conservative check.
+Appending an unrelated attribute preserves the earlier name bindings.
 
 **The latest tick is BEGIN's.** A tick-less write in an explicit transaction
 lands on the latest tick of the snapshot BEGIN pinned, whether another
@@ -555,9 +553,9 @@ Queries read the transaction's committed snapshot. They do **not** see the trans
 own writes. Later write forms can resolve handles created by earlier forms and
 `:set`/`:if-missing` see staged writes through the native transaction. Optimistic
 queries record coarse attribute, node-type and entity-definition dependencies;
-unknown labels also record the absent node type. Graph-result enrichment
-conservatively records a whole-world read. This prevents write skew while scalar
-queries on unrelated attributes can commit independently. A query that runs after
+unknown labels and undeclared properties record their absent names. Returning
+a whole node or relationship records its identity, including graph values
+nested in lists and paths. A query that runs after
 its transaction staged a schema change (a rename, a declaration, also an inferred
 one) records a whole-world read: its names might mean other attributes in the
 transaction's provisional schema. Weak mode skips conflict checks. Sending a provisional entity ID pins it: a commit that would renumber it
@@ -660,7 +658,7 @@ carries the same `type` for that RUN), and:
 
 Optional summary details share a bounded budget while each form is committed;
 excess details are counted rather than retained. If the final encoded summary
-still exceeds the wire-message limit, detail lists are shortened in this order: notifications, ID mappings, entry IDs. `kala.notifications_omitted`,
+still exceeds the wire-message limit, detail lists are shortened in this order: notifications, operations, ID mappings, entry IDs. `kala.notifications_omitted`,
 `kala.ids_omitted` and `kala.entries_omitted` report exactly how many elements were
 omitted. The bookmark, transaction number, totals and counters are retained.
 This ensures a durable commit still returns SUCCESS. Fetch complete history with
@@ -716,8 +714,10 @@ request can't make every writer replay the log.
 | `--acknowledge-recovery` | false | Cut a world's damaged last transaction without an operator (see "Damaged tails") |
 
 Durations accept `ms`, `s`, `m` or bare seconds. Native defaults live in
-`ServerConfig`. Each transaction accepts at most 256 forms, retains at most
-16 MiB of write text, and observes the existing Datalog per-form limits.
+`ServerConfig`. Each transaction accepts at most 256 forms. The 16 MiB transaction budget
+includes write text and, for Cypher, parameters and the estimated memory for
+expanded primitive operations and their reports. Datalog also observes its
+per-form limits.
 Materialized write records are capped at 16 MiB per RUN. Socket messages remain
 bounded by `max_message_bytes` and `max_depth`. The idle clock starts when a
 response has been sent and stops when the next request has arrived: a statement

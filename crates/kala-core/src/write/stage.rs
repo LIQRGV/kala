@@ -490,6 +490,23 @@ impl Stager {
         self.state.remaining_bytes
     }
 
+    /// Conservative admission cost of retaining this expanded statement until
+    /// its transaction ends. This accounts for 128 bytes of form metadata,
+    /// 512 bytes per native operation (including no-ops), and four copies
+    /// of its charged name/value bytes for replay, fact data and indexes.
+    /// In-memory transactions need no replay log; changed facts still carry
+    /// the same cost there. SET includes both requested and held values.
+    pub fn retained_bytes(&self) -> usize {
+        let payload = crate::MAX_ENTRY_BYTES - self.state.remaining_bytes;
+        self.report.ops.iter().zip(&self.report.spans).fold(
+            128usize.saturating_add(payload.saturating_mul(4)),
+            |total, (op, span)| {
+                let primitives = span.len().max(op.changed).max(1);
+                total.saturating_add(primitives.saturating_mul(512))
+            },
+        )
+    }
+
     /// Finish this statement without committing the caller's transaction.
     pub fn finish(self) -> StagedWrite {
         self.report
@@ -630,6 +647,13 @@ fn stage_set(
         None
     };
     let stored_attr = inverse.as_deref().unwrap_or(attr);
+    if state.bounded_statement {
+        // A read or inference may survive even when the difference is empty.
+        state.charge(attr.len())?;
+        if inverse.is_some() {
+            state.charge(stored_attr.len())?;
+        }
+    }
     if let Some(v) = wanted.values().next() {
         tx.infer_write_attribute(stored_attr, v, Op::Assert)
             .map_err(Failure::Store)?;
@@ -700,6 +724,10 @@ fn stage_set(
     let changes = removed.len().saturating_add(wanted.len());
     if changes > state.remaining {
         return Err(state.operation_limit());
+    }
+    if state.bounded_statement {
+        // Each individual native write owns the attribute name in its replay log.
+        state.charge(stored_attr.len().saturating_mul(changes))?;
     }
     let mut changed = 0;
     for (op, value) in removed

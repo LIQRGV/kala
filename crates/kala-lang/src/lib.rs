@@ -82,36 +82,20 @@ pub fn classify(
     text: &str,
     refuse: &dyn Fn(&str) -> bool,
 ) -> Result<Statement, LangError> {
-    if front_end.name() == "datalog" {
-        return kala_datalog::form_kind(text)
-            .map(|kind| match kind {
-                kala_datalog::FormKind::Query => Statement::Query,
-                kala_datalog::FormKind::Write => Statement::Writes,
-            })
-            .map_err(|e| LangError {
-                kind: ErrorKind::Syntax,
-                message: e.to_string(),
-            });
-    }
-    match kala_cypher::parse_statement(text).map_err(cypher_error)? {
-        kala_cypher::ast::Statement::Write(statement) => {
-            if statement.attributes().iter().any(|a| refuse(a)) {
-                return Err(LangError::refused());
-            }
-            Ok(Statement::CypherWrite(Box::new(statement)))
-        }
-        kala_cypher::ast::Statement::Concurrency(mode) => Ok(Statement::Concurrency(mode)),
-        kala_cypher::ast::Statement::Read(query) => {
-            Ok(match Cypher::server(text, &query, refuse)? {
-                Some(statement) => Statement::Server(Box::new(statement)),
-                None => Statement::Query,
-            })
-        }
-    }
+    front_end.classify(text, refuse)
 }
 
 /// A query language Kala parses: parse, refuse attributes in the AST, compile.
 pub trait FrontEnd: Sync {
+    /// Classify a complete RUN without opening a world. Read-only front-ends
+    /// may supply server metadata through the existing preparation hook.
+    fn classify(&self, text: &str, refuse: &dyn Fn(&str) -> bool) -> Result<Statement, LangError> {
+        Ok(match self.prepare_server(text, refuse)? {
+            Some(statement) => Statement::Server(Box::new(statement)),
+            None => Statement::Query,
+        })
+    }
+
     /// Recognize and prepare a pure server-metadata pipeline without world I/O.
     /// None means ordinary world preparation. The refusal hook still covers
     /// every parsed expression, even when a projection would drop it.
@@ -150,6 +134,18 @@ pub fn refuse_nothing(_attribute: &str) -> bool {
 pub struct Datalog;
 
 impl FrontEnd for Datalog {
+    fn classify(&self, text: &str, _refuse: &dyn Fn(&str) -> bool) -> Result<Statement, LangError> {
+        kala_datalog::form_kind(text)
+            .map(|kind| match kind {
+                kala_datalog::FormKind::Query => Statement::Query,
+                kala_datalog::FormKind::Write => Statement::Writes,
+            })
+            .map_err(|e| LangError {
+                kind: ErrorKind::Syntax,
+                message: e.to_string(),
+            })
+    }
+
     fn name(&self) -> &'static str {
         "datalog"
     }
@@ -214,6 +210,24 @@ impl Cypher {
 }
 
 impl FrontEnd for Cypher {
+    fn classify(&self, text: &str, refuse: &dyn Fn(&str) -> bool) -> Result<Statement, LangError> {
+        match kala_cypher::parse_statement(text).map_err(cypher_error)? {
+            kala_cypher::ast::Statement::Write(statement) => {
+                if statement.attributes().iter().any(|a| refuse(a)) {
+                    return Err(LangError::refused());
+                }
+                Ok(Statement::CypherWrite(Box::new(statement)))
+            }
+            kala_cypher::ast::Statement::Concurrency(mode) => Ok(Statement::Concurrency(mode)),
+            kala_cypher::ast::Statement::Read(query) => {
+                Ok(match Cypher::server(text, &query, refuse)? {
+                    Some(statement) => Statement::Server(Box::new(statement)),
+                    None => Statement::Query,
+                })
+            }
+        }
+    }
+
     fn prepare_server(
         &self,
         text: &str,
