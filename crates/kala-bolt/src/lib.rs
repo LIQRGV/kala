@@ -12,6 +12,9 @@ mod registry;
 mod server;
 mod session;
 pub mod transport;
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use server::OpenCounts;
 pub use server::{Server, ServerConfig};
 
 // The `system` database lives in kala-system; `crate::system` names it here.

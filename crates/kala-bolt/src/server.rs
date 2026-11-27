@@ -83,6 +83,21 @@ pub struct Server {
     registry: Arc<Registry>,
     auth: Arc<dyn Authenticator>,
 }
+/// Test hook: see [`Server::open_counts`].
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub struct OpenCounts(Arc<Registry>);
+#[cfg(feature = "test-hooks")]
+impl OpenCounts {
+    /// How often the shared read snapshot of `db` was replayed.
+    pub fn reader(&self, db: &str) -> usize {
+        self.0.opens(db).0
+    }
+    /// How often a writable handle of `db` was replayed.
+    pub fn writer(&self, db: &str) -> usize {
+        self.0.opens(db).1
+    }
+}
 type TransportWrapper = dyn Fn(Box<dyn Transport>) -> Box<dyn Transport> + Send + Sync;
 
 struct Client {
@@ -234,6 +249,13 @@ impl Server {
             registry,
             auth,
         })
+    }
+    /// Test hook: a counter of how often each kind of handle of a database
+    /// was replayed from its file, readable while the server runs.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn open_counts(&self) -> OpenCounts {
+        OpenCounts(Arc::clone(&self.registry))
     }
     /// Actual bound endpoints, in configuration order.
     pub fn local_addrs(&self) -> io::Result<Vec<ListenAddr>> {

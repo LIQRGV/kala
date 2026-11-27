@@ -13,12 +13,17 @@ pub(crate) const STORE: &str = "Neo.DatabaseError.General.UnknownError";
 pub(crate) struct Failure {
     pub code: &'static str,
     pub message: String,
+    /// The store error behind this failure left its world handle unusable
+    /// (see `write::leaves_handle_unusable`): whoever caches that handle
+    /// must reopen it. Never sent to the client.
+    pub handle_lost: bool,
 }
 impl Failure {
     pub fn new(code: &'static str, message: impl AsRef<str>) -> Self {
         Self {
             code,
             message: escape(message.as_ref()),
+            handle_lost: false,
         }
     }
     pub fn invalid() -> Self {

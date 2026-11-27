@@ -38,7 +38,12 @@ fn accounts(dir: &std::path::Path) {
     }
 }
 
-fn server_with(mut config: ServerConfig) -> Running {
+fn server_with(config: ServerConfig) -> Running {
+    counted_server(config).0
+}
+
+/// A server and the counters of how often it replayed a world's log.
+fn counted_server(mut config: ServerConfig) -> (Running, kala_bolt::OpenCounts) {
     let dir = tempfile::tempdir().unwrap();
     drop(kala_fixture::load_fixture_to(VARROW, &dir.path().join("varrow.kala")).unwrap());
     drop(kala_fixture::load_fixture_to(VARROW, &dir.path().join("other.kala")).unwrap());
@@ -46,7 +51,8 @@ fn server_with(mut config: ServerConfig) -> Running {
     config.listen = vec!["127.0.0.1:0".parse().unwrap()];
     config.default_db = Some("varrow".into());
     let server = Server::bind_accounts(dir.path(), config).unwrap();
-    Running::from_server(dir, server)
+    let counts = server.open_counts();
+    (Running::from_server(dir, server), counts)
 }
 
 fn server() -> Running {
@@ -353,4 +359,108 @@ fn any_other_request_after_a_transaction_expired_gets_the_timeout_failure() {
         assert_eq!(client.query(client::ALLIES).len(), 2);
     }
     assert!(world(&server).entity_by_handle("expired_here").is_none());
+}
+
+// ---------------------------------------------------------------- D
+
+#[test]
+fn a_failed_write_keeps_the_cached_writer_and_a_diverged_log_reopens_it() {
+    let (server, counts) = counted_server(ServerConfig::default());
+    let path = server.dir.path().join("varrow.kala");
+    let original = std::fs::read(&path).unwrap();
+    let mut client = Client::ready(&server);
+    write(&mut client, "[:assert :greg :alias \"First\" :at 300]");
+    assert_eq!(counts.writer("varrow"), 1);
+    // Ordinary client errors: none of them damages the handle, so none may
+    // cost the next writer a replay of the whole log.
+    for bad in [
+        "[:assert :nobody_here :alias \"x\" :at 300]",
+        "[:retract :greg :alias \"First\" :at 300]",
+        "[:assert :greg :alias 7 :at 300]",
+        "[:assert :greg :alias \"ok\" :at 301] [:assert :greg",
+        "[:create :CHARACTER :greg]",
+    ] {
+        send_run(&mut client, &datalog(bad), map(&[]));
+        let failure = any_failure(&mut client);
+        assert!(
+            code(&failure).starts_with("Neo.ClientError."),
+            "{failure:?}"
+        );
+        client.reset();
+    }
+    let mut reader = login(&server, "reader");
+    send_run(&mut reader, WRITE, map(&[]));
+    reader.failure(FORBIDDEN);
+    write(&mut client, "[:assert :greg :alias \"Second\" :at 300]");
+    assert_eq!(
+        counts.writer("varrow"),
+        1,
+        "a client error must not drop the cached writer"
+    );
+    // Another process replaced the log: this handle's history is gone, so
+    // it is reopened and the retry works on the new file.
+    std::fs::write(&path, &original).unwrap();
+    send_run(&mut client, WRITE, map(&[]));
+    let failure = any_failure(&mut client);
+    assert!(transient(&failure), "{failure:?}");
+    client.reset();
+    write(&mut client, "[:assert :greg :alias \"Third\" :at 300]");
+    assert_eq!(counts.writer("varrow"), 2);
+    let greg = world(&server).entity_by_handle("greg").unwrap();
+    let held = world(&server)
+        .as_of(greg, "alias", kala_core::Tick(300))
+        .unwrap();
+    assert!(held.contains(&kala_core::Value::Str("Third".into())));
+    assert!(!held.contains(&kala_core::Value::Str("Second".into())));
+}
+
+#[test]
+fn sequential_auto_commit_writes_replay_the_log_once_not_once_per_write() {
+    let (server, counts) = counted_server(ServerConfig::default());
+    let mut client = Client::ready(&server);
+    let mut bookmark = None;
+    for n in 0..12 {
+        // Each write names the previous one's bookmark, as a driver session
+        // does: the check must not cost a replay either.
+        let extra = bookmark
+            .take()
+            .map_or_else(|| map(&[]), |b| map(&[("bookmarks", Value::List(vec![b]))]));
+        client.run(
+            &datalog(&format!("[:assert :greg :alias \"Write {n}\" :at 300]")),
+            map(&[]),
+            extra,
+        );
+        let (_, summary) = client.pull(-1);
+        bookmark = Some(summary["bookmark"].clone());
+    }
+    assert_eq!(counts.writer("varrow"), 1);
+    assert_eq!(
+        counts.reader("varrow"),
+        0,
+        "an auto-commit write must not reload the reader snapshot"
+    );
+    // A bookmark from the future is still refused after the bounded wait.
+    let start = Instant::now();
+    send_run(
+        &mut client,
+        WRITE,
+        map(&[(
+            "bookmarks",
+            Value::List(vec![string("kala:varrow:999999999")]),
+        )]),
+    );
+    let failure = any_failure(&mut client);
+    assert!(transient(&failure), "{failure:?}");
+    assert!(text(&failure).contains("bookmark"), "{failure:?}");
+    assert!(start.elapsed() < Duration::from_secs(8));
+    client.reset();
+    // And a reader given the last write's bookmark sees it: one reload.
+    send_run(
+        &mut client,
+        ALIASES,
+        map(&[("bookmarks", Value::List(vec![bookmark.unwrap()]))]),
+    );
+    client.success();
+    assert!(client.pull(-1).0.contains(&vec![string("Write 11")]));
+    assert_eq!(counts.reader("varrow"), 1);
 }

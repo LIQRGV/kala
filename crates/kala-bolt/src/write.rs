@@ -22,6 +22,24 @@ pub(crate) const MAX_STAGED_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) fn timeout() -> Failure {
     Failure::new(TIMEOUT, "transaction timed out; nothing was written")
 }
+/// Whether a handle that reported `error` must be reopened before it can
+/// write again. Everything else (a store rule, a conflict, a held lock, a
+/// deadline, a transaction that failed or was dropped) leaves the `World`
+/// valid: see `OwnedTxn::commit` and `Txn` in kala-core. The registry's
+/// cached writer is dropped only for these, because reopening replays the
+/// whole log while the database's writer mutex is held.
+pub(crate) fn leaves_handle_unusable(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::LogDiverged
+            | Error::Corrupt(_)
+            | Error::Io { .. }
+            | Error::BadMagic
+            | Error::UnsupportedVersion(_)
+            | Error::RecoveryRequired { .. }
+            | Error::RecoveryUnacknowledged
+    )
+}
 pub(crate) fn store_error(error: Error, read: bool) -> Failure {
     let (code, message) = match &error {
         Error::WorkInterrupted { reason: kala_core::WorkInterruptReason::Stopped } => return timeout(),
@@ -34,14 +52,16 @@ pub(crate) fn store_error(error: Error, read: bool) -> Failure {
         Error::SameTickConflict { .. } | Error::TxnKeyConflict { .. } | Error::DuplicateHandle(_) | Error::HandleTypeMismatch { .. } => (CONSTRAINT, error.to_string()),
         _ => (SEMANTIC, error.to_string()),
     };
-    Failure::new(
+    let mut failure = Failure::new(
         code,
         if read || matches!(code, LOCK | STORE) {
             message
         } else {
             "write failed; details require read privilege".into()
         },
-    )
+    );
+    failure.handle_lost = leaves_handle_unusable(&error);
+    failure
 }
 pub(crate) fn write_error(error: write::WriteError, read: bool) -> Failure {
     match error.cause {

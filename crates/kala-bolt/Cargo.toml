@@ -3,6 +3,11 @@ name = "kala-bolt"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Test-only observation points (how often a world was opened); never enabled
+# by another crate.
+test-hooks = []
+
 [lints]
 workspace = true
 
@@ -15,6 +20,8 @@ kala-lang = { path = "../kala-lang" }
 kala-system = { path = "../kala-system" }
 
 [dev-dependencies]
+# The crate's own tests use the test hooks.
+kala-bolt = { path = ".", features = ["test-hooks"] }
 kala-fixture = { path = "../kala-fixture" }
 tempfile = "3.27.0"
 proptest = "1.12.0"

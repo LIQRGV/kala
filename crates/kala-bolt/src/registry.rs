@@ -17,6 +17,11 @@ struct Database {
     /// (peak memory stays at about two snapshots, not one per connection).
     loading: Mutex<()>,
     writer: Mutex<Option<World>>,
+    /// How often the reader snapshot was replayed from the file, and how
+    /// often a writable handle was. Each is a replay of the whole log, so
+    /// tests pin how many a sequence of requests may cost.
+    reader_opens: AtomicUsize,
+    writer_opens: AtomicUsize,
 }
 
 /// What a cached snapshot was loaded from. The length alone is not enough:
@@ -74,6 +79,12 @@ fn stamp(path: &Path) -> Result<Stamp, Failure> {
         tail,
     })
 }
+fn bookmark_unavailable() -> Failure {
+    Failure::new(
+        crate::write::CONFLICT,
+        "bookmark is not available within the busy timeout",
+    )
+}
 /// Whether a registry serves the reserved `system` database.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SystemDb {
@@ -95,46 +106,98 @@ impl Drop for WriteSlot {
     }
 }
 impl Registry {
-    /// Cached writers are borrowed only during staging/commit, never client I/O.
+    /// `(reader, writer)`: how often each kind of handle of `name` was
+    /// replayed from its file.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn opens(&self, name: &str) -> (usize, usize) {
+        let db = &self.databases[name];
+        (
+            db.reader_opens.load(Ordering::Relaxed),
+            db.writer_opens.load(Ordering::Relaxed),
+        )
+    }
+    /// Runs `f` on the database's cached writable handle, caught up with
+    /// the file and holding at least tx `at_least` (a bookmark; 0 for none).
+    ///
+    /// The handle is borrowed only while one statement stages and commits,
+    /// never across client I/O. It is opened on first use and kept: an
+    /// ordinary failed write (a store rule, a conflict, a syntax error in a
+    /// later form) leaves it valid, and only an error that breaks the handle
+    /// (`write::leaves_handle_unusable`, or a failed catch-up) drops it, so
+    /// that a client repeating a bad request can't make every writer replay
+    /// the log under this mutex.
+    ///
+    /// A bookmark the file hasn't reached yet is waited for, up to `busy`,
+    /// with the mutex released between looks. The reader snapshot is not
+    /// touched: a write neither needs nor refreshes it.
     pub fn write<R>(
         &self,
         name: &str,
         busy: Duration,
+        at_least: u64,
         f: impl FnOnce(&mut World) -> Result<R, Failure>,
     ) -> Result<R, Failure> {
         self.require(name)?;
         let db = &self.databases[name];
         let until = Instant::now() + busy;
         let mut cached = loop {
+            let mut cached = Self::lock_writer(db, until)?;
+            if cached.is_none() {
+                *cached = Some(self.open_writer(name, busy)?);
+            }
+            let world = cached.as_mut().ok_or_else(Failure::invalid)?;
+            world.set_busy_timeout(busy);
+            if let Err(error) = world.catch_up() {
+                *cached = None;
+                return Err(crate::write::store_error(error, true));
+            }
+            if world.latest_tx().0 >= at_least {
+                break cached;
+            }
+            drop(cached);
+            if Instant::now() >= until {
+                return Err(bookmark_unavailable());
+            }
+            std::thread::sleep(
+                Duration::from_millis(5).min(until.saturating_duration_since(Instant::now())),
+            );
+        };
+        let result = f(cached.as_mut().ok_or_else(Failure::invalid)?);
+        if result.as_ref().is_err_and(|failure| failure.handle_lost) {
+            *cached = None;
+        }
+        result
+    }
+    /// The database's writer slot, waiting for another statement until
+    /// `until`. A poisoned mutex (a session thread panicked while it held
+    /// the writer) is recovered by discarding the handle that thread was
+    /// using: the next statement rebuilds one from the log, which is the
+    /// source of truth, instead of the database refusing writes until the
+    /// server restarts.
+    fn lock_writer(
+        db: &Database,
+        until: Instant,
+    ) -> Result<std::sync::MutexGuard<'_, Option<World>>, Failure> {
+        loop {
             match db.writer.try_lock() {
-                Ok(lock) => break lock,
-                Err(std::sync::TryLockError::Poisoned(_)) => {
-                    return Err(Failure::new(crate::error::STORE, "writer unavailable"));
+                Ok(lock) => return Ok(lock),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    let mut lock = poisoned.into_inner();
+                    *lock = None;
+                    db.writer.clear_poison();
+                    return Ok(lock);
                 }
                 Err(std::sync::TryLockError::WouldBlock) if Instant::now() < until => {
-                    std::thread::sleep(Duration::from_millis(2))
+                    std::thread::sleep(Duration::from_millis(2));
                 }
-                Err(_) => {
+                Err(std::sync::TryLockError::WouldBlock) => {
                     return Err(crate::write::store_error(
                         kala_core::Error::WorldLocked,
                         true,
                     ));
                 }
             }
-        };
-        if cached.is_none() {
-            *cached = Some(self.open_writer(name, busy)?);
         }
-        let world = cached.as_mut().ok_or_else(Failure::invalid)?;
-        world.set_busy_timeout(busy);
-        let result = world
-            .catch_up()
-            .map_err(|e| crate::write::store_error(e, true))
-            .and_then(|_| f(world));
-        if result.is_err() {
-            *cached = None;
-        }
-        result
     }
     pub fn open_writer(&self, name: &str, busy: Duration) -> Result<World, Failure> {
         self.require(name)?;
@@ -146,6 +209,9 @@ impl Registry {
         }
         let path = &self.databases[name].path;
         stamp(path)?;
+        self.databases[name]
+            .writer_opens
+            .fetch_add(1, Ordering::Relaxed);
         let world =
             World::open_waiting(path, busy).map_err(|e| crate::write::store_error(e, true))?;
         if crate::system::is_system(&world) {
@@ -175,10 +241,7 @@ impl Registry {
                 return Ok(world);
             }
             if Instant::now() >= deadline {
-                return Err(Failure::new(
-                    crate::write::CONFLICT,
-                    "bookmark is not available within the busy timeout",
-                ));
+                return Err(bookmark_unavailable());
             }
             std::thread::sleep(
                 Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now())),
@@ -208,6 +271,8 @@ impl Registry {
                         cached: Mutex::new(None),
                         loading: Mutex::new(()),
                         writer: Mutex::new(None),
+                        reader_opens: AtomicUsize::new(0),
+                        writer_opens: AtomicUsize::new(0),
                     },
                 );
             } else {
@@ -285,6 +350,7 @@ impl Registry {
         {
             return Ok((name.into(), Arc::clone(world)));
         }
+        db.reader_opens.fetch_add(1, Ordering::Relaxed);
         let world = Arc::new(World::open_read_only(&db.path).map_err(Failure::store)?);
         // Content, not a filename, identifies privileged worlds. A renamed
         // system file must never become readable using an ordinary read grant.
@@ -297,5 +363,91 @@ impl Registry {
         );
         *lock()? = Some((stamp, Arc::clone(&world)));
         Ok((name.into(), world))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registry() -> (tempfile::TempDir, Registry) {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = include_str!("../../kala-core/tests/fixtures/varrow.yaml");
+        drop(kala_fixture::load_fixture_to(fixture, &dir.path().join("varrow.kala")).unwrap());
+        let registry = Registry::open(dir.path(), None, SystemDb::Skip).unwrap();
+        (dir, registry)
+    }
+
+    #[test]
+    fn a_poisoned_writer_mutex_is_recovered_by_reopening_the_writer() {
+        let (_dir, registry) = registry();
+        let busy = Duration::from_secs(1);
+        registry.write("varrow", busy, 0, |_| Ok(())).unwrap();
+        let panicked = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    registry.write("varrow", busy, 0, |_| -> Result<(), Failure> {
+                        panic!("a session thread panicked while holding the writer")
+                    })
+                })
+                .join()
+        });
+        assert!(panicked.is_err());
+        assert!(registry.databases["varrow"].writer.is_poisoned());
+        // The handle the panic interrupted is discarded, not trusted; the
+        // next write rebuilds one from the log and the database stays
+        // writable without a restart.
+        let tx = registry
+            .write("varrow", busy, 0, |world| {
+                let greg = world.entity_by_handle("greg").unwrap();
+                let mut tx = world.begin();
+                tx.assert(
+                    greg,
+                    "alias",
+                    kala_core::Value::Str("After the panic".into()),
+                    Some(kala_core::Tick(300)),
+                )
+                .unwrap();
+                Ok(tx.commit().unwrap().tx)
+            })
+            .unwrap();
+        assert_eq!(registry.opens("varrow").1, 2);
+        assert!(!registry.databases["varrow"].writer.is_poisoned());
+        registry.write("varrow", busy, tx.0, |_| Ok(())).unwrap();
+        assert_eq!(registry.opens("varrow").1, 2);
+    }
+
+    #[test]
+    fn only_errors_that_break_the_handle_drop_the_cached_writer() {
+        use kala_core::Error;
+        for (error, lost) in [
+            (Error::LogDiverged, true),
+            (Error::Corrupt("x".into()), true),
+            (Error::BadMagic, true),
+            (Error::UnsupportedVersion(9), true),
+            (Error::RecoveryUnacknowledged, true),
+            (Error::WorldLocked, false),
+            (Error::TransactionAborted, false),
+            (Error::DuplicateHandle("greg".into()), false),
+            (Error::UnknownAttribute("nope".into()), false),
+        ] {
+            assert_eq!(
+                crate::write::leaves_handle_unusable(&error),
+                lost,
+                "{error:?}"
+            );
+            let (_dir, registry) = registry();
+            let busy = Duration::from_secs(1);
+            let failed = registry.write("varrow", busy, 0, |_| -> Result<(), Failure> {
+                Err(crate::write::store_error(error.clone(), true))
+            });
+            assert!(failed.is_err());
+            registry.write("varrow", busy, 0, |_| Ok(())).unwrap();
+            assert_eq!(
+                registry.opens("varrow").1,
+                1 + usize::from(lost),
+                "{error:?}"
+            );
+        }
     }
 }

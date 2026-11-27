@@ -942,19 +942,13 @@ impl Session<'_> {
             }
         } else {
             let deadline = self.started + options.timeout;
-            self.registry.at_least(
-                db,
-                options.bookmark,
-                self.config
-                    .busy_timeout
-                    .min(deadline.saturating_duration_since(Instant::now())),
-            )?;
             let mut summary = write::Summary::new(self.config.max_message_bytes);
             self.registry.write(
                 db,
                 self.config
                     .busy_timeout
                     .min(deadline.saturating_duration_since(Instant::now())),
+                options.bookmark,
                 |world| {
                     let mut committed = 0;
                     for (index, form) in forms.enumerate() {
