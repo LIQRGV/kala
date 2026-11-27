@@ -780,19 +780,22 @@ impl Session<'_> {
                 if let Some(tx) = &mut self.transaction {
                     tx.server_statement = true;
                 }
-                query::until(stop, deadline, |cancel| {
+                query::until(deadline, |deadline| {
                     let rows = crate::metadata::rows(
                         &statement.request,
                         self.registry,
                         identity,
                         &self.advertised_address,
-                        cancel,
+                        stop,
                     )?;
                     query::run_server(
                         &statement,
                         rows,
                         params,
-                        cancel,
+                        query::Stop {
+                            flag: stop,
+                            deadline,
+                        },
                         self.config.max_message_bytes,
                         self.config.max_depth,
                         system,
@@ -811,7 +814,7 @@ impl Session<'_> {
                     self.id
                 );
                 let output = if let Some(tx) = &mut self.transaction {
-                    let output = query::run_until(
+                    let output = query::run(
                         tx.world(),
                         text,
                         params,
@@ -834,7 +837,7 @@ impl Session<'_> {
                         options.bookmark,
                         self.config.busy_timeout.min(options.timeout),
                     )?;
-                    query::run_until(
+                    query::run(
                         &world,
                         text,
                         params,

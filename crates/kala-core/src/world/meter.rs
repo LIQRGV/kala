@@ -17,6 +17,8 @@ pub struct WorkMeter<'a> {
     pub(super) limit: Option<AtomicU64>,
     stop: Option<&'a AtomicBool>,
     deadline: Option<std::time::Instant>,
+    /// Reads counted since the clock was last looked at (see `count`).
+    polls: AtomicU64,
     interrupted: AtomicU8,
     // ID walks also need a bound when their prefix seeks find no keys.
     // Kept separate to preserve historical index-key accounting.
@@ -24,8 +26,17 @@ pub struct WorkMeter<'a> {
     id_limit: Option<u64>,
 }
 
+/// How many counted reads share one look at the clock.
+const CLOCK_EVERY: u64 = 64;
+
 impl<'a> WorkMeter<'a> {
     /// Stop reads at an absolute deadline, in addition to work/cancellation limits.
+    ///
+    /// [`WorkMeter::check`] compares the clock every time it is called.
+    /// While a read counts keys, the clock is looked at for the first key
+    /// and then for every 64th, so a deadline costs a long scan next to
+    /// nothing and still stops it within a few dozen keys (the stop flag
+    /// is read for every key, as before).
     pub fn with_deadline(mut self, deadline: Option<std::time::Instant>) -> Self {
         self.deadline = deadline;
         self
@@ -76,17 +87,24 @@ impl<'a> WorkMeter<'a> {
         self.keys.swap(0, AtomicOrdering::Relaxed)
     }
 
-    /// Report a latched interruption or a currently set stop flag.
+    /// Report a latched interruption, a currently set stop flag or a
+    /// deadline that has passed.
     pub fn check(&self) -> Result<(), Error> {
+        self.poll(true)
+    }
+
+    /// [`WorkMeter::check`], comparing the clock only if `clock`.
+    fn poll(&self, clock: bool) -> Result<(), Error> {
         let reason = self.interrupted.load(AtomicOrdering::Relaxed);
         let reason = if reason != 0 {
             reason
         } else if self
             .stop
             .is_some_and(|flag| flag.load(AtomicOrdering::Relaxed))
-            || self
-                .deadline
-                .is_some_and(|at| std::time::Instant::now() >= at)
+            || (clock
+                && self
+                    .deadline
+                    .is_some_and(|at| std::time::Instant::now() >= at))
         {
             self.interrupted.store(2, AtomicOrdering::Relaxed);
             2
@@ -107,7 +125,13 @@ impl<'a> WorkMeter<'a> {
             count.fetch_add(n, AtomicOrdering::Relaxed);
             return true;
         }
-        if self.check().is_err() {
+        // Reading the clock costs about as much as examining a key.
+        let clock = self.deadline.is_some()
+            && self
+                .polls
+                .fetch_add(1, AtomicOrdering::Relaxed)
+                .is_multiple_of(CLOCK_EVERY);
+        if self.poll(clock).is_err() {
             return false;
         }
         let before = count.fetch_add(n, AtomicOrdering::Relaxed);

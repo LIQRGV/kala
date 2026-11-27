@@ -54,3 +54,26 @@ fn cumulative_summary_details_are_bounded_before_final_encoding() {
     };
     assert_eq!(retained + usize::try_from(*omitted).unwrap(), 256 * 100);
 }
+
+/// A request's deadline is carried into the executor's own cancellation
+/// checks; no helper thread watches the clock. (A thread per query costs
+/// every read, and `spawn` panics when the OS refuses a thread.) A thread
+/// that is not started can't be observed from a test, so this pins the
+/// source: the request path names no thread API.
+#[test]
+fn the_request_path_spawns_no_thread() {
+    for (file, source) in [
+        ("query.rs", include_str!("query.rs")),
+        ("session.rs", include_str!("session.rs")),
+        ("metadata.rs", include_str!("metadata.rs")),
+    ] {
+        for api in [
+            "thread::scope",
+            "thread::spawn",
+            "thread::Builder",
+            ".spawn(",
+        ] {
+            assert!(!source.contains(api), "{file} uses {api}");
+        }
+    }
+}

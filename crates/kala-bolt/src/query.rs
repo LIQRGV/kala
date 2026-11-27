@@ -8,6 +8,7 @@ use kala_core::{
 use kala_query::{Datum, Limits, ParamKind, QueryError, QueryParams};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::AtomicBool;
+use std::time::Instant;
 
 pub(crate) struct Output {
     pub fields: Vec<String>,
@@ -16,6 +17,9 @@ pub(crate) struct Output {
     pub exposes: VecDeque<bool>,
     pub reads: crate::reads::Reads,
 }
+/// Prepares and runs a query. `stop` (server shutdown) and `deadline` (the
+/// request's or its transaction's) both end it early; past the deadline the
+/// answer is the timeout failure.
 pub(crate) fn run(
     world: &World,
     text: &str,
@@ -23,6 +27,20 @@ pub(crate) fn run(
     stop: &AtomicBool,
     max_message: usize,
     max_depth: usize,
+    deadline: Instant,
+) -> Result<Output, Failure> {
+    until(deadline, |deadline| {
+        run_inner(world, text, given, stop, max_message, max_depth, deadline)
+    })
+}
+fn run_inner(
+    world: &World,
+    text: &str,
+    given: &Map,
+    stop: &AtomicBool,
+    max_message: usize,
+    max_depth: usize,
+    deadline: Instant,
 ) -> Result<Output, Failure> {
     let source = crate::language::detect(text)?;
     let front_end = source.front_end;
@@ -46,11 +64,21 @@ pub(crate) fn run(
         world,
         &prepared,
         params,
-        stop,
+        Stop {
+            flag: stop,
+            deadline,
+        },
         max_message,
         max_depth,
         system,
     )
+}
+/// What ends a run early: the server's shutdown flag and the request's
+/// deadline.
+#[derive(Clone, Copy)]
+pub(crate) struct Stop<'a> {
+    pub flag: &'a AtomicBool,
+    pub deadline: Instant,
 }
 /// Prepare adapter requests through the language seam; no query-text matching here.
 pub(crate) fn server_statement(
@@ -68,7 +96,7 @@ pub(crate) fn run_server(
     statement: &kala_lang::ServerStatement,
     rows: Vec<Datum>,
     given: &Map,
-    stop: &AtomicBool,
+    stop: Stop<'_>,
     max_message: usize,
     max_depth: usize,
     system: bool,
@@ -101,7 +129,7 @@ fn execute(
     world: &World,
     prepared: &kala_query::Prepared,
     params: QueryParams,
-    stop: &AtomicBool,
+    stop: Stop<'_>,
     max_message: usize,
     max_depth: usize,
     system: bool,
@@ -111,11 +139,14 @@ fn execute(
         world,
         &prepared.plan,
         &params,
-        kala_query::RunOptions::new(limits).with_cancel(stop),
+        kala_query::RunOptions::new(limits)
+            .with_cancel(stop.flag)
+            .with_deadline(stop.deadline),
     )
     .map(|(rs, _)| rs)
     .map_err(query_error)?;
-    let meter = WorkMeter::bounded(limits.max_steps, Some(stop));
+    let meter =
+        WorkMeter::bounded(limits.max_steps, Some(stop.flag)).with_deadline(Some(stop.deadline));
     let view = world.at_canon(result.canon).metered(&meter);
     let mut budget = Budget {
         bytes: 0,
@@ -578,64 +609,19 @@ fn graph_value(datum: &Datum) -> bool {
     }
 }
 
-/// The query engine already checks a cancellation flag in scans and operators.
-/// A joined watchdog supplies the transaction deadline without a detached task.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_until(
-    world: &World,
-    text: &str,
-    given: &Map,
-    stop: &AtomicBool,
-    max_message: usize,
-    max_depth: usize,
-    deadline: std::time::Instant,
-) -> Result<Output, Failure> {
-    until(stop, deadline, |cancel| {
-        run(world, text, given, cancel, max_message, max_depth)
-    })
-}
-
+/// Runs `run` under a deadline: it gets the deadline to hand to whatever
+/// can stop early (the executor checks it where it checks the cancel flag,
+/// see `kala_query::RunOptions::with_deadline`), and a result that arrives
+/// after the deadline is the timeout failure whatever it was. No thread
+/// watches the clock.
 pub(crate) fn until<T>(
-    stop: &AtomicBool,
-    deadline: std::time::Instant,
-    run: impl FnOnce(&AtomicBool) -> Result<T, Failure>,
+    deadline: Instant,
+    run: impl FnOnce(Instant) -> Result<T, Failure>,
 ) -> Result<T, Failure> {
-    use std::sync::{Condvar, Mutex, atomic::Ordering};
-    use std::time::{Duration, Instant};
-    let cancel = AtomicBool::new(false);
-    let done = Mutex::new(false);
-    let wake = Condvar::new();
-    std::thread::scope(|scope| {
-        scope.spawn(|| {
-            let Ok(mut finished) = done.lock() else {
-                cancel.store(true, Ordering::Relaxed);
-                return;
-            };
-            while !*finished {
-                if Instant::now() >= deadline || stop.load(Ordering::Relaxed) {
-                    cancel.store(true, Ordering::Relaxed);
-                    return;
-                }
-                let Ok((guard, _)) = wake.wait_timeout(
-                    finished,
-                    Duration::from_millis(5)
-                        .min(deadline.saturating_duration_since(Instant::now())),
-                ) else {
-                    cancel.store(true, Ordering::Relaxed);
-                    return;
-                };
-                finished = guard;
-            }
-        });
-        let result = run(&cancel);
-        if let Ok(mut finished) = done.lock() {
-            *finished = true;
-            wake.notify_all();
-        }
-        if Instant::now() >= deadline {
-            Err(crate::write::timeout())
-        } else {
-            result
-        }
-    })
+    let result = run(deadline);
+    if Instant::now() >= deadline {
+        Err(crate::write::timeout())
+    } else {
+        result
+    }
 }
