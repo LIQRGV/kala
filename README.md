@@ -39,7 +39,8 @@ The name means "time" in Sanskrit, Javanese and Indonesian.
 
 ## Build
 
-Needs Rust 1.89 or later (edition 2024).
+Needs Rust 1.89 or later (edition 2024) and a C compiler: the TLS crypto
+provider (`ring`) compiles C and assembly at build time.
 
 ```sh
 cargo build --release -p kala-cli     # the `kala` binary

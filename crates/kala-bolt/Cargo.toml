@@ -22,8 +22,6 @@ kala-system = { path = "../kala-system" }
 
 # Blocking TLS over the Bolt transport seam; ring avoids an aws-lc/cmake build.
 rustls = { version = "0.23.46", default-features = false, features = ["std", "ring", "tls12"] }
-# Validate the configured certificate chain's DER and the leaf's validity dates.
-x509-parser = { version = "0.18.1", default-features = false }
 
 [dev-dependencies]
 # Fresh self-signed certificates for the transport conformance suite.

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 mod config;
+mod der;
 pub use config::TlsReloader;
 
 pub(super) struct Tls {

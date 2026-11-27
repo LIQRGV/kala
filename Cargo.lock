@@ -539,7 +539,6 @@ dependencies = [
  "rustix",
  "rustls",
  "tempfile",
- "x509-parser",
 ]
 
 [[package]]
