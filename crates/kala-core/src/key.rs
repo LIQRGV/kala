@@ -156,6 +156,18 @@ fn e_value_part_len(rest: &[u8]) -> Result<usize, ValueError> {
 /// Length of every `R` key: `R|target|attr|source|^tick|^tx`.
 pub(crate) const R_KEY_LEN: usize = 1 + 8 + 4 + 8 + SUFFIX_LEN;
 
+/// Length of the entity prefix shared by forward-key and reverse-key layouts.
+pub(crate) const ENTITY_PREFIX_LEN: usize = 1 + 8;
+
+/// The attribute in a stored forward or reverse history prefix.
+pub(crate) fn history_attribute(prefix: &[u8]) -> Option<AttrId> {
+    let bytes = prefix
+        .get(ENTITY_PREFIX_LEN..E_ATTR_PREFIX_LEN)?
+        .try_into()
+        .ok()?;
+    Some(AttrId(u32::from_be_bytes(bytes)))
+}
+
 /// Length of `E|entity|attr|`, the part before the value.
 pub(crate) const E_ATTR_PREFIX_LEN: usize = 1 + 8 + 4;
 

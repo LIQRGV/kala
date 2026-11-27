@@ -543,3 +543,60 @@ kala query varrow.kala --lang cypher "MATCH p = (e {kala_handle: 'edwin'})-[:all
 
 Variable-length patterns require an upper bound of at most 10 hops. Exceeding a
 query resource limit reports an error rather than a partial result.
+
+## Move Greg and import a character with Cypher
+
+Save this statement in `move.cypher` and run it on the Varrow fixture.
+
+```cypher
+MATCH (g {kala_handle:'greg'}), (a {kala_handle:'ashford'})
+SET g.located_in = a AT TICK 225;
+```
+
+```sh
+kala transact --lang cypher varrow.kala move.cypher
+```
+
+At tick 225 Greg leaves Varrow and enters Ashford. The two changes produce
+no overlap warning. Running it again reports zero changes.
+
+Save the following import in `import.cypher`. The permanent handle makes
+it safe to run the file again.
+
+```cypher
+MERGE (n:CHARACTER {kala_handle:'kael2'})
+ON CREATE SET n.name = 'Kael' AT TICK 700;
+```
+
+```sh
+kala transact --lang cypher varrow.kala import.cypher
+```
+
+The first run creates the character and asserts the name. The second finds
+the character and appends nothing.
+
+## Write through a Neo4j driver
+
+With `kala serve worlds --default-db varrow`, a local bootstrap root account can
+use `auth=None`; other accounts need a `write` grant (and `read` for `:set`).
+Send Datalog write text with the first-line prefix and no parameters:
+
+```python
+from neo4j import GraphDatabase
+
+with GraphDatabase.driver("bolt://localhost:7687", auth=None) as driver:
+    with driver.session(database="varrow") as session:
+        result = session.run('// kala:datalog\n[:assert :greg :alias "Ned" :at 300]')
+        print(result.data())
+        print(result.consume().metadata["kala"])
+```
+
+Use `session.execute_write(callback)` for an optimistic transaction that the
+driver can retry, or `begin_transaction()` followed by `commit()`/`rollback()`.
+Queries within a transaction read its starting snapshot, so they do not see its
+own staged writes. Several write forms within one transaction do see each
+other's created handles. See the [driver tests](e2e/test_python_driver.py) for
+executable write, retry, bookmark and rollback examples, and the
+[Bolt README](crates/kala-bolt/README.md#writing-and-transactions) for permissions
+and result fields. This Python example is covered by the driver suite rather
+than the Rust `guide.rs` CLI tests.

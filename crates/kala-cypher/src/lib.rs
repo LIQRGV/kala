@@ -4,8 +4,10 @@ mod compile;
 mod error;
 mod lex;
 mod parse;
+pub mod write;
 pub use error::{CypherError, ErrorKind};
 pub use kala_query::{ParamKind, Prepared};
+pub use lex::statements;
 /// Maximum UTF-8 query size, matching Datalog.
 pub const MAX_QUERY_BYTES: usize = 64 * 1024;
 /// Maximum expression nesting.
@@ -14,6 +16,18 @@ pub const MAX_DEPTH: usize = 32;
 pub const MAX_PATTERNS: usize = 256;
 /// Parse a supported Cypher read query.
 pub fn parse(text: &str) -> Result<ast::Query, CypherError> {
+    match parse_statement(text)? {
+        ast::Statement::Read(query) => Ok(query),
+        _ => Err(CypherError::new(
+            text,
+            0,
+            ErrorKind::Syntax,
+            "write statements require kala transact --lang cypher",
+        )),
+    }
+}
+/// Parse one complete statement before opening a writer or checking privileges.
+pub fn parse_statement(text: &str) -> Result<ast::Statement, CypherError> {
     parse::parse(text)
 }
 /// Parse and compile against the world's schema.

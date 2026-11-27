@@ -208,9 +208,15 @@ pub struct SchemaArgs {
 pub struct ServeArgs {
     /// Directory containing <database>.kala world files.
     pub dir: PathBuf,
-    /// Repeatable: IP:port, bolt://HOST:port, or unix:///absolute/path (no DNS).
+    /// Repeatable: IP:port, bolt://HOST:port, bolt+s://HOST:port, or unix:///absolute/path (no DNS).
     #[arg(long, default_value = "127.0.0.1:7687")]
     pub listen: Vec<String>,
+    /// PEM certificate chain for every bolt+s:// listener, leaf first.
+    #[arg(long = "tls.cert", value_name = "FILE")]
+    pub tls_cert: Option<PathBuf>,
+    /// Unencrypted PEM private key for that certificate.
+    #[arg(long = "tls.key", value_name = "FILE")]
+    pub tls_key: Option<PathBuf>,
     /// Unix socket permissions in octal; other-write requires an explicit mode.
     #[arg(long = "unix.mode", default_value = "0600", value_parser = crate::cmd::serve::unix_mode)]
     pub unix_mode: u32,
@@ -231,6 +237,27 @@ pub struct ServeArgs {
     /// Seconds allowed to receive a complete message.
     #[arg(long, default_value_t = 600)]
     pub idle_timeout: u64,
+    /// Refuse every write (transactions may still read).
+    #[arg(long)]
+    pub read_only: bool,
+    /// Let the server cut a world's damaged last transaction to a quarantine
+    /// file by itself and go on writing, instead of refusing writes until an
+    /// operator runs a write command with this flag. Entry IDs of a cut
+    /// transaction are issued again. Never applies to `system`.
+    #[arg(long)]
+    pub acknowledge_recovery: bool,
+    /// Maximum open explicit write transactions (default: 8).
+    #[arg(long)]
+    pub max_write_transactions: Option<usize>,
+    /// Maximum transaction lifetime (default: 60s).
+    #[arg(long, value_parser = parse_busy_timeout)]
+    pub tx_timeout: Option<Duration>,
+    /// Maximum time between transaction messages (default: 30s).
+    #[arg(long, value_parser = parse_busy_timeout)]
+    pub tx_idle_timeout: Option<Duration>,
+    /// Maximum wait for a world writer or bookmark (default: 5s).
+    #[arg(long, value_parser = parse_busy_timeout)]
+    pub busy_timeout: Option<Duration>,
 }
 
 // `kala user`.
@@ -422,6 +449,9 @@ pub struct QueryArgs {
 // `kala transact`.
 #[derive(Debug, Args)]
 pub struct TransactArgs {
+    /// Language of the transaction file. A Cypher file has one transaction per statement.
+    #[arg(long, default_value = "datalog", value_parser = crate::cmd::language::NAMES, conflicts_with = "create")]
+    pub lang: String,
     /// Replay a dump into a new world, preserving its genesis.
     #[arg(long, conflicts_with_all = ["dry_run", "acknowledge_recovery"])]
     pub create: bool,

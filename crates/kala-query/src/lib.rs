@@ -25,6 +25,7 @@ pub use ir::{
 mod prepared;
 pub use prepared::{ParamKind, Prepared};
 
+pub mod reads;
 pub mod rows;
 pub use rows::{
     BagAggregate, BagFn, Expr, MAX_VAR_LENGTH, Orientation, OutputSpec, RowAction, RowFn,

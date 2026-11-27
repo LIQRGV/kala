@@ -8,7 +8,7 @@ before last week's retcon?
 The name means "time" in Sanskrit, Javanese and Indonesian.
 
 > **Status: early.** The storage engine, terminal writes, the REPL and Datalog work.
-> Read-only Bolt 5 access supports a Cypher read subset and Datalog through Neo4j drivers.
+> Bolt 5 supports Cypher and Datalog reads, writes and explicit transactions through Neo4j drivers.
 > Gremlin is not built yet. The
 > on-disk format may still change without migration.
 
@@ -39,7 +39,8 @@ The name means "time" in Sanskrit, Javanese and Indonesian.
 
 ## Build
 
-Needs Rust 1.89 or later (edition 2024).
+Needs Rust 1.89 or later (edition 2024) and a C compiler: the TLS crypto
+provider (`ring`) compiles C and assembly at build time.
 
 ```sh
 cargo build --release -p kala-cli     # the `kala` binary
@@ -95,12 +96,12 @@ The server defaults to account authentication. First startup creates
 `worlds/system.kala` with `root@localhost`, a loopback-only `trust` account,
 so the example's `auth=None` works locally. Use `kala user set worlds
 root@localhost --password-stdin` to switch root to a password, and `kala user`
-to manage per-database grants. Password accounts use Argon2id; non-loopback
-listeners require `--insecure-allow-plaintext` until TLS is available.
-`--auth none` remains a loopback-only development option. The server is read-only.
+to manage per-database grants. Password accounts use Argon2id. Use a
+`bolt+s://` listener with `--tls.cert` and `--tls.key` for remote connections.
+Non-loopback plaintext listeners require `--insecure-allow-plaintext`.
+`--auth none` remains a loopback-only development option. Use `--read-only` to refuse writes; `--auth none` grants read access only.
 Changes committed by `kala transact` become visible on the next query.
-Ctrl-C (SIGINT) or SIGTERM stops the server cleanly. Cypher reads and routing are supported; explicit transactions,
-Neo4j Browser and writes over Bolt are not supported yet. See the
+Ctrl-C (SIGINT) or SIGTERM stops the server cleanly. Cypher and Datalog share the native transaction path for writes over Bolt. See the
 [Bolt support and limits](crates/kala-bolt/README.md) and the opt-in
 [driver E2E tests](e2e/README.md).
 
@@ -187,10 +188,10 @@ The native Rust API (`kala-core`) can also write directly. See
 | `kala-fixture` | The YAML fixture loader |
 | `kala-query` | A language-neutral query IR and executor, with row, step and memory budgets |
 | `kala-datalog` | The Datalog parser, compiler and planner |
-| `kala-cypher` | Cypher read parser and compiler to the same IR |
+| `kala-cypher` | Cypher parser and compiler to shared query and write primitives |
 | `kala-lang` | One `FrontEnd` interface over the query languages |
 | `kala-system` | The `system` database: accounts, privileges, password hashing, database names |
-| `kala-bolt` | Read-only Bolt 5 server, authentication boundary and driver value mapping |
+| `kala-bolt` | Bolt 5 server, transactions, authentication boundary and driver value mapping |
 | `kala-cli` | The `kala` command-line tool |
 
 ## Roadmap
@@ -209,8 +210,11 @@ The native Rust API (`kala-core`) can also write directly. See
 - [x] Shared write applier, Datalog `:set` / `:if-missing`, bounded commit warnings and write-privilege groundwork (slice 15a)
 - [x] Shared Bolt transport seam, multiple listeners and Unix sockets (slice 16)
 - [x] Several writers on one world: writer lock per commit with a busy timeout, log catch-up, chained checksums (log format 6), optimistic conflict detection with an explicit weak mode, `--concurrency` / `--busy-timeout` and a conflict exit code (slice 15b)
-- [ ] Writes over Bolt and explicit transactions (slices 15c–15d)
+- [x] Datalog writes over Bolt and explicit transactions (slice 15c)
+- [x] Cypher CREATE, SET, REMOVE, DELETE, DETACH DELETE and handle-based MERGE over Bolt and the CLI (slice 15 complete)
 - [ ] Web clients (WebSocket and remaining Browser stubs), then Gremlin when requested
 - [x] Accounts, host matching, Argon2id passwords and database privileges
-- [ ] TLS for encrypted Bolt connections
+- [x] TLS for encrypted Bolt connections, with certificate reload on SIGUSR1 (slice 17)
 - [ ] On-disk indexes with checkpoints
+
+After slices 11–17, Kala is a complete database for its purpose.

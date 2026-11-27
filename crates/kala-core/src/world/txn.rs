@@ -195,9 +195,21 @@ pub enum TickOccupant {
 #[derive(Debug)]
 pub struct Txn<'w> {
     pub(super) world: &'w mut World,
+    /// Everything the transaction staged, recorded and read.
+    pub(super) s: TxnState,
+}
+
+/// What a transaction holds besides its world: the staged entries, the
+/// recorded operations and reads, its settings. A [`Txn`] borrows a world
+/// and owns one of these; an [`OwnedTxn`](super::OwnedTxn) keeps one next to
+/// the world it owns between borrows, so both forms run the same code on
+/// the same state.
+#[derive(Debug)]
+pub(super) struct TxnState {
     /// The world's latest tick when the transaction began: the tick of a
     /// write with no tick of its own and no transaction default.
     pub(super) base_tick: Tick,
+    pub(super) deadline: Option<std::time::Instant>,
     default_tick: Option<Tick>,
     /// The tx this transaction commits as. Fixed at begin: the `Txn` holds
     /// the world mutably, so no other commit can take it first.
@@ -208,10 +220,15 @@ pub struct Txn<'w> {
     pub(super) staged: Index,
     /// The staged entries in write order: the order of their log entries.
     pub(super) entries: Vec<Staged>,
+    /// For each entity, the `(source, attribute)` of every staged entry
+    /// whose ref value points at it (duplicates removed): the staged side of
+    /// the `R` index, so a read of "what points at X" costs what it finds
+    /// instead of a walk of every staged entry.
+    pub(super) incoming: BTreeMap<EntityId, std::collections::BTreeSet<(EntityId, AttrId)>>,
     /// Entities created and edges interned by this transaction.
     pub(super) ids: StagedIds,
     /// Set by the first failed write; the transaction then applies nothing.
-    poisoned: bool,
+    pub(super) poisoned: bool,
     pub(super) schema_before: Option<SchemaSnapshot>,
     pub(super) schema_changes: Vec<SchemaChange>,
     pub(super) order: Vec<OrderedEntry>,
@@ -238,8 +255,18 @@ pub struct Txn<'w> {
     pub(super) snapshot: Snapshot,
     /// Whether a write fell back to `base_tick`.
     pub(super) used_base_tick: Cell<bool>,
+    /// [`Txn::set_read_version`]: the reads were made on the world as of
+    /// this tx, older than the snapshot, so the commit's read-set check
+    /// covers every transaction after it.
+    pub(super) read_version: Option<TxId>,
+    /// [`Txn::set_schema_additions_only`].
+    pub(super) additions_only: bool,
+    /// [`Txn::set_unknown_settings_allowed`].
+    pub(super) unknown_settings: bool,
     /// A read was made under [`Concurrency::Weak`], which records none.
     pub(super) unrecorded_reads: Cell<bool>,
+    /// Inside [`Txn::without_read_recording`]: reads record nothing.
+    pub(super) reads_muted: Cell<bool>,
     /// A replay regenerating what a committed transaction staged (a
     /// migration's copy): nothing of it is written, so the world's write
     /// gate (read-only, unacknowledged recovery, failed log) isn't asked.
@@ -247,6 +274,34 @@ pub struct Txn<'w> {
 }
 
 impl Txn<'_> {
+    /// Bound staging and the start of durable append by an absolute deadline.
+    /// Expiry returns `Error::WorkInterrupted` with `WorkInterruptReason::Stopped`.
+    /// The deadline survives reborrowing and commit finalization. It bounds the
+    /// writer-lock wait and is checked before append; an append already started
+    /// is completed durably and reported as success.
+    pub fn set_deadline(&mut self, deadline: std::time::Instant) {
+        self.s.deadline = Some(deadline);
+    }
+
+    /// The caller's deadline, if one was supplied.
+    pub fn deadline(&self) -> Option<std::time::Instant> {
+        self.s.deadline
+    }
+
+    pub(super) fn check_deadline(&self) -> Result<(), Error> {
+        if self
+            .s
+            .deadline
+            .is_some_and(|at| std::time::Instant::now() >= at)
+        {
+            Err(Error::WorkInterrupted {
+                reason: WorkInterruptReason::Stopped,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
     /// Find a handle of the requested type, or stage a new entity. The returned
     /// boolean says whether a definition was staged. Type mismatches poison the
     /// transaction just like ordinary duplicate-handle errors.
@@ -305,16 +360,23 @@ impl Txn<'_> {
         max_bytes: usize,
         meter: &WorkMeter<'_>,
     ) -> Result<HeldValues, Error> {
-        if self.poisoned {
+        if self.s.poisoned {
             return Err(Error::TransactionAborted);
         }
-        let resolved = self.world.catalog.resolve(&self.ids, entity, attr);
-        let (attr_id, def) = self.or_absent(attr, resolved)?;
+        let resolved = self
+            .world
+            .catalog
+            .resolve_neighbor_attr(attr, Direction::Out);
+        let (attr_id, direction) = self.or_absent(attr, resolved)?;
+        if !self.world.catalog.is_defined_staged(&self.s.ids, entity) {
+            return Err(Error::UnknownEntity(entity));
+        }
+        let def = &self.world.catalog.attributes[attr_id.0 as usize];
         // The read `[:set …]` decides from: a newer entry on this entity
         // and attribute invalidates it.
-        self.note_key(entity, attr_id, attr, true);
+        self.note_key(entity, attr_id, &def.name, direction.reads_out());
         let work = Work(Some(meter));
-        let layers = [&self.world.indexes.e_index, &self.staged];
+        let layers = [&self.world.indexes.e_index, &self.s.staged];
         let mut values = BTreeMap::new();
         let mut bytes = 0usize;
         let mut error = None;
@@ -348,7 +410,8 @@ impl Txn<'_> {
             let part = &prefix[key::E_ATTR_PREFIX_LEN..];
             let encoding = if def.value_type == ValueType::Str && !def.indexed {
                 key::ValueRef::from_key_bytes(part).and_then(|r| {
-                    self.ids
+                    self.s
+                        .ids
                         .values
                         .resolve(r)
                         .or_else(|| self.world.indexes.values.resolve(r))
@@ -360,17 +423,19 @@ impl Txn<'_> {
                 keep(encoding);
             }
         };
-        let prefix = key::e_attr_prefix(entity, attr_id);
-        for index in layers {
-            index::for_each_history(
-                index,
-                &prefix,
-                |k| key::E_ATTR_PREFIX_LEN + key::e_value_bytes(k).map_or(0, |v| v.len()),
-                work,
-                &mut read,
-            );
+        if direction.reads_out() {
+            let prefix = key::e_attr_prefix(entity, attr_id);
+            for index in layers {
+                index::for_each_history(
+                    index,
+                    &prefix,
+                    |k| key::E_ATTR_PREFIX_LEN + key::e_value_bytes(k).map_or(0, |v| v.len()),
+                    work,
+                    &mut read,
+                );
+            }
         }
-        if self.world.catalog.is_bidirectional(attr_id) {
+        if direction.reads_in() || self.world.catalog.is_bidirectional(attr_id) {
             // Committed reverse histories identify partners. Judge their E keys
             // against both layers so staged retracts/corrections are visible.
             let mut reverse = |source: EntityId| {
@@ -394,13 +459,12 @@ impl Txn<'_> {
                     }
                 },
             );
-            for entry in &self.entries {
+            for (source, attr) in self.s.incoming.get(&entity).into_iter().flatten() {
                 if !work.add(1) {
                     break;
                 }
-                let (fact, _) = entry.key_and_mark();
-                if fact.attr == attr_id && fact.target == Some(entity) {
-                    reverse(fact.entity);
+                if *attr == attr_id {
+                    reverse(*source);
                 }
             }
         }
@@ -426,7 +490,7 @@ impl Txn<'_> {
         meter: &WorkMeter<'_>,
     ) -> Result<Option<TickOccupant>, Error> {
         let fact = self.world.prepare_fact(
-            &self.ids,
+            &self.s.ids,
             FactRequest {
                 entity,
                 attr,
@@ -444,12 +508,13 @@ impl Txn<'_> {
             meter.check()?;
         }
         if self
+            .s
             .staged
             .scan_from(&prefix)
             .next()
             .is_some_and(|(k, _)| k.starts_with(&prefix))
         {
-            for (position, entry) in self.entries.iter().enumerate().rev() {
+            for (position, entry) in self.s.entries.iter().enumerate().rev() {
                 if !work.add(1) {
                     meter.check()?;
                 }
@@ -530,9 +595,9 @@ impl Txn<'_> {
 
     /// Resolve an optional tick using the transaction's stable defaults.
     pub fn write_tick(&self, tick: Option<Tick>) -> Tick {
-        tick.or(self.default_tick).unwrap_or_else(|| {
+        tick.or(self.s.default_tick).unwrap_or_else(|| {
             self.note_base_tick();
-            self.base_tick
+            self.s.base_tick
         })
     }
     /// The tick [`Txn::write_tick`] resolves `tick` to, without counting as
@@ -541,15 +606,32 @@ impl Txn<'_> {
     /// operation), which must not raise the commit's
     /// [`TickMoved`](crate::TickMoved) warning.
     pub fn report_tick(&self, tick: Option<Tick>) -> Tick {
-        tick.or(self.default_tick).unwrap_or(self.base_tick)
+        tick.or(self.s.default_tick).unwrap_or(self.s.base_tick)
+    }
+    /// Says that this transaction **started at latest tick `tick`**: the
+    /// tick its tick-less writes land on (after the write's own tick and
+    /// [`Txn::set_default_tick`]), in place of the latest tick of the world
+    /// its handle began on.
+    ///
+    /// For a caller whose transaction began before its handle did: a
+    /// server session pins a read snapshot at `BEGIN` and opens its
+    /// writable handle at the first write, and the latest tick a
+    /// transaction uses is the one taken when the transaction starts. If
+    /// the world's latest tick is another one when the transaction commits
+    /// and a tick-less write used this one, the commit says so
+    /// ([`CommitResult::latest_tick_moved`]), exactly as for a commit that
+    /// moved it while the transaction ran. Set it before the first write:
+    /// writes already made keep the tick they resolved to.
+    pub fn set_start_tick(&mut self, tick: Tick) {
+        self.s.base_tick = tick;
     }
     /// Number of primitive entries staged so far, for language report offsets.
     pub fn staged_entry_count(&self) -> usize {
-        self.entries.len()
+        self.s.entries.len()
     }
     /// Poison the transaction after an adapter error; partial forms cannot commit.
     pub fn abort(&mut self) {
-        self.poisoned = true;
+        self.s.poisoned = true;
     }
     /// Current committed correction target (staged corrections of it are refused).
     /// A read of the entry's chain: under optimistic concurrency a newer
@@ -569,7 +651,7 @@ impl Txn<'_> {
     /// own (`AT TICK` for the transaction). It wins over the world's latest
     /// tick; a write's own tick wins over it.
     pub fn set_default_tick(&mut self, t: Tick) {
-        self.default_tick = Some(t);
+        self.s.default_tick = Some(t);
     }
 
     /// Stages a new entity of the given node type, with an optional handle,
@@ -599,10 +681,10 @@ impl Txn<'_> {
                     let def = txn
                         .world
                         .catalog
-                        .prepare_entity(&txn.ids, node_type, handle)?;
+                        .prepare_entity(&txn.s.ids, node_type, handle)?;
                     let id = def.id;
-                    txn.order.push(OrderedEntry::Entity(txn.ids.defs.len()));
-                    txn.ids.push(def);
+                    txn.s.order.push(OrderedEntry::Entity(txn.s.ids.defs.len()));
+                    txn.s.ids.push(def);
                     Ok(id)
                 })
             },
@@ -616,16 +698,18 @@ impl Txn<'_> {
         &mut self,
         f: impl FnOnce(&mut Self) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        if self.poisoned {
+        if self.s.poisoned {
             return Err(Error::TransactionAborted);
         }
-        let gate = if self.replaying {
+        let gate = if self.s.replaying {
             Ok(())
         } else {
             self.world.writable()
         };
-        let res = gate.and_then(|()| f(self));
-        self.poisoned = res.is_err();
+        let res = gate
+            .and_then(|()| self.check_deadline())
+            .and_then(|()| f(self));
+        self.s.poisoned = res.is_err();
         res
     }
 
@@ -687,12 +771,49 @@ impl Txn<'_> {
         self.write(entity, attr, &v, tick, Op::Retract, Precision::Exact)
     }
 
+    /// Resolve the stored orientation of a relationship name, flipping endpoints
+    /// for an inverse name. An unknown name stays as written for schema inference.
+    pub fn relationship<'a>(
+        &'a self,
+        source: EntityId,
+        attr: &'a str,
+        target: EntityId,
+    ) -> (EntityId, &'a str, EntityId) {
+        if let Some(id) = self.world.catalog.inverse_by_name.get(attr) {
+            (
+                target,
+                &self.world.catalog.attributes[id.0 as usize].name,
+                source,
+            )
+        } else {
+            (source, attr, target)
+        }
+    }
+
+    /// Look up the stored triple for a committed or provisionally interned edge.
+    pub fn edge(&self, id: EdgeId) -> Option<(EntityId, String, EntityId)> {
+        if let Some(triple) = self.world.edge(id) {
+            return Some(triple);
+        }
+        let index = usize::try_from(id.seq().checked_sub(1)?)
+            .ok()?
+            .checked_sub(self.world.catalog.edges.len())?;
+        let edge = self.s.ids.edges.get(index)?;
+        Some((
+            edge.source,
+            self.world.catalog.attr_name(edge.attr)?.to_owned(),
+            edge.target,
+        ))
+    }
+
     /// The edge interned for `(source, attr, target)`, as
     /// [`World::edge_id`] but also seeing edges interned earlier in this
     /// transaction.
     pub fn edge_id(&self, source: EntityId, attr: &str, target: EntityId) -> Option<EdgeId> {
         let attr = *self.world.catalog.attr_by_name.get(attr)?;
-        self.world.catalog.edge_of(&self.ids, source, attr, target)
+        self.world
+            .catalog
+            .edge_of(&self.s.ids, source, attr, target)
     }
 
     /// Resolves the tick, validates, judges against committed + staged
@@ -732,7 +853,7 @@ impl Txn<'_> {
     ) -> Result<WriteResult, Error> {
         self.guard(|txn| {
             let fact = txn.world.prepare_fact(
-                &txn.ids,
+                &txn.s.ids,
                 FactRequest {
                     entity,
                     attr,
@@ -745,7 +866,13 @@ impl Txn<'_> {
                 },
             )?;
             check_entry_size(attr, &fact)?;
-            if judge(&txn.world.indexes.e_index, &txn.staged, &fact, entity, attr)? == Verdict::Noop
+            if judge(
+                &txn.world.indexes.e_index,
+                &txn.s.staged,
+                &fact,
+                entity,
+                attr,
+            )? == Verdict::Noop
             {
                 // Find-then-act: nothing to change, so nothing is staged.
                 return Ok(WriteResult {
@@ -784,10 +911,10 @@ impl Txn<'_> {
     /// before, even if this correction would be a no-op) or at a replaced
     /// fact's new key.
     pub fn correct(&mut self, entry: EntryId, c: Correction) -> Result<WriteResult, Error> {
-        let recorded = self.track.then(|| c.clone());
+        let recorded = self.s.track.then(|| c.clone());
         // The committed chain as this transaction sees it (staging changes
         // nothing committed, so before or after the call is the same).
-        let chain = (self.track && !self.nested)
+        let chain = (self.s.track && !self.s.nested)
             .then(|| self.world.correction_target(entry).ok())
             .flatten()
             .map(|target| (target.base, target.chain.rev));
@@ -825,7 +952,7 @@ impl Txn<'_> {
             // which may swap it with the value.
             let current = &target.fact;
             let new = txn.world.prepare_fact(
-                &txn.ids,
+                &txn.s.ids,
                 FactRequest {
                     entity: current.entity,
                     attr: &attr,
@@ -855,7 +982,7 @@ impl Txn<'_> {
         // Judged against the committed chain: if this transaction already
         // corrected it, that state is stale, so refuse before anything
         // else (a "no-op" against stale state could be a real change).
-        if has_key(&self.staged, current) {
+        if has_key(&self.s.staged, current) {
             return Err(Error::TxnKeyConflict {
                 entity: current.entity,
                 attr: attr.to_owned(),
@@ -917,7 +1044,7 @@ impl Txn<'_> {
         // A moved key: the same-tick rule at the new key, judged at the
         // latest canon plus the staged entries. The hold-based no-op
         // rules don't apply: this changes what canon says, not the story.
-        let layers = [&self.world.indexes.e_index, &self.staged];
+        let layers = [&self.world.indexes.e_index, &self.s.staged];
         let mut prefix = key::e_value_prefix(new.entity, new.attr, new.key_value());
         let there = op_at_tick(&layers, &mut prefix, new.tick, TxId(u64::MAX));
         match there {
@@ -936,7 +1063,7 @@ impl Txn<'_> {
                 Ok(written(1, tick))
             }
             None => {
-                if has_key(&self.staged, &new) {
+                if has_key(&self.s.staged, &new) {
                     return Err(Error::TxnKeyConflict {
                         entity: new.entity,
                         attr,
@@ -964,10 +1091,12 @@ impl Txn<'_> {
             && let Some(edge) =
                 self.world
                     .catalog
-                    .prepare_edge(&self.ids, fact.entity, fact.attr, target)?
+                    .prepare_edge(&self.s.ids, fact.entity, fact.attr, target)?
         {
-            self.order.push(OrderedEntry::Edge(self.ids.edges.len()));
-            self.ids.push_edge(edge);
+            self.s
+                .order
+                .push(OrderedEntry::Edge(self.s.ids.edges.len()));
+            self.s.ids.push_edge(edge);
         }
         Ok(())
     }
@@ -981,12 +1110,25 @@ impl Txn<'_> {
         if let Some(r) = fact.value_ref()
             && self.world.indexes.values.get(&fact.value).is_none()
         {
-            self.ids.values.insert(&fact.value, r);
+            self.s.ids.values.insert(&fact.value, r);
         }
-        let k = key::e_fact_key(fact.entity, fact.attr, fact.key_value(), fact.tick, self.tx);
-        self.staged.insert(k, mark);
-        self.order.push(OrderedEntry::Fact(self.entries.len()));
-        self.entries.push(entry);
+        let k = key::e_fact_key(
+            fact.entity,
+            fact.attr,
+            fact.key_value(),
+            fact.tick,
+            self.s.tx,
+        );
+        self.s.staged.insert(k, mark);
+        if let Some(target) = fact.target {
+            self.s
+                .incoming
+                .entry(target)
+                .or_default()
+                .insert((fact.entity, fact.attr));
+        }
+        self.s.order.push(OrderedEntry::Fact(self.s.entries.len()));
+        self.s.entries.push(entry);
     }
 
     /// Makes every staged entity, write and correction visible as one new
@@ -1082,11 +1224,13 @@ impl Txn<'_> {
     /// The body of [`Txn::commit`]; `warn` selects whether the overlap
     /// warnings diff is computed. Nothing else depends on it.
     pub(super) fn commit_with(mut self, warn: bool) -> Result<CommitResult, Error> {
-        if self.poisoned {
+        if self.s.poisoned {
             return Err(Error::TransactionAborted);
         }
+        self.check_deadline()?;
         self.world.accepts_writes()?;
-        if self.order.is_empty() {
+        if self.s.order.is_empty() {
+            self.validate_older_reads()?;
             return Ok(CommitResult {
                 committed: false,
                 tx: self.world.latest_tx(),
@@ -1104,46 +1248,69 @@ impl Txn<'_> {
         // The writer lock, from here until the log has the transaction (or
         // this returns: the guard releases it on every path, a panic
         // included). `None` only in memory.
-        let held = match self.held.take() {
+        let held = match self.s.held.take() {
             Some(held) => Some(held),
-            None => match self.world.lock_log()? {
-                Some(held) => {
-                    let applied = self.catch_up_under_lock(&held)?;
-                    if applied > 0 {
-                        return self.finalize(held, applied, warn);
-                    }
-                    Some(held)
+            None => {
+                let busy = self.world.busy_timeout();
+                if let Some(deadline) = self.s.deadline {
+                    self.world.set_busy_timeout(
+                        busy.min(deadline.saturating_duration_since(std::time::Instant::now())),
+                    );
                 }
-                None => None,
-            },
+                let locked = self.world.lock_log();
+                self.world.set_busy_timeout(busy);
+                self.check_deadline()?;
+                match locked? {
+                    Some(held) => {
+                        let applied = self.catch_up_under_lock(&held)?;
+                        // Reads made on an older snapshot than the one this
+                        // transaction began on are checked against the
+                        // transactions in between as well, by the same
+                        // path: the world is put back on its committed
+                        // schema and the operations are made again (which,
+                        // with nothing appended since, stages what was
+                        // staged).
+                        if applied > 0 || self.reads_behind() > 0 {
+                            if let Some(before) = self.s.schema_before.take() {
+                                before.restore(&mut self.world.catalog);
+                            }
+                            return self.finalize(held, applied, warn);
+                        }
+                        Some(held)
+                    }
+                    None => None,
+                }
+            }
         };
+        let latest_tick_moved = self.tick_moved(&self.s.ops);
         let encoded = self.encode_ordered()?;
         let scope = self.warning_scope(warn);
         // The staged schema edits were applied provisionally; the world is
         // the committed one again until the log has the transaction.
-        if let Some(before) = self.schema_before.take() {
+        if let Some(before) = self.s.schema_before.take() {
             before.restore(&mut self.world.catalog);
         }
         let before = OverlapsBefore::capture(scope, self.world);
+        self.check_deadline()?;
         self.world.journal.append(held.as_ref(), &encoded)?;
         // Durable: other handles may commit while this one updates its
         // own copy.
         drop(held);
         let entries = self.apply(&encoded);
-        self.world.journal.set_latest_tx(self.tx);
-        self.world.journal.record(encoded.entries, self.tx);
+        self.world.journal.set_latest_tx(self.s.tx);
+        self.world.journal.record(encoded.entries, self.s.tx);
         let warnings = before.warnings(self.world);
         Ok(CommitResult {
             committed: true,
-            tx: self.tx,
-            changed: self.entries.len(),
-            declared: self.schema_changes.len(),
+            tx: self.s.tx,
+            changed: self.s.entries.len(),
+            declared: self.s.schema_changes.len(),
             entries,
-            edges: self.ids.edges.iter().map(|d| d.id).collect(),
+            edges: self.s.ids.edges.iter().map(|d| d.id).collect(),
             warnings,
-            schema: std::mem::take(&mut self.schema_changes),
+            schema: std::mem::take(&mut self.s.schema_changes),
             ids: IdMap::default(),
-            latest_tick_moved: None,
+            latest_tick_moved,
             finalized: None,
         })
     }
@@ -1163,7 +1330,7 @@ impl Txn<'_> {
             return Ok(0);
         };
         if tail.tip.is_some()
-            && let Some(before) = self.schema_before.take()
+            && let Some(before) = self.s.schema_before.take()
         {
             before.restore(&mut self.world.catalog);
         }
@@ -1180,9 +1347,10 @@ impl Txn<'_> {
         // touches (a relabel, rename or migration) needs the whole-world scan;
         // new declarations, node types, deprecations and settings keep the
         // touched-sides diff, which costs what the transaction wrote.
-        let schema_changed = self.schema_before.as_ref().is_some_and(|before| {
+        let schema_changed = self.s.schema_before.as_ref().is_some_and(|before| {
             before.changes_overlaps(&self.world.catalog)
                 || self
+                    .s
                     .order
                     .iter()
                     .any(|e| matches!(e, OrderedEntry::Schema(SchemaEdit::Migration { .. })))
@@ -1196,7 +1364,7 @@ impl Txn<'_> {
         WarningScope::Sides(
             self.world
                 .catalog
-                .touched_side_values(self.entries.iter().map(|e| e.key_and_mark().0)),
+                .touched_side_values(self.s.entries.iter().map(|e| e.key_and_mark().0)),
         )
     }
 
@@ -1207,28 +1375,28 @@ impl Txn<'_> {
     fn apply(&mut self, encoded: &EncodedTxn) -> Vec<EntryId> {
         let mut entries = Vec::new();
         let mut migrating = false;
-        for (ordered, logged) in self.order.iter().zip(&encoded.entries) {
+        for (ordered, logged) in self.s.order.iter().zip(&encoded.entries) {
             match ordered {
                 OrderedEntry::Schema(SchemaEdit::Migration { .. }) => {
                     migrating = true;
                 }
                 OrderedEntry::Schema(edit) => {
                     self.world
-                        .apply_schema_edit(edit, self.tx, migrating)
+                        .apply_schema_edit(edit, self.s.tx, migrating)
                         .expect("invariant: staged schema edit was validated in operation order");
                 }
                 OrderedEntry::Entity(i) => {
-                    let d = &self.ids.defs[*i];
+                    let d = &self.s.ids.defs[*i];
                     self.world.catalog.apply_entity(
                         EntityDef {
                             id: d.id,
                             handle: d.handle.clone(),
                         },
-                        self.tx,
+                        self.s.tx,
                     );
                 }
                 OrderedEntry::Edge(i) => {
-                    let d = &self.ids.edges[*i];
+                    let d = &self.s.ids.edges[*i];
                     self.world.catalog.apply_edge(
                         EdgeDef {
                             id: d.id,
@@ -1236,12 +1404,12 @@ impl Txn<'_> {
                             attr: d.attr,
                             target: d.target,
                         },
-                        self.tx,
+                        self.s.tx,
                     );
                 }
                 OrderedEntry::Fact(i) => {
                     self.world
-                        .apply_staged(&self.entries[*i], logged.id, self.tx);
+                        .apply_staged(&self.s.entries[*i], logged.id, self.s.tx);
                     entries.push(logged.id);
                 }
             }
@@ -1752,19 +1920,27 @@ impl World {
     /// Starts a write transaction on the world as this handle has it,
     /// without looking at the log file.
     pub(super) fn begin_without_catch_up(&mut self) -> Txn<'_> {
+        let s = self.new_txn_state();
+        Txn { world: self, s }
+    }
+
+    /// The state of a transaction that begins on the world as this handle
+    /// has it now.
+    pub(super) fn new_txn_state(&self) -> TxnState {
         let base_tick = self.latest_tick();
         let tx = self.next_tx();
         // Only a file other handles can append to can change under a
         // transaction.
         let track = self.journal.log.is_some();
         let snapshot = Snapshot::of(&self.catalog);
-        Txn {
-            world: self,
+        TxnState {
             base_tick,
+            deadline: None,
             default_tick: None,
             tx,
             staged: OrderedMap::new(),
             entries: Vec::new(),
+            incoming: BTreeMap::new(),
             ids: StagedIds::default(),
             poisoned: false,
             schema_before: None,
@@ -1779,7 +1955,11 @@ impl World {
             ids_exposed: false,
             snapshot,
             used_base_tick: Cell::new(false),
+            read_version: None,
+            additions_only: false,
+            unknown_settings: false,
             unrecorded_reads: Cell::new(false),
+            reads_muted: Cell::new(false),
             replaying: false,
         }
     }
@@ -1799,8 +1979,8 @@ impl World {
         let held = self.lock_and_catch_up()?;
         let mut txn = self.begin_without_catch_up();
         // Under the lock nothing can be appended before the commit.
-        txn.track = held.is_none() && txn.track;
-        txn.held = held;
+        txn.s.track = held.is_none() && txn.s.track;
+        txn.s.held = held;
         Ok(txn)
     }
 }

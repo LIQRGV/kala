@@ -128,6 +128,8 @@ pub struct AccountSummary {
 #[derive(Debug)]
 pub(crate) struct Account {
     id: EntityId,
+    /// See [`Identity::generation`].
+    pub(crate) generation: i64,
     pub(crate) summary: AccountSummary,
     pub(crate) host: HostPattern,
     pub(crate) password: Option<Credentials>,
@@ -138,6 +140,7 @@ impl Account {
             principal: self.summary.user.clone(),
             host: self.summary.host.clone(),
             grants: self.summary.grants.clone(),
+            generation: self.generation,
         }
     }
 }
@@ -369,8 +372,22 @@ pub(crate) fn read_accounts(world: &World) -> Result<Vec<Account>, SystemError> 
             let (privilege, db) = grant.split_once(':').ok_or(SystemError::InvalidSystem)?;
             validate_grant(privilege, db)?;
         }
+        // The account's entity (and handle) is reused when a dropped
+        // account is added again, so the entity is not the account's
+        // identity over time. The tick of its current `user` fact is: a
+        // drop retracts the fact, an add asserts it at a new tick, and
+        // nothing else writes it.
+        let generation = world
+            .history(id, "user")
+            .map_err(store)?
+            .iter()
+            .filter(|change| change.op == kala_core::Op::Assert)
+            .map(|change| change.tick.0)
+            .max()
+            .ok_or(SystemError::InvalidSystem)?;
         accounts.push(Account {
             id,
+            generation,
             summary: AccountSummary {
                 user,
                 host,

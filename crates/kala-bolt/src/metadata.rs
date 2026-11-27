@@ -131,6 +131,7 @@ mod tests {
             principal: "test".into(),
             host: "localhost".into(),
             grants: vec!["read:*".into()],
+            generation: 0,
         };
         for request in [
             ServerRequest::Components,

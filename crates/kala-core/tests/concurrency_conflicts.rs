@@ -1529,3 +1529,49 @@ fn reads_of_an_entity_only_this_transaction_knows_never_conflict() {
     assert_eq!(rb.ids.entities.len(), 1);
     clean(&mut p);
 }
+
+#[test]
+fn reads_made_without_read_recording_never_conflict_and_the_others_still_do() {
+    let look = |t: &Txn<'_>, who: EntityId, attr: &str| {
+        let meter = WorkMeter::bounded(10_000, None);
+        t.values_at(who, attr, Tick(700), 16, 1 << 20, &meter)
+            .unwrap()
+            .values
+    };
+    for recorded in [false, true] {
+        let mut p = pair();
+        let c = p.c;
+        let mut tb = p.b.begin();
+        // A look nothing depends on: the name, a full-entity read and a
+        // name the schema doesn't have.
+        let names = tb.without_read_recording(|t| {
+            t.note_read_entity(c.edwin);
+            assert!(t.note_read(c.edwin, "nickname").is_err());
+            look(t, c.edwin, "name")
+        });
+        assert_eq!(names.len(), 1);
+        // Recording is back on afterwards.
+        if recorded {
+            look(&tb, c.edwin, "name");
+        }
+        tb.assert(c.mara, "tag", s("mine"), Some(Tick(700)))
+            .unwrap();
+        let mut ta = p.a.begin();
+        ta.retract(c.edwin, "name", names[0].clone(), Some(Tick(700)))
+            .unwrap();
+        ta.commit().unwrap();
+        if recorded {
+            let got = conflict(tb.commit());
+            assert_eq!(
+                got.key,
+                ConflictKey::EntityAttribute {
+                    entity: c.edwin,
+                    attr: "name".into()
+                }
+            );
+        } else {
+            assert_eq!(tb.commit().unwrap().changed, 1);
+            clean(&mut p);
+        }
+    }
+}

@@ -141,7 +141,9 @@ impl std::fmt::Display for TickMoved {
 /// ([`CommitResult::finalized`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Finalized {
-    /// How many transactions were committed since this one began.
+    /// How many transactions were committed since this one began (or
+    /// since the older snapshot its reads were made on, see
+    /// [`Txn::set_read_version`]; then possibly none after it began).
     pub applied: usize,
     /// One per operation the transaction made, in order (index =
     /// [`Txn::operation_count`] before the operation).
@@ -171,6 +173,16 @@ pub(super) struct Snapshot {
 }
 
 impl Snapshot {
+    /// Whether the committed schema the transaction began on has `id`.
+    pub(super) fn has_attr(&self, id: AttrId) -> bool {
+        (id.0 as usize) < self.attrs
+    }
+
+    /// Whether the committed schema the transaction began on has `id`.
+    pub(super) fn has_node_type(&self, id: NodeTypeId) -> bool {
+        usize::from(id.0) < self.node_types
+    }
+
     pub(super) fn of(catalog: &Catalog) -> Snapshot {
         Snapshot {
             attrs: catalog.attributes.len(),
@@ -280,6 +292,7 @@ pub(super) struct ReadSet {
     /// `note_read_all`: any newer transaction conflicts.
     all: Option<usize>,
     /// `(entity, attribute)`: a newer entry on that entity and attribute.
+    entities: HashMap<EntityId, usize>,
     entity_attr: HashMap<(EntityId, AttrId), usize>,
     /// `(target, attribute)`: a newer entry whose value is that target.
     reverse: HashMap<(EntityId, AttrId), usize>,
@@ -439,7 +452,8 @@ fn as_fact_or_marker(body: &EntryBody) -> Option<(EntityId, AttrId, &Value)> {
 
 impl ReadSet {
     fn exact_keys(&self) -> usize {
-        self.entity_attr.len()
+        self.entities.len()
+            + self.entity_attr.len()
             + self.reverse.len()
             + self.value_count
             + self.types.len()
@@ -454,6 +468,10 @@ impl ReadSet {
             return;
         }
         self.coarse = true;
+        // An entity read spans every attribute, including future ones.
+        if let Some(at) = self.entities.drain().map(|(_, at)| at).min() {
+            self.read_all(at);
+        }
         let attr = |attrs: &mut HashMap<AttrId, usize>, a: AttrId, at: usize| {
             let first = attrs.entry(a).or_insert(at);
             *first = (*first).min(at);
@@ -598,6 +616,14 @@ impl ReadSet {
                     if let Some(at) = self.attrs.get(attr) {
                         return conflict(ConflictKey::Attribute { attr: name(*attr) }, *at);
                     }
+                    if let Some(at) = self.entities.get(entity) {
+                        return conflict(ConflictKey::Entity { entity: *entity }, *at);
+                    }
+                    if let Value::Ref(target) = value
+                        && let Some(at) = self.entities.get(target)
+                    {
+                        return conflict(ConflictKey::Entity { entity: *target }, *at);
+                    }
                     if let Some(at) = self.entity_attr.get(&(*entity, *attr)) {
                         return conflict(
                             ConflictKey::EntityAttribute {
@@ -652,6 +678,18 @@ impl ReadSet {
                 EntryBody::Schema(SchemaEdit::Attribute { id, .. })
                 | EntryBody::Schema(SchemaEdit::Migration { source: id, .. })
                 | EntryBody::DefineAttr { id, .. } => {
+                    // Renaming or changing an existing property changes its
+                    // rendering. A new attribute has no values on this entity
+                    // unless this tail also contains its corresponding fact.
+                    if !self.entities.is_empty()
+                        && world.catalog.attribute_history[id.0 as usize]
+                            .first()
+                            .is_some_and(|(tx, _)| *tx < first)
+                        && let Some((&entity, &at)) =
+                            self.entities.iter().min_by_key(|(id, at)| (**at, **id))
+                    {
+                        return conflict(ConflictKey::Entity { entity }, at);
+                    }
                     if let Some(at) = self.attr_read(*id) {
                         return conflict(ConflictKey::Attribute { attr: name(*id) }, at);
                     }
@@ -732,19 +770,19 @@ impl Txn<'_> {
     /// A transaction that has read nothing yet changes mode freely.
     pub fn set_concurrency(&mut self, mode: Concurrency) {
         // Only reads that went unrecorded can't be vouched for.
-        if self.concurrency == Concurrency::Weak
+        if self.s.concurrency == Concurrency::Weak
             && mode == Concurrency::Optimistic
-            && self.unrecorded_reads.get()
+            && self.s.unrecorded_reads.get()
         {
-            let at = self.ops.len();
-            self.reads.borrow_mut().read_all(at);
+            let at = self.s.ops.len();
+            self.s.reads.borrow_mut().read_all(at);
         }
-        self.concurrency = mode;
+        self.s.concurrency = mode;
     }
 
     /// This transaction's concurrency mode.
     pub fn concurrency(&self) -> Concurrency {
-        self.concurrency
+        self.s.concurrency
     }
 
     /// Says whether IDs this transaction allocated (created entities,
@@ -755,19 +793,99 @@ impl Txn<'_> {
     /// [`Error::Conflict`] ([`ConflictKey::ExposedId`]) instead, in either
     /// concurrency mode. Off by default.
     pub fn set_ids_exposed(&mut self, exposed: bool) {
-        self.ids_exposed = exposed;
+        self.s.ids_exposed = exposed;
     }
 
     /// Whether [`Txn::set_ids_exposed`] is set.
     pub fn ids_exposed(&self) -> bool {
-        self.ids_exposed
+        self.s.ids_exposed
     }
 
     /// The latest committed tx of the world this transaction began on: its
     /// snapshot. A caller that read the world before [`World::begin`] can
     /// tell from it whether `begin` caught up with newer commits first.
     pub fn snapshot_tx(&self) -> TxId {
-        TxId(self.tx.0 - 1)
+        TxId(self.s.tx.0 - 1)
+    }
+
+    /// Says that what this transaction read (the `note_*` reads recorded so
+    /// far and every later one) was read on the world **as of `tx`**, an
+    /// older snapshot than the one the transaction began on
+    /// ([`Txn::snapshot_tx`]).
+    ///
+    /// The commit's read-set check then covers every transaction committed
+    /// after `tx`, not only those committed after this transaction began:
+    /// under [`Concurrency::Optimistic`], a transaction in `tx + 1 ..=
+    /// snapshot_tx` that wrote through a key this one read fails the commit
+    /// with [`Error::Conflict`] just as one committed later does
+    /// ([`Conflict::applied`] counts them all). Transactions that touched
+    /// nothing it read don't matter, whichever side of the snapshot they
+    /// are on. [`Concurrency::Weak`] checks nothing, as always.
+    ///
+    /// For a caller that read before it had this transaction: a server
+    /// session queries the read snapshot it pinned at `BEGIN` and opens its
+    /// writable handle at the first write, when other transactions may
+    /// have committed. It notes the queries' keys here and names the
+    /// pinned tx.
+    ///
+    /// The version only moves back (the earliest one named wins), and a
+    /// `tx` at or past the snapshot changes nothing. The one version covers
+    /// the transaction's own reads too ([`Txn::values_at`], find-or-create,
+    /// a correction's entry), which were made on the snapshot: they are
+    /// checked from `tx` as well, which can only conflict more often.
+    /// Keys are recorded by name on the snapshot's schema; a name that
+    /// meant something else at `tx` is covered because the schema edit in
+    /// between conflicts with every read of the attribute.
+    pub fn set_read_version(&mut self, tx: TxId) {
+        if tx < self.snapshot_tx() {
+            self.s.read_version = Some(self.s.read_version.map_or(tx, |v| v.min(tx)));
+        }
+    }
+
+    /// How many committed transactions lie between the version this
+    /// transaction's reads were made on ([`Txn::set_read_version`]) and its
+    /// snapshot, if its commit checks reads at all; else 0.
+    pub(super) fn reads_behind(&self) -> usize {
+        if !self.s.track || self.s.concurrency != Concurrency::Optimistic {
+            return 0;
+        }
+        self.s
+            .read_version
+            .map_or(0, |v| (self.snapshot_tx().0.saturating_sub(v.0)) as usize)
+    }
+
+    /// A no-op can serialize on this handle's snapshot only if reads made
+    /// before the handle opened are also valid there. Its committed tail
+    /// is already in memory, so this check needs no lock or filesystem I/O.
+    pub(super) fn validate_older_reads(&self) -> Result<(), Error> {
+        let behind = self.reads_behind();
+        if behind > 0 {
+            self.s
+                .reads
+                .borrow()
+                .check(self.world, TxId(self.s.tx.0 - behind as u64), behind)?;
+        }
+        Ok(())
+    }
+
+    /// The warning of a commit whose tick-less writes landed on the latest
+    /// tick the transaction began with (`ops`: its recorded operations)
+    /// while the world it is committed over has another latest tick.
+    pub(super) fn tick_moved(&self, ops: &[Recorded]) -> Option<TickMoved> {
+        let from = self.s.base_tick;
+        let to = self.world.latest_tick();
+        // A transaction that records operations knows whether a write that
+        // fell back to the base tick was actually made (not only resolved).
+        let used = self.s.used_base_tick.get()
+            && (!self.s.track
+                || ops.iter().any(|r| {
+                    matches!(
+                        r.call,
+                        Call::Write { tick, .. } | Call::InferredWrite { tick, .. }
+                            if tick == from
+                    )
+                }));
+        (used && to != from).then_some(TickMoved { from, to })
     }
 
     /// How many write operations (creates, asserts, retracts, corrections,
@@ -776,7 +894,7 @@ impl Txn<'_> {
     /// [`Conflict::operation`]. Counted only by a transaction on a
     /// file-backed world that didn't take the lock when it began; else 0.
     pub fn operation_count(&self) -> usize {
-        self.ops.len()
+        self.s.ops.len()
     }
 
     /// Records that the transaction read `attr` of `entity` (its values or
@@ -828,7 +946,7 @@ impl Txn<'_> {
         let Some(mut reads) = self.reads() else {
             return Ok(());
         };
-        let at = self.ops.len();
+        let at = self.s.ops.len();
         if self.provisional_attr(attr_id) {
             self.note_new_attr(&mut reads, attr_id, NewAttrKey::Whole);
         } else {
@@ -847,7 +965,7 @@ impl Txn<'_> {
                 .map(|_| ())
                 .ok_or_else(|| Error::UnknownNodeType(node_type.to_owned()));
         };
-        let at = self.ops.len();
+        let at = self.s.ops.len();
         let Some(id) = id else {
             // "No such type" is a read of its absence (no entities of it):
             // a newer declaration of the name invalidates it.
@@ -857,7 +975,7 @@ impl Txn<'_> {
                 .or_insert(at);
             return Err(Error::UnknownNodeType(node_type.to_owned()));
         };
-        if usize::from(id.0) >= self.snapshot.node_types {
+        if usize::from(id.0) >= self.s.snapshot.node_types {
             reads
                 .undeclared_types
                 .entry(node_type.to_owned())
@@ -876,7 +994,7 @@ impl Txn<'_> {
         let Some(mut reads) = self.reads() else {
             return Ok(());
         };
-        let at = self.ops.len();
+        let at = self.s.ops.len();
         if self.provisional_attr(attr_id) {
             self.note_new_attr(&mut reads, attr_id, NewAttrKey::Whole);
         } else {
@@ -885,13 +1003,67 @@ impl Txn<'_> {
         Ok(())
     }
 
-    /// Records that the transaction's writes depend on the whole world (a
-    /// read the other keys can't describe): the commit then conflicts with
-    /// any transaction committed since this one began.
+    /// Record every fact on or pointing to one entity, including new
+    /// attributes. Useful when rendering a full entity or enumerating all
+    /// its incoming and outgoing relationships at a tick.
+    pub fn note_read_entity(&self, entity: EntityId) {
+        let Some(mut reads) = self.reads() else {
+            return;
+        };
+        let at = self.s.ops.len();
+        if self.is_provisional(entity) {
+            if entity.is_edge() {
+                reads
+                    .provisional
+                    .entry(entity)
+                    .or_insert_with(|| (at, "properties".to_owned()));
+            }
+        } else if reads.coarse {
+            reads.read_all(at);
+        } else {
+            reads.entities.entry(entity).or_insert(at);
+            reads.bound();
+        }
+    }
+
+    /// Records a scan of entity definitions or the handle table, including
+    /// future node types. Fact-only commits do not invalidate this read.
+    pub fn note_entity_definitions(&self) {
+        if let Some(mut reads) = self.reads() {
+            reads.any_define.get_or_insert(self.s.ops.len());
+        }
+    }
+
+    /// Records that the transaction's writes depend on the whole world:
+    /// any transaction committed since this one began invalidates this read.
     pub fn note_read_all(&self) {
         if let Some(mut reads) = self.reads() {
-            reads.read_all(self.ops.len());
+            reads.read_all(self.s.ops.len());
         }
+    }
+
+    /// Runs `f` with read recording off: whatever `f` reads through this
+    /// transaction ([`Txn::values_at`], the `note_*` reads, a name found
+    /// undeclared) is not added to the read set, so no newer commit
+    /// conflicts with it, and under [`Concurrency::Weak`] it doesn't count
+    /// as an unrecorded read either. Reads made before and after are
+    /// recorded as always.
+    ///
+    /// Only for a look at the staged state that **nothing depends on**:
+    /// neither what the transaction goes on to write nor anything shown to
+    /// its client before the commit. A server uses it to measure, before an
+    /// auto-commit write is appended, the answer it will render again from
+    /// the committed world afterwards. Using it for a read that decides a
+    /// write gives up serializability for that read.
+    pub fn without_read_recording<R>(&self, f: impl FnOnce(&Self) -> R) -> R {
+        struct Restore<'a>(&'a std::cell::Cell<bool>, bool);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.1);
+            }
+        }
+        let _restore = Restore(&self.s.reads_muted, self.s.reads_muted.replace(true));
+        f(self)
     }
 
     /// The read set, if this transaction records reads: optimistic, on a
@@ -899,21 +1071,21 @@ impl Txn<'_> {
     /// under [`Concurrency::Weak`] is remembered as one that went
     /// unrecorded (see [`Txn::set_concurrency`]).
     fn reads(&self) -> Option<RefMut<'_, ReadSet>> {
-        if !self.track {
+        if !self.s.track || self.s.reads_muted.get() {
             return None;
         }
-        if self.concurrency == Concurrency::Weak {
-            self.unrecorded_reads.set(true);
+        if self.s.concurrency == Concurrency::Weak {
+            self.s.unrecorded_reads.set(true);
             return None;
         }
-        Some(self.reads.borrow_mut())
+        Some(self.s.reads.borrow_mut())
     }
 
     /// Whether the committed schema this transaction began on has `name`,
     /// as an attribute's name or its inverse name. The transaction's own
     /// schema edits (a rename away, a new declaration) don't count.
     fn declared_at_snapshot(&self, name: &str) -> bool {
-        match &self.schema_before {
+        match &self.s.schema_before {
             Some(before) => before.declares(name),
             None => {
                 self.world.catalog.attr_by_name.contains_key(name)
@@ -937,7 +1109,7 @@ impl Txn<'_> {
             .new_attrs
             .entry(def.name.clone())
             .or_insert_with(|| NewAttrRead {
-                at: self.ops.len(),
+                at: self.s.ops.len(),
                 def: Some(def.clone()),
                 whole: false,
                 forward: HashSet::new(),
@@ -947,15 +1119,15 @@ impl Txn<'_> {
     }
 
     fn provisional_attr(&self, attr: AttrId) -> bool {
-        attr.0 as usize >= self.snapshot.attrs
+        attr.0 as usize >= self.s.snapshot.attrs
     }
 
     /// Whether this transaction allocated `id` (an entity it created or an
     /// edge it interned).
-    fn provisional(&self, id: EntityId) -> bool {
+    pub fn is_provisional(&self, id: EntityId) -> bool {
         match id.as_edge() {
-            Some(edge) => edge.seq() > self.snapshot.edges as u64,
-            None => self.ids.created(id),
+            Some(edge) => edge.seq() > self.s.snapshot.edges as u64,
+            None => self.s.ids.created(id),
         }
     }
 
@@ -968,7 +1140,7 @@ impl Txn<'_> {
         name: &str,
         forward: bool,
     ) -> Result<(), Error> {
-        if !self.world.catalog.is_defined_staged(&self.ids, entity) {
+        if !self.world.catalog.is_defined_staged(&self.s.ids, entity) {
             return Err(Error::UnknownEntity(entity));
         }
         self.note_key(entity, attr, name, forward);
@@ -980,8 +1152,8 @@ impl Txn<'_> {
         let Some(mut reads) = self.reads() else {
             return;
         };
-        let at = self.ops.len();
-        if self.provisional(entity) {
+        let at = self.s.ops.len();
+        if self.is_provisional(entity) {
             // Nobody else wrote an entity only this transaction knows,
             // unless it is an edge a newer commit interned too: then the
             // commit merges the two, and the newer commit may have written
@@ -1033,7 +1205,7 @@ impl Txn<'_> {
     /// Records that `handle` was found free.
     pub(super) fn note_free_handle(&self, handle: &str) {
         if let Some(mut reads) = self.reads() {
-            reads.read_handle(handle, self.ops.len());
+            reads.read_handle(handle, self.s.ops.len());
         }
     }
 
@@ -1050,7 +1222,7 @@ impl Txn<'_> {
         if self.declared_at_snapshot(name) {
             return;
         }
-        let at = self.ops.len();
+        let at = self.s.ops.len();
         let read = reads
             .new_attrs
             .entry(name.to_owned())
@@ -1069,14 +1241,14 @@ impl Txn<'_> {
     /// attribute `attr`), which the caller named as `named`.
     pub(super) fn note_chain(&self, base: EntryId, named: EntryId, attr: AttrId) {
         if let Some(mut reads) = self.reads() {
-            reads.read_entry(base, named, attr, self.ops.len());
+            reads.read_entry(base, named, attr, self.s.ops.len());
         }
     }
 
     /// Notes that a write with no tick of its own or the transaction's
     /// landed on the latest tick the transaction began with.
     pub(super) fn note_base_tick(&self) {
-        self.used_base_tick.set(true);
+        self.s.used_base_tick.set(true);
     }
 
     /// Runs one public write operation `f` and, if it succeeds, records it
@@ -1090,15 +1262,15 @@ impl Txn<'_> {
         call: impl FnOnce(&T) -> Call,
         f: impl FnOnce(&mut Self) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        if !self.track || self.nested {
+        if !self.s.track || self.s.nested {
             return f(self);
         }
-        let edges_before = self.ids.edges.len();
-        self.nested = true;
+        let edges_before = self.s.ids.edges.len();
+        self.s.nested = true;
         let result = f(self);
-        self.nested = false;
+        self.s.nested = false;
         if let Ok(value) = &result {
-            let edges = self.ids.edges[edges_before..]
+            let edges = self.s.ids.edges[edges_before..]
                 .iter()
                 .map(|e| {
                     let attr = self.world.catalog.attributes[e.attr.0 as usize]
@@ -1107,7 +1279,7 @@ impl Txn<'_> {
                     (e.id, e.source, attr, e.target)
                 })
                 .collect();
-            self.ops.push(Recorded {
+            self.s.ops.push(Recorded {
                 call: call(value),
                 edges,
             });
@@ -1140,6 +1312,12 @@ impl<'w> Txn<'w> {
         applied: usize,
         warn: bool,
     ) -> Result<CommitResult, Error> {
+        let reads = std::mem::take(&mut *self.s.reads.borrow_mut());
+        let optimistic = self.s.concurrency == Concurrency::Optimistic;
+        // Reads made on an older snapshot ([`Txn::set_read_version`]) are
+        // checked from there on.
+        let behind = self.reads_behind();
+        let applied = applied + behind;
         let conflict = |key: ConflictKey, operation: usize| {
             Error::Conflict(Conflict {
                 key,
@@ -1147,49 +1325,41 @@ impl<'w> Txn<'w> {
                 applied,
             })
         };
-        let reads = std::mem::take(&mut *self.reads.borrow_mut());
-        let optimistic = self.concurrency == Concurrency::Optimistic;
         if optimistic {
-            reads.check(self.world, self.tx, applied)?;
+            let first = TxId(self.s.tx.0 - behind as u64);
+            reads.check(self.world, first, applied)?;
         }
-        let ops = std::mem::take(&mut self.ops);
-        let exposed = self.ids_exposed;
-        let base_tick = self.base_tick;
-        let moved_to = self.world.latest_tick();
-        let tick_moved = (self.used_base_tick.get()
-            && moved_to != base_tick
-            && ops.iter().any(|r| {
-                matches!(
-                    r.call,
-                    Call::Write { tick, .. } | Call::InferredWrite { tick, .. }
-                        if tick == base_tick
-                )
-            }))
-        .then_some(TickMoved {
-            from: base_tick,
-            to: moved_to,
-        });
+        let ops = std::mem::take(&mut self.s.ops);
+        let exposed = self.s.ids_exposed;
+        let base_tick = self.s.base_tick;
+        let tick_moved = self.tick_moved(&ops);
         // The edges every handle knows now: one found among them for a
         // triple this transaction interned is a newer commit's.
         let committed_edges = self.world.catalog.edges.len() as u64;
 
+        let deadline = self.s.deadline;
+        let (additions_only, unknown_settings) = (self.s.additions_only, self.s.unknown_settings);
         let mut fresh = self.world.begin_without_catch_up();
-        fresh.held = Some(held);
-        fresh.track = false;
-        fresh.base_tick = base_tick;
+        fresh.s.deadline = deadline;
+        fresh.s.held = Some(held);
+        fresh.s.track = false;
+        fresh.s.base_tick = base_tick;
+        fresh.s.additions_only = additions_only;
+        fresh.s.unknown_settings = unknown_settings;
         // Provisional ID -> final ID, for every ID this transaction
         // allocated (edges as entity IDs).
         let mut map: HashMap<EntityId, EntityId> = HashMap::new();
         let mut ids = IdMap::default();
         let mut outcomes = Vec::with_capacity(ops.len());
         for (index, recorded) in ops.iter().enumerate() {
+            fresh.check_deadline()?;
             let translate = |id: EntityId| map.get(&id).copied().unwrap_or(id);
             let value_of = |v: &Value| match v {
                 Value::Ref(id) => Value::Ref(translate(*id)),
                 other => other.clone(),
             };
-            let entries_before = fresh.entries.len();
-            let schema_before = fresh.schema_changes.len();
+            let entries_before = fresh.s.entries.len();
+            let schema_before = fresh.s.schema_changes.len();
             let mut outcome = FinalizedOp {
                 changed: 0,
                 declared: 0,
@@ -1367,8 +1537,8 @@ impl<'w> Txn<'w> {
                     ids.edges.push((*provisional, fin));
                 }
             }
-            outcome.changed = fresh.entries.len() - entries_before;
-            outcome.declared = fresh.schema_changes.len() - schema_before;
+            outcome.changed = fresh.s.entries.len() - entries_before;
+            outcome.declared = fresh.s.schema_changes.len() - schema_before;
             outcomes.push(outcome);
         }
         let mut result = fresh.commit_with(warn)?;

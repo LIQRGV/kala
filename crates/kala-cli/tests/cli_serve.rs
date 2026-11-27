@@ -268,3 +268,47 @@ fn two_listeners_print_two_lines() {
     assert_eq!(addresses[1].ip().to_string(), "127.0.0.2");
     assert!(addresses.iter().all(|address| address.port() != 0));
 }
+
+#[test]
+fn serve_help_documents_write_limits_and_read_only_mode() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kala"))
+        .args(["serve", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    for flag in [
+        "--read-only",
+        "--max-write-transactions",
+        "--tx-timeout",
+        "--tx-idle-timeout",
+        "--busy-timeout",
+    ] {
+        assert!(
+            help.contains(flag),
+            "serve help does not document {flag}: {help}"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn serve_accepts_transaction_limit_flags_and_durations() {
+    let server = Process::with_options(
+        "127.0.0.1:0",
+        &[
+            "--read-only",
+            "--max-write-transactions",
+            "2",
+            "--tx-timeout",
+            "3s",
+            "--tx-idle-timeout",
+            "1s",
+            "--busy-timeout",
+            "50ms",
+        ],
+        false,
+    );
+    let (stdout, _) = server.stop();
+    assert!(stdout.starts_with("kala serve: listening on "));
+}
