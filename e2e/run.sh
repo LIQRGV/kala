@@ -24,6 +24,7 @@ cleanup() {
     fi
     if [[ $status -ne 0 ]]; then
         cat "$task_tmp/server.stderr" >&2 2>/dev/null || true
+        cat "$task_tmp/writes/server.stderr" >&2 2>/dev/null || true
     fi
     rm -rf -- "$task_tmp"
     exit "$status"
@@ -35,6 +36,18 @@ export KALA_WORLD="$task_tmp/varrow.kala"
 "$KALA_BINARY" load crates/kala-core/tests/fixtures/varrow.yaml "$task_tmp/hidden.kala" >> "$task_tmp/load.stdout"
 "$KALA_BINARY" user add "$task_tmp" test-user@localhost --trust > "$task_tmp/user.stdout"
 "$KALA_BINARY" user grant "$task_tmp" test-user@localhost read varrow >> "$task_tmp/user.stdout"
+# Keep writes and their accounts on a separate server so every existing read
+# test retains its database list and fixture. The Python suite owns its lifetime.
+export KALA_WRITE_DIR="$task_tmp/writes"
+mkdir "$KALA_WRITE_DIR"
+cp "$KALA_WORLD" "$KALA_WRITE_DIR/varrow.kala"
+for user in writer write-only reader; do
+    "$KALA_BINARY" user add "$KALA_WRITE_DIR" "$user@localhost" --trust >> "$task_tmp/user.stdout"
+done
+"$KALA_BINARY" user grant "$KALA_WRITE_DIR" writer@localhost read varrow >> "$task_tmp/user.stdout"
+"$KALA_BINARY" user grant "$KALA_WRITE_DIR" writer@localhost write varrow >> "$task_tmp/user.stdout"
+"$KALA_BINARY" user grant "$KALA_WRITE_DIR" write-only@localhost write varrow >> "$task_tmp/user.stdout"
+"$KALA_BINARY" user grant "$KALA_WRITE_DIR" reader@localhost read varrow >> "$task_tmp/user.stdout"
 export KALA_SERVER_STDOUT="$task_tmp/server.stdout"
 export KALA_SERVER_STDERR="$task_tmp/server.stderr"
 mkfifo "$task_tmp/ready"
@@ -54,4 +67,4 @@ printf '%s\n' "$ready" > "$KALA_SERVER_STDOUT"
 cat <&"$ready_fd" >> "$KALA_SERVER_STDOUT" &
 stdout_pid=$!
 export KALA_BOLT_URI="bolt://${ready#kala serve: listening on }"
-e2e/.venv/bin/python e2e/test_python_driver.py
+e2e/.venv/bin/python e2e/test_python_driver.py "$@"

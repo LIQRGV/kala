@@ -17,6 +17,7 @@ pub fn run(args: &ServeArgs) -> Result<String, CliError> {
         .iter()
         .map(|s| s.parse::<ListenAddr>().map_err(server_error))
         .collect::<Result<Vec<_>, _>>()?;
+    let defaults = ServerConfig::default();
     let config = ServerConfig {
         listen: addresses.clone(),
         unix_mode: args.unix_mode,
@@ -25,7 +26,14 @@ pub fn run(args: &ServeArgs) -> Result<String, CliError> {
         insecure_allow_plaintext: args.insecure_allow_plaintext,
         max_connections: args.max_connections,
         idle_timeout: Duration::from_secs(args.idle_timeout),
-        ..ServerConfig::default()
+        read_only: args.read_only,
+        max_write_transactions: args
+            .max_write_transactions
+            .unwrap_or(defaults.max_write_transactions),
+        tx_timeout: args.tx_timeout.unwrap_or(defaults.tx_timeout),
+        tx_idle_timeout: args.tx_idle_timeout.unwrap_or(defaults.tx_idle_timeout),
+        busy_timeout: args.busy_timeout.unwrap_or(defaults.busy_timeout),
+        ..defaults
     };
     // Never create the directory, in either auth mode.
     super::user::require_directory(dir)?;

@@ -62,6 +62,39 @@ pub struct ServerStatement {
 }
 pub use kala_query::{DatabaseSelection, ServerRequest};
 
+/// Adapter-level statement classification, before opening a writable handle.
+pub enum Statement {
+    /// An ordinary query.
+    Query,
+    /// A server-supplied metadata table.
+    Server(Box<ServerStatement>),
+    /// One or more Datalog transaction forms, parsed incrementally by `write_forms`.
+    Writes,
+}
+
+/// Classifies prefix-stripped text through its selected front-end.
+pub fn classify(
+    front_end: &dyn FrontEnd,
+    text: &str,
+    refuse: &dyn Fn(&str) -> bool,
+) -> Result<Statement, LangError> {
+    if front_end.name() == "datalog" {
+        return kala_datalog::form_kind(text)
+            .map(|kind| match kind {
+                kala_datalog::FormKind::Query => Statement::Query,
+                kala_datalog::FormKind::Write => Statement::Writes,
+            })
+            .map_err(|e| LangError {
+                kind: ErrorKind::Syntax,
+                message: e.to_string(),
+            });
+    }
+    if let Some(statement) = front_end.prepare_server(text, refuse)? {
+        return Ok(Statement::Server(Box::new(statement)));
+    }
+    Ok(Statement::Query)
+}
+
 /// A query language Kala parses: parse, refuse attributes in the AST, compile.
 pub trait FrontEnd: Sync {
     /// Recognize and prepare a pure server-metadata pipeline without world I/O.
@@ -252,6 +285,22 @@ mod tests {
 /// `[:concurrency :weak]` (or `:optimistic`) sets its own.
 /// [`commit`](write::commit) reports a conflict at the op that read.
 pub mod write {
+    /// Whether staging this form reads existing data before writing it.
+    pub fn requires_read(form: &WriteTxn) -> bool {
+        use kala_datalog::ast::WriteOp;
+        form.ops.iter().any(|op| {
+            matches!(
+                op,
+                WriteOp::Set { .. }
+                    | WriteOp::Correct { .. }
+                    | WriteOp::Migrate { .. }
+                    | WriteOp::Create {
+                        if_missing: true,
+                        ..
+                    }
+            )
+        })
+    }
     pub use kala_core::Concurrency;
     pub use kala_core::write::{StagedWrite, WriteOperation, WriteReport};
     pub use kala_datalog::apply::{

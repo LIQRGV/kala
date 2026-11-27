@@ -1,12 +1,11 @@
 # kala-bolt
 
-A read-only Bolt 5.0–5.4 server over Kala's Cypher and Datalog front-ends
+A Bolt 5.0–5.4 server with Datalog writes and explicit transactions over Kala's Cypher and Datalog front-ends
 and shared query executor. `kala serve DIR` exposes each regular
 `DIR/<name>.kala` file as a database (`[a-z0-9_-]+` names only). Symlinks and
 invalid names are skipped with a startup diagnostic. Files are discovered at
-startup and opened read-only on first RUN. File stamps (length, modification time, file identity and commit tail) trigger a reload of
-committed transactions; each result pins one snapshot. A torn tail is never
-served or repaired by this server. The served directory and its files
+startup; readers open immutable snapshots on first RUN. File stamps (length, modification time, file identity and commit tail) trigger a reload of
+committed transactions; each result pins one snapshot. A damaged tail is never acknowledged or cut by this server; an operator must acknowledge recovery through the CLI. The served directory and its files
 are trusted local input: concurrent replacement of directory entries is outside
 the network security boundary.
 
@@ -201,7 +200,7 @@ passwords on local accounts before exposing such a proxy.
 
 Grants are `read`, `write` or `admin`, on a database name or `*`. Every RUN checks
 the authenticated identity's grants before loading the database. `admin` implies
-read and write; `write` is stored for future Bolt writes and does not imply read.
+read and write; `write` and `read` do not imply each other.
 Denied queries return `Neo.ClientError.Security.Forbidden`. `system` requires
 `admin:system` or `admin:*`, even if the account has a read grant on it.
 
@@ -228,9 +227,7 @@ The plain handshake selects the highest offered version in 5.0–5.4, including
 minor-version ranges. Unsupported manifest proposals are skipped in favor of
 a supported plain proposal; a manifest-only or 4.x-only proposal is rejected.
 HELLO authenticates in 5.0; 5.1+ requires LOGON. LOGOFF returns to authentication.
-RUN, PULL, DISCARD, RESET, GOODBYE, ROUTE and 5.4 TELEMETRY are supported. BEGIN,
-COMMIT and ROLLBACK return `Neo.ClientError.Request.Invalid` with
-"not supported yet". Malformed PackStream closes after FAILURE when possible;
+RUN, PULL, DISCARD, RESET, GOODBYE, ROUTE, BEGIN, COMMIT, ROLLBACK and 5.4 TELEMETRY are supported. Malformed PackStream closes after FAILURE when possible;
 pre-authentication failures close. Other failures enter FAILED, which answers
 IGNORED until RESET. RESET never grants authentication.
 
@@ -361,8 +358,7 @@ OPTIONAL MATCH NULLs, UNWIND list parameters, Path hydration and stored edge
 directions, all four procedures below, database visibility and protected
 system attributes. Other official drivers and TCP tools such as `cypher-shell`
 and JDBC tools are expected to use these Bolt operations; they have not been
-run and compatibility is not claimed as tested. Explicit transactions remain
-unsupported: driver `execute_query`/`execute_read` still require slice 15.
+run and compatibility is not claimed as tested. Explicit transactions, `execute_query`, `execute_read` and `execute_write` are covered by the driver suite.
 
 | Request | Answer |
 | --- | --- |
@@ -385,18 +381,18 @@ Unknown procedures return `Neo.ClientError.Procedure.ProcedureNotFound`.
 ROUTE is accepted only when authenticated and Ready. It returns a routing table
 with ttl=300, the resolved database name, and the single advertised address in
 WRITE, READ and ROUTE roles. Writer=true and the WRITE role keep driver routing
-usable; write queries still fail. Database authorization and unknown-database
-errors are shared with RUN, with one exception: ROUTE for `system` answers any
+usable; Datalog writes require write privilege. Database authorization and unknown-database
+errors preserve the existing read behavior; write-only identities may also ROUTE. One exception: ROUTE for `system` answers any
 authenticated identity, so a routing driver (`neo4j://`) can reach the database
 listing there. That table grants nothing; RUN still refuses a non-admin's reads
 of `system`. Client routing-context addresses are never echoed.
 
 Impersonation (`imp_user`, a driver session's `impersonated_user`) is refused
-on both ROUTE and RUN with `Neo.ClientError.Security.Forbidden`
+on ROUTE, BEGIN and RUN with `Neo.ClientError.Security.Forbidden`
 ("impersonation is not supported"); a request is never run with the
 connection's own grants instead. A non-string `imp_user` is an invalid request.
 
-RUN checks that the database exists and may be read before it parses the query,
+RUN checks that the database exists and the caller has read or write access before it parses the query,
 so a malformed query on an unknown or forbidden database gets the database
 error. A Path whose nodes would include an edge (a ref attribute may point at
 one) is refused with an execution error; return its nodes and relationships
@@ -417,3 +413,192 @@ both forms. HELLO's
 Bolt over WebSocket, UNION ALL, `dbms.showCurrentUser()`, `dbms.clientConfig()`,
 and SHOW PROCEDURES/FUNCTIONS. Those belong to a later slice; the current
 transports are TCP and Unix sockets.
+
+## Writing and transactions
+
+Datalog write forms use the same native applier as `kala transact`. Cypher remains
+read-only. Write parameters are not supported: send an empty parameter map.
+For example, with a `read` + `write` account on the varrow fixture:
+
+```python
+from neo4j import GraphDatabase
+
+with GraphDatabase.driver("bolt://localhost:7687", auth=("writer", "")) as driver:
+    with driver.session(database="varrow") as session:
+        result = session.run('// kala:datalog\n[:assert :greg :alias "Ned" :at 300]')
+        print(result.data())
+        summary = result.consume()
+        print(summary.counters.properties_set, summary.metadata["kala"])
+        print(session.last_bookmarks())
+        session.execute_write(lambda tx: tx.run(
+            '// kala:datalog\n[:assert :greg :alias "The Grey" :at 301]'
+        ).consume())
+```
+
+The official driver suite in [`e2e/`](../../e2e/) exercises this flow with both
+`bolt://` and `neo4j://`, managed retries, explicit commit/rollback and bookmarks.
+Python 5.28.8 retains custom auto-commit metadata in `summary.metadata`, but
+its transaction API discards custom COMMIT metadata; use socket COMMIT metadata
+for the full explicit result, and `session.last_bookmarks()` for its bookmark.
+
+| State | Accepted transaction transitions |
+| --- | --- |
+| Ready | BEGIN → TxReady; auto-commit RUN → Streaming |
+| TxReady | RUN → TxStreaming; COMMIT or ROLLBACK → Ready |
+| TxStreaming | PULL/DISCARD remains here until fully consumed, then TxReady |
+| Failed | Requests are IGNORED until RESET → Ready |
+
+COMMIT/ROLLBACK outside a transaction, nested BEGIN and COMMIT while streaming
+are invalid requests. RESET, GOODBYE, disconnect, timeout and server shutdown
+discard staged writes and release the write slot. There is one open result:
+`qid` must be `0` or `-1`. RUN commits an auto-commit write before sending its
+SUCCESS, even if the client never pulls. Several top-level forms commit
+individually, in order. A later failure reports `form N failed; K prior forms
+committed`; after a partial commit it is never a transient error that invites
+the driver to replay the whole RUN. Inside BEGIN, all forms across RUNs commit
+as one transaction; any failed form discards everything and enters Failed.
+
+BEGIN and auto-commit RUN accept `db`, `mode` (`r`/`w`, default `w`),
+`tx_timeout` (nonnegative milliseconds, capped by the server; zero uses the cap),
+`tx_metadata` (a map, at most 16 KiB), and `bookmarks`.
+`tx_metadata.concurrency_mode` is `weak` or `optimistic`; other metadata is ignored.
+A leading `[:concurrency :weak]` or `:optimistic` overrides this default, but only
+the first write form may set it inside an explicit transaction.
+Notification preferences are accepted and ignored. Impersonation is refused.
+
+Queries read the committed snapshot at BEGIN. They do **not** see the transaction's
+own writes. Later write forms can resolve handles created by earlier forms and
+`:set`/`:if-missing` see staged writes through the native transaction. Optimistic
+queries record coarse attribute, node-type and entity-definition dependencies;
+unknown labels also record the absent node type. Graph-result enrichment
+conservatively records a whole-world read. This prevents write skew while scalar
+queries on unrelated attributes can commit independently. Weak mode skips conflict
+checks. Sending a provisional entity ID pins it: a commit that would renumber it
+fails transiently. Discarding the record does not expose that ID.
+
+### Write privileges
+
+| Operation | Privilege on the selected user database |
+| --- | --- |
+| Query | read |
+| Assert, retract, plain create, schema declarations | write |
+| Set, create with `:if-missing`, correct, migrate | read and write |
+| ROUTE | read or write |
+| Any write to system, including as admin | Always forbidden |
+
+Admin implies read and write on user databases. `--auth none` grants `read:*`
+only. `--read-only` refuses all writes and BEGIN in write mode before world I/O.
+A read-mode transaction cannot write. Form permissions are checked before staging.
+A reader-only identity can open a default-mode transaction backed by a read snapshot.
+
+Write-only reports retain form/op/kind/tick/changed/entries and newly created
+entity identities. Existing entity details and non-true `created` fields are null;
+write-result nodes contain identity/type but no stored properties or handle.
+Store-rule error details are replaced by `write failed; details require read privilege`.
+Overlap descriptions contain only `overlap details require read privilege`.
+No held values appear in these records, errors or notifications. Changed counts
+remain visible, as do commit IDs and counts. Inferred declaration names and
+latest-tick movement remain visible. Queries retain their ordinary property-rich
+Node/Relationship mapping for identities with read access.
+
+### Write records and summaries
+
+Each operation produces one record with fields:
+
+```
+["form", "op", "kind", "tick", "changed", "entries", "entity", "created"]
+```
+
+`form` is one-based within the RUN, `op` is one-based within that form, `kind`
+is the verb without a colon, and `tick` is the tick actually used. `entries`
+is a list of integer entry IDs; inside BEGIN it is empty until COMMIT.
+`entity` identifies a created/found node (otherwise null); `created` is true/false
+for create operations, null for other operations. Plain create reports true.
+
+The final auto-commit PULL or explicit COMMIT summary contains `db`,
+`bookmark: "kala:<db>:<tx>"`, `type` (`w`, `rw` when queries also ran, or `s`
+for schema-only forms), and:
+
+- `stats`: `nodes-created`, `relationships-created`, `properties-set` (non-ref
+  asserted fact/revision entries), and `contains-updates`. Counters describe
+  finalized committed operations, including conditional creates that become no-ops.
+- `kala`: `tx`, `changed`, `declared`, `entries`; `ids` when IDs moved (pairs of
+  provisional/final raw IDs); `latest_tick_moved: {from, to}` when applicable.
+- `notifications`: maps with `code`, `title`, `description`, `severity`.
+  Codes are `Kala.Warning.Overlap`, `Kala.Information.OverlapResolved`,
+  `Kala.Information.OverlapsOmitted`, `Kala.Warning.LatestTickMoved`, and
+  `Kala.Information.InferredDeclaration`. Severities are WARNING/INFORMATION.
+  The native commit caps introduced and resolved overlaps at 100 each and
+  reports omitted counts in the final overlap notification.
+
+Optional summary details share a bounded budget while each form is committed;
+excess details are counted rather than retained. If the final encoded summary
+still exceeds the wire-message limit, detail lists are shortened in this order: notifications, ID mappings, entry IDs. `kala.notifications_omitted`,
+`kala.ids_omitted` and `kala.entries_omitted` report exactly how many elements were
+omitted. The bookmark, transaction number, totals and counters are retained.
+This ensures a durable commit still returns SUCCESS. Fetch complete history with
+`kala log` when detail is omitted. Write-capable protocol settings require at
+least a 1024-byte message limit and nesting depth 8.
+
+Bookmarks on BEGIN and auto-commit reads/writes must be lists of at most 64
+strings, each at most 256 bytes, matching the selected database. Readers refresh
+before pinning their snapshot and wait at most the busy timeout for the highest
+requested transaction. Future bookmarks fail transiently after that bound.
+
+### Errors and limits
+
+| Failure | Bolt code |
+| --- | --- |
+| Invalid state, options, parameters or transaction cap on forms/text | Neo.ClientError.Request.Invalid |
+| Write syntax | Neo.ClientError.Statement.SyntaxError |
+| Wrong value type | Neo.ClientError.Statement.TypeError |
+| Same-tick conflict, duplicate handle/type mismatch | Neo.ClientError.Schema.ConstraintValidationFailed |
+| Unknown handle/attribute, deprecated attribute, strict schema, event retract, other store-rule errors | Neo.ClientError.Statement.SemanticError |
+| Missing privilege, system write, read-only server | Neo.ClientError.Security.Forbidden |
+| Write in read transaction | Neo.ClientError.Transaction.ForbiddenDueToTransactionType |
+| Optimistic conflict, diverged handle, future bookmark, write-slot cap | Neo.TransientError.Transaction.DeadlockDetected |
+| Writer lock busy timeout | Neo.TransientError.Transaction.LockAcquisitionTimeout |
+| Transaction expiry | Neo.ClientError.Transaction.TransactionTimedOut |
+| Malformed or wrong-database bookmark | Neo.ClientError.Transaction.InvalidBookmark |
+| Recovery required or store I/O failure | Neo.DatabaseError.General.UnknownError |
+
+The pinned Python driver marks generic transient errors retryable; neither
+Outdated nor DeadlockDetected has a specialized entry, so Kala uses the familiar
+DeadlockDetected fallback. The read-mode code is explicitly listed by that driver.
+ConstraintValidationFailed uses Neo4j's Schema namespace. Recovery failures direct
+an operator to a CLI write with `--acknowledge-recovery`; the server never does it.
+A diverged cached writer is dropped, so retry opens a fresh handle.
+
+| Serve flag | Default | Meaning |
+| --- | --- | --- |
+| `--read-only` | false | Refuse write forms and BEGIN w |
+| `--max-write-transactions` | 8 | Open explicit writable snapshots |
+| `--tx-timeout` | 60s | Maximum transaction lifetime |
+| `--tx-idle-timeout` | 30s | Time between messages, including slow response delivery |
+| `--busy-timeout` | 5s | Writer mutex/file lock or bookmark wait |
+
+Durations accept `ms`, `s`, `m` or bare seconds. Native defaults live in
+`ServerConfig`. Each transaction accepts at most 256 forms, retains at most
+16 MiB of write text, and observes the existing Datalog per-form limits.
+Materialized write records are capped at 16 MiB per RUN. Socket messages remain
+bounded by `max_message_bytes` and `max_depth`. Transaction expiry also releases
+an idle or trickling client's slot; partial outbound responses close the connection.
+The durable append/fsync cannot be interrupted: once appended, the server reports
+success, even if completion crosses the deadline.
+
+Each explicit writable transaction owns one replayed world handle and reserves
+a slot at BEGIN; read-mode and reader-only transactions pin cached snapshots.
+Writable BEGIN is eager to preserve its snapshot and enforce the cap before the
+first RUN. Auto-commit uses one mutex-protected writable handle per database,
+caught up on each use. The mutex is never held across client I/O. Reader file
+stamps make subsequent connections see committed writes.
+
+Writes have **at-least-once** delivery under a lost connection: the log may commit
+before SUCCESS reaches the client. Do not blindly retry non-idempotent creates
+after an unknown network outcome. Use stable handles and `:if-missing` when that
+matches the application's intent. No transient failure is deliberately returned
+after the same RUN has committed an earlier form.
+
+Structured write logs contain connection ID, database, authenticated user,
+transaction number, form count and changed count, or a refusal category. They
+never contain Datalog text, values, handles or credentials.

@@ -352,12 +352,11 @@ class DriverTests(unittest.TestCase):
         with self.driver.session(database="varrow") as session:
             self.assertEqual(len(list(session.run(ALLIES))), 2)
 
-    def test_explicit_transaction_refused_and_session_stays_usable(self):
+    def test_explicit_read_transaction_and_session_stays_usable(self):
         with self.driver.session(database="varrow") as session:
-            with self.assertRaises(ClientError) as error:
-                session.begin_transaction()
-            self.assertEqual(error.exception.code, "Neo.ClientError.Request.Invalid")
-            self.assertIn("not supported yet", error.exception.message)
+            with session.begin_transaction() as transaction:
+                self.assertEqual(len(list(transaction.run(ALLIES))), 2)
+                transaction.commit()
             self.assertEqual(len(list(session.run(ALLIES))), 2)
 
     def test_external_cli_commit_visible_without_restart(self):
@@ -495,6 +494,281 @@ class DriverTests(unittest.TestCase):
                 if process.poll() is None:
                     process.send_signal(signal.SIGINT)
                 process.communicate(timeout=15)
+
+
+class WriteDriverTests(unittest.TestCase):
+    """The writable scratch world is isolated from all original read tests."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = os.environ["KALA_WRITE_DIR"]
+        cls.stderr = open(os.path.join(cls.directory, "server.stderr"), "w", encoding="utf-8")
+        cls.process = subprocess.Popen(
+            [os.environ["KALA_BINARY"], "serve", cls.directory, "--listen", "127.0.0.1:0", "--default-db", "varrow"],
+            stdout=subprocess.PIPE, stderr=cls.stderr, text=True,
+        )
+        cls.addClassCleanup(cls.stop_server)
+        ready, _, _ = select.select([cls.process.stdout], [], [], 20)
+        if not ready:
+            raise AssertionError("write server did not announce readiness")
+        line = cls.process.stdout.readline().strip()
+        if not line.startswith("kala serve: listening on 127.0.0.1:"):
+            raise AssertionError("write server did not start: " + line)
+        cls.uri = "bolt://" + line.split("listening on ", 1)[1]
+
+    @classmethod
+    def stop_server(cls):
+        if cls.process.poll() is None:
+            cls.process.send_signal(signal.SIGINT)
+        cls.process.communicate(timeout=15)
+        cls.stderr.close()
+
+    def driver(self, user="writer", routing=False):
+        uri = self.uri.replace("bolt://", "neo4j://", 1) if routing else self.uri
+        driver = GraphDatabase.driver(
+            uri, auth=None if user == "root" else (user, ""), connection_timeout=5,
+            max_transaction_retry_time=5, initial_retry_delay=0.01,
+        )
+        self.addCleanup(driver.close)
+        return driver
+
+    def aliases(self, driver):
+        with driver.session(database="varrow", default_access_mode=neo4j.READ_ACCESS) as session:
+            return [r[0] for r in session.run(PREFIX + "[:find ?a :where [:greg :alias ?a]]")]
+
+    def test_autocommit_records_summary_and_second_connection_visibility(self):
+        with self.driver().session(database="varrow") as session:
+            result = session.run(PREFIX + '[:assert :greg :alias "Driver auto commit" :at 300]')
+            self.assertEqual(result.keys(), ["form", "op", "kind", "tick", "changed", "entries", "entity", "created"])
+            row = dict(result.single())
+            self.assertEqual({k: row[k] for k in ["form", "op", "kind", "tick", "changed"]},
+                             {"form": 1, "op": 1, "kind": "assert", "tick": 300, "changed": 1})
+            self.assertEqual(len(row["entries"]), 1)
+            self.assertIs(type(row["entries"][0]), int)
+            self.assertIsNone(row["entity"])
+            self.assertIsNone(row["created"])
+            summary = result.consume()
+            self.assertEqual(summary.query_type, "w")
+            self.assertEqual(summary.database, "varrow")
+            self.assertEqual(summary.counters.properties_set, 1)
+            self.assertTrue(summary.counters.contains_updates)
+            # Unknown server keys are available on the public ResultSummary.
+            self.assertEqual(summary.metadata["kala"]["changed"], 1)
+            self.assertEqual(summary.metadata["kala"]["entries"], row["entries"])
+            bookmark = "kala:varrow:" + str(summary.metadata["kala"]["tx"])
+            self.assertEqual(summary.metadata["bookmark"], bookmark)
+            self.assertEqual(session.last_bookmarks().raw_values, frozenset([bookmark]))
+        self.assertIn("Driver auto commit", self.aliases(self.driver()))
+        doctor = subprocess.run(
+            [os.environ["KALA_BINARY"], "doctor", os.path.join(self.directory, "varrow.kala")],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(doctor.returncode, 0, doctor.stderr)
+
+    def test_execute_write_execute_read_and_execute_query_direct_and_routed(self):
+        for routed in [False, True]:
+            with self.subTest(routing=routed):
+                driver = self.driver(routing=routed)
+                alias = "Driver managed routed" if routed else "Driver managed direct"
+                with driver.session(database="varrow") as session:
+                    rows = session.execute_write(lambda tx: list(tx.run(PREFIX + f'[:assert :greg :alias "{alias}" :at 301]')))
+                    self.assertEqual(rows[0]["changed"], 1)
+                    # IDs are assigned at COMMIT, after these records were pulled.
+                    self.assertEqual(rows[0]["entries"], [])
+                    aliases = session.execute_read(lambda tx: [r[0] for r in tx.run(PREFIX + "[:find ?a :where [:greg :alias ?a]]")])
+                    self.assertIn(alias, aliases)
+                records, _, keys = driver.execute_query(
+                    PREFIX + f'[:assert :greg :alias "{alias} execute query" :at 302]',
+                    database_="varrow",
+                )
+                self.assertIn("changed", keys)
+                self.assertEqual(records[0]["changed"], 1)
+
+    def test_explicit_commit_rollback_and_snapshot_reads(self):
+        driver = self.driver()
+        with driver.session(database="varrow") as session:
+            with session.begin_transaction() as tx:
+                created = tx.run(PREFIX + "[:create :CHARACTER :driver_commit :if-missing]").single()
+                self.assertIsInstance(created["entity"], Node)
+                self.assertTrue(created["created"])
+                self.assertEqual(created["entries"], [])
+                tx.run(PREFIX + '[:assert :driver_commit :name "Driver committed" :at -300]').consume()
+                # Query reads the BEGIN snapshot, unlike the write applier.
+                self.assertEqual(list(tx.run("MATCH (n {kala_handle: 'driver_commit'}) RETURN n")), [])
+                tx.commit()
+            self.assertTrue(session.last_bookmarks().raw_values)
+            self.assertEqual(session.run("MATCH (n {kala_handle: 'driver_commit'}) RETURN n.name").single()[0], "Driver committed")
+            with session.begin_transaction() as tx:
+                tx.run(PREFIX + "[:create :CHARACTER :driver_rollback]").consume()
+                tx.run(PREFIX + '[:assert :driver_rollback :name "Driver rolled back" :at -300]').consume()
+                tx.rollback()
+            self.assertEqual(list(session.run("MATCH (n {kala_handle: 'driver_rollback'}) RETURN n")), [])
+
+    def test_bookmark_causal_read_across_connections(self):
+        with self.driver().session(database="varrow") as first:
+            first.execute_write(lambda tx: tx.run(PREFIX + '[:assert :greg :alias "Driver causal" :at 303]').consume())
+            bookmarks = first.last_bookmarks()
+        self.assertEqual(len(bookmarks.raw_values), 1)
+        with self.driver().session(database="varrow", bookmarks=bookmarks) as second:
+            aliases = second.execute_read(lambda tx: [r[0] for r in tx.run(PREFIX + "[:find ?a :where [:greg :alias ?a]]")])
+            self.assertIn("Driver causal", aliases)
+        for bookmark in ["not-a-kala-bookmark", "kala:another_database:1"]:
+            with self.subTest(bookmark=bookmark):
+                with self.driver().session(database="varrow", bookmarks=neo4j.Bookmarks.from_raw_values([bookmark])) as session:
+                    with self.assertRaises(ClientError) as error:
+                        session.run(ALLIES).consume()
+                    self.assertEqual(error.exception.code, "Neo.ClientError.Transaction.InvalidBookmark")
+
+    def test_conflicting_execute_write_is_retried_and_both_increments_commit(self):
+        driver = self.driver()
+        with driver.session(database="varrow") as session:
+            session.run(PREFIX + '[:assert :greg :driver_counter 0 :at 5000]').consume()
+        barrier = threading.Barrier(2, timeout=10)
+        attempts = [0, 0]
+
+        def increment(worker):
+            with driver.session(database="varrow") as session:
+                def work(tx):
+                    attempts[worker] += 1
+                    current = tx.run(PREFIX + "[:find ?n :where [:greg :driver_counter ?n]]").single()[0]
+                    if attempts[worker] == 1:
+                        barrier.wait()
+                    tx.run(PREFIX + f"[:set :greg :driver_counter {current + 1} :at {5001 + current}]").consume()
+                    return current + 1
+                return session.execute_write(work)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(increment, worker) for worker in range(2)]
+            self.assertEqual(sorted(f.result(timeout=20) for f in futures), [1, 2])
+        self.assertGreaterEqual(sum(attempts), 3)
+        with driver.session(database="varrow") as session:
+            self.assertEqual(session.run(PREFIX + "[:find ?n :where [:greg :driver_counter ?n]]").single()[0], 2)
+
+    def test_notifications_inferred_schema_and_overlap(self):
+        with self.driver().session(database="varrow") as session:
+            inferred = session.run(PREFIX + "[:assert :greg :driver_inferred_age 17 :at 5100]").consume()
+            self.assertEqual(inferred.metadata["kala"]["declared"], 1)
+            self.assertEqual(inferred.counters.properties_set, 1)
+            declarations = inferred.notifications or []
+            self.assertTrue(any("inferred" in n["description"] for n in declarations), declarations)
+            overlap = session.run(PREFIX + '[:assert :greg :name "Driver overlap" :at 5101]').consume()
+            notifications = overlap.notifications or []
+            self.assertTrue(any(n["code"] == "Kala.Warning.Overlap" for n in notifications), notifications)
+            for note in declarations + notifications:
+                self.assertTrue(note["code"].startswith("Kala."))
+                self.assertTrue({"code", "title", "description", "severity"}.issubset(note))
+                self.assertIn(note["severity"], ["WARNING", "INFORMATION"])
+
+    def test_created_entities_edges_and_schema_have_honest_counters(self):
+        with self.driver().session(database="varrow") as session:
+            result = session.run(PREFIX + '[[:create :CHARACTER :driver_stats :if-missing] '
+                                 '[:assert :driver_stats :name "Driver Stats" :at 5400] '
+                                 '[:assert :driver_stats :located_in :varrow :at 5400]]')
+            rows = list(result)
+            self.assertEqual(len(rows), 3)
+            self.assertIsInstance(rows[0]["entity"], Node)
+            self.assertTrue(rows[0]["created"])
+            summary = result.consume()
+            self.assertEqual(summary.counters.nodes_created, 1)
+            self.assertEqual(summary.counters.relationships_created, 1)
+            self.assertEqual(summary.counters.properties_set, 1)
+            schema = session.run(PREFIX + "[:attribute :driver_declared_age :i64]").consume()
+            self.assertEqual(schema.query_type, "s")
+            self.assertTrue(schema.counters.contains_updates)
+            self.assertEqual(schema.metadata["kala"]["declared"], 1)
+
+    def test_auto_commit_multiple_forms_report_partial_success(self):
+        with self.driver().session(database="varrow") as session:
+            with self.assertRaises(ClientError) as error:
+                session.run(PREFIX + '[:assert :greg :alias "Driver first form" :at 5500]\n'
+                            '[:assert :missing_driver_handle :alias "Must fail" :at 5500]').consume()
+            self.assertIn("form 2 failed; 1 prior forms committed", error.exception.message)
+            self.assertIn("Driver first form", [r[0] for r in session.run(PREFIX + "[:find ?a :where [:greg :alias ?a]]")])
+            with self.assertRaises(ClientError) as error:
+                session.run(PREFIX + '[:assert :greg :alias "Parameters refused" :at 5500]', unexpected=1).consume()
+            self.assertEqual(error.exception.code, "Neo.ClientError.Request.Invalid")
+
+    def test_read_and_write_privileges_and_read_transaction_mode(self):
+        for routing in [False, True]:
+            with self.subTest(routing=routing):
+                with self.driver("reader", routing=routing).session(database="varrow") as session:
+                    with self.assertRaises(ClientError) as error:
+                        session.run(PREFIX + '[:assert :greg :alias "Must not commit" :at 5200]').consume()
+                    self.assertEqual(error.exception.code, "Neo.ClientError.Security.Forbidden")
+                with self.driver(routing=routing).session(database="varrow", default_access_mode=neo4j.READ_ACCESS) as session:
+                    with self.assertRaises(ClientError) as error:
+                        with session.begin_transaction() as tx:
+                            tx.run(PREFIX + '[:assert :greg :alias "Read transaction" :at 5200]').consume()
+                    self.assertEqual(error.exception.code, "Neo.ClientError.Transaction.ForbiddenDueToTransactionType")
+        forms = [
+            '[:set :greg :name "Ned"]',
+            '[:create :CHARACTER :greg :if-missing]',
+            '[:correct 67 :delete]',
+            '[:migrate :name :unindexed]',
+            '[[:assert :greg :alias "Hidden write"] [:set :greg :name "Ned"]]',
+        ]
+        for form in forms:
+            with self.subTest(form=form):
+                with self.driver("write-only").session(database="varrow") as session:
+                    with self.assertRaises(ClientError) as error:
+                        session.run(PREFIX + form).consume()
+                    self.assertEqual(error.exception.code, "Neo.ClientError.Security.Forbidden")
+                    self.assertIn("read", error.exception.message)
+        self.assertNotIn("Hidden write", self.aliases(self.driver()))
+
+    def test_write_only_reduced_report_and_failure_hide_existing_values(self):
+        driver = self.driver("write-only", routing=True)
+        with driver.session(database="varrow") as session:
+            summary = session.run(PREFIX + '[:assert :greg :name "Driver private overlap" :at 5300]').consume()
+            self.assertEqual(summary.metadata["kala"]["changed"], 1)
+            for notification in summary.notifications or []:
+                self.assertNotIn("Driver overlap", notification["description"])
+                self.assertNotIn("Greg", notification["description"])
+            with self.assertRaises(ClientError) as error:
+                session.run(PREFIX + '[:retract :greg :name "Driver private overlap" :at 5300]').consume()
+            self.assertIn("read", error.exception.message)
+            self.assertNotIn("Driver private overlap", error.exception.message)
+            self.assertNotIn("Greg", error.exception.message)
+
+    def test_write_logs_are_structured_and_omit_form_values(self):
+        private_value = "driver-log-private-value-734829"
+        with self.driver().session(database="varrow") as session:
+            session.run(PREFIX + f'[:assert :greg :alias "{private_value}" :at 5600]').consume()
+        with self.driver("reader").session(database="varrow") as session:
+            with self.assertRaises(ClientError):
+                session.run(PREFIX + f'[:assert :greg :alias "{private_value}" :at 5601]').consume()
+        with open(os.path.join(self.directory, "server.stderr"), encoding="utf-8") as captured:
+            output = captured.read()
+        commits = [line for line in output.splitlines() if "event=bolt_write_committed " in line]
+        refusals = [line for line in output.splitlines() if "event=bolt_write_refused " in line]
+        self.assertTrue(commits, "missing committed-write event")
+        self.assertTrue(refusals, "missing refused-write event")
+        for line in commits:
+            for key in ["connection_id=", "db=varrow", "user=", "tx=", "forms=", "changed="]:
+                self.assertIn(key, line)
+        for line in refusals:
+            for key in ["connection_id=", "db=", "user=", "reason="]:
+                self.assertIn(key, line)
+        self.assertNotIn(private_value, output)
+        self.assertFalse(any(":greg" in line or "[:assert" in line for line in commits + refusals))
+
+    def test_system_is_never_writable_and_file_stays_identical(self):
+        path = os.path.join(self.directory, "system.kala")
+        with open(path, "rb") as stream:
+            before = stream.read()
+        for user in ["root", "writer", "write-only"]:
+            for explicit in [False, True]:
+                with self.subTest(user=user, explicit=explicit):
+                    with self.driver(user).session(database="system") as session:
+                        with self.assertRaises(ClientError) as error:
+                            if explicit:
+                                with session.begin_transaction() as tx:
+                                    tx.run(PREFIX + "[:create :ACCOUNT :driver_intruder]").consume()
+                            else:
+                                session.run(PREFIX + "[:create :ACCOUNT :driver_intruder]").consume()
+                        self.assertEqual(error.exception.code, "Neo.ClientError.Security.Forbidden")
+        with open(path, "rb") as stream:
+            self.assertEqual(stream.read(), before)
 
 
 if __name__ == "__main__":

@@ -38,6 +38,16 @@ pub struct ServerConfig {
     pub write_timeout: Duration,
     /// Largest incoming or outgoing message.
     pub max_message_bytes: usize,
+    /// Refuse writes before opening a world.
+    pub read_only: bool,
+    /// Maximum open explicit write snapshots.
+    pub max_write_transactions: usize,
+    /// Maximum total lifetime of an explicit transaction.
+    pub tx_timeout: Duration,
+    /// Maximum idle time between transaction messages.
+    pub tx_idle_timeout: Duration,
+    /// Maximum wait for a writer or a causal bookmark.
+    pub busy_timeout: Duration,
     /// PackStream nesting limit (at most 32).
     pub max_depth: usize,
 }
@@ -55,6 +65,11 @@ impl Default for ServerConfig {
             write_timeout: Duration::from_secs(10),
             max_message_bytes: 1 << 20,
             max_depth: 32,
+            read_only: false,
+            max_write_transactions: 8,
+            tx_timeout: Duration::from_secs(60),
+            tx_idle_timeout: Duration::from_secs(30),
+            busy_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -173,7 +188,10 @@ impl Server {
                 "advertised address must be HOST:PORT or [IPv6]:PORT",
             ));
         }
-        if config.max_connections == 0
+        if std::time::Instant::now()
+            .checked_add(config.busy_timeout)
+            .is_none()
+            || config.max_connections == 0
             || config.max_message_bytes == 0
             || config.max_depth == 0
             || config.max_depth > 32
@@ -181,6 +199,8 @@ impl Server {
                 config.handshake_timeout,
                 config.idle_timeout,
                 config.write_timeout,
+                config.tx_timeout,
+                config.tx_idle_timeout,
             ]
             .iter()
             .any(|d| d.is_zero() || std::time::Instant::now().checked_add(*d).is_none())

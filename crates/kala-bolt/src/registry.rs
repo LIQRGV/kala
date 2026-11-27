@@ -4,7 +4,11 @@ use kala_core::World;
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
+use std::time::{Duration, Instant};
 struct Database {
     path: PathBuf,
     cached: Mutex<Option<(Stamp, Arc<World>)>>,
@@ -12,6 +16,7 @@ struct Database {
     /// new snapshot share one replay instead of each replaying the world
     /// (peak memory stays at about two snapshots, not one per connection).
     loading: Mutex<()>,
+    writer: Mutex<Option<World>>,
 }
 
 /// What a cached snapshot was loaded from. The length alone is not enough:
@@ -81,8 +86,106 @@ pub(crate) enum SystemDb {
 pub(crate) struct Registry {
     databases: BTreeMap<String, Database>,
     default: Option<String>,
+    write_transactions: Arc<AtomicUsize>,
+}
+pub(crate) struct WriteSlot(Arc<AtomicUsize>);
+impl Drop for WriteSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 impl Registry {
+    /// Cached writers are borrowed only during staging/commit, never client I/O.
+    pub fn write<R>(
+        &self,
+        name: &str,
+        busy: Duration,
+        f: impl FnOnce(&mut World) -> Result<R, Failure>,
+    ) -> Result<R, Failure> {
+        self.require(name)?;
+        let db = &self.databases[name];
+        let until = Instant::now() + busy;
+        let mut cached = loop {
+            match db.writer.try_lock() {
+                Ok(lock) => break lock,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(Failure::new(crate::error::STORE, "writer unavailable"));
+                }
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < until => {
+                    std::thread::sleep(Duration::from_millis(2))
+                }
+                Err(_) => {
+                    return Err(crate::write::store_error(
+                        kala_core::Error::WorldLocked,
+                        true,
+                    ));
+                }
+            }
+        };
+        if cached.is_none() {
+            *cached = Some(self.open_writer(name, busy)?);
+        }
+        let world = cached.as_mut().ok_or_else(Failure::invalid)?;
+        world.set_busy_timeout(busy);
+        let result = world
+            .catch_up()
+            .map_err(|e| crate::write::store_error(e, true))
+            .and_then(|_| f(world));
+        if result.is_err() {
+            *cached = None;
+        }
+        result
+    }
+    pub fn open_writer(&self, name: &str, busy: Duration) -> Result<World, Failure> {
+        self.require(name)?;
+        if name == "system" {
+            return Err(Failure::new(
+                crate::error::FORBIDDEN,
+                "the system database is written only with kala user",
+            ));
+        }
+        let path = &self.databases[name].path;
+        stamp(path)?;
+        let world =
+            World::open_waiting(path, busy).map_err(|e| crate::write::store_error(e, true))?;
+        if crate::system::is_system(&world) {
+            return Err(Failure::new(
+                crate::error::FORBIDDEN,
+                "the system database is written only with kala user",
+            ));
+        }
+        Ok(world)
+    }
+    pub fn write_slot(&self, max: usize) -> Result<WriteSlot, Failure> {
+        self.write_transactions
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < max).then_some(n + 1)
+            })
+            .map_err(|_| {
+                Failure::new(crate::write::CONFLICT, "too many open write transactions")
+            })?;
+        Ok(WriteSlot(Arc::clone(&self.write_transactions)))
+    }
+    /// Causal reads share the normal stamped snapshot refresh, with a bounded wait.
+    pub fn at_least(&self, name: &str, tx: u64, busy: Duration) -> Result<Arc<World>, Failure> {
+        let deadline = Instant::now() + busy;
+        loop {
+            let (_, world) = self.get(Some(name))?;
+            if world.latest_tx().0 >= tx {
+                return Ok(world);
+            }
+            if Instant::now() >= deadline {
+                return Err(Failure::new(
+                    crate::write::CONFLICT,
+                    "bookmark is not available within the busy timeout",
+                ));
+            }
+            std::thread::sleep(
+                Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+
     pub fn open(directory: &Path, default: Option<String>, system: SystemDb) -> io::Result<Self> {
         let mut databases = BTreeMap::new();
         for entry in std::fs::read_dir(directory)? {
@@ -104,6 +207,7 @@ impl Registry {
                         path: entry.path(),
                         cached: Mutex::new(None),
                         loading: Mutex::new(()),
+                        writer: Mutex::new(None),
                     },
                 );
             } else {
@@ -119,7 +223,11 @@ impl Registry {
         // The reserved system world is never an implicit user database.
         let user_names: Vec<_> = databases.keys().filter(|name| *name != "system").collect();
         let default = default.or_else(|| (user_names.len() == 1).then(|| user_names[0].clone()));
-        Ok(Self { databases, default })
+        Ok(Self {
+            databases,
+            default,
+            write_transactions: Arc::new(AtomicUsize::new(0)),
+        })
     }
     /// Resolve the name before loading a world, so authorization precedes I/O.
     pub fn name<'a>(&'a self, requested: Option<&'a str>) -> Result<&'a str, Failure> {

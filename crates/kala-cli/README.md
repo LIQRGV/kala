@@ -860,3 +860,15 @@ attribute types before execution; nested lists have a depth limit of 32. The
 query/explain commands accept OPTIONAL MATCH, WITH, aggregates and bounded paths.
 `db.labels()`, `db.relationshipTypes()` and `db.propertyKeys()` work locally;
 server components and database listings report "only over Bolt".
+
+### Bolt write limits
+
+`kala serve` accepts Datalog writes through accounts with `write` grants.
+`--read-only` restores read-only server behavior and refuses BEGIN in write mode.
+`--max-write-transactions` defaults to 8; `--tx-timeout` to 60s;
+`--tx-idle-timeout` to 30s; `--busy-timeout` to 5s. Duration flags accept `ms`,
+`s`, `m` and bare seconds. The busy timeout applies to writer locks and causal
+bookmark waits. `--auth none` remains read-only. The system world is written
+only through `kala user`, including when the caller is an administrator.
+See [Bolt transactions, reports and limits](../kala-bolt/README.md#writing-and-transactions)
+for driver examples and error codes.

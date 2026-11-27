@@ -12,6 +12,9 @@ use std::sync::atomic::AtomicBool;
 pub(crate) struct Output {
     pub fields: Vec<String>,
     pub rows: VecDeque<Vec<u8>>,
+    pub encoded_bytes: usize,
+    pub exposes: VecDeque<bool>,
+    pub reads: crate::reads::Reads,
 }
 pub(crate) fn run(
     world: &World,
@@ -121,10 +124,15 @@ fn execute(
         system,
     };
     let mut rows = VecDeque::new();
+    let mut reads = crate::reads::Reads::plan(&prepared.plan, world);
     for row in result.rows {
         budget.step(&meter)?;
         let mut values = Vec::new();
         for datum in row {
+            // Graph-value enrichment reads properties beyond those explicitly named.
+            if graph_value(&datum) {
+                reads.all = true;
+            }
             values.push(datum_value(datum, &view, result.tick, &meter, &mut budget)?);
         }
         let record = Value::Structure(0x71, vec![Value::List(values)]);
@@ -137,7 +145,10 @@ fn execute(
     }
     Ok(Output {
         fields: result.columns.into_iter().map(|v| v.0).collect(),
+        encoded_bytes: rows.iter().map(Vec::len).sum(),
         rows,
+        exposes: VecDeque::new(),
+        reads,
     })
 }
 /// Generic on purpose: says what is refused, nothing about stored values.
@@ -557,4 +568,74 @@ fn path_value(
         0x50,
         vec![Value::List(nodes), Value::List(rels), Value::List(indices)],
     ))
+}
+
+fn graph_value(datum: &Datum) -> bool {
+    match datum {
+        Datum::Value(CoreValue::Ref(_)) | Datum::Path(_) => true,
+        Datum::List(values) => values.iter().any(graph_value),
+        _ => false,
+    }
+}
+
+/// The query engine already checks a cancellation flag in scans and operators.
+/// A joined watchdog supplies the transaction deadline without a detached task.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_until(
+    world: &World,
+    text: &str,
+    given: &Map,
+    stop: &AtomicBool,
+    max_message: usize,
+    max_depth: usize,
+    deadline: std::time::Instant,
+) -> Result<Output, Failure> {
+    until(stop, deadline, |cancel| {
+        run(world, text, given, cancel, max_message, max_depth)
+    })
+}
+
+pub(crate) fn until<T>(
+    stop: &AtomicBool,
+    deadline: std::time::Instant,
+    run: impl FnOnce(&AtomicBool) -> Result<T, Failure>,
+) -> Result<T, Failure> {
+    use std::sync::{Condvar, Mutex, atomic::Ordering};
+    use std::time::{Duration, Instant};
+    let cancel = AtomicBool::new(false);
+    let done = Mutex::new(false);
+    let wake = Condvar::new();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let Ok(mut finished) = done.lock() else {
+                cancel.store(true, Ordering::Relaxed);
+                return;
+            };
+            while !*finished {
+                if Instant::now() >= deadline || stop.load(Ordering::Relaxed) {
+                    cancel.store(true, Ordering::Relaxed);
+                    return;
+                }
+                let Ok((guard, _)) = wake.wait_timeout(
+                    finished,
+                    Duration::from_millis(5)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                ) else {
+                    cancel.store(true, Ordering::Relaxed);
+                    return;
+                };
+                finished = guard;
+            }
+        });
+        let result = run(&cancel);
+        if let Ok(mut finished) = done.lock() {
+            *finished = true;
+            wake.notify_all();
+        }
+        if Instant::now() >= deadline {
+            Err(crate::write::timeout())
+        } else {
+            result
+        }
+    })
 }

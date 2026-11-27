@@ -231,6 +231,21 @@ pub struct ServeArgs {
     /// Seconds allowed to receive a complete message.
     #[arg(long, default_value_t = 600)]
     pub idle_timeout: u64,
+    /// Refuse every write and BEGIN in write mode.
+    #[arg(long)]
+    pub read_only: bool,
+    /// Maximum open explicit write transactions (default: 8).
+    #[arg(long)]
+    pub max_write_transactions: Option<usize>,
+    /// Maximum transaction lifetime (default: 60s).
+    #[arg(long, value_parser = parse_busy_timeout)]
+    pub tx_timeout: Option<Duration>,
+    /// Maximum time between transaction messages (default: 30s).
+    #[arg(long, value_parser = parse_busy_timeout)]
+    pub tx_idle_timeout: Option<Duration>,
+    /// Maximum wait for a world writer or bookmark (default: 5s).
+    #[arg(long, value_parser = parse_busy_timeout)]
+    pub busy_timeout: Option<Duration>,
 }
 
 // `kala user`.
