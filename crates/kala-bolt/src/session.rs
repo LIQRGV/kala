@@ -60,6 +60,8 @@ struct Session<'a> {
     transaction: Option<Transaction>,
     summary: Option<Map>,
     output_ids: bool,
+    /// The open transaction expired while the next request was awaited.
+    expired: bool,
 }
 /// What every connection of one server shares.
 pub(crate) struct Shared<'a> {
@@ -114,6 +116,7 @@ pub(crate) fn serve(
         transaction: None,
         summary: None,
         output_ids: false,
+        expired: false,
     };
     loop {
         let Some(message) = session.receive(stream.as_mut())? else {
@@ -123,6 +126,15 @@ pub(crate) fn serve(
         if matches!(message, Ok(Message::Goodbye)) {
             return Ok(());
         }
+        // The transaction is already gone (rolled back, its slot free). RESET
+        // must succeed whatever happened before, and GOODBYE (above) closes;
+        // any other request is told why it cannot run.
+        let message =
+            if std::mem::take(&mut session.expired) && !matches!(message, Ok(Message::Reset)) {
+                Err(write::timeout())
+            } else {
+                message
+            };
         if session.state == State::Failed && !matches!(message, Ok(Message::Reset)) {
             session.send(stream.as_mut(), &Value::Structure(0x7e, vec![]), deadline)?;
             continue;
@@ -136,6 +148,12 @@ pub(crate) fn serve(
         {
             return Ok(());
         }
+        // The idle clock runs only while the server waits for the client:
+        // it starts when the response has been sent, never while a request
+        // is being worked on.
+        if let Some(tx) = &mut session.transaction {
+            tx.idle_deadline = Instant::now() + config.tx_idle_timeout;
+        }
     }
 }
 impl Session<'_> {
@@ -147,7 +165,7 @@ impl Session<'_> {
         stream: &mut dyn Transport,
     ) -> io::Result<Option<Result<Message, Failure>>> {
         let config = self.config;
-        let expires = self.transaction.as_ref().map(Transaction::expires);
+        let expires = self.transaction.as_ref().map(Transaction::idle_expires);
         let mut expired = false;
         let bytes = match chunk::read_message_expiring(
             stream,
@@ -171,12 +189,7 @@ impl Session<'_> {
             }
             Err(e) => return Err(e),
         };
-        if expired {
-            return Ok(Some(Err(write::timeout())));
-        }
-        if let Some(tx) = &mut self.transaction {
-            tx.idle_deadline = Instant::now() + config.tx_idle_timeout;
-        }
+        self.expired = expired;
         let value =
             packstream::decode_with_limits(&bytes, config.max_message_bytes, config.max_depth);
         // Input may carry credentials. Drop the original bytes before dispatch,
@@ -229,7 +242,7 @@ impl Session<'_> {
         let deadline = self
             .transaction
             .as_ref()
-            .map_or(deadline, |tx| tx.expires().min(deadline));
+            .map_or(deadline, |tx| tx.deadline.min(deadline));
         let bytes = packstream::encode_with_limits(
             value,
             self.config.max_message_bytes,
@@ -618,7 +631,7 @@ impl Session<'_> {
             .as_ref()
             .is_some_and(|id| id.permits_read(&db));
         let forms = transaction.forms;
-        let deadline = transaction.deadline.min(transaction.idle_deadline);
+        let deadline = transaction.deadline;
         if let Snapshot::Write(mut tx, _slot) = transaction.snapshot {
             if forms.is_empty() {
                 let txid = tx.snapshot_tx().0;
@@ -774,7 +787,7 @@ impl Session<'_> {
                 let deadline = self
                     .transaction
                     .as_ref()
-                    .map_or(self.started + options.timeout, Transaction::expires);
+                    .map_or(self.started + options.timeout, |tx| tx.deadline);
                 if let Some(tx) = &mut self.transaction {
                     tx.server_statement = true;
                 }
@@ -816,7 +829,7 @@ impl Session<'_> {
                         stop,
                         self.config.max_message_bytes,
                         self.config.max_depth,
-                        tx.expires(),
+                        tx.deadline,
                     )?;
                     if let Snapshot::Write(owned, _) = &mut tx.snapshot {
                         owned.with(|t| output.reads.note(t));
@@ -907,7 +920,7 @@ impl Session<'_> {
             for (index, form) in forms.enumerate() {
                 let form = form.map_err(write::parse_error)?;
                 let prior = tx.forms.len();
-                let expires = tx.expires();
+                let expires = tx.deadline;
                 let owned = tx.write()?;
                 let staged = owned.with(|t| {
                     t.set_deadline(expires);
@@ -1066,7 +1079,7 @@ impl Session<'_> {
             .transaction
             .as_ref()
             .map_or(Instant::now() + self.config.write_timeout, |tx| {
-                tx.expires().min(Instant::now() + self.config.write_timeout)
+                tx.deadline.min(Instant::now() + self.config.write_timeout)
             });
         for _ in 0..count {
             let exposes = output.exposes.pop_front().unwrap_or(false);

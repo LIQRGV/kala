@@ -125,7 +125,13 @@ pub(crate) struct Transaction {
     pub bytes: usize,
     pub queried: bool,
     pub server_statement: bool,
+    /// The end of the transaction's total time (`--tx-timeout`, or the
+    /// client's shorter `tx_timeout`). It bounds all server-side work:
+    /// queries, staging, the commit and sending responses.
     pub deadline: Instant,
+    /// When the client has been idle for too long: counted from the moment
+    /// the last response was sent, and only read while the next request is
+    /// awaited. Work in progress is never "idle".
     pub idle_deadline: Instant,
 }
 impl Transaction {
@@ -144,7 +150,8 @@ impl Transaction {
             )),
         }
     }
-    pub fn expires(&self) -> Instant {
+    /// When to give up waiting for the client's next request.
+    pub fn idle_expires(&self) -> Instant {
         self.deadline.min(self.idle_deadline)
     }
 }
