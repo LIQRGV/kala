@@ -277,3 +277,59 @@ fn tls_files_each_allow_one_mib_and_refuse_one_byte_more() {
         fs::write(path, &pem[..LIMIT]).unwrap();
     }
 }
+
+// PR #23 polish: like ssh, any group or other access to the key is refused,
+// not only read access: a key others can write can be replaced before the
+// next reload.
+#[test]
+fn a_private_key_with_any_group_or_other_access_is_refused_naming_the_mode() {
+    let dir = short_dir();
+    pair(dir.path(), &valid_params());
+    let key = dir.path().join("key.pem");
+    for mode in [0o620, 0o602, 0o622, 0o610, 0o601, 0o640, 0o644] {
+        fs::set_permissions(&key, fs::Permissions::from_mode(mode)).unwrap();
+        let error = refused(dir.path(), &[TLS], FILE_FLAGS);
+        assert!(
+            error.contains("key.pem")
+                && error.contains("permissions")
+                && error.contains(&format!("mode {mode:04o}"))
+                && error.contains("chmod 600"),
+            "{mode:o}: {error}"
+        );
+    }
+    for mode in [0o600, 0o400] {
+        fs::set_permissions(&key, fs::Permissions::from_mode(mode)).unwrap();
+        let mut server = start(dir.path(), &[TLS]);
+        assert!(server.signal("-TERM").success(), "{mode:o}");
+        assert!(!server.stderr().contains("WARNING"), "{}", server.stderr());
+    }
+}
+
+// A certificate is public, but one that group or others can write lets them
+// swap the server's identity at the next reload: warn at startup and at
+// each reload, and keep serving.
+#[test]
+fn a_group_or_other_writable_certificate_file_is_a_warning() {
+    let dir = short_dir();
+    pair(dir.path(), &valid_params());
+    let chain = dir.path().join("chain.pem");
+    let warning = "is writable by group or others (mode 0664)";
+    // Readable by everyone is normal for a certificate.
+    fs::set_permissions(&chain, fs::Permissions::from_mode(0o644)).unwrap();
+    let mut server = start(dir.path(), &[TLS]);
+    assert!(server.signal("-TERM").success());
+    assert!(!server.stderr().contains("WARNING"), "{}", server.stderr());
+    fs::set_permissions(&chain, fs::Permissions::from_mode(0o664)).unwrap();
+    let mut server = start(dir.path(), &[TLS]);
+    let stderr = server.stderr();
+    assert_eq!(stderr.matches(warning).count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("kala serve: WARNING: certificate file"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("chain.pem"), "{stderr}");
+    server.send_signal("-USR1");
+    let stderr = server.await_stderr("event=bolt_tls_reloaded");
+    assert_eq!(stderr.matches(warning).count(), 2, "{stderr}");
+    assert!(server.signal("-TERM").success());
+}

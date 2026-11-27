@@ -87,10 +87,20 @@ fn read_pem<T>(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if private && meta.permissions().mode() & 0o044 != 0 {
+        let mode = meta.permissions().mode() & 0o7777;
+        // As ssh does: no access at all for group and others. A key others
+        // can write is as lost as one they can read.
+        if private && mode & 0o077 != 0 {
             return Err(invalid(format!(
-                "insecure private key permissions on {path:?}: remove group and other read access (chmod 600)"
+                "insecure private key permissions on {path:?}: mode {mode:04o} gives group or others access; make it readable by its owner only (chmod 600)"
             )));
+        }
+        // The chain is public, but whoever can write it chooses what the
+        // next reload serves.
+        if !private && mode & 0o022 != 0 {
+            logln!(
+                "kala serve: WARNING: certificate file {path:?} is writable by group or others (mode {mode:04o})"
+            );
         }
     }
     #[cfg(not(unix))]
