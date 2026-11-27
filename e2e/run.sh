@@ -53,6 +53,32 @@ done
 "$KALA_BINARY" user grant "$KALA_WRITE_DIR" writer@localhost write annex >> "$task_tmp/user.stdout"
 "$KALA_BINARY" user grant "$KALA_WRITE_DIR" write-only@localhost write varrow >> "$task_tmp/user.stdout"
 "$KALA_BINARY" user grant "$KALA_WRITE_DIR" reader@localhost read varrow >> "$task_tmp/user.stdout"
+# The TLS tests use a self-signed server and a separate CA-signed server.
+# Keep generated keys private even when invoked with a permissive umask.
+generate_test_certificates() (
+    umask 077
+    cd "$task_tmp/tls" || return 1
+    openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj /CN=localhost \
+        -addext 'subjectAltName=IP:127.0.0.1,DNS:localhost' \
+        -keyout self-pkcs8.key -out self.pem &&
+    openssl pkey -in self-pkcs8.key -traditional -out self.key &&
+    openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj '/CN=Kala test CA' \
+        -addext 'basicConstraints=critical,CA:TRUE' -addext 'keyUsage=critical,keyCertSign' \
+        -keyout ca.key -out ca.pem &&
+    openssl ecparam -name prime256v1 -genkey -noout -out signed.key &&
+    openssl req -new -key signed.key -subj /CN=localhost -out signed.csr &&
+    openssl x509 -req -in signed.csr -CA ca.pem -CAkey ca.key -set_serial 1 -days 30 \
+        -extfile <(printf '%s\n' 'basicConstraints=critical,CA:FALSE' \
+            'extendedKeyUsage=serverAuth' 'subjectAltName=IP:127.0.0.1,DNS:localhost') \
+        -out signed.pem
+)
+mkdir "$task_tmp/tls"
+unset KALA_TLS_FIXTURES
+if command -v openssl >/dev/null && generate_test_certificates >/dev/null 2>&1; then
+    export KALA_TLS_FIXTURES="$task_tmp/tls"
+else
+    echo "Skipping TLS driver tests: OpenSSL could not generate the test certificates." >&2
+fi
 export KALA_SERVER_STDOUT="$task_tmp/server.stdout"
 export KALA_SERVER_STDERR="$task_tmp/server.stderr"
 mkfifo "$task_tmp/ready"

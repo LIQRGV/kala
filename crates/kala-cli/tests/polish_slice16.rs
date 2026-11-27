@@ -2,100 +2,14 @@
 //! SIGTERM runs the clean shutdown, and the auth log names the transport.
 #![cfg(unix)]
 
-use std::io::{BufRead, BufReader, Read, Write};
+#[path = "common/serving.rs"]
+mod serving;
+
+use serving::{Serving, short_dir};
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
-
-struct Serving {
-    child: Child,
-    stderr: PathBuf,
-    addresses: Vec<String>,
-}
-
-impl Serving {
-    fn start(dir: &Path, listeners: &[&str]) -> Self {
-        let stderr = dir.join("stderr.txt");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_kala"));
-        command.arg("serve").arg(dir).args(["--auth", "none"]);
-        for listen in listeners {
-            command.args(["--listen", listen]);
-        }
-        let mut child = command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(std::fs::File::create(&stderr).unwrap())
-            .spawn()
-            .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                let _ = tx.send(line);
-            }
-        });
-        let mut serving = Self {
-            child,
-            stderr,
-            addresses: Vec::new(),
-        };
-        for _ in listeners {
-            let line = rx
-                .recv_timeout(Duration::from_secs(10))
-                .unwrap_or_else(|e| panic!("missing startup line: {e}; {}", serving.stderr()));
-            serving.addresses.push(
-                line.strip_prefix("kala serve: listening on ")
-                    .unwrap_or_else(|| panic!("invalid startup line {line:?}"))
-                    .to_owned(),
-            );
-        }
-        serving
-    }
-
-    fn stderr(&self) -> String {
-        std::fs::read_to_string(&self.stderr).unwrap()
-    }
-
-    /// Sends `signal` and waits for the process to end.
-    fn signal(&mut self, signal: &str) -> ExitStatus {
-        assert!(
-            Command::new("kill")
-                .args([signal, &self.child.id().to_string()])
-                .status()
-                .unwrap()
-                .success()
-        );
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                return status;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "{signal} did not stop the server"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-}
-
-impl Drop for Serving {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn short_dir() -> tempfile::TempDir {
-    // Keep Unix sun_path use independent of a long TMPDIR.
-    tempfile::Builder::new()
-        .prefix("kp-")
-        .tempdir_in("/tmp")
-        .unwrap()
-}
+use std::time::Duration;
 
 /// One chunked Bolt message.
 fn send(stream: &mut impl Write, message: &[u8]) {
@@ -153,38 +67,30 @@ fn log_on(stream: &mut (impl Read + Write)) {
     success(stream);
 }
 
-// `systemctl stop` and `docker stop` send SIGTERM, not SIGINT, and a closed
-// terminal sends SIGHUP: both must run the same shutdown as Ctrl-C (drain,
-// close, remove the socket file) and exit 0.
+// SIGHUP leaves a Unix-only listener running. SIGTERM drains its active
+// sessions and removes the socket published at startup.
 #[test]
-fn sigterm_and_sighup_shut_down_cleanly_and_remove_the_socket() {
-    for signal in ["-TERM", "-HUP"] {
-        let dir = short_dir();
-        let path = dir.path().join("bolt.sock");
-        let unix = format!("unix://{}", path.display());
-        let mut serving = Serving::start(dir.path(), &[&unix]);
-        assert!(path.exists());
-        let mut client = UnixStream::connect(&path).unwrap();
-        client
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        log_on(&mut client);
-        let status = serving.signal(signal);
-        assert!(
-            status.success(),
-            "{signal} must exit 0 after a clean shutdown, got {status:?}; {}",
-            serving.stderr()
-        );
-        assert!(!path.exists(), "socket file survived {signal}");
-        // The open client was closed by the shutdown, not left to a killed process.
-        let mut byte = [0];
-        assert_eq!(client.read(&mut byte).unwrap(), 0);
-        assert!(
-            serving.stderr().contains("event=bolt_disconnected"),
-            "{}",
-            serving.stderr()
-        );
-    }
+fn sighup_preserves_the_unix_listener_and_sigterm_shuts_down_cleanly() {
+    let dir = short_dir();
+    let path = dir.path().join("bolt.sock");
+    let unix = format!("unix://{}", path.display());
+    let mut serving = Serving::start(dir.path(), &[&unix], &["--auth", "none"]);
+    serving.send_signal("-HUP");
+    let mut client = UnixStream::connect(&path).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    log_on(&mut client);
+    let status = serving.signal("-TERM");
+    assert!(
+        status.success(),
+        "SIGTERM returned {status:?}; {}",
+        serving.stderr()
+    );
+    assert!(!path.exists(), "socket file survived SIGTERM");
+    let mut byte = [0];
+    assert_eq!(client.read(&mut byte).unwrap(), 0);
+    assert!(serving.stderr().contains("event=bolt_disconnected"));
 }
 
 // A Unix peer has no IP: the auth log says so instead of `localhost`, and
@@ -194,7 +100,7 @@ fn the_auth_log_names_the_transport_and_gives_unix_peers_no_ip() {
     let dir = short_dir();
     let path = dir.path().join("bolt.sock");
     let unix = format!("unix://{}", path.display());
-    let mut serving = Serving::start(dir.path(), &[&unix, "127.0.0.1:0"]);
+    let mut serving = Serving::start(dir.path(), &[&unix, "127.0.0.1:0"], &["--auth", "none"]);
     let mut local = UnixStream::connect(&path).unwrap();
     local
         .set_read_timeout(Some(Duration::from_secs(5)))

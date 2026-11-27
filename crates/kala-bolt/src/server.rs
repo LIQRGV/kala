@@ -149,13 +149,19 @@ impl Server {
     /// Never creates, opens or reads `system.kala`, and never serves the
     /// `system` database; writes no database files.
     pub fn bind(directory: impl AsRef<Path>, config: ServerConfig) -> io::Result<Self> {
-        Self::validate_listeners(&config)?;
+        let tls = Self::validate_listeners(&config)?;
         Self::require_loopback(&config)?;
-        Self::bind_inner(directory.as_ref(), config, Arc::new(NoAuth), SystemDb::Skip)
+        Self::bind_inner(
+            directory.as_ref(),
+            config,
+            tls,
+            Arc::new(NoAuth),
+            SystemDb::Skip,
+        )
     }
     /// Bind with persisted accounts, bootstrapping root@localhost when needed.
     pub fn bind_accounts(directory: impl AsRef<Path>, config: ServerConfig) -> io::Result<Self> {
-        Self::validate_listeners(&config)?;
+        let tls = Self::validate_listeners(&config)?;
         if config
             .listen
             .iter()
@@ -185,7 +191,7 @@ impl Server {
             }
         }
         let auth = Accounts::open(directory).map_err(io::Error::other)?;
-        Self::bind_inner(directory, config, Arc::new(auth), SystemDb::Serve)
+        Self::bind_inner(directory, config, tls, Arc::new(auth), SystemDb::Serve)
     }
     /// Supply an authenticator on a loopback-only listener.
     pub fn bind_with_auth(
@@ -193,11 +199,11 @@ impl Server {
         config: ServerConfig,
         auth: Arc<dyn Authenticator>,
     ) -> io::Result<Self> {
-        Self::validate_listeners(&config)?;
+        let tls = Self::validate_listeners(&config)?;
         Self::require_loopback(&config)?;
-        Self::bind_inner(directory.as_ref(), config, auth, SystemDb::Serve)
+        Self::bind_inner(directory.as_ref(), config, tls, auth, SystemDb::Serve)
     }
-    fn validate_listeners(config: &ServerConfig) -> io::Result<()> {
+    fn validate_listeners(config: &ServerConfig) -> io::Result<Option<TlsReloader>> {
         if config.listen.is_empty() || config.listen.len() > 16 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -221,7 +227,11 @@ impl Server {
                 ));
             }
         }
-        Ok(())
+        TlsReloader::configured(
+            &config.listen,
+            config.tls_cert.as_deref(),
+            config.tls_key.as_deref(),
+        )
     }
     fn require_loopback(config: &ServerConfig) -> io::Result<()> {
         if config.listen.iter().any(|a| !a.is_loopback()) {
@@ -235,6 +245,7 @@ impl Server {
     fn bind_inner(
         directory: &Path,
         config: ServerConfig,
+        tls: Option<TlsReloader>,
         auth: Arc<dyn Authenticator>,
         system: SystemDb,
     ) -> io::Result<Self> {
@@ -283,11 +294,6 @@ impl Server {
                 "kala serve: WARNING: --acknowledge-recovery is on: a world's damaged last transaction is cut to a quarantine file without asking, and its entry IDs are issued again"
             );
         }
-        let tls = TlsReloader::configured(
-            &config.listen,
-            config.tls_cert.as_deref(),
-            config.tls_key.as_deref(),
-        )?;
         let registry = Arc::new(
             Registry::open(directory, config.default_db.clone(), system)?
                 .acknowledging_recovery(config.acknowledge_recovery && !config.read_only),
@@ -486,7 +492,13 @@ impl Server {
                     stop: &stop,
                 };
                 let result = session::serve(stream.as_mut(), origin, id, &shared);
-                if result.is_ok() {
+                // Framing reports EOF between Bolt messages as UnexpectedEof.
+                // Give a peer closing its stream first the same orderly reply.
+                if result
+                    .as_ref()
+                    .err()
+                    .is_none_or(|e| e.kind() == io::ErrorKind::UnexpectedEof)
+                {
                     let _ = stream.finish(std::time::Instant::now() + config.write_timeout);
                 }
                 eprintln!(

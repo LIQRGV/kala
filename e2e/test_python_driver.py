@@ -18,6 +18,8 @@ from neo4j import GraphDatabase
 from neo4j.exceptions import AuthError, ClientError, CypherSyntaxError
 from neo4j.graph import Node, Relationship, Path
 
+from test_tls_driver import TlsDriverTests
+
 URI = os.environ["KALA_BOLT_URI"]
 PREFIX = "// kala:datalog\n"
 ALLIES = PREFIX + "[:find ?a :at -210 :where [:edwin :ally_of ?a]]"

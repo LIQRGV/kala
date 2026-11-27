@@ -11,6 +11,8 @@ fn accepted_tcp_listen_specs_are_canonical() {
         ("bolt://127.0.0.1:7687", "127.0.0.1:7687"),
         ("bolt://localhost:0", "127.0.0.1:0"),
         ("bolt://[::1]:0", "[::1]:0"),
+        ("bolt+s://localhost:0", "bolt+s://127.0.0.1:0"),
+        ("bolt+s://[::1]:7687", "bolt+s://[::1]:7687"),
     ] {
         let parsed: ListenAddr = input.parse().unwrap();
         assert_eq!(parsed.to_string(), expected, "{input}");
@@ -19,7 +21,7 @@ fn accepted_tcp_listen_specs_are_canonical() {
 
 #[test]
 fn rejected_listen_schemes_and_hostnames_explain_the_problem() {
-    for scheme in ["ws", "wss", "bolt+s", "bolt+ssc", "invented"] {
+    for scheme in ["ws", "wss", "invented"] {
         let error = format!("{scheme}://127.0.0.1:7687")
             .parse::<ListenAddr>()
             .unwrap_err()
@@ -27,6 +29,14 @@ fn rejected_listen_schemes_and_hostnames_explain_the_problem() {
         assert!(error.contains(scheme), "{error}");
         assert!(error.contains("not supported yet"), "{error}");
     }
+    let error = "bolt+ssc://localhost:0"
+        .parse::<ListenAddr>()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("bolt+ssc://") && error.contains("bolt+s://"),
+        "{error}"
+    );
     let error = "neo4j://localhost:7687"
         .parse::<ListenAddr>()
         .unwrap_err()
@@ -38,6 +48,7 @@ fn rejected_listen_schemes_and_hostnames_explain_the_problem() {
     for input in [
         "example.org:7687",
         "bolt://example.org:7687",
+        "bolt+s://example.org:7687",
         "localhost",
         "127.0.0.1",
         "localhost:65536",

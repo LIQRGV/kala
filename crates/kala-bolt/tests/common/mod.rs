@@ -49,7 +49,9 @@ impl Running {
     }
 
     pub fn from_server(dir: tempfile::TempDir, server: Server) -> Self {
-        let kala_bolt::transport::ListenAddr::Tcp(addr) = server.local_addrs().unwrap()[0] else {
+        use kala_bolt::transport::ListenAddr;
+        let (ListenAddr::Tcp(addr) | ListenAddr::Tls(addr)) = server.local_addrs().unwrap()[0]
+        else {
             panic!("TCP test helper needs a TCP listener")
         };
         let shutdown = Arc::new(AtomicBool::new(false));

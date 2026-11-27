@@ -153,6 +153,9 @@ impl Transport for Tls {
         Ok(n)
     }
     fn finish(&mut self, deadline: Instant) -> io::Result<()> {
+        if self.conn.is_handshaking() {
+            return Ok(());
+        }
         self.conn.send_close_notify();
         self.send_records(deadline)?;
         self.inner.finish(deadline)

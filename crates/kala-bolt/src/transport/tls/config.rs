@@ -4,7 +4,7 @@ use super::super::{ListenAddr, invalid};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use rustls::{ServerConfig, crypto::ring, server::NoServerSessionStorage};
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use x509_parser::prelude::{ASN1Time, parse_x509_certificate};
@@ -59,7 +59,13 @@ impl TlsReloader {
     }
 }
 
-fn open_file(path: &Path, private: bool) -> io::Result<File> {
+const MAX_PEM_BYTES: u64 = 1 << 20;
+
+fn read_pem<T>(
+    path: &Path,
+    private: bool,
+    parse: impl FnOnce(&mut io::Take<File>) -> io::Result<T>,
+) -> io::Result<T> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -88,13 +94,25 @@ fn open_file(path: &Path, private: bool) -> io::Result<File> {
     }
     #[cfg(not(unix))]
     let _ = private;
-    Ok(file)
+    let too_large = || invalid(format!("TLS file {path:?} exceeds the 1 MiB limit"));
+    if meta.len() > MAX_PEM_BYTES {
+        return Err(too_large());
+    }
+    // Also bound the decoder if the file grows after the descriptor check.
+    let mut reader = file.take(MAX_PEM_BYTES + 1);
+    let parsed = parse(&mut reader);
+    if reader.limit() == 0 {
+        return Err(too_large());
+    }
+    parsed
 }
 
 fn load(cert: &Path, key: &Path) -> io::Result<ServerConfig> {
-    let chain = CertificateDer::pem_reader_iter(open_file(cert, false)?)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| invalid(format!("invalid PEM certificate chain in {cert:?}")))?;
+    let chain = read_pem(cert, false, |reader| {
+        CertificateDer::pem_reader_iter(reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| invalid(format!("invalid PEM certificate chain in {cert:?}")))
+    })?;
     if chain.is_empty() {
         return Err(invalid(format!("no certificates in {cert:?}")));
     }
@@ -127,10 +145,12 @@ fn load(cert: &Path, key: &Path) -> io::Result<ServerConfig> {
             }
         }
     }
-    let private = PrivateKeyDer::from_pem_reader(open_file(key, true)?).map_err(|_| {
-        invalid(format!(
-            "expected an unencrypted PEM private key in {key:?}"
-        ))
+    let private = read_pem(key, true, |reader| {
+        PrivateKeyDer::from_pem_reader(reader).map_err(|_| {
+            invalid(format!(
+                "expected an unencrypted PEM private key in {key:?}"
+            ))
+        })
     })?;
     let mut config = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
         .with_safe_default_protocol_versions()
