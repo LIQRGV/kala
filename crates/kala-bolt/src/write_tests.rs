@@ -143,3 +143,73 @@ fn a_failure_after_committed_forms_never_says_nothing_was_written_or_invites_a_r
     let own = form_failed(lock(), 1, 0, 1, "varrow", 15);
     assert_eq!(own.code, crate::error::EXECUTION);
 }
+
+#[test]
+fn retained_cost_of_compact_unwind_statements_counts_across_a_transaction() {
+    let mut world = World::in_memory(kala_core::Schema::new().node_type("T")).unwrap();
+    let front_end = kala_lang::front_end("cypher").unwrap();
+    let params = kala_query::QueryParams::default();
+    let statement = "UNWIND [1,2,3] AS i CREATE (:T {score:i})";
+    let kala_lang::Statement::CypherWrite(stmt) =
+        kala_lang::classify(front_end, statement, &kala_lang::refuse_nothing).unwrap()
+    else {
+        panic!("expected a write")
+    };
+    let mut tx = world.begin();
+    let mut costs = vec![];
+    for _ in 0..3 {
+        let input = write::prepare_statement(
+            tx.base_world(),
+            &stmt,
+            &params,
+            kala_query::RunOptions::default(),
+        )
+        .unwrap();
+        let staged = write::stage_statement(&mut tx, &stmt, input, &params).unwrap();
+        // The expanded input creates three entities and three facts per RUN.
+        assert_eq!(staged.staged.ops.len(), 6);
+        assert!(staged.retained_bytes > statement.len() + 6 * "score".len());
+        costs.push(staged.retained_bytes);
+    }
+    // Start near the real cap to exercise its boundary with three small RUNs.
+    let mut total = MAX_STAGED_BYTES - costs[0] - costs[1];
+    charge(&mut total, costs[0]).unwrap();
+    charge(&mut total, costs[1]).unwrap();
+    assert_eq!(total, MAX_STAGED_BYTES);
+    assert!(charge(&mut total, costs[2]).is_err());
+    assert_eq!(total, MAX_STAGED_BYTES);
+}
+
+#[test]
+fn set_retention_includes_noop_and_member_payloads() {
+    let mut world = World::in_memory(kala_core::Schema::new().node_type("T")).unwrap();
+    world.create_entity("T", Some("n")).unwrap();
+    let mut tx = world.begin();
+    let fe = kala_lang::front_end("cypher").unwrap();
+    let params = kala_query::QueryParams::default();
+    let mut costs = vec![];
+    for q in [
+        "MATCH (n {kala_handle:'n'}) SET n.tags = 'a' AT TICK 0",
+        "MATCH (n {kala_handle:'n'}) SET n.tags = 'a' AT TICK 1",
+        "MATCH (n {kala_handle:'n'}) SET n.tags = ['a','longer member','another member'] AT TICK 2",
+    ] {
+        let kala_lang::Statement::CypherWrite(stmt) =
+            kala_lang::classify(fe, q, &kala_lang::refuse_nothing).unwrap()
+        else {
+            panic!("expected a write")
+        };
+        let input = write::prepare_statement(
+            tx.base_world(),
+            &stmt,
+            &params,
+            kala_query::RunOptions::default(),
+        )
+        .unwrap();
+        let result = write::stage_statement(&mut tx, &stmt, input, &params).unwrap();
+        costs.push((result.staged.ops[0].changed, result.retained_bytes));
+    }
+    assert_eq!(costs[1].0, 0);
+    assert!(costs[1].1 >= std::mem::size_of::<WriteOperation>());
+    assert_eq!(costs[2].0, 2);
+    assert!(costs[2].1 >= costs[0].1 + "longer member".len() + "another member".len());
+}

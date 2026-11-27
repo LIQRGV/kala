@@ -1,5 +1,9 @@
 //! Terminal writes are adapters over the native transaction API.
-use super::{Done, query::read_text_file, read::core_err as read_core_err};
+use super::{
+    Done,
+    query::{read_text_file, row_text, table},
+    read::core_err as read_core_err,
+};
 use crate::error::{CONFLICT_ADVICE, CliError, Conflicted};
 use crate::{cli::TransactArgs, escape, names, out};
 use kala_core::{Concurrency, Conflict, ConflictKey, EntityId, Tick, Value, World};
@@ -50,8 +54,18 @@ struct TickMoved {
     line: String,
 }
 #[derive(Serialize)]
+struct Returned {
+    columns: Vec<String>,
+    rows: Vec<Vec<out::JValue>>,
+}
+
+#[derive(Serialize)]
 pub struct Report {
     form: usize,
+    /// What the text output calls one input item: a Datalog "form" or a
+    /// Cypher "statement". The JSON field stays `form` for both.
+    #[serde(skip)]
+    item: &'static str,
     dry_run: bool,
     /// The committed transaction; `null` when the form changed nothing, so
     /// nothing was appended.
@@ -70,6 +84,10 @@ pub struct Report {
     schema: Vec<serde_json::Value>,
     #[serde(skip)]
     schema_text: Vec<String>,
+    #[serde(flatten)]
+    returned: Option<Returned>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    return_error: Option<String>,
 }
 
 /// Opens `path` for writing. A damaged last transaction (fully present,
@@ -179,6 +197,9 @@ fn conflict_err(w: &World, op: Option<(usize, &'static str)>, conflict: &Conflic
         None => "this transaction".to_string(),
     };
     let what = match &conflict.key {
+        ConflictKey::Entity { entity: id } => {
+            format!("read {}, which another transaction changed", entity(*id))
+        }
         ConflictKey::EntityAttribute { entity: e, attr: a } => format!(
             "read {} {}, which another transaction changed",
             entity(*e),
@@ -322,7 +343,10 @@ fn committed_report(w: &World, result: WriteReport) -> Report {
     };
     Report {
         form: 1,
+        item: "form",
         dry_run: false,
+        returned: None,
+        return_error: None,
         tx: result.tx.map(|tx| tx.0),
         schema: result
             .schema
@@ -371,7 +395,8 @@ pub fn render(report: &Report, json: bool) -> String {
     }
     let mut s = match report.tx {
         Some(tx) => format!(
-            "form {}: {}tx#{tx}: {}\n",
+            "{} {}: {}tx#{tx}: {}\n",
+            report.item,
             report.form,
             if report.dry_run {
                 "dry-run "
@@ -381,7 +406,8 @@ pub fn render(report: &Report, json: bool) -> String {
             counts(report.changed, report.declared)
         ),
         None => format!(
-            "form {}: {}: 0 changed\n",
+            "{} {}: {}: 0 changed\n",
+            report.item,
             report.form,
             if report.dry_run {
                 "dry-run, nothing to commit"
@@ -443,7 +469,138 @@ pub fn render(report: &Report, json: bool) -> String {
             report.warnings.resolved_omitted
         );
     }
+    if let Some(result) = &report.returned {
+        let columns: Vec<_> = result
+            .columns
+            .iter()
+            .map(|name| escape::value(name))
+            .collect();
+        let _ = writeln!(s, "  {}", columns.join("  "));
+        if result.rows.is_empty() {
+            s.push_str("  (no rows)\n");
+        }
+        for row in &result.rows {
+            let _ = writeln!(s, "  {}", row_text(row));
+        }
+    }
     s
+}
+
+enum Input<'a> {
+    Form(WriteTxn),
+    Statement(&'a str),
+}
+impl Input<'_> {
+    fn execute(self, world: &mut World, mode: Concurrency) -> Result<Report, CliError> {
+        match self {
+            Self::Form(form) => execute(world, &form, None, mode),
+            Self::Statement(text) => {
+                let statement = match kala_lang::classify(
+                    &kala_lang::Cypher,
+                    text,
+                    &kala_lang::refuse_nothing,
+                )
+                .map_err(|e| user(e.to_string()))?
+                {
+                    kala_lang::Statement::CypherWrite(statement) => statement,
+                    kala_lang::Statement::Concurrency(_) => {
+                        return Err(user(
+                            "use --concurrency for a transaction file, or put SET CONCURRENCY_MODE first in an explicit Bolt transaction",
+                        ));
+                    }
+                    _ => {
+                        return Err(user(
+                            "expected a write statement; use kala query --lang cypher for a read query",
+                        ));
+                    }
+                };
+                execute_cypher(world, &statement, mode)
+            }
+        }
+    }
+}
+
+/// Use the transaction's starting snapshot for input, then project final IDs
+/// and property values from the committed world at the statement's write tick.
+fn execute_cypher(
+    world: &mut World,
+    stmt: &kala_lang::write::WriteStatement,
+    mode: Concurrency,
+) -> Result<Report, CliError> {
+    use kala_lang::write::{Failure, StatementError, prepare_statement, stage_statement};
+    let params = kala_query::QueryParams::new();
+    let staged = (|| {
+        let mut tx = world.begin();
+        tx.set_concurrency(mode);
+        let input = prepare_statement(tx.base_world(), stmt, &params, Default::default())?;
+        let staged = stage_statement(&mut tx, stmt, input, &params)?;
+        let result = tx.commit().map_err(|error| {
+            let operation = match &error {
+                kala_core::Error::Conflict(c) => staged
+                    .staged
+                    .operation_of(c.operation)
+                    .map(|op| (op.position, op.kind)),
+                _ => None,
+            };
+            StatementError::Stage(WriteError {
+                operation,
+                cause: Failure::Store(error),
+            })
+        })?;
+        Ok((staged, result))
+    })();
+    let (mut staged, result) = match staged {
+        Ok(ok) => ok,
+        Err(
+            e @ StatementError::Stage(WriteError {
+                cause: Failure::SetEvent(_),
+                ..
+            }),
+        ) => return Err(user(e.to_string())),
+        Err(StatementError::Stage(e)) => return committed(world, Err(e)),
+        Err(StatementError::Store(e)) => return Err(core_err(e)),
+        Err(e) => return Err(user(e.to_string())),
+    };
+
+    let fields = stmt.fields();
+    let returned = if fields.is_empty() {
+        Ok(None)
+    } else {
+        staged.committed_rows(world, &result.ids).map(|rows| {
+            let (columns, rows) = table(
+                world,
+                &kala_query::ResultSet {
+                    columns: fields.into_iter().map(kala_query::Var).collect(),
+                    rows,
+                    tick: staged.tick,
+                    canon: world.latest_tx(),
+                },
+            );
+            Some(Returned { columns, rows })
+        })
+    };
+    let written = staged.staged.complete(&result);
+    // A Cypher CREATE names its handle as MERGE does (a Datalog `:create`
+    // report keeps its shape).
+    let handles: Vec<_> = written
+        .ops
+        .iter()
+        .map(|op| {
+            op.entity
+                .and_then(|e| world.handle_of(e).map(str::to_owned))
+        })
+        .collect();
+    let mut report = committed_report(world, written);
+    report.item = "statement";
+    for (op, handle) in report.ops.iter_mut().zip(handles) {
+        op.handle = handle;
+    }
+    match returned {
+        Ok(rows) => report.returned = rows,
+        // Save the write report even when a bounded post-commit read fails.
+        Err(e) => report.return_error = Some(e.to_string()),
+    }
+    Ok(report)
 }
 
 pub fn run(args: &TransactArgs) -> Result<Done, CliError> {
@@ -451,7 +608,19 @@ pub fn run(args: &TransactArgs) -> Result<Done, CliError> {
     let text = read_input(&args.input)?;
     let mode = crate::cli::concurrency(&args.concurrency);
     let mut w = open_target(args)?;
-    let forms = kala_datalog::write_forms(&text).map_err(|e| user(e.to_string()))?;
+    let cypher = args.lang == "cypher";
+    let forms: Box<dyn Iterator<Item = Result<Input<'_>, CliError>> + '_> = if cypher {
+        Box::new(
+            kala_lang::write::statements(&text)
+                .map(|s| s.map(Input::Statement).map_err(|e| user(e.to_string()))),
+        )
+    } else {
+        Box::new(
+            kala_datalog::write_forms(&text)
+                .map_err(|e| user(e.to_string()))?
+                .map(|f| f.map(Input::Form).map_err(|e| user(e.to_string()))),
+        )
+    };
     // A dry run previews every form on one discarded copy, so later forms
     // see earlier ones exactly as a real run would.
     let mut preview = if dry_run {
@@ -461,26 +630,38 @@ pub fn run(args: &TransactArgs) -> Result<Done, CliError> {
     };
     let mut count = 0;
     for (i, form) in forms.enumerate() {
-        let action = || -> Result<Report, CliError> {
-            let form = form.map_err(|e| user(e.to_string()))?;
-            match &mut preview {
-                Some(copy) => execute(copy, &form, None, mode),
-                None => execute(&mut w, &form, None, mode),
-            }
-        };
-        let mut report = match action() {
-            Ok(report) => report,
-            Err(e) => {
-                let e = form_failed(i + 1, count, dry_run, e);
-                if let (true, CliError::Conflict(conflict)) = (json, &e) {
-                    print(&conflict_json(i + 1, count, conflict))?;
+        let mut report =
+            match form.and_then(|input| input.execute(preview.as_mut().unwrap_or(&mut w), mode)) {
+                Ok(report) => report,
+                Err(e) => {
+                    let e = item_failed(
+                        if cypher { "statement" } else { "form" },
+                        i + 1,
+                        count,
+                        dry_run,
+                        e,
+                    );
+                    if let (true, CliError::Conflict(conflict)) = (json, &e) {
+                        print(&conflict_json(i + 1, count, conflict))?;
+                    }
+                    return Err(e);
                 }
-                return Err(e);
-            }
-        };
+            };
         report.form = i + 1;
         report.dry_run = dry_run;
         print(&render(&report, json))?;
+        if let Some(error) = report.return_error {
+            let outcome = match (dry_run, report.tx) {
+                (true, Some(tx)) => format!("previewed tx#{tx}"),
+                (true, None) => "previewed without changes".to_owned(),
+                (false, Some(tx)) => format!("committed tx#{tx}"),
+                (false, None) => "completed without changes".to_owned(),
+            };
+            return Err(CliError::Store(format!(
+                "statement {} {outcome}, but RETURN failed: {error}",
+                i + 1
+            )));
+        }
         count += 1;
     }
     if count == 0 {
@@ -538,16 +719,20 @@ fn open_target(args: &TransactArgs) -> Result<World, CliError> {
 /// exit 3, a conflict exit 4). A conflict's "run it again" is about this
 /// form: when forms before it were committed, the message says where to
 /// start again, since running the whole file would apply those twice.
+#[cfg(test)]
 fn form_failed(form: usize, count: usize, dry_run: bool, e: CliError) -> CliError {
+    item_failed("form", form, count, dry_run, e)
+}
+fn item_failed(item: &str, form: usize, count: usize, dry_run: bool, e: CliError) -> CliError {
     let rerun = match &e {
         CliError::Conflict(_) if count > 0 && !dry_run => format!(
-            " (run form {form} and those after it: the {count} before it are already committed)"
+            " (run {item} {form} and those after it: the {count} before it are already committed)"
         ),
         _ => String::new(),
     };
     e.map_message(|message| {
         format!(
-            "form {form} failed; {count} prior forms {}: {message}{rerun}",
+            "{item} {form} failed; {count} prior {item}s {}: {message}{rerun}",
             if dry_run {
                 "previewed (nothing committed)"
             } else {

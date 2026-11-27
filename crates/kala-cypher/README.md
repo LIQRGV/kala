@@ -1,6 +1,6 @@
 # kala-cypher
 
-A bounded, hand-written Cypher read parser and compiler to `kala-query`'s shared
+A bounded, hand-written Cypher parser and compiler to `kala-query`'s shared
 IR. It depends only on `kala-core` and `kala-query`. The executor and store are
 shared with Datalog. `prepare(world, text)` returns a `Prepared` plan and parameter
 kinds; `parse` and `prepare_parsed` allow callers to inspect attributes first.
@@ -32,7 +32,7 @@ Keywords ignore case; identifiers and labels match exact case. Backtick names,
 Cypher string escapes (including Unicode), `//` and `/* */` comments, and one
 trailing semicolon are accepted. Queries are at most 64 KiB, expression nesting
 at most 32, and pattern/expression elements at most 256. Errors include a line
-and column. UNION, dynamic property access, writes, arbitrary functions and
+and column. UNION, dynamic property access, arbitrary functions and
 unbounded traversal are not supported yet.
 
 ## Pipelines, aggregates and paths
@@ -189,3 +189,132 @@ sequence ordering, and enrichment at the default tick are documented differences
 from Neo4j. Secret refusal covers every new expression position, including
 aggregates, WITH, UNWIND, optional maps and variable-length relationship maps;
 account nodes inside Paths use the same property redaction as Node results.
+
+## Writing a world
+
+A statement can start with a reading pipeline. Kala evaluates the whole
+pipeline on one snapshot, then applies the write clauses once per row in
+order. A statement starting with a write has one input row. Each statement
+allows 10,000 input rows and 10,000 write primitives. The row limit counts
+the rows that reach the write clauses, not the rows a MATCH scans on the
+way. The reads that SET, REMOVE and DELETE make are bounded by 256 index
+keys per primitive (2,560,000 a statement) and by the statement's step
+budget and deadline; one SET takes at most 256 values for a property. Each
+limit has its own error message. A failure rolls back
+the transaction. For bulk imports, pass a list of scalar handles to
+`UNWIND $handles AS h MERGE (n:CHARACTER {kala_handle:h})`.
+For parallel lists, pass the row positions as `$indices` and index each list
+with the same position.
+
+```cypher
+UNWIND $indices AS i
+MERGE (n:CHARACTER {kala_handle:$handles[i]})
+ON CREATE SET n.name = $names[i]
+```
+
+Positions start at zero. Negative offsets count from the end, and a missing
+element produces NULL. Parameters support scalars, lists and NULL.
+Map-valued parameters (`UNWIND $rows AS row … row.name`) are not supported
+yet; use parallel lists. `UNWIND … CREATE` has a reading part, so it is a
+reading statement: over Bolt it needs `read` as well as `write`.
+
+Parameters take the kind their position gives them, as in a read query: a
+handle string given where the reading part compares a ref attribute
+(`MATCH (c {located_in:$place})`) names that entity, and a value of the
+wrong type is a type error before anything runs. A string written to a ref
+attribute (`SET c.located_in = $place`, `SET c.located_in = 'varrow'`, a
+CREATE property map) is a handle too, as in a Datalog form; a handle nobody
+holds is the `unknown entity` error.
+
+The following pairs show the primitive operations for one input row.
+The SET, REMOVE and DELETE examples assume a preceding MATCH binds the named
+variables. Here `g` is Greg, `a` is Ashford and `r` is their `located_in` edge.
+
+| Cypher | Datalog equivalent |
+| --- | --- |
+| `CREATE (:CHARACTER:Scout {kala_handle:'s', name:'S'}) AT TICK 700` | `[:at 700 [:create :CHARACTER :s] [:assert :s :label "Scout"] [:assert :s :name "S"]]` |
+| `CREATE (g)-[:located_in {since:3}]->(a) AT TICK 700` | `[:at 700 [:assert :greg :located_in :ashford] [:assert [:greg :located_in :ashford] :since 3]]` |
+| `SET g.located_in = a AT TICK 225` | `[:set :greg :located_in :ashford :at 225]` |
+| `SET g += {alias:['Grey','Greg']}` | `[:set :greg :alias ["Grey" "Greg"]]` |
+| `SET g:Scout` / `REMOVE g:Scout` | `[:assert :greg :label "Scout"]` / `[:retract :greg :label "Scout"]` |
+| `REMOVE g.alias` or `SET g.alias = NULL` | `[:set :greg :alias []]` |
+| `DELETE r AT TICK 226` | `[:retract :greg :located_in :ashford :at 226]` |
+| `DELETE n` | One `[:retract …]` per held state. The node must have no active relationships. |
+| `DETACH DELETE n` | The same state retracts plus one `[:retract …]` per active state relationship in either direction. |
+| `MERGE (:CHARACTER {kala_handle:'s'})` | `[:create :CHARACTER :s :if-missing]` |
+| `MERGE (g)-[:located_in]->(a)` | `[:assert :greg :located_in :ashford]` |
+
+`REMOVE n.x`, `SET n.x = NULL` and `REMOVE n:Label` on a property (or on
+`label`) that nobody declared change nothing; the Datalog form
+`[:set … :x []]` on an unknown attribute is an error. SET and REMOVE on a
+variable that is NULL (an OPTIONAL MATCH that found nothing) skip that row,
+as DELETE does.
+
+The first label gives a new node its permanent type. A `label` attribute
+declared by inference is cardinality-many (in Datalog too; a world written
+by an older Kala replays unchanged). Additional labels are
+string values of `label`. Lists are sets of property values. A node variable
+on the right of SET supplies a reference. Replacing a property writes the
+difference between its old and new sets, including the explicit retracts.
+Handles are permanent. Use `SET n += {key: value}` to update selected keys.
+Kala refuses whole-map replacement with `SET n = {…}`.
+
+A node MERGE uses exactly one type and its permanent `kala_handle`. A
+relationship MERGE requires two bound endpoints and a type. Use
+`ON CREATE SET` for a new node or newly asserted relationship and
+`ON MATCH SET` for an existing match. CREATE always creates its nodes.
+Relationship writes require an arrow. Bidirectional attributes have one
+stored edge, and inverse names select the stored edge with reversed endpoints,
+whether written as a relationship (`CREATE (c)-[:child_of]->(p)`), in SET
+(`SET c.child_of = p`) or in a CREATE property map (`{child_of: p}`).
+
+DELETE preserves node identity, handle, history and events. Events never
+block a plain DELETE and are never retracted, by DELETE or DETACH DELETE.
+The values of deprecated attributes (including the `name@old` a
+`[:migrate]` leaves behind) are left as they are: a deprecated attribute
+accepts no retract, so its values neither end nor count as relationships. A detached
+relationship's own properties keep their history too. `kala doctor` can
+warn about a property held on an inactive edge. Summaries count retracted
+relationships and omit a nodes-deleted counter.
+
+One `AT TICK` applies to both reads and writes. Supply it after MATCH and
+again after the writes to choose different ticks. A tick-less write uses
+the transaction's starting latest tick. Corrections use the Datalog
+`[:correct …]` form: a same-tick conflict from any clause (SET, CREATE,
+MERGE, labels, DELETE) names the entry that holds the tick and the
+`[:correct N …]` to use, or, when the same statement or transaction staged
+it, the operation to change.
+
+### Declaring a property type
+
+```cypher
+CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:Label) REQUIRE n.prop IS :: INTEGER
+```
+
+declares attribute `prop` exactly as `[:attribute :prop :i64]` does. The
+types are `INTEGER`/`INT` (i64), `FLOAT` (f64), `STRING` and
+`BOOLEAN`/`BOOL`; `IS TYPED TYPE` is accepted too. It is a statement of its
+own, needs only `write` over Bolt and its summary type is `s`.
+
+A constraint only ever adds a declaration. With `IF NOT EXISTS`, a `prop`
+that is already an attribute (whatever its type or other labels) makes the
+statement a no-op: nothing is declared, not even a new label. Without it,
+the same type is a no-op and a different type is refused, for an
+administrator too (`attribute :prop already exists with type T; change it
+with // kala:datalog [:attribute …] or [:migrate …]`): an existing
+definition is changed with the Datalog forms.
+
+Differences from Neo4j: Kala attributes are not per label, so the
+declaration holds for every node type; the label must be a node type, or
+becomes one as schema-on-write declares it, **permanently** (a node type
+cannot be removed), so mind its spelling; the constraint name is accepted
+and ignored. Uniqueness, existence, key and relationship constraints,
+`CREATE INDEX` and `DROP …` are refused.
+
+A write without RETURN produces zero records. RETURN accepts bound variables,
+property access, literals and parameters. Auto-commit renders graph values
+at the write tick with final IDs and committed properties. Within BEGIN,
+write RETURN can read staged properties. Sending a provisional identity
+protects it against renumbering at COMMIT. A later MATCH still reads the
+transaction snapshot. Ordering, aggregation and a new reading pipeline
+after a write are outside this subset.

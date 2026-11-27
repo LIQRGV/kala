@@ -1,17 +1,21 @@
 //! Conservative query dependencies, extracted from the shared prepared IR.
-use kala_core::{Txn, World};
-use kala_query::{AttrRef, Op, Plan, RowAction};
+use crate::{AttrRef, Op, Plan, RowAction};
+use kala_core::{EntityId, Txn, World};
+use std::collections::BTreeSet;
 /// Most attribute and type names a merged read set keeps (see
 /// [`Reads::merge`]).
 const MAX_PENDING: usize = 256;
+/// Bounded dependencies of snapshot queries, retained until a transaction opens its writer.
 #[derive(Default)]
-pub(crate) struct Reads {
+pub struct Reads {
     attributes: Vec<String>,
     types: Vec<String>,
     definitions: bool,
-    pub all: bool,
+    entities: BTreeSet<EntityId>,
+    all: bool,
 }
 impl Reads {
+    /// Collect dependencies independent of how many rows the plan finds.
     pub fn plan(plan: &Plan, world: &World) -> Self {
         let mut reads = Self {
             attributes: plan
@@ -85,9 +89,57 @@ impl Reads {
         }
         reads
     }
+    /// Record a graph identity whose properties were rendered, including in a list or path.
+    pub fn rendered(&mut self, id: EntityId) {
+        if !self.all {
+            self.entities.insert(id);
+            self.bound();
+        }
+    }
+    fn bound(&mut self) {
+        if self.all || self.entities.len() + self.attributes.len() + self.types.len() > MAX_PENDING
+        {
+            self.all = true;
+            self.entities.clear();
+            self.attributes.clear();
+            self.types.clear();
+        }
+    }
+    /// Schema visibility for this plan's attribute and label names. Keep these
+    /// bits with materialized rows when a writer may open on a later snapshot.
+    /// If a name disappears or becomes defined, recording its new lookup alone
+    /// can lose the dependency on the old name or on an absent node type.
+    pub fn defined_names(&self, world: &World) -> Vec<bool> {
+        let view = world.at_canon(world.latest_tx());
+        self.attributes
+            .iter()
+            .map(|name| view.resolve_attribute(name).is_ok())
+            .chain(
+                self.types
+                    .iter()
+                    .map(|name| world.node_types().any(|ty| ty == name)),
+            )
+            .collect()
+    }
+
+    /// A newly declared node type can change a label predicate on an older
+    /// snapshot even before an entity of that type exists.
+    pub fn same_type_names(&self, from: &World, to: &World) -> bool {
+        self.types.iter().all(|name| {
+            from.node_types().any(|ty| ty == name) == to.node_types().any(|ty| ty == name)
+        })
+    }
+    /// Whether this pipeline ran independently of stored data and names.
+    pub fn is_empty(&self) -> bool {
+        !self.all
+            && !self.definitions
+            && self.attributes.is_empty()
+            && self.types.is_empty()
+            && self.entities.is_empty()
+    }
     /// Adds another query's dependencies to these. A transaction that has
     /// not written yet keeps one merged set for all its queries; past
-    /// [`MAX_PENDING`] names it is coarsened to "everything", so the set
+    /// the pending-key bound it is coarsened to "everything", so the set
     /// stays small however many queries a long transaction runs.
     pub fn merge(&mut self, other: &Self) {
         self.all |= other.all;
@@ -102,22 +154,25 @@ impl Reads {
                 }
             }
         }
-        if self.all || self.attributes.len() + self.types.len() > MAX_PENDING {
-            self.all = true;
-            self.attributes.clear();
-            self.types.clear();
-        }
+        self.entities.extend(other.entities.iter().copied());
+        self.bound();
     }
+    /// Register these dependencies on an optimistic transaction.
     pub fn note(&self, tx: &Txn<'_>) {
         if self.all {
             tx.note_read_all();
             return;
         }
+        for id in &self.entities {
+            tx.note_read_entity(*id);
+        }
         if self.definitions {
             tx.note_entity_definitions();
         }
         for attr in &self.attributes {
-            if tx.note_read_attribute(attr).is_err() {
+            if let Err(error) = tx.note_read_attribute(attr)
+                && !matches!(error, kala_core::Error::UnknownAttribute(_))
+            {
                 tx.note_read_all();
             }
         }

@@ -537,3 +537,37 @@ fn guide_two_terminals_share_one_world() {
     let o = f.run("doctor", &[]);
     assert_eq!(code(&o), 0, "{}", stdout(&o));
 }
+
+#[test]
+fn guide_cypher_move_and_merge_scripts_are_rerunnable() {
+    const MOVE: &str = "MATCH (g {kala_handle:'greg'}), (a {kala_handle:'ashford'}) SET g.located_in = a AT TICK 225;";
+    const IMPORT: &str =
+        "MERGE (n:CHARACTER {kala_handle:'kael2'}) ON CREATE SET n.name = 'Kael' AT TICK 700;";
+    let f = fixture_through_cli();
+    let prose = normalized(&guide());
+    for (filename, statement, changed) in [("move.cypher", MOVE, 2), ("import.cypher", IMPORT, 1)] {
+        let path = f.dir.path().join(filename);
+        fs::write(&path, statement).unwrap();
+        let arguments = ["--lang", "cypher", path.to_str().unwrap()];
+        let first = f.json("transact", &arguments);
+        assert_eq!(first["changed"], changed);
+        assert!(
+            first["warnings"]["introduced"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let before = fs::read(&f.path).unwrap();
+        assert_eq!(f.json("transact", &arguments)["changed"], 0);
+        assert_eq!(fs::read(&f.path).unwrap(), before);
+        assert!(
+            prose.contains(&normalized(statement)),
+            "example missing from GUIDE: {statement}"
+        );
+        let command = format!("kala transact --lang cypher varrow.kala {filename}");
+        assert!(
+            prose.contains(&command),
+            "command missing from GUIDE: {command}"
+        );
+    }
+}

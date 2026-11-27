@@ -220,6 +220,11 @@ pub(super) struct TxnState {
     pub(super) staged: Index,
     /// The staged entries in write order: the order of their log entries.
     pub(super) entries: Vec<Staged>,
+    /// For each entity, the `(source, attribute)` of every staged entry
+    /// whose ref value points at it (duplicates removed): the staged side of
+    /// the `R` index, so a read of "what points at X" costs what it finds
+    /// instead of a walk of every staged entry.
+    pub(super) incoming: BTreeMap<EntityId, std::collections::BTreeSet<(EntityId, AttrId)>>,
     /// Entities created and edges interned by this transaction.
     pub(super) ids: StagedIds,
     /// Set by the first failed write; the transaction then applies nothing.
@@ -260,6 +265,8 @@ pub(super) struct TxnState {
     pub(super) unknown_settings: bool,
     /// A read was made under [`Concurrency::Weak`], which records none.
     pub(super) unrecorded_reads: Cell<bool>,
+    /// Inside [`Txn::without_read_recording`]: reads record nothing.
+    pub(super) reads_muted: Cell<bool>,
     /// A replay regenerating what a committed transaction staged (a
     /// migration's copy): nothing of it is written, so the world's write
     /// gate (read-only, unacknowledged recovery, failed log) isn't asked.
@@ -356,11 +363,18 @@ impl Txn<'_> {
         if self.s.poisoned {
             return Err(Error::TransactionAborted);
         }
-        let resolved = self.world.catalog.resolve(&self.s.ids, entity, attr);
-        let (attr_id, def) = self.or_absent(attr, resolved)?;
+        let resolved = self
+            .world
+            .catalog
+            .resolve_neighbor_attr(attr, Direction::Out);
+        let (attr_id, direction) = self.or_absent(attr, resolved)?;
+        if !self.world.catalog.is_defined_staged(&self.s.ids, entity) {
+            return Err(Error::UnknownEntity(entity));
+        }
+        let def = &self.world.catalog.attributes[attr_id.0 as usize];
         // The read `[:set …]` decides from: a newer entry on this entity
         // and attribute invalidates it.
-        self.note_key(entity, attr_id, attr, true);
+        self.note_key(entity, attr_id, &def.name, direction.reads_out());
         let work = Work(Some(meter));
         let layers = [&self.world.indexes.e_index, &self.s.staged];
         let mut values = BTreeMap::new();
@@ -409,17 +423,19 @@ impl Txn<'_> {
                 keep(encoding);
             }
         };
-        let prefix = key::e_attr_prefix(entity, attr_id);
-        for index in layers {
-            index::for_each_history(
-                index,
-                &prefix,
-                |k| key::E_ATTR_PREFIX_LEN + key::e_value_bytes(k).map_or(0, |v| v.len()),
-                work,
-                &mut read,
-            );
+        if direction.reads_out() {
+            let prefix = key::e_attr_prefix(entity, attr_id);
+            for index in layers {
+                index::for_each_history(
+                    index,
+                    &prefix,
+                    |k| key::E_ATTR_PREFIX_LEN + key::e_value_bytes(k).map_or(0, |v| v.len()),
+                    work,
+                    &mut read,
+                );
+            }
         }
-        if self.world.catalog.is_bidirectional(attr_id) {
+        if direction.reads_in() || self.world.catalog.is_bidirectional(attr_id) {
             // Committed reverse histories identify partners. Judge their E keys
             // against both layers so staged retracts/corrections are visible.
             let mut reverse = |source: EntityId| {
@@ -443,13 +459,12 @@ impl Txn<'_> {
                     }
                 },
             );
-            for entry in &self.s.entries {
+            for (source, attr) in self.s.incoming.get(&entity).into_iter().flatten() {
                 if !work.add(1) {
                     break;
                 }
-                let (fact, _) = entry.key_and_mark();
-                if fact.attr == attr_id && fact.target == Some(entity) {
-                    reverse(fact.entity);
+                if *attr == attr_id {
+                    reverse(*source);
                 }
             }
         }
@@ -754,6 +769,41 @@ impl Txn<'_> {
         tick: Option<Tick>,
     ) -> Result<WriteResult, Error> {
         self.write(entity, attr, &v, tick, Op::Retract, Precision::Exact)
+    }
+
+    /// Resolve the stored orientation of a relationship name, flipping endpoints
+    /// for an inverse name. An unknown name stays as written for schema inference.
+    pub fn relationship<'a>(
+        &'a self,
+        source: EntityId,
+        attr: &'a str,
+        target: EntityId,
+    ) -> (EntityId, &'a str, EntityId) {
+        if let Some(id) = self.world.catalog.inverse_by_name.get(attr) {
+            (
+                target,
+                &self.world.catalog.attributes[id.0 as usize].name,
+                source,
+            )
+        } else {
+            (source, attr, target)
+        }
+    }
+
+    /// Look up the stored triple for a committed or provisionally interned edge.
+    pub fn edge(&self, id: EdgeId) -> Option<(EntityId, String, EntityId)> {
+        if let Some(triple) = self.world.edge(id) {
+            return Some(triple);
+        }
+        let index = usize::try_from(id.seq().checked_sub(1)?)
+            .ok()?
+            .checked_sub(self.world.catalog.edges.len())?;
+        let edge = self.s.ids.edges.get(index)?;
+        Some((
+            edge.source,
+            self.world.catalog.attr_name(edge.attr)?.to_owned(),
+            edge.target,
+        ))
     }
 
     /// The edge interned for `(source, attr, target)`, as
@@ -1070,6 +1120,13 @@ impl Txn<'_> {
             self.s.tx,
         );
         self.s.staged.insert(k, mark);
+        if let Some(target) = fact.target {
+            self.s
+                .incoming
+                .entry(target)
+                .or_default()
+                .insert((fact.entity, fact.attr));
+        }
         self.s.order.push(OrderedEntry::Fact(self.s.entries.len()));
         self.s.entries.push(entry);
     }
@@ -1173,6 +1230,7 @@ impl Txn<'_> {
         self.check_deadline()?;
         self.world.accepts_writes()?;
         if self.s.order.is_empty() {
+            self.validate_older_reads()?;
             return Ok(CommitResult {
                 committed: false,
                 tx: self.world.latest_tx(),
@@ -1882,6 +1940,7 @@ impl World {
             tx,
             staged: OrderedMap::new(),
             entries: Vec::new(),
+            incoming: BTreeMap::new(),
             ids: StagedIds::default(),
             poisoned: false,
             schema_before: None,
@@ -1900,6 +1959,7 @@ impl World {
             additions_only: false,
             unknown_settings: false,
             unrecorded_reads: Cell::new(false),
+            reads_muted: Cell::new(false),
             replaying: false,
         }
     }

@@ -1,6 +1,6 @@
 # kala-bolt
 
-A Bolt 5.0–5.4 server with Datalog writes and explicit transactions over Kala's Cypher and Datalog front-ends
+A Bolt 5.0–5.4 server with Cypher and Datalog writes and explicit transactions over Kala's Cypher and Datalog front-ends
 and shared query executor. `kala serve DIR` exposes each regular
 `DIR/<name>.kala` file as a database (`[a-z0-9_-]+` names only). Symlinks and
 invalid names are skipped with a startup diagnostic. Files are discovered at
@@ -19,11 +19,10 @@ kala serve worlds --listen 127.0.0.1:7687 --auth accounts \
 Port 0 selects a free port, reported by a stdout startup line for each listener
 `kala serve: listening on <address>`. Other diagnostics use structured stderr
 lines; neither queries, parameters nor credentials are logged. `localhost`
-resolves to `127.0.0.1`; `127.0.0.0/8` and `::1` are accepted. Other listen
-addresses require accounts and `--insecure-allow-plaintext`; `--auth none`
-always requires loopback. Setting the shutdown flag closes every listener and
+resolves to `127.0.0.1`; `127.0.0.0/8` and `::1` are accepted. Remote TCP listeners require accounts and either TLS or an explicit
+`--insecure-allow-plaintext`. Local TCP and Unix listeners also support `--auth none`. Setting the shutdown flag closes every listener and
 client socket, cancels queries and joins connection threads; `kala serve` sets
-it on SIGINT or SIGTERM (and SIGHUP), so `systemctl stop` and `docker stop`
+it on SIGINT or SIGTERM, so `systemctl stop` and `docker stop`
 shut down cleanly and remove Unix socket files.
 
 A single discovered user database is the implicit default (`system` is excluded). With multiple databases,
@@ -47,10 +46,10 @@ not supported yet. See the [Cypher subset](../kala-cypher/README.md).
 ## Transports and multiple listeners
 
 A transport carries the same Bolt bytes with absolute read/write deadlines,
-peer identity, a reached address, and an independent shutdown handle. TCP and
+peer identity, a reached address, and an independent shutdown handle. TCP, TLS and
 Unix streams use one session implementation, including authentication, message
-size/depth bounds and failure/RESET behavior. TLS and WebSocket are planned as
-wrappers of this seam. `Transport` requires no raw descriptor, and
+size/depth bounds and failure/RESET behavior. A blocking rustls wrapper encrypts the stream before
+the first Bolt handshake byte. `Transport` requires no raw descriptor, and
 `Server::with_transport_wrapper` can decorate accepted streams; conformance
 also runs through a wrapper that splits every read and write into single bytes.
 The peer used for account matching and the reached address are read from the
@@ -61,7 +60,7 @@ accepting.
 
 `ServerConfig::listen` is a list of `ListenAddr` values; `Server::local_addrs()`
 returns every actual bound endpoint in order. `--listen` accepts bare
-`IP:PORT`, `[IPv6]:PORT`, `localhost:PORT`, the same forms after `bolt://`, and
+`IP:PORT`, `[IPv6]:PORT`, `localhost:PORT`, the same forms after `bolt://` or `bolt+s://`, and
 (on Unix) `unix:///absolute/path`. DNS is never used. The default remains
 `127.0.0.1:7687`. Up to 16 distinct listeners share one `--max-connections` cap.
 All listeners bind before any startup line is printed; a failed bind closes
@@ -130,7 +129,7 @@ Regular files and symlinks at the socket path are refused without deletion.
 Clean shutdown removes only the socket inode this listener created; if the
 parent directory's permissions were loosened meanwhile it logs
 `event=bolt_socket_cleanup_failed` and leaves the socket, which a later start
-reclaims. `kala serve` runs this cleanup on SIGINT, SIGTERM and SIGHUP; only an
+reclaims. `kala serve` runs this cleanup on SIGINT and SIGTERM; only an
 uncatchable kill (SIGKILL, power loss) leaves the two files behind.
 
 **Who may connect.** `--unix.mode` is the access control of a Unix listener.
@@ -155,8 +154,8 @@ permissions are the access boundary, not peer-credential authentication. Some
 Unix systems do not enforce socket write permissions, so restrict the directory
 as well. IP-only custom authenticators retain their existing API and refuse
 local peers unless they implement `authenticate_peer`. Unix listeners count as
-local for `--auth none` and need no plaintext opt-in; every non-loopback TCP
-listener still requires accounts and `--insecure-allow-plaintext`.
+local for `--auth none` and need no plaintext opt-in; every non-loopback plaintext TCP
+listener requires accounts and `--insecure-allow-plaintext`.
 
 With no `--advertised-address`, Unix `SHOW DATABASES` reports `unix:///path`,
 and `ROUTE` fails with `routing over a Unix socket needs --advertised-address`.
@@ -231,9 +230,62 @@ of its login (or of its last BEGIN or write) until LOGOFF or disconnect. `kala u
 command and works while the server is running. The last `admin:*` account cannot
 be dropped or have that grant revoked.
 
-TLS is not implemented. Non-loopback account listeners need the explicit
-`--insecure-allow-plaintext` opt-in, which prints a warning that passwords travel
-unencrypted. This opt-in never permits `--auth none` on a non-loopback address.
+### TLS for remote accounts
+
+Use `bolt+s://` on the server. The wrapper negotiates TLS 1.3 or 1.2 with the
+ring provider and uses the server certificate for authentication. It requests
+no client certificate, negotiates no ALPN protocol, and disables early data
+and session resumption. A TLS connection takes a slot from the shared cap
+before the handshake. The TLS and Bolt handshakes share the handshake
+deadline. Partial records and blocked writes use the caller’s absolute deadline.
+Outgoing buffering is capped at 64 KiB per connection. An orderly Bolt close
+sends a best-effort TLS close notification within the write timeout.
+
+On startup Kala checks the PEM chain, leaf validity, matching private key and
+Unix key permissions before binding. SIGUSR1 repeats those checks and installs
+the new pair for future connections. Failed reloads log one error and preserve
+the active identity. Existing connections keep their original session. The
+reload runs off the signal thread, and signals that arrive while one is in
+flight coalesce into one more run. On a server without TLS listeners SIGUSR1
+logs `event=bolt_tls_reload_ignored reason=no_tls_listener` and does nothing.
+SIGHUP, like SIGTERM and SIGINT, is the clean shutdown.
+
+The key file must give group and others no access (`mode & 077 == 0`, as ssh
+requires); a chain file that group or others can write is a warning. Validity
+dates are read by a small strict DER walk (`transport/tls/der.rs`), and only
+when the files are read, at startup and at reload: a leaf that expires during
+uptime is served until it is replaced. The accept loop re-checks the date once
+an hour and logs a warning while the leaf is within 14 days of its end or
+expired.
+
+A client whose handshake rustls rejects is sent the fatal alert (bounded by the
+handshake deadline and one second) before the close. Bytes that are not TLS at
+all get a bare close instead: a plaintext Bolt driver would read the alert
+record as the Bolt version reply. Handshake failures are
+logged through one rate limiter (`suppressed_since_last=N`). The auth log line
+says `peer=tls` for these connections, `peer=tcp` for plaintext TCP and
+`peer=unix` for a Unix socket. A failed record write ends the stream: later
+writes and the close notification fail at once.
+
+The `ring` provider offers X25519 and the NIST curves only: there is no
+post-quantum hybrid key exchange (X25519MLKEM768 comes with `aws-lc-rs`, which
+needs cmake). `ring` compiles C and assembly, so building Kala needs a C
+compiler.
+
+Each non-loopback plaintext listener requires `--insecure-allow-plaintext`,
+including on a server that also serves TLS. The accepted TCP peer address
+determines account host matching. A remote TLS peer still needs a password
+account, and only local listeners support `--auth none`.
+
+ROUTE and SHOW DATABASES return a bare host and port for TLS connections.
+The default is the endpoint reached by this connection. Routing drivers reuse
+the encryption scheme of their original URI, so any configured
+`--advertised-address` must also be reachable over TLS and covered by the
+server certificate when clients verify its identity. A server has one
+advertised address: with a plaintext and a TLS listener together it is given to
+clients of both, so routing over the listener it does not belong to fails
+closed (a `neo4j://` client is sent to a TLS-only port, or a `neo4j+s://`
+client to a plaintext one; neither side falls back).
 
 ## Protocol
 
@@ -426,12 +478,93 @@ both forms. HELLO's
 **Neo4j Browser and other web-page clients are not supported yet.** They need
 Bolt over WebSocket, UNION ALL, `dbms.showCurrentUser()`, `dbms.clientConfig()`,
 and SHOW PROCEDURES/FUNCTIONS. Those belong to a later slice; the current
-transports are TCP and Unix sockets.
+transports are TCP, TLS over TCP and Unix sockets.
 
 ## Writing and transactions
 
-Datalog write forms use the same native applier as `kala transact`. Cypher remains
-read-only. Write parameters are not supported: send an empty parameter map.
+Cypher and Datalog both stage native writes. A blind Cypher CREATE needs
+`write`. Reading clauses, SET, REMOVE, DELETE, MERGE, property reads and
+RETURN also need `read`. Admission checks the entire statement before opening
+a writer. Both languages use the same database, mode and privilege checks,
+with reduced diagnostics for a write-only identity. Pass an empty parameter
+map for Datalog writes. Cypher accepts parameters in both pipelines and updates,
+converted with the kinds the statement gives them as for a read query (a handle
+string for a ref position names the entity; a wrong type is a TypeError before
+anything runs). `UNWIND … CREATE` has a reading part, so it needs `read` as well
+as `write`.
+
+**Type constraints.** `CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:Label)
+REQUIRE n.prop IS :: TYPE` declares attribute `prop` (`write`, summary type
+`s`), exactly as `[:attribute :prop :type]` does. A constraint only ever *adds*
+a declaration:
+
+- A label that is not a node type yet is declared as one, by the
+  schema-on-write rule (an inferred node type). **That is
+  permanent**: node types cannot be removed or renamed away, so check the
+  label's spelling. A strict world refuses it instead.
+- With `IF NOT EXISTS`, if `prop` is already an attribute — whatever its type
+  or other labels — the statement does nothing: no schema entry, no node type
+  for a new label, `declared: 0`.
+- Without it, the same type is a no-op (or confirms an inferred attribute as
+  declared). A different type is refused for every identity, `admin` included:
+  `attribute :prop already exists with type T; change it with // kala:datalog
+  [:attribute …] or [:migrate …]`. Changing a definition is done with those
+  Datalog forms (which need `admin`).
+
+**Where an auto-commit Cypher write reads.** A write never replays the log to
+get a snapshot; which handle its reading part runs on depends on the statement:
+
+| Statement | Reading part runs |
+| --- | --- |
+| Blind: only `CREATE` or a constraint, no `RETURN` | Nowhere to speak of (one empty row), compiled on the writer under the database's writer mutex |
+| Reads (`MATCH`, `UNWIND`, `SET`, `MERGE`, `RETURN`, …), default (optimistic) mode, and the cached reader snapshot is the current committed state | **Off the mutex**, on that snapshot, before the writer is taken: a heavy MATCH never blocks other writers |
+| Reads, but there is no current reader snapshot to be had without a replay; or weak mode | **Under the mutex**, on the writer |
+
+- The reader snapshot is "current" when a read query loaded it and nothing was
+  committed since, or when it is behind and unused: the write path then applies
+  just the log's tail to it (never a reload). It is not to be had when no read
+  query ever loaded one, while a query is still reading the stale one, or while
+  a reader is reloading; a bookmark the snapshot hasn't reached is waited for on
+  the writer.
+- Off the mutex, a commit that lands between the read and the stage is a
+  transient conflict only if it touched what the statement read, and a
+  tick-less write lands on the latest tick the reading part saw (the summary
+  reports `latest_tick_moved` if another commit moved it).
+- Under the mutex other writers wait, so the reading part has a tenth of a
+  query's step budget (1,000,000 steps), besides the 10,000 rows a statement
+  may write from and its deadline; over it the statement fails with `query
+  step limit exceeded` and nothing written. Staging has the full statement
+  budget on both paths.
+- Weak mode checks no reads, so it always reads the writer's own state: a
+  snapshot a commit may have overtaken would widen its lost-update window.
+
+A `RETURN` that cannot be sent (message or result limits, deadline) is refused
+before the commit, with nothing written. That check renders the answer from the
+staged transaction without recording reads: only what the statement itself read
+(its MATCH, the values a SET replaces) can conflict, not every property of a
+returned node. A refused Cypher write logs `event=bolt_write_refused` with
+`reason=privilege|conflict|statement`, as a Datalog one does.
+
+```python
+session.execute_write(lambda tx: tx.run(
+    "MATCH (c {kala_handle:$h}) SET c.hp = $hp AT TICK $t",
+    h="greg", hp=30, t=700,
+).consume())
+```
+
+A Cypher write returns rows only for RETURN. Auto-commit renders the committed
+properties and final IDs. Inside BEGIN, write RETURN sees the transaction's
+staged changes. A subsequent query reads the snapshot. The committed
+`kala.ops` list gives operation positions, kinds, ticks, changed counts and
+entry IDs. `ops_omitted` counts operations left out to fit the response.
+`relationships-created` counts newly interned edges in both languages,
+`relationships-deleted` counts retracted reference facts, and `labels-added`
+and `labels-removed` count changes to the label attribute. Nodes keep their
+permanent identity after DELETE. A Cypher summary has type `rw` for a
+reading pipeline or RETURN, otherwise `w`.
+
+Use `SET CONCURRENCY_MODE = 'weak'` or `'optimistic'` as the first statement
+of an explicit transaction, or set the mode in BEGIN metadata.
 For example, with a `read` + `write` account on the varrow fixture:
 
 ```python
@@ -495,8 +628,9 @@ bookmark wait) and costs nothing else: drivers begin in write mode by default,
 also for reads. The private writable handle is opened, and a write slot taken, at
 the transaction's **first write form**, on the world as it is then:
 
-- a transaction that has run no query yet simply takes that world as its
-  snapshot;
+- an initial Datalog write can adopt that world if it ran before any query.
+  A Cypher update pins its input to BEGIN, including the single empty row
+  of a blind CREATE. Its later MATCH clauses keep reading BEGIN's snapshot.
 - a transaction that queried first has its queries' read keys recorded on the
   handle. If **other transactions committed in between**, those keys are
   checked at COMMIT against everything committed since BEGIN's snapshot, not
@@ -511,12 +645,10 @@ the transaction's **first write form**, on the world as it is then:
   newer; what they read is checked from BEGIN's snapshot as well, so they can
   conflict but never slip through.)
 
-Two cases are checked more coarsely, as "read everything as of BEGIN" (any
-commit since then conflicts): a transaction whose queries read more than 256
-distinct attribute and node-type names before its first write, and one that
-queried before another transaction **changed the schema** (the read keys are
-names, and a name may mean another attribute afterwards). Weak mode skips
-all of these checks.
+An accumulated read set exceeding 256 attributes, node types and rendered
+identities falls back to checking every commit since BEGIN. Resolving the
+same names across a schema rewrite can also require this conservative check.
+Appending an unrelated attribute preserves the earlier name bindings.
 
 **The latest tick is BEGIN's.** A tick-less write in an explicit transaction
 lands on the latest tick of the snapshot BEGIN pinned, whether another
@@ -530,9 +662,9 @@ Queries read the transaction's committed snapshot. They do **not** see the trans
 own writes. Later write forms can resolve handles created by earlier forms and
 `:set`/`:if-missing` see staged writes through the native transaction. Optimistic
 queries record coarse attribute, node-type and entity-definition dependencies;
-unknown labels also record the absent node type. Graph-result enrichment
-conservatively records a whole-world read. This prevents write skew while scalar
-queries on unrelated attributes can commit independently. A query that runs after
+unknown labels and undeclared properties record their absent names. Returning
+a whole node or relationship records its identity, including graph values
+nested in lists and paths. A query that runs after
 its transaction staged a schema change (a rename, a declaration, also an inferred
 one) records a whole-world read: its names might mean other attributes in the
 transaction's provisional schema. Weak mode skips conflict checks. Sending a provisional entity ID pins it: a commit that would renumber it
@@ -545,6 +677,8 @@ fails transiently. Discarding the record does not expose that ID.
 | Query | read |
 | `[:assert …]`, `[:retract …]`, plain `[:create …]`, declarations (`[:attribute …]`, `[:node-type …]`, names a write declares by inference) | write |
 | `[:set …]`, `[:create … :if-missing]`, `[:correct …]` | read and write |
+| Cypher: `CREATE` with no reading part and no `RETURN`; `CREATE CONSTRAINT … IS :: TYPE` (it only adds: see "Type constraints") | write |
+| Cypher: anything with a reading part (`MATCH`, `UNWIND`, …), `SET`, `REMOVE`, `DELETE`, `MERGE`, `RETURN` | read and write |
 | `[:world-setting …]`, `[:rename …]`, `[:deprecate …]`, `[:cardinality …]`, `[:migrate …]` | admin (`admin:<db>` or `admin:*`) |
 | `[:attribute …]` or `[:node-type …]` that **changes** an attribute or node type the committed schema already has | admin (`admin:<db>` or `admin:*`) |
 | ROUTE | read or write |
@@ -604,7 +738,7 @@ Node/Relationship mapping for identities with read access.
 
 ### Write records and summaries
 
-Each operation produces one record with fields:
+Each Datalog operation produces one record with fields:
 
 ```
 ["form", "op", "kind", "tick", "changed", "entries", "entity", "created"]
@@ -635,7 +769,7 @@ carries the same `type` for that RUN), and:
 
 Optional summary details share a bounded budget while each form is committed;
 excess details are counted rather than retained. If the final encoded summary
-still exceeds the wire-message limit, detail lists are shortened in this order: notifications, ID mappings, entry IDs. `kala.notifications_omitted`,
+still exceeds the wire-message limit, detail lists are shortened in this order: notifications, operations, ID mappings, entry IDs. `kala.notifications_omitted`,
 `kala.ids_omitted` and `kala.entries_omitted` report exactly how many elements were
 omitted. The bookmark, transaction number, totals and counters are retained.
 This ensures a durable commit still returns SUCCESS. Fetch complete history with
@@ -691,8 +825,10 @@ request can't make every writer replay the log.
 | `--acknowledge-recovery` | false | Cut a world's damaged last transaction without an operator (see "Damaged tails") |
 
 Durations accept `ms`, `s`, `m` or bare seconds. Native defaults live in
-`ServerConfig`. Each transaction accepts at most 256 forms, retains at most
-16 MiB of write text, and observes the existing Datalog per-form limits.
+`ServerConfig`. Each transaction accepts at most 256 forms. The 16 MiB transaction budget
+includes write text and, for Cypher, parameters and the estimated memory for
+expanded primitive operations and their reports. Datalog also observes its
+per-form limits.
 Materialized write records are capped at 16 MiB per RUN. Socket messages remain
 bounded by `max_message_bytes` and `max_depth`. The idle clock starts when a
 response has been sent and stops when the next request has arrived: a statement

@@ -292,6 +292,7 @@ pub(super) struct ReadSet {
     /// `note_read_all`: any newer transaction conflicts.
     all: Option<usize>,
     /// `(entity, attribute)`: a newer entry on that entity and attribute.
+    entities: HashMap<EntityId, usize>,
     entity_attr: HashMap<(EntityId, AttrId), usize>,
     /// `(target, attribute)`: a newer entry whose value is that target.
     reverse: HashMap<(EntityId, AttrId), usize>,
@@ -451,7 +452,8 @@ fn as_fact_or_marker(body: &EntryBody) -> Option<(EntityId, AttrId, &Value)> {
 
 impl ReadSet {
     fn exact_keys(&self) -> usize {
-        self.entity_attr.len()
+        self.entities.len()
+            + self.entity_attr.len()
             + self.reverse.len()
             + self.value_count
             + self.types.len()
@@ -466,6 +468,10 @@ impl ReadSet {
             return;
         }
         self.coarse = true;
+        // An entity read spans every attribute, including future ones.
+        if let Some(at) = self.entities.drain().map(|(_, at)| at).min() {
+            self.read_all(at);
+        }
         let attr = |attrs: &mut HashMap<AttrId, usize>, a: AttrId, at: usize| {
             let first = attrs.entry(a).or_insert(at);
             *first = (*first).min(at);
@@ -610,6 +616,14 @@ impl ReadSet {
                     if let Some(at) = self.attrs.get(attr) {
                         return conflict(ConflictKey::Attribute { attr: name(*attr) }, *at);
                     }
+                    if let Some(at) = self.entities.get(entity) {
+                        return conflict(ConflictKey::Entity { entity: *entity }, *at);
+                    }
+                    if let Value::Ref(target) = value
+                        && let Some(at) = self.entities.get(target)
+                    {
+                        return conflict(ConflictKey::Entity { entity: *target }, *at);
+                    }
                     if let Some(at) = self.entity_attr.get(&(*entity, *attr)) {
                         return conflict(
                             ConflictKey::EntityAttribute {
@@ -664,6 +678,18 @@ impl ReadSet {
                 EntryBody::Schema(SchemaEdit::Attribute { id, .. })
                 | EntryBody::Schema(SchemaEdit::Migration { source: id, .. })
                 | EntryBody::DefineAttr { id, .. } => {
+                    // Renaming or changing an existing property changes its
+                    // rendering. A new attribute has no values on this entity
+                    // unless this tail also contains its corresponding fact.
+                    if !self.entities.is_empty()
+                        && world.catalog.attribute_history[id.0 as usize]
+                            .first()
+                            .is_some_and(|(tx, _)| *tx < first)
+                        && let Some((&entity, &at)) =
+                            self.entities.iter().min_by_key(|(id, at)| (**at, **id))
+                    {
+                        return conflict(ConflictKey::Entity { entity }, at);
+                    }
                     if let Some(at) = self.attr_read(*id) {
                         return conflict(ConflictKey::Attribute { attr: name(*id) }, at);
                     }
@@ -828,6 +854,20 @@ impl Txn<'_> {
             .map_or(0, |v| (self.snapshot_tx().0.saturating_sub(v.0)) as usize)
     }
 
+    /// A no-op can serialize on this handle's snapshot only if reads made
+    /// before the handle opened are also valid there. Its committed tail
+    /// is already in memory, so this check needs no lock or filesystem I/O.
+    pub(super) fn validate_older_reads(&self) -> Result<(), Error> {
+        let behind = self.reads_behind();
+        if behind > 0 {
+            self.s
+                .reads
+                .borrow()
+                .check(self.world, TxId(self.s.tx.0 - behind as u64), behind)?;
+        }
+        Ok(())
+    }
+
     /// The warning of a commit whose tick-less writes landed on the latest
     /// tick the transaction began with (`ops`: its recorded operations)
     /// while the world it is committed over has another latest tick.
@@ -963,6 +1003,29 @@ impl Txn<'_> {
         Ok(())
     }
 
+    /// Record every fact on or pointing to one entity, including new
+    /// attributes. Useful when rendering a full entity or enumerating all
+    /// its incoming and outgoing relationships at a tick.
+    pub fn note_read_entity(&self, entity: EntityId) {
+        let Some(mut reads) = self.reads() else {
+            return;
+        };
+        let at = self.s.ops.len();
+        if self.is_provisional(entity) {
+            if entity.is_edge() {
+                reads
+                    .provisional
+                    .entry(entity)
+                    .or_insert_with(|| (at, "properties".to_owned()));
+            }
+        } else if reads.coarse {
+            reads.read_all(at);
+        } else {
+            reads.entities.entry(entity).or_insert(at);
+            reads.bound();
+        }
+    }
+
     /// Records a scan of entity definitions or the handle table, including
     /// future node types. Fact-only commits do not invalidate this read.
     pub fn note_entity_definitions(&self) {
@@ -979,12 +1042,36 @@ impl Txn<'_> {
         }
     }
 
+    /// Runs `f` with read recording off: whatever `f` reads through this
+    /// transaction ([`Txn::values_at`], the `note_*` reads, a name found
+    /// undeclared) is not added to the read set, so no newer commit
+    /// conflicts with it, and under [`Concurrency::Weak`] it doesn't count
+    /// as an unrecorded read either. Reads made before and after are
+    /// recorded as always.
+    ///
+    /// Only for a look at the staged state that **nothing depends on**:
+    /// neither what the transaction goes on to write nor anything shown to
+    /// its client before the commit. A server uses it to measure, before an
+    /// auto-commit write is appended, the answer it will render again from
+    /// the committed world afterwards. Using it for a read that decides a
+    /// write gives up serializability for that read.
+    pub fn without_read_recording<R>(&self, f: impl FnOnce(&Self) -> R) -> R {
+        struct Restore<'a>(&'a std::cell::Cell<bool>, bool);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.1);
+            }
+        }
+        let _restore = Restore(&self.s.reads_muted, self.s.reads_muted.replace(true));
+        f(self)
+    }
+
     /// The read set, if this transaction records reads: optimistic, on a
     /// world other handles can write. Every read asks here, so a read made
     /// under [`Concurrency::Weak`] is remembered as one that went
     /// unrecorded (see [`Txn::set_concurrency`]).
     fn reads(&self) -> Option<RefMut<'_, ReadSet>> {
-        if !self.s.track {
+        if !self.s.track || self.s.reads_muted.get() {
             return None;
         }
         if self.s.concurrency == Concurrency::Weak {
@@ -1037,7 +1124,7 @@ impl Txn<'_> {
 
     /// Whether this transaction allocated `id` (an entity it created or an
     /// edge it interned).
-    fn provisional(&self, id: EntityId) -> bool {
+    pub fn is_provisional(&self, id: EntityId) -> bool {
         match id.as_edge() {
             Some(edge) => edge.seq() > self.s.snapshot.edges as u64,
             None => self.s.ids.created(id),
@@ -1066,7 +1153,7 @@ impl Txn<'_> {
             return;
         };
         let at = self.s.ops.len();
-        if self.provisional(entity) {
+        if self.is_provisional(entity) {
             // Nobody else wrote an entity only this transaction knows,
             // unless it is an edge a newer commit interned too: then the
             // commit merges the two, and the newer commit may have written

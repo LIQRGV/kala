@@ -134,6 +134,11 @@ pub(crate) struct Transaction {
     pub forms: Vec<StagedWrite>,
     pub bytes: usize,
     pub queried: bool,
+    /// The summary type includes reads for a query, a read pipeline or RETURN.
+    pub summary_reads: bool,
+    pub mode_set: bool,
+    /// Indexes into forms for which the per-operation report goes in the summary.
+    pub cypher_forms: Vec<usize>,
     pub server_statement: bool,
     /// What the queries run so far depend on, kept until the writable
     /// handle exists to record it on.
@@ -162,6 +167,33 @@ impl Transaction {
             (None, Snapshot::Write(tx, _)) => tx.world(),
         }
     }
+    /// Attach dependencies before opening a writer or directly to a live transaction.
+    pub fn record(&mut self, reads: &Reads, include_in_summary: bool) {
+        self.queried = true;
+        self.summary_reads |= include_in_summary;
+        if reads.is_empty() {
+            return;
+        }
+        match &mut self.snapshot {
+            Snapshot::Write(owned, _) => {
+                // A query may still be reading BEGIN after the writer opened
+                // on a newer catalog. Record an absent/present name only if
+                // both snapshots resolve it the same way.
+                let same_names = self.begun.as_ref().is_none_or(|before| {
+                    reads.defined_names(before) == reads.defined_names(owned.world())
+                });
+                owned.with(|tx| {
+                    if same_names && tx.schema_changes().is_empty() {
+                        reads.note(tx);
+                    } else {
+                        tx.note_read_all();
+                    }
+                });
+            }
+            Snapshot::Read(_) if !self.read_only => self.pending.merge(reads),
+            _ => {}
+        }
+    }
     /// The transaction's writable handle, if it has written.
     pub fn written(&mut self) -> Option<&mut OwnedTxn> {
         match &mut self.snapshot {
@@ -180,8 +212,9 @@ impl Transaction {
     /// which may be newer than the read snapshot pinned at BEGIN (tx
     /// `pinned`).
     ///
-    /// - If the transaction has run no query yet, nothing depended on the
-    ///   older snapshot and the newer one simply becomes the transaction's.
+    /// - A Datalog write opened before any query can adopt the newer
+    ///   snapshot. Cypher pins BEGIN when it evaluates its input, including
+    ///   the single, empty row for a blind CREATE.
     /// - If it has, the read keys its queries recorded (`pending`) are
     ///   noted on the handle, and when other transactions committed in
     ///   between, the handle is told that those reads were made at
@@ -229,9 +262,16 @@ impl Transaction {
             let moved = owned.snapshot_tx() != pinned;
             // The pending keys are names: exact only if every name means
             // on the handle what it meant on the BEGIN snapshot.
-            let same_schema = !moved || {
+            let stable_names = !moved || self.pending.is_empty() || {
                 let now = owned.world();
-                begun.attributes().eq(now.attributes()) && begun.node_types().eq(now.node_types())
+                // Attribute IDs are append-only. New names can be recorded
+                // on the newer handle: reading the new attribute conflicts
+                // with its declaration in the tail since BEGIN. A rename or
+                // redefinition can change the meaning of an older ID.
+                begun
+                    .attributes()
+                    .eq(now.attributes().take(begun.attributes().count()))
+                    && self.pending.same_type_names(&begun, now)
             };
             owned.with(|tx| {
                 tx.set_concurrency(self.concurrency);
@@ -239,7 +279,7 @@ impl Transaction {
                 tx.set_schema_additions_only(!admin);
                 tx.set_start_tick(begun.latest_tick());
                 if self.queried {
-                    if same_schema {
+                    if stable_names {
                         self.pending.note(tx);
                     } else {
                         tx.note_read_all();

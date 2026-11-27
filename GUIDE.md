@@ -544,6 +544,37 @@ kala query varrow.kala --lang cypher "MATCH p = (e {kala_handle: 'edwin'})-[:all
 Variable-length patterns require an upper bound of at most 10 hops. Exceeding a
 query resource limit reports an error rather than a partial result.
 
+## Move Greg and import a character with Cypher
+
+Save this statement in `move.cypher` and run it on the Varrow fixture.
+
+```cypher
+MATCH (g {kala_handle:'greg'}), (a {kala_handle:'ashford'})
+SET g.located_in = a AT TICK 225;
+```
+
+```sh
+kala transact --lang cypher varrow.kala move.cypher
+```
+
+At tick 225 Greg leaves Varrow and enters Ashford. The two changes produce
+no overlap warning. Running it again reports zero changes.
+
+Save the following import in `import.cypher`. The permanent handle makes
+it safe to run the file again.
+
+```cypher
+MERGE (n:CHARACTER {kala_handle:'kael2'})
+ON CREATE SET n.name = 'Kael' AT TICK 700;
+```
+
+```sh
+kala transact --lang cypher varrow.kala import.cypher
+```
+
+The first run creates the character and asserts the name. The second finds
+the character and appends nothing.
+
 ## Write through a Neo4j driver
 
 With `kala serve worlds --default-db varrow`, a local bootstrap root account can

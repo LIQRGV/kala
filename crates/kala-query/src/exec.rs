@@ -160,6 +160,13 @@ pub struct RunOptions<'a> {
     /// every few dozen checks, so a deadline needs no watchdog thread and
     /// costs a query next to nothing.
     pub deadline: Option<std::time::Instant>,
+    /// Refuse the run with [`QueryError::RowLimit`] (carrying this number)
+    /// when more rows than this reach the final projection, before the
+    /// answer is built. Unlike [`Limits::max_rows`] it does not bound
+    /// intermediate operators: a caller that accepts only so many answer
+    /// rows (a write statement's reading part) can still scan and filter
+    /// more. `None` sets no such bound.
+    pub result_rows: Option<usize>,
 }
 
 impl<'a> RunOptions<'a> {
@@ -169,6 +176,15 @@ impl<'a> RunOptions<'a> {
             limits,
             cancel: None,
             deadline: None,
+            result_rows: None,
+        }
+    }
+
+    /// The same options, refusing an answer of more than `rows` rows.
+    pub fn with_result_rows(self, rows: usize) -> RunOptions<'a> {
+        RunOptions {
+            result_rows: Some(rows),
+            ..self
         }
     }
 
@@ -208,6 +224,7 @@ pub fn run_with(
         limits: &options.limits,
         cancel: options.cancel.unwrap_or(&never),
         deadline: options.deadline,
+        result_rows: options.result_rows,
     };
     check_cancel(request.cancel)?;
     check_deadline(request.deadline)?;
@@ -242,6 +259,7 @@ pub fn execute(
         limits,
         cancel: &AtomicBool::new(false),
         deadline: None,
+        result_rows: None,
     };
     request.execute_on(view).map(|(rows, _)| rows)
 }
@@ -254,6 +272,7 @@ struct Request<'a> {
     limits: &'a Limits,
     cancel: &'a AtomicBool,
     deadline: Option<std::time::Instant>,
+    result_rows: Option<usize>,
 }
 
 impl Request<'_> {
@@ -331,6 +350,11 @@ impl Request<'_> {
         // The default tick's read (a walk of the E index at an older canon).
         ex.charge_index_work()?;
         let rows = ex.eval(&prog.steps)?;
+        if let Some(limit) = self.result_rows
+            && rows.len() > limit
+        {
+            return Err(QueryError::RowLimit { limit });
+        }
         let rows = match output {
             Some(spec) => output_rows(&rows, &find, spec, &slots, self.params, &mut ex.budget)?,
             None => set_rows(&rows, &find, &mut ex.budget)?,

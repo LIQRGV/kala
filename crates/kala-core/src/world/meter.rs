@@ -257,6 +257,20 @@ impl MeteredView<'_> {
         entity: EntityId,
         attr: &str,
         t: Tick,
+        visitor: impl FnMut(Value) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        self.visit_non_ref_values_charged(entity, attr, t, |_| Ok(()), visitor)
+    }
+
+    /// As [`Self::visit_non_ref_values`], charging encoded bytes before decoding
+    /// each value. The charge also precedes copying an unindexed string from
+    /// its intern table, so a caller can enforce its remaining memory budget.
+    pub fn visit_non_ref_values_charged(
+        &self,
+        entity: EntityId,
+        attr: &str,
+        t: Tick,
+        mut charge: impl FnMut(usize) -> Result<(), Error>,
         mut visitor: impl FnMut(Value) -> Result<(), Error>,
     ) -> Result<(), Error> {
         let (attr_id, def) = self.view.resolve(entity, attr)?;
@@ -266,11 +280,19 @@ impl MeteredView<'_> {
         self.view.work.finish(Ok(()))?;
         let mut result = Ok(());
         self.view
-            .for_each_e_value_holding(entity, attr_id, t, |encoded| {
-                if result.is_ok()
-                    && let Some(value) = self.view.world.decode_e_part(attr_id, encoded)
-                {
-                    result = visitor(value);
+            .for_each_e_value_holding(entity, attr_id, t, |part| {
+                if result.is_err() {
+                    return;
+                }
+                if let Some(encoded) = self.view.world.e_part_encoding(attr_id, part) {
+                    result = charge(encoded.len()).and_then(|()| {
+                        if let Ok(value) = Value::decode(encoded)
+                            && value.value_type() == def.value_type
+                        {
+                            visitor(value)?;
+                        }
+                        Ok(())
+                    });
                 }
             });
         result?;

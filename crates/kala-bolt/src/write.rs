@@ -19,6 +19,14 @@ const CONSTRAINT: &str = "Neo.ClientError.Schema.ConstraintValidationFailed";
 pub(crate) const MAX_FORMS: usize = 256;
 pub(crate) const MAX_STAGED_BYTES: usize = 16 * 1024 * 1024;
 
+/// Charge retained statement data across the entire explicit transaction.
+pub(crate) fn charge(total: &mut usize, bytes: usize) -> Result<(), Failure> {
+    *total = total
+        .checked_add(bytes)
+        .filter(|n| *n <= MAX_STAGED_BYTES)
+        .ok_or_else(|| Failure::new(INVALID, "transaction exceeds the 16 MiB staged byte limit"))?;
+    Ok(())
+}
 const REDUCED: &str = "write failed; details require read privilege";
 /// A write refused by a store rule: something about the data it met (a
 /// handle that exists or doesn't, a value that is held, a declared type, a
@@ -113,6 +121,25 @@ pub(crate) fn write_error(error: write::WriteError, read: bool) -> Failure {
         }
     }
 }
+pub(crate) fn statement_error(error: write::StatementError, read: bool) -> Failure {
+    match error {
+        write::StatementError::Stage(e)
+            if matches!(
+                e.cause,
+                write::Failure::Store(_)
+                    | write::Failure::SystemWorld
+                    | write::Failure::SameTick(_)
+            ) =>
+        {
+            write_error(e, read)
+        }
+        // The statement's own wording (a Cypher fix, never a Datalog verb).
+        e @ write::StatementError::Stage(_) => store_rule(SEMANTIC, e.to_string(), read),
+        write::StatementError::Store(e) => store_error(e, read),
+        write::StatementError::Query(e) if read => crate::query::query_error(e),
+        e => store_rule(SEMANTIC, e.to_string(), read),
+    }
+}
 /// What the connection's identity holds on the database a write targets.
 #[derive(Clone, Copy)]
 pub(crate) struct Privileges {
@@ -146,19 +173,35 @@ pub(crate) struct Privileges {
 /// remote identity needs `admin` for them. The owner may relax it; the CLI
 /// is not affected (its boundary is the file's permissions).
 pub(crate) fn admit(form: &WriteTxn, prior: usize, held: Privileges) -> Result<(), Failure> {
-    if write::requires_admin(form) && !held.admin {
+    admit_needs(
+        write::requires_read(form),
+        write::requires_admin(form),
+        form.concurrency.is_some(),
+        prior,
+        held,
+    )
+}
+
+pub(crate) fn admit_needs(
+    read: bool,
+    admin: bool,
+    mode: bool,
+    prior: usize,
+    held: Privileges,
+) -> Result<(), Failure> {
+    if admin && !held.admin {
         return Err(Failure::new(
             FORBIDDEN,
             "this write form requires admin privilege on the database",
         ));
     }
-    if write::requires_read(form) && !held.read {
+    if read && !held.read {
         return Err(Failure::new(
             FORBIDDEN,
             "this write form requires read privilege",
         ));
     }
-    if prior > 0 && form.concurrency.is_some() {
+    if prior > 0 && mode {
         return Err(Failure::new(
             INVALID,
             "concurrency is allowed only in the first write form of a transaction",
@@ -328,10 +371,17 @@ pub(crate) struct Summary {
     notifications: Vec<Value>,
     nodes: usize,
     edges: usize,
+    relationships_deleted: usize,
+    labels_added: usize,
+    labels_removed: usize,
+    ops: Vec<Value>,
+    ops_omitted: usize,
+    cypher: bool,
     properties: usize,
     pub tx: u64,
     updates: bool,
     data: bool,
+    schema: bool,
     moved: Option<Value>,
     remaining: usize,
     entries_omitted: usize,
@@ -384,6 +434,31 @@ impl Summary {
             self.ids_omitted += 1;
         }
     }
+    /// Save bounded per-operation details where a Cypher result's rows
+    /// have been reserved for RETURN. Counts, positions and entry IDs carry
+    /// the same information as the reduced Datalog operation records.
+    pub fn operations(&mut self, form: usize, ops: &[WriteOperation]) {
+        self.cypher = true;
+        for op in ops {
+            let cost = 192usize.saturating_add(op.entries.len().saturating_mul(9));
+            if cost > self.remaining {
+                self.ops_omitted += 1;
+                continue;
+            }
+            self.remaining -= cost;
+            self.ops.push(Value::Map(
+                [
+                    ("form".into(), int(form)),
+                    ("op".into(), int(op.position)),
+                    ("kind".into(), Value::String(op.kind.into())),
+                    ("tick".into(), Value::Integer(op.tick.0)),
+                    ("changed".into(), int(op.changed)),
+                    ("entries".into(), ids(&op.entries)),
+                ]
+                .into(),
+            ));
+        }
+    }
     pub fn add(&mut self, world: &World, result: &CommitResult, forms: &[StagedWrite], read: bool) {
         self.tx = result.tx.0;
         self.changed += result.changed;
@@ -400,16 +475,31 @@ impl Summary {
         self.edges += result.edges.len();
         for form in forms {
             for op in &form.ops {
-                self.nodes += usize::from(op.created == Some(true));
+                self.nodes += usize::from(op.kind == "create" && op.created != Some(false));
                 self.data |= writes_data(op.kind);
+                self.schema |= !writes_data(op.kind);
             }
         }
         for id in &result.entries {
             if let Some(info) = world.entry(*id) {
                 use kala_core::log::EntryBody;
-                if matches!(info.body, EntryBody::Fact { op: kala_core::Op::Assert, ref value, .. } | EntryBody::Revised { op: kala_core::Op::Assert, ref value, .. } if !matches!(value, kala_core::Value::Ref(_)))
+                if let EntryBody::Fact {
+                    op, attr, value, ..
+                }
+                | EntryBody::Revised {
+                    op, attr, value, ..
+                } = info.body
                 {
-                    self.properties += 1;
+                    let asserted = op == kala_core::Op::Assert;
+                    if matches!(value, kala_core::Value::Ref(_)) {
+                        self.relationships_deleted += usize::from(!asserted);
+                    } else {
+                        self.properties += usize::from(asserted);
+                        if world.attr_name(attr) == Some("label") {
+                            self.labels_added += usize::from(asserted);
+                            self.labels_removed += usize::from(!asserted);
+                        }
+                    }
                 }
             }
         }
@@ -512,7 +602,11 @@ impl Summary {
             ("entries".into(), ids(&self.entries)),
         ]
         .into();
+        if self.cypher {
+            kala.insert("ops".into(), Value::List(self.ops));
+        }
         for (name, count) in [
+            ("ops_omitted", self.ops_omitted),
             ("entries_omitted", self.entries_omitted),
             ("ids_omitted", self.ids_omitted),
             ("notifications_omitted", self.notifications_omitted),
@@ -530,6 +624,12 @@ impl Summary {
         let stats = [
             ("nodes-created".into(), int(self.nodes)),
             ("relationships-created".into(), int(self.edges)),
+            (
+                "relationships-deleted".into(),
+                int(self.relationships_deleted),
+            ),
+            ("labels-added".into(), int(self.labels_added)),
+            ("labels-removed".into(), int(self.labels_removed)),
             ("properties-set".into(), int(self.properties)),
             ("contains-updates".into(), Value::Bool(self.updates)),
         ]
@@ -540,7 +640,7 @@ impl Summary {
                 Value::String(
                     if queried {
                         "rw"
-                    } else if self.data {
+                    } else if self.data || (self.cypher && !self.schema) {
                         "w"
                     } else {
                         "s"
@@ -562,7 +662,7 @@ impl Summary {
         }
         // A durable commit always has a bounded SUCCESS. Details are optional;
         // the bookmark, tx, totals and counters must never be lost to encoding.
-        for field in ["notifications", "ids", "entries"] {
+        for field in ["notifications", "ops", "ids", "entries"] {
             while packstream::encode_with_limits(
                 &Value::Structure(0x70, vec![Value::Map(map.clone())]),
                 max.saturating_sub(32),
@@ -624,6 +724,9 @@ pub(crate) fn commit_error(w: &World, error: Error, forms: &[StagedWrite], read:
         None => "this transaction".to_string(),
     };
     let what = match &conflict.key {
+        ConflictKey::Entity { entity: id } => {
+            format!("read {}, which another transaction changed", entity(*id))
+        }
         ConflictKey::EntityAttribute { entity: e, attr: a } => format!(
             "read {} {}, which another transaction changed",
             entity(*e),

@@ -58,6 +58,7 @@
 
 mod catalog;
 mod concurrency;
+mod delete;
 mod ids;
 mod index;
 mod journal;

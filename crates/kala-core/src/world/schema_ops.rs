@@ -134,8 +134,20 @@ impl SchemaSnapshot {
     }
 }
 
-/// The schema half of the catalog: validating and applying schema edits.
-/// Live edits and replay both go through [`Catalog::apply_schema_edit`].
+/// Scalar attributes infer one value, except node labels, which are a set.
+/// Restore accepts the original label-one default used by older dumps/logs.
+fn inferred_cardinality(name: &str, ty: ValueType, stored: Option<Cardinality>) -> Cardinality {
+    if name == "label" && ty == ValueType::Str {
+        stored.unwrap_or(Cardinality::Many)
+    } else if ty == ValueType::Ref {
+        Cardinality::Many
+    } else {
+        Cardinality::One
+    }
+}
+
+/// The schema half of the catalog. Live edits and replay both go through
+/// [`Catalog::apply_schema_edit`].
 impl Catalog {
     /// Rebuilds the name tables (attributes, inverses, node types) from the
     /// definitions, after an edit or a restore changed them.
@@ -273,11 +285,7 @@ impl Catalog {
                 &def.name,
                 def.value_type,
                 Kind::State,
-                if def.value_type == ValueType::Ref {
-                    Cardinality::Many
-                } else {
-                    Cardinality::One
-                },
+                inferred_cardinality(&def.name, def.value_type, Some(def.cardinality)),
             );
             expected.inferred = true;
             if self.is_strict() || *def != expected {
@@ -665,6 +673,31 @@ impl Txn<'_> {
         }
         def
     }
+    /// The cardinality used to render a property from this side of a relationship.
+    /// Unlabelled inverses render a single held value as a scalar, like the query executor.
+    pub fn property_cardinality(&self, name: &str) -> Option<Cardinality> {
+        if let Some(id) = self.world.catalog.inverse_by_name.get(name) {
+            Some(
+                self.world.catalog.attributes[id.0 as usize]
+                    .reverse_cardinality
+                    .unwrap_or(Cardinality::One),
+            )
+        } else {
+            self.attribute(name).map(|def| def.cardinality)
+        }
+    }
+
+    /// All attribute definitions, including those staged by this transaction.
+    pub fn attributes(&self) -> impl Iterator<Item = &AttrDef> {
+        self.world.attributes()
+    }
+
+    /// The underlying world for query preparation on a newly opened transaction.
+    /// Read it before staging: schema changes become visible here during staging.
+    pub fn base_world(&self) -> &World {
+        self.world
+    }
+
     /// Whether the transaction writes a system world ([`World::is_system`]).
     pub fn is_system(&self) -> bool {
         self.world.is_system()
@@ -719,7 +752,7 @@ impl Txn<'_> {
             let ty = value.value_type();
             if txn.world.world_setting("schema") == Some("strict") { return Err(Error::Schema(format!("attribute {:?} is not in the schema; declare it first: [:attribute :{} :{}]", name,name,ty.name()))); }
             if let Value::Str(value) = value && value.len() > crate::MAX_INDEXED_STRING_BYTES { return Err(Error::Schema(format!("string over 256 bytes for an indexed attribute; declare it first: [:attribute :{} :string :unindexed]", name))); }
-            let mut def = AttrDef::new(name,ty,Kind::State,if ty == ValueType::Ref { Cardinality::Many } else { Cardinality::One });
+            let mut def = AttrDef::new(name,ty,Kind::State,inferred_cardinality(name, ty, None));
             def.inferred = true;
             txn.declare_attr_inner(def)
         })
@@ -749,11 +782,7 @@ impl Txn<'_> {
         options: &AttributeOptions,
     ) -> Result<(), Error> {
         self.guard(|txn| {
-            let cardinality = if ty == ValueType::Ref {
-                Cardinality::Many
-            } else {
-                Cardinality::One
-            };
+            let cardinality = inferred_cardinality(name, ty, options.cardinality);
             if options.kind.is_some_and(|v| v != Kind::State)
                 || options.cardinality.is_some_and(|v| v != cardinality)
                 || options
@@ -767,6 +796,12 @@ impl Txn<'_> {
                 return Err(Error::Schema(
                     "an inferred declaration must be new and use inference defaults".into(),
                 ));
+            }
+            if cardinality != inferred_cardinality(name, ty, None) {
+                // Restore the old inferred label-one declaration verbatim.
+                let mut def = AttrDef::new(name, ty, Kind::State, cardinality);
+                def.inferred = true;
+                return txn.declare_attr_inner(def);
             }
             let sample = match ty {
                 ValueType::Bool => Value::Bool(false),

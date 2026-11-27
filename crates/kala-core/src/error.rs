@@ -142,6 +142,14 @@ pub enum Error {
         /// The limit, [`MAX_ENTRY_BYTES`](crate::log::MAX_ENTRY_BYTES).
         max: usize,
     },
+    /// Deleting the node would leave an asserted relationship attached.
+    ConnectedEntity {
+        name: String,
+        handle: Option<String>,
+        tick: Tick,
+    },
+    /// Enumerating a node's state would exceed the statement's write allowance.
+    DeleteLimit,
     /// A retract of an event attribute. Events are never retracted in
     /// story time; un-canon one with a correction instead.
     RetractEvent(String),
@@ -298,6 +306,8 @@ pub struct Conflict {
 /// gave it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConflictKey {
+    /// A change to an entity whose state or relationships were read.
+    Entity { entity: EntityId },
     /// A read of an entity's attribute (`[:set …]`, `Txn::values_at`,
     /// `Txn::note_read`): a newer entry is on that entity and attribute.
     EntityAttribute {
@@ -370,6 +380,7 @@ impl ConflictKey {
     /// to their own codes.
     pub fn kind(&self) -> &'static str {
         match self {
+            ConflictKey::Entity { .. } => "entity",
             ConflictKey::EntityAttribute { .. } => "entity-attribute",
             ConflictKey::Reverse { .. } => "reverse",
             ConflictKey::Value { .. } => "value",
@@ -389,6 +400,9 @@ impl fmt::Display for Conflict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("conflict: ")?;
         match &self.key {
+            ConflictKey::Entity { .. } => {
+                f.write_str("another transaction changed an entity this transaction read")?
+            }
             ConflictKey::EntityAttribute { attr, .. } => write!(
                 f,
                 "another transaction wrote {} of an entity this transaction read",
@@ -560,6 +574,18 @@ impl fmt::Display for Error {
                  {max}-byte limit",
                 Quoted(attr)
             ),
+            Error::ConnectedEntity { name, handle, tick } => {
+                write!(f, "cannot delete {}", Echo(name))?;
+                if let Some(h) = handle {
+                    write!(f, " ({})", Echo(h))?;
+                }
+                write!(
+                    f,
+                    ": it still has relationships at tick {}; use DETACH DELETE",
+                    tick.0
+                )
+            }
+            Error::DeleteLimit => f.write_str("DELETE exceeds the 10000-primitive write limit"),
             Error::RetractEvent(a) => write!(
                 f,
                 "attribute {} is an event and can't be retracted (use a correction)",

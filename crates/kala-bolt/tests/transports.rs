@@ -1,8 +1,10 @@
-//! One Bolt conformance suite for TCP, Unix sockets and decorating transports.
+//! One Bolt conformance suite for TCP, Unix sockets, TLS and decorating transports.
 #![cfg(unix)]
 #[path = "common/client.rs"]
 mod client;
 mod common;
+#[path = "common/tls.rs"]
+mod tls;
 use client::{ALLIES, Client, map, string};
 use kala_bolt::packstream::Value;
 use kala_bolt::transport::{ListenAddr, Peer, ShutdownHandle, Transport};
@@ -26,15 +28,23 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, Debug)]
 enum Kind {
     Tcp,
+    Tls,
     Unix,
     WrappedTcp,
     WrappedUnix,
 }
-const KINDS: [Kind; 4] = [Kind::Tcp, Kind::WrappedTcp, Kind::Unix, Kind::WrappedUnix];
+const KINDS: [Kind; 5] = [
+    Kind::Tls,
+    Kind::Tcp,
+    Kind::WrappedTcp,
+    Kind::Unix,
+    Kind::WrappedUnix,
+];
 impl Kind {
     fn address(self, dir: &Path) -> ListenAddr {
         match self {
             Self::Tcp | Self::WrappedTcp => ListenAddr::Tcp("127.0.0.1:0".parse().unwrap()),
+            Self::Tls => ListenAddr::Tls("127.0.0.1:0".parse().unwrap()),
             Self::Unix | Self::WrappedUnix => ListenAddr::Unix(dir.join("bolt.sock")),
         }
     }
@@ -45,20 +55,25 @@ impl Kind {
 
 enum Stream {
     Tcp(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
     Unix(UnixStream),
 }
 impl Stream {
-    fn connect(addr: &ListenAddr) -> Self {
+    fn connect(addr: &ListenAddr, dir: &Path) -> Self {
         match addr {
-            ListenAddr::Tcp(addr) => {
-                let stream = TcpStream::connect(addr).unwrap();
+            ListenAddr::Tcp(socket) | ListenAddr::Tls(socket) => {
+                let stream = TcpStream::connect(socket).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
                 stream
                     .set_write_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
-                Self::Tcp(stream)
+                if matches!(addr, ListenAddr::Tls(_)) {
+                    Self::Tls(Box::new(tls::stream(dir, stream)))
+                } else {
+                    Self::Tcp(stream)
+                }
             }
             ListenAddr::Unix(path) => {
                 let stream = UnixStream::connect(path).unwrap();
@@ -72,11 +87,32 @@ impl Stream {
             }
         }
     }
+    /// A forced timeout or server shutdown can cut the encrypted stream short.
+    /// rustls distinguishes this case from the clean EOF after a Bolt GOODBYE.
+    fn assert_interrupted(&mut self) {
+        if matches!(self, Self::Tls(_)) {
+            match self.read(&mut [0]) {
+                Ok(0) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::BrokenPipe
+                    ) => {}
+                other => panic!("expected the server to close the TLS connection, got {other:?}"),
+            }
+        } else {
+            common::assert_closed(self);
+        }
+    }
 }
 impl Read for Stream {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Tcp(s) => s.read(bytes),
+            Self::Tls(s) => s.read(bytes),
             Self::Unix(s) => s.read(bytes),
         }
     }
@@ -85,12 +121,14 @@ impl Write for Stream {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         match self {
             Self::Tcp(s) => s.write(bytes),
+            Self::Tls(s) => s.write(bytes),
             Self::Unix(s) => s.write(bytes),
         }
     }
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Self::Tcp(s) => s.flush(),
+            Self::Tls(s) => s.flush(),
             Self::Unix(s) => s.flush(),
         }
     }
@@ -125,7 +163,7 @@ impl Transport for SplitTransport {
 
 struct Running {
     // The server is joined before this directory is dropped.
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     addrs: Vec<ListenAddr>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<io::Result<()>>>,
@@ -137,7 +175,19 @@ impl Running {
         config.listen = vec![kind.address(dir.path())];
         Self::in_dir(dir, config, kind.wrapped(), true)
     }
-    fn in_dir(dir: tempfile::TempDir, config: ServerConfig, wrap: bool, accounts: bool) -> Self {
+    fn in_dir(
+        dir: tempfile::TempDir,
+        mut config: ServerConfig,
+        wrap: bool,
+        accounts: bool,
+    ) -> Self {
+        if config
+            .listen
+            .iter()
+            .any(|addr| matches!(addr, ListenAddr::Tls(_)))
+        {
+            tls::configure(dir.path(), &mut config);
+        }
         let result = if accounts {
             Server::bind_accounts(dir.path(), config)
         } else {
@@ -164,15 +214,18 @@ impl Running {
         let shutdown = stop.clone();
         let worker = thread::spawn(move || server.run(shutdown));
         Self {
-            _dir: dir,
+            dir,
             addrs,
             stop,
             worker: Some(worker),
             writes,
         }
     }
+    fn stream(&self, index: usize) -> Stream {
+        Stream::connect(&self.addrs[index], self.dir.path())
+    }
     fn connected(&self, index: usize, minor: u8) -> Client<Stream> {
-        let mut stream = Stream::connect(&self.addrs[index]);
+        let mut stream = self.stream(index);
         common::handshake(&mut stream, minor);
         Client { stream }
     }
@@ -243,7 +296,7 @@ fn conformance_versions_hello_logon_query_and_failure_reset() {
             c.reset();
             assert_eq!(c.query(ALLIES).len(), 2);
         }
-        let mut range = Stream::connect(&server.addrs[0]);
+        let mut range = server.stream(0);
         range
             .write_all(&[
                 0x60, 0x60, 0xb0, 0x17, 0, 4, 6, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -252,7 +305,7 @@ fn conformance_versions_hello_logon_query_and_failure_reset() {
         let mut version = [0; 4];
         range.read_exact(&mut version).unwrap();
         assert_eq!(version, [0, 0, 4, 5]);
-        let mut unsupported = Stream::connect(&server.addrs[0]);
+        let mut unsupported = server.stream(0);
         unsupported
             .write_all(&[
                 0x60, 0x60, 0xb0, 0x17, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -341,28 +394,28 @@ fn conformance_handshake_idle_partial_chunk_and_noop_deadlines() {
                 ..ServerConfig::default()
             },
         );
-        let mut incomplete = Stream::connect(&server.addrs[0]);
+        let mut incomplete = server.stream(0);
         incomplete.write_all(&[0x60]).unwrap();
-        common::assert_closed(&mut incomplete);
+        incomplete.assert_interrupted();
         let mut idle = server.ready(0);
-        common::assert_closed(&mut idle.stream);
+        idle.stream.assert_interrupted();
         let mut partial = server.ready(0);
         partial.stream.write_all(&[0, 10, 0xb1]).unwrap();
-        common::assert_closed(&mut partial.stream);
+        partial.stream.assert_interrupted();
         let mut noop = server.ready(0);
         noop.stream.write_all(&[0, 0, 0, 0]).unwrap();
-        common::assert_closed(&mut noop.stream);
+        noop.stream.assert_interrupted();
     }
 }
 
-fn wait_for_slot(addr: &ListenAddr) {
+fn wait_for_slot(server: &Running, index: usize) -> Stream {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         assert!(
             Instant::now() < deadline,
             "connection slot was not reclaimed"
         );
-        let mut stream = Stream::connect(addr);
+        let mut stream = server.stream(index);
         let proposal = [
             0x60, 0x60, 0xb0, 0x17, 0, 0, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
@@ -372,7 +425,7 @@ fn wait_for_slot(addr: &ListenAddr) {
         let mut response = [0; 4];
         if stream.read_exact(&mut response).is_ok() {
             assert_eq!(response, [0, 0, 4, 5]);
-            return;
+            return stream;
         }
         thread::yield_now();
     }
@@ -408,7 +461,7 @@ fn conformance_write_deadline_reclaims_a_blocked_connection() {
         blocked.send(0x3f, vec![map(&[("n", Value::Integer(-1))])]);
         // 13 MiB exceeds a kernel send buffer. The old connection stays open
         // and unread while the shared cap proves the write deadline released it.
-        wait_for_slot(&server.addrs[0]);
+        wait_for_slot(&server, 0);
     }
 }
 
@@ -429,7 +482,7 @@ fn conformance_cap_is_shared_and_shutdown_closes_all_listeners_and_clients() {
         let mut tcp = server.ready(0);
         let mut unix = server.ready(1);
         for addr in &server.addrs {
-            common::assert_closed(&mut Stream::connect(addr));
+            common::assert_closed(&mut Stream::connect(addr, server.dir.path()));
         }
         assert_eq!(tcp.query(ALLIES).len(), 2);
         assert_eq!(unix.query(ALLIES).len(), 2);
@@ -442,6 +495,110 @@ fn conformance_cap_is_shared_and_shutdown_closes_all_listeners_and_clients() {
         assert!(TcpStream::connect(tcp_addr).is_err());
         assert!(!path.exists());
         assert!(UnixStream::connect(path).is_err());
+    }
+}
+
+#[test]
+fn conformance_explicit_write_commits_for_other_connections() {
+    for kind in KINDS {
+        let server = Running::start(kind, ServerConfig::default());
+        let mut writer = server.ready(0);
+        writer.send(0x11, vec![map(&[("db", string("varrow"))])]);
+        writer.success();
+        assert_eq!(
+            writer
+                .query("// kala:datalog\n[:assert :greg :alias \"committed\" :at 300]")
+                .len(),
+            1
+        );
+        writer.send(0x12, vec![]);
+        writer.success();
+        assert!(
+            server
+                .ready(0)
+                .query("// kala:datalog\n[:find ?a :at 300 :where [:greg :alias ?a]]")
+                .contains(&vec![string("committed")]),
+            "{kind:?}"
+        );
+    }
+}
+
+#[test]
+fn conformance_tls_handshake_uses_shared_cap_and_shutdown_interrupts_idle_tls() {
+    let dir = world_dir();
+    let config = ServerConfig {
+        listen: vec![Kind::Tls.address(dir.path()), Kind::Tcp.address(dir.path())],
+        max_connections: 1,
+        ..ServerConfig::default()
+    };
+    let mut server = Running::in_dir(dir, config, false, true);
+    let ListenAddr::Tls(addr) = server.addrs[0] else {
+        panic!("expected TLS listener")
+    };
+    let mut hello = tls::client(server.dir.path());
+    let mut handshaking = TcpStream::connect(addr).unwrap();
+    handshaking
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    hello.write_tls(&mut handshaking).unwrap();
+    // Reading the first ServerHello byte proves the server took this connection's slot.
+    let mut byte = [0];
+    handshaking.read_exact(&mut byte).unwrap();
+    assert_eq!(byte, [22]);
+    common::assert_closed(&mut server.stream(1));
+    drop(handshaking);
+    wait_for_slot(&server, 1);
+    let mut idle = Client {
+        stream: wait_for_slot(&server, 0),
+    };
+    idle.hello();
+    idle.success();
+    idle.send(0x6a, vec![map(&[("scheme", string("none"))])]);
+    idle.success();
+    let start = Instant::now();
+    server.shutdown();
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "shutdown must interrupt the TLS read"
+    );
+    idle.stream.assert_interrupted();
+}
+
+#[test]
+fn tls_metadata_reports_the_reached_address_without_a_scheme() {
+    for advertised in [None, Some("graph.example.test:17687")] {
+        let server = Running::start(
+            Kind::Tls,
+            ServerConfig {
+                advertised_address: advertised.map(str::to_owned),
+                ..ServerConfig::default()
+            },
+        );
+        let ListenAddr::Tls(addr) = server.addrs[0] else {
+            panic!("expected TLS listener")
+        };
+        let expected = advertised
+            .map(str::to_owned)
+            .unwrap_or_else(|| addr.to_string());
+        let mut client = server.ready(0);
+        let rows = client.query("SHOW DATABASES YIELD address");
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| row == &vec![string(&expected)]));
+        client.send(0x66, vec![map(&[]), Value::List(vec![]), map(&[])]);
+        let response = client.success();
+        let Value::Map(rt) = &response["rt"] else {
+            panic!("routing table")
+        };
+        let Value::List(servers) = &rt["servers"] else {
+            panic!("routing servers")
+        };
+        assert_eq!(servers.len(), 3);
+        for server in servers {
+            let Value::Map(server) = server else {
+                panic!("routing server")
+            };
+            assert_eq!(server["addresses"], Value::List(vec![string(&expected)]));
+        }
     }
 }
 

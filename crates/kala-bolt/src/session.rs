@@ -1,4 +1,5 @@
 //! One connection's Bolt state. Authentication failures are terminal.
+use crate::log::logln;
 use crate::transport::Peer;
 use crate::{
     auth::{AuthToken, Authenticator, Credentials, Identity},
@@ -53,6 +54,8 @@ struct Session<'a> {
     config: &'a ServerConfig,
     id: u64,
     peer: Peer,
+    /// The connection arrived over TLS (for the auth log only).
+    tls: bool,
     advertised_address: String,
     output: Option<query::Output>,
     db: String,
@@ -83,24 +86,22 @@ pub(crate) struct Origin {
     pub peer: Peer,
     /// The reached endpoint, advertised when no address is configured.
     pub reached: crate::transport::ListenAddr,
+    /// Whether the listener that accepted it wraps connections in TLS.
+    pub tls: bool,
 }
 pub(crate) fn serve(
-    mut stream: Box<dyn Transport>,
+    stream: &mut dyn Transport,
     origin: Origin,
     id: u64,
     shared: &Shared<'_>,
 ) -> io::Result<()> {
     let config = shared.config;
-    let Origin { peer, reached } = origin;
-    let Some(minor) = handshake::negotiate(
-        stream.as_mut(),
-        config.handshake_timeout,
-        config.write_timeout,
-    )?
+    let Origin { peer, reached, tls } = origin;
+    let Some(minor) = handshake::negotiate(stream, config.handshake_timeout, config.write_timeout)?
     else {
         return Ok(());
     };
-    eprintln!("event=bolt_negotiated connection_id={id} version=5.{minor}");
+    logln!("event=bolt_negotiated connection_id={id} version=5.{minor}");
     let mut session = Session {
         state: State::Connected,
         minor,
@@ -111,6 +112,7 @@ pub(crate) fn serve(
         config,
         id,
         peer,
+        tls,
         advertised_address: config
             .advertised_address
             .clone()
@@ -125,7 +127,7 @@ pub(crate) fn serve(
         grants_seen: None,
     };
     loop {
-        let Some(message) = session.receive(stream.as_mut())? else {
+        let Some(message) = session.receive(stream)? else {
             return Ok(());
         };
         let deadline = Instant::now() + config.write_timeout;
@@ -142,15 +144,15 @@ pub(crate) fn serve(
                 message
             };
         if session.state == State::Failed && !matches!(message, Ok(Message::Reset)) {
-            session.send(stream.as_mut(), &Value::Structure(0x7e, vec![]), deadline)?;
+            session.send(stream, &Value::Structure(0x7e, vec![]), deadline)?;
             continue;
         }
         let result = match message {
-            Ok(msg) => session.handle(stream.as_mut(), msg, shared.stop),
+            Ok(msg) => session.handle(stream, msg, shared.stop),
             Err(e) => Err(RequestError::Client(e)),
         };
         if let Err(error) = result
-            && session.fail(stream.as_mut(), error)?.is_break()
+            && session.fail(stream, error)?.is_break()
         {
             return Ok(());
         }
@@ -226,9 +228,10 @@ impl Session<'_> {
             RequestError::Transport(error) => return Err(error),
             RequestError::Client(failure) => failure,
         };
-        eprintln!(
+        logln!(
             "event=bolt_request_failed connection_id={} code={}",
-            self.id, failure.code
+            self.id,
+            failure.code
         );
         self.output = None;
         self.transaction = None;
@@ -296,10 +299,11 @@ impl Session<'_> {
         // A Unix peer has no IP; `-` rather than a host name that could be
         // mistaken for a loopback TCP client.
         let (client_ip, transport) = match self.peer {
+            Peer::Ip(ip) if self.tls => (ip.to_string(), "tls"),
             Peer::Ip(ip) => (ip.to_string(), "tcp"),
             Peer::Local => ("-".to_owned(), "unix"),
         };
-        eprintln!(
+        logln!(
             "event=bolt_authenticated connection_id={} user={:?} client_ip={client_ip} peer={transport}",
             self.id,
             crate::error::escape(&identity.principal),
@@ -474,7 +478,7 @@ impl Session<'_> {
                 )
             })
             .collect();
-        eprintln!("event=bolt_route connection_id={} db={db}", self.id);
+        logln!("event=bolt_route connection_id={} db={db}", self.id);
         Ok(success([(
             "rt",
             Value::Map(
@@ -565,7 +569,7 @@ impl Session<'_> {
         }
     }
     fn log_refused(&self, db: &str, reason: &str) {
-        eprintln!(
+        logln!(
             "event=bolt_write_refused connection_id={} db={:?} user={:?} reason={reason}",
             self.id,
             crate::error::escape(db),
@@ -576,7 +580,7 @@ impl Session<'_> {
     }
     fn log_commit(&self, db: &str, result: &kala_core::CommitResult, forms: usize) {
         if result.committed {
-            eprintln!(
+            logln!(
                 "event=bolt_write_committed connection_id={} db={} user={:?} tx={} forms={forms} changed={}",
                 self.id,
                 crate::error::escape(db),
@@ -630,6 +634,9 @@ impl Session<'_> {
             forms: Vec::new(),
             bytes: 0,
             queried: false,
+            summary_reads: false,
+            mode_set: false,
+            cypher_forms: Vec::new(),
             server_statement: false,
             pending: crate::reads::Reads::default(),
             begun: None,
@@ -688,11 +695,14 @@ impl Session<'_> {
                 })
                 .collect();
             summary.add(&world, &result, &completed, read);
+            for index in transaction.cypher_forms {
+                summary.operations(index + 1, &completed[index].ops);
+            }
             Ok(Value::Structure(
                 0x70,
                 vec![Value::Map(summary.metadata(
                     &db,
-                    transaction.queried,
+                    transaction.summary_reads,
                     self.config.max_message_bytes,
                     self.config.max_depth,
                 ))],
@@ -764,20 +774,27 @@ impl Session<'_> {
         self.summary = None;
         self.run_type = "r";
         let output = match statement {
-            kala_lang::Statement::Writes => {
-                // An explicit transaction's grants were refreshed at BEGIN.
-                if self.transaction.is_none() {
-                    self.refresh_grants()?;
+            kala_lang::Statement::Concurrency(mode) => {
+                self.allow_write_run(&name, &options)?;
+                let tx = self.transaction.as_mut().ok_or_else(|| Failure::new(INVALID,
+                    "use BEGIN metadata or put SET CONCURRENCY_MODE first in an explicit transaction"))?;
+                if tx.mode_set || tx.queried || tx.server_statement || !tx.forms.is_empty() {
+                    return Err(Failure::new(
+                        INVALID,
+                        "concurrency is allowed only in the first statement of a transaction",
+                    ));
                 }
-                let read = self
-                    .identity
-                    .as_ref()
-                    .is_some_and(|id| id.permits_read(&name));
-                let mode = self
-                    .transaction
-                    .as_ref()
-                    .map_or(options.read_only, |tx| tx.read_only);
-                self.write_allowed(&name, mode)?;
+                tx.concurrency = mode;
+                tx.mode_set = true;
+                query::Output::empty()
+            }
+            kala_lang::Statement::CypherWrite(statement) => {
+                let held = self.allow_write_run(&name, &options)?;
+                self.cypher_run(&name, &statement, params, text.len(), &options, held, stop)
+                    .inspect_err(|failure| self.log_refused(&name, refusal_reason(failure)))?
+            }
+            kala_lang::Statement::Writes => {
+                let read = self.allow_write_run(&name, &options)?.read;
                 if !params.is_empty() {
                     return Err(Failure::new(
                         INVALID,
@@ -786,18 +803,7 @@ impl Session<'_> {
                 }
                 let source = source?;
                 self.write_run(&name, &source.text, &options, read)
-                    .inspect_err(|failure| {
-                        self.log_refused(
-                            &name,
-                            if failure.code == crate::error::FORBIDDEN {
-                                "privilege"
-                            } else if failure.code.starts_with("Neo.TransientError") {
-                                "conflict"
-                            } else {
-                                "statement"
-                            },
-                        );
-                    })?
+                    .inspect_err(|failure| self.log_refused(&name, refusal_reason(failure)))?
             }
             kala_lang::Statement::Server(statement) => {
                 if self
@@ -856,7 +862,7 @@ impl Session<'_> {
                         "read privilege is required",
                     ));
                 }
-                eprintln!(
+                logln!(
                     "event=bolt_query_started connection_id={} db={name}",
                     self.id
                 );
@@ -870,27 +876,7 @@ impl Session<'_> {
                         self.config.max_depth,
                         tx.deadline,
                     )?;
-                    match &mut tx.snapshot {
-                        // The query read the COMMITTED world, but its read
-                        // keys are recorded by name on the transaction,
-                        // whose schema is provisional: after a rename or a
-                        // new declaration a name can mean another attribute
-                        // there (or only there). Once the transaction has
-                        // edited the schema, a query counts as having read
-                        // everything instead of being recorded under the
-                        // wrong attribute.
-                        Snapshot::Write(owned, _) => owned.with(|t| {
-                            if t.schema_changes().is_empty() {
-                                output.reads.note(t);
-                            } else {
-                                t.note_read_all();
-                            }
-                        }),
-                        // Kept for the writable handle, if one ever opens.
-                        Snapshot::Read(_) if !tx.read_only => tx.pending.merge(&output.reads),
-                        Snapshot::Read(_) => {}
-                    }
-                    tx.queried = true;
+                    tx.record(&output.reads, true);
                     output
                 } else {
                     let world = self.registry.at_least(
@@ -908,7 +894,7 @@ impl Session<'_> {
                         self.started + options.timeout,
                     )?
                 };
-                eprintln!(
+                logln!(
                     "event=bolt_query_completed connection_id={} rows={}",
                     self.id,
                     output.rows.len()
@@ -938,13 +924,19 @@ impl Session<'_> {
             ("qid", Value::Integer(0)),
         ]))
     }
-    fn write_run(
+    fn allow_write_run(
         &mut self,
         db: &str,
-        text: &str,
         options: &Options,
-        read: bool,
-    ) -> Result<query::Output, Failure> {
+    ) -> Result<write::Privileges, Failure> {
+        if self.transaction.is_none() {
+            self.refresh_grants()?;
+        }
+        let mode = self
+            .transaction
+            .as_ref()
+            .map_or(options.read_only, |tx| tx.read_only);
+        self.write_allowed(db, mode)?;
         if self.config.max_message_bytes < 1024 || self.config.max_depth < 8 {
             return Err(Failure::new(
                 INVALID,
@@ -961,6 +953,257 @@ impl Session<'_> {
                 "server statements and writes cannot share a transaction",
             ));
         }
+        let identity = self.identity.as_ref().ok_or_else(Failure::invalid)?;
+        Ok(write::Privileges {
+            read: identity.permits_read(db),
+            admin: identity.permits_admin(db),
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn cypher_run(
+        &mut self,
+        db: &str,
+        statement: &kala_lang::write::WriteStatement,
+        given: &Map,
+        text_len: usize,
+        options: &Options,
+        held: write::Privileges,
+        flag: &AtomicBool,
+    ) -> Result<query::Output, Failure> {
+        use kala_lang::write::{compile_statement, run_statement, stage_statement};
+        let fields = statement.fields();
+        let rw = statement.has_reading_part() || !fields.is_empty();
+        let prior = self.transaction.as_ref().map_or(0, |tx| tx.forms.len());
+        write::admit_needs(statement.requires_read(), false, false, prior, held)?;
+        let deadline = self
+            .transaction
+            .as_ref()
+            .map_or(self.started + options.timeout, |tx| tx.deadline);
+        let stop = query::Stop { flag, deadline };
+        let max = self.config.max_message_bytes;
+        let depth = self.config.max_depth;
+        // RUN publishes its field names before PULL. Verify that response
+        // fits before we append anything, even for a long quoted alias.
+        let header = success([
+            (
+                "fields",
+                Value::List(fields.iter().cloned().map(Value::String).collect()),
+            ),
+            ("t_first", Value::Integer(i64::MAX)),
+            ("qid", Value::Integer(0)),
+        ]);
+        crate::packstream::encode_with_limits(&header, max, depth)
+            .map_err(|_| Failure::new(INVALID, "RETURN column names exceed the message limit"))?;
+        // Parameters take the kinds the reading part's compilation computed,
+        // as for a read query: a handle given for a ref position resolves to
+        // its entity, and a wrongly typed value is refused before evaluation.
+        let prepare = |world: &kala_core::World, limits: kala_query::Limits| {
+            let compiled = compile_statement(world, statement)
+                .map_err(|e| write::statement_error(e, held.read))?;
+            let params = query::parameters(world, compiled.parameter_kinds(), given, true)?;
+            let run = kala_query::RunOptions::new(limits)
+                .with_cancel(flag)
+                .with_deadline(deadline);
+            let input = query::until(deadline, |_| {
+                run_statement(world, statement, compiled, &params, run)
+                    .map_err(|e| write::statement_error(e, held.read))
+            })?;
+            Ok::<_, Failure>((params, input))
+        };
+        let full = kala_query::Limits::default();
+        if let Some(tx) = &mut self.transaction {
+            let account = self
+                .identity
+                .as_ref()
+                .map(|id| format!("{}@{}", id.principal, id.host))
+                .ok_or_else(Failure::invalid)?;
+            let param_size =
+                crate::packstream::encode_with_limits(&Value::Map(given.clone()), max, depth)
+                    .map_err(|_| Failure::new(INVALID, "parameter limit exceeded"))?
+                    .len();
+            write::charge(&mut tx.bytes, text_len.saturating_add(param_size))?;
+            let (params, input) = prepare(tx.world(), full)?;
+            // Pin BEGIN even for the one empty input row of a blind CREATE.
+            // A later MATCH reads that same snapshot.
+            tx.record(input.reads(), rw);
+            let owned = tx.writer(self.registry, self.config, &account, held.admin)?;
+            let (output, staged, retained_bytes) = owned.with(|t| {
+                let result = stage_statement(t, statement, input, &params)
+                    .map_err(|e| write::statement_error(e, held.read))?;
+                let output = query::render(
+                    query::RenderWorld::Staged(t),
+                    fields,
+                    result.rows,
+                    result.tick,
+                    Default::default(),
+                    query::RenderOptions::write(stop, max, depth),
+                )?;
+                Ok::<_, Failure>((output, result.staged, result.retained_bytes))
+            })?;
+            write::charge(&mut tx.bytes, retained_bytes)?;
+            self.run_type = if rw {
+                "rw"
+            } else if statement.schema_only() {
+                "s"
+            } else {
+                "w"
+            };
+            tx.cypher_forms.push(tx.forms.len());
+            tx.forms.push(staged);
+            Ok(output)
+        } else {
+            // Where the reading part runs. A write never replays the log to
+            // get a snapshot (`Registry::cached_at_least` only ever applies
+            // the log's tail to the cached one):
+            //
+            // - A blind statement (nothing but CREATE or a constraint, no
+            //   RETURN) has no reading part to speak of, one empty row: it
+            //   takes no snapshot and is compiled on the writer.
+            // - A statement that reads, in the default mode, reads the
+            //   cached reader snapshot BEFORE the database's writer is
+            //   taken, when that snapshot is the current committed state:
+            //   however heavy the reading part is, no other writer waits
+            //   for it. A commit that lands between this read and the stage
+            //   below is checked precisely: staging records the read keys
+            //   as read at the snapshot's tx (`Txn::set_read_version`), so
+            //   only a commit that touched what was read is a conflict
+            //   (transient: drivers retry it).
+            // - Otherwise (no current snapshot to be had without a replay,
+            //   or weak mode, which checks no reads and so must not read a
+            //   state a commit may have overtaken) the reading part runs on
+            //   the writer, under the mutex, within `UNDER_WRITER_STEPS`.
+            let reads = statement.requires_read();
+            let snapshot = if reads && options.concurrency != kala_core::Concurrency::Weak {
+                self.registry.cached_at_least(db, options.bookmark)?
+            } else {
+                None
+            };
+            let early = match snapshot {
+                Some(snapshot) => {
+                    let (params, input) = prepare(&snapshot, full)?;
+                    // A statement that read lands its tick-less writes on
+                    // the latest tick its reading part saw.
+                    let seen = (snapshot.latest_tx().0, snapshot.latest_tick());
+                    drop(snapshot);
+                    #[cfg(feature = "test-hooks")]
+                    if let Some(hook) = &self.config.after_statement_read {
+                        (hook.0)();
+                    }
+                    Some((params, input, seen))
+                }
+                None => None,
+            };
+            let pinned = early.as_ref().map_or(0, |(_, _, (tx, _))| *tx);
+            let (output, summary) = self.registry.write(
+                db,
+                self.config
+                    .busy_timeout
+                    .min(deadline.saturating_duration_since(Instant::now())),
+                options.bookmark.max(pinned),
+                |world| {
+                    let mut tx = world.begin();
+                    tx.set_concurrency(options.concurrency);
+                    tx.set_schema_additions_only(!held.admin);
+                    tx.set_deadline(deadline);
+                    let (params, input) = match early {
+                        Some((params, input, (_, tick))) => {
+                            tx.set_start_tick(tick);
+                            (params, input)
+                        }
+                        None => {
+                            // Other writers wait while this runs, so a
+                            // reading part gets a tenth of a query's steps;
+                            // staging then has the whole statement's budget
+                            // again, as on the other path.
+                            let limits = kala_query::Limits {
+                                max_steps: if reads { UNDER_WRITER_STEPS } else { full.max_steps },
+                                ..full
+                            };
+                            let (params, input) = prepare(tx.base_world(), limits)?;
+                            (params, input.with_stage_limits(full))
+                        }
+                    };
+                    let mut staged = stage_statement(&mut tx, statement, input, &params)
+                        .map_err(|e| write::statement_error(e, held.read))?;
+                    // Render RETURN from the staged transaction before the
+                    // durable append, under the limits the real rendering
+                    // has: a result that cannot be sent refuses the
+                    // statement while nothing is committed. Final IDs can
+                    // only be a few digits wider (a commit renumbering over
+                    // another process's writes), hence the margin.
+                    if !fields.is_empty() {
+                        query::render(
+                            query::RenderWorld::Staged(&tx),
+                            fields.clone(),
+                            staged.rows.clone(),
+                            staged.tick,
+                            Default::default(),
+                            query::RenderOptions::write(stop, max.saturating_sub(64), depth)
+                                .preview(),
+                        )?;
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(write::timeout());
+                    }
+                    let result = tx.commit().map_err(|e| {
+                        write::commit_error(
+                            world,
+                            e,
+                            std::slice::from_ref(&staged.staged),
+                            held.read,
+                        )
+                    })?;
+                    self.log_commit(db, &result, 1);
+                    let outcome = if result.committed {
+                        "write committed"
+                    } else {
+                        "write completed without changes"
+                    };
+                    // Past the append nothing is retryable: a failure the
+                    // preview could not see is reported as committed.
+                    let after_commit = || {
+                        Failure::new(
+                            crate::error::STORE,
+                            format!(
+                                "{outcome} at tx {} (bookmark kala:{db}:{}); RETURN could not be rendered",
+                                result.tx.0, result.tx.0
+                            ),
+                        )
+                    };
+                    let rows = staged
+                        .committed_rows(world, &result.ids)
+                        .map_err(|_| after_commit())?;
+                    let output = query::render(
+                        query::RenderWorld::Snapshot(world, result.tx),
+                        fields,
+                        rows,
+                        staged.tick,
+                        Default::default(),
+                        query::RenderOptions::write(stop, max, depth),
+                    )
+                    .map_err(|_| after_commit())?;
+                    let ops = staged.staged.clone().complete(&result).ops;
+                    let form = StagedWrite {
+                        ops,
+                        ..staged.staged
+                    };
+                    let mut summary = write::Summary::new(max);
+                    summary.add(world, &result, std::slice::from_ref(&form), held.read);
+                    summary.operations(1, &form.ops);
+                    Ok((output, summary.metadata(db, rw, max, depth)))
+                },
+            )?;
+            self.summary = Some(summary);
+            Ok(output)
+        }
+    }
+    fn write_run(
+        &mut self,
+        db: &str,
+        text: &str,
+        options: &Options,
+        read: bool,
+    ) -> Result<query::Output, Failure> {
         let forms = kala_lang::write::write_forms(text).map_err(write::parse_error)?;
         // Every form of the RUN is parsed and admitted (its privileges and
         // its place in the transaction) before a writable handle is opened
@@ -997,7 +1240,11 @@ impl Session<'_> {
                     Failure::new(INVALID, "transaction exceeds the staged-text byte limit")
                 })?;
             for (index, form) in forms.iter().enumerate() {
-                write::admit(form, tx.forms.len() + index, held)?;
+                write::admit(
+                    form,
+                    tx.forms.len() + index + usize::from(tx.mode_set),
+                    held,
+                )?;
             }
             let mut data = false;
             for (index, form) in forms.iter().enumerate() {
@@ -1022,7 +1269,7 @@ impl Session<'_> {
                 })?;
                 tx.forms.push(staged);
             }
-            self.run_type = if tx.queried {
+            self.run_type = if tx.summary_reads {
                 "rw"
             } else if data {
                 "w"
@@ -1199,6 +1446,24 @@ impl Session<'_> {
         } else {
             Ok(success([("has_more", Value::Bool(true))]))
         }
+    }
+}
+/// The `reason=` of a refused write's log line: never the statement's text
+/// or values, only which kind of refusal it was.
+/// The step budget of an auto-commit Cypher write's reading part when it
+/// has to run on the writable handle, i.e. while every other writer of the
+/// database waits: a tenth of a query's default (10,000,000). The rows it
+/// may hand to the write clauses (10,000) and the statement's deadline bound
+/// it as everywhere else.
+const UNDER_WRITER_STEPS: u64 = 1_000_000;
+
+fn refusal_reason(failure: &Failure) -> &'static str {
+    if failure.code == crate::error::FORBIDDEN {
+        "privilege"
+    } else if failure.code.starts_with("Neo.TransientError") {
+        "conflict"
+    } else {
+        "statement"
     }
 }
 fn elapsed(start: Instant) -> i64 {
