@@ -93,12 +93,10 @@ pub(crate) fn write_error(error: write::WriteError, read: bool) -> Failure {
         }
     }
 }
-pub(crate) fn stage(
-    tx: &mut kala_core::Txn<'_>,
-    form: &WriteTxn,
-    prior: usize,
-    read: bool,
-) -> Result<StagedWrite, Failure> {
+/// What a form needs before anything is staged (or a writable handle
+/// opened) for it: the privileges it requires and its place in the
+/// transaction (`prior` forms already staged).
+pub(crate) fn admit(form: &WriteTxn, prior: usize, read: bool) -> Result<(), Failure> {
     if write::requires_read(form) && !read {
         return Err(Failure::new(
             FORBIDDEN,
@@ -117,6 +115,14 @@ pub(crate) fn stage(
             "transaction exceeds the 256-form limit",
         ));
     }
+    Ok(())
+}
+/// Stages a form [`admit`] accepted.
+pub(crate) fn stage(
+    tx: &mut kala_core::Txn<'_>,
+    form: &WriteTxn,
+    read: bool,
+) -> Result<StagedWrite, Failure> {
     let mut staged = write::stage(tx, form, None).map_err(|e| write_error(e, read))?;
     for op in &mut staged.ops {
         if op.kind == "create" && op.created.is_none() {

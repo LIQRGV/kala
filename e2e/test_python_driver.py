@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Opt-in official-driver tests. Run through ./e2e/run.sh, never cargo test."""
 import concurrent.futures
+import contextlib
 import os
 import select
 import shutil
@@ -639,6 +640,29 @@ class WriteDriverTests(unittest.TestCase):
                     )
                     self.assertIn(f"Two databases {round}", [r[0] for r in records])
 
+    def test_default_routing_reads_never_take_a_write_slot(self):
+        # execute_query begins a write-mode transaction unless told otherwise.
+        # The server caps open WRITE transactions at 8; a transaction that
+        # only reads must not count, however many run.
+        driver = self.driver()
+        held = []
+        with contextlib.ExitStack() as stack:
+            for _ in range(10):
+                session = stack.enter_context(driver.session(database="varrow"))
+                tx = stack.enter_context(session.begin_transaction())
+                self.assertEqual(len(list(tx.run(ALLIES))), 2)
+                held.append(tx)
+            for _ in range(20):
+                records, summary, _ = driver.execute_query(ALLIES, database_="varrow")
+                self.assertEqual(len(records), 2)
+                self.assertEqual(summary.query_type, "r")
+            for tx in held:
+                tx.commit()
+
+    def test_admin_lists_databases_on_system_with_default_routing(self):
+        records, _, _ = self.driver("root").execute_query("SHOW DATABASES", database_="system")
+        self.assertLessEqual({"varrow", "annex", "system"}, {r["name"] for r in records})
+
     def test_conflicting_execute_write_is_retried_and_both_increments_commit(self):
         driver = self.driver()
         with driver.session(database="varrow") as session:
@@ -763,8 +787,10 @@ class WriteDriverTests(unittest.TestCase):
         refusals = [line for line in output.splitlines() if "event=bolt_write_refused " in line]
         self.assertTrue(commits, "missing committed-write event")
         self.assertTrue(refusals, "missing refused-write event")
+        self.assertTrue(any(" db=varrow " in line for line in commits))
         for line in commits:
-            for key in ["connection_id=", "db=varrow", "user=", "tx=", "forms=", "changed="]:
+            # The write server has two databases (varrow and annex).
+            for key in ["connection_id=", " db=", "user=", "tx=", "forms=", "changed="]:
                 self.assertIn(key, line)
         for line in refusals:
             for key in ["connection_id=", "db=", "user=", "reason="]:

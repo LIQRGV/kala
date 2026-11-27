@@ -663,10 +663,24 @@ fn system_write_is_forbidden_even_for_admin_and_never_changes_bytes() {
         let mut client = login(&server, user);
         for explicit in [false, true] {
             if explicit {
+                // An admin's BEGIN on `system` pins a read snapshot (drivers
+                // begin in write mode for reads too); the write form is
+                // what is refused. Everyone else is refused at BEGIN.
                 client.send(
                     0x11,
                     vec![map(&[("db", string("system")), ("mode", string("w"))])],
                 );
+                if user == "root" {
+                    client.success();
+                    client.send(
+                        0x10,
+                        vec![
+                            string("// kala:datalog\n[:create :ACCOUNT :backdoor]"),
+                            map(&[]),
+                            map(&[]),
+                        ],
+                    );
+                }
                 client.failure(FORBIDDEN);
             } else {
                 client.send(
@@ -774,8 +788,12 @@ fn inferred_schema_overlap_and_latest_tick_movement_are_notified() {
     assert!(text.contains("Kala.Warning.Overlap"), "{text}");
     let pinned_tick = world(&server).latest_tick().0;
     begin(&mut a);
-    write(&mut b, "[:assert :greg :alias \"Later\" :at 999]");
+    // The latest tick is taken when the transaction starts writing (its
+    // writable handle opens at the first write form) and kept from then on.
     let (rows, _) = write(&mut a, "[:assert :greg :alias \"Pinned\"]");
+    assert_eq!(rows[0][3], Value::Integer(pinned_tick));
+    write(&mut b, "[:assert :greg :alias \"Later\" :at 999]");
+    let (rows, _) = write(&mut a, "[:assert :greg :alias \"Pinned too\"]");
     assert_eq!(rows[0][3], Value::Integer(pinned_tick));
     let moved = commit(&mut a);
     let text = format!("{moved:?}");
@@ -878,7 +896,18 @@ fn unix_transaction_lifecycle_and_privileges_match_tcp() {
         client.failure(INVALID);
         client.reset();
     }
+    // BEGIN on `system` is a read snapshot for an admin; a write form in it
+    // is refused.
     client.send(0x11, vec![map(&[("db", string("system"))])]);
+    client.success();
+    client.send(
+        0x10,
+        vec![
+            string("// kala:datalog\n[:create :ACCOUNT :backdoor]"),
+            map(&[]),
+            map(&[]),
+        ],
+    );
     client.failure(FORBIDDEN);
     client.reset();
     begin(&mut client);
@@ -1113,12 +1142,23 @@ fn diverged_cached_writer_is_reopened_and_retry_succeeds() {
     assert!(held.contains(&kala_core::Value::Str("Retry succeeded".into())));
 }
 
+/// Begins a transaction and makes it write, retrying until a write slot is
+/// free: the slot is taken at a transaction's first write form, not at BEGIN.
 fn await_write_begin(client: &mut Client) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        client.send(0x11, vec![map(&[])]);
+        begin(client);
+        client.send(
+            0x10,
+            vec![
+                string("// kala:datalog\n[:create :CHARACTER :slot_probe]"),
+                map(&[]),
+                map(&[]),
+            ],
+        );
         let response = client.recv();
         if matches!(response, Value::Structure(0x70, _)) {
+            client.pull(-1);
             return;
         }
         let failure = client::metadata(response, 0x7f);
@@ -1145,7 +1185,16 @@ fn write_transaction_cap_releases_slots_on_every_ending() {
         let mut b = Client::ready(&server);
         begin(&mut a);
         write(&mut a, &format!("[:create :CHARACTER :cap_{index}]"));
-        b.send(0x11, vec![map(&[])]);
+        // The slot is taken by a transaction's first write form.
+        begin(&mut b);
+        b.send(
+            0x10,
+            vec![
+                string("// kala:datalog\n[:create :CHARACTER :over_the_cap]"),
+                map(&[]),
+                map(&[]),
+            ],
+        );
         let failure = client::metadata(b.recv(), 0x7f);
         assert!(
             matches!(failure.get("code"), Some(Value::String(code)) if code.starts_with("Neo.TransientError.Transaction.")),
@@ -1226,11 +1275,15 @@ fn read_only_server_refuses_write_begin_and_autocommit_before_staging() {
     });
     let before = std::fs::read(server.dir.path().join("varrow.kala")).unwrap();
     let mut client = Client::ready(&server);
-    for (tag, fields) in [
-        (0x11, vec![map(&[("mode", string("w"))])]),
-        (0x10, vec![string(WRITE), map(&[]), map(&[])]),
-    ] {
-        client.send(tag, fields);
+    // A write-mode BEGIN is only a read snapshot until a write form
+    // arrives (drivers begin in write mode for reads too), so the refusal
+    // is at the write form, inside a transaction as outside one.
+    for explicit in [true, false] {
+        if explicit {
+            client.send(0x11, vec![map(&[("mode", string("w"))])]);
+            client.success();
+        }
+        client.send(0x10, vec![string(WRITE), map(&[]), map(&[])]);
         let failure = client.failure(FORBIDDEN);
         assert!(failure_text(&failure).contains("this server is read-only"));
         client.reset();

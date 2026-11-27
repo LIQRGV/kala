@@ -97,13 +97,40 @@ pub(crate) enum SystemDb {
 pub(crate) struct Registry {
     databases: BTreeMap<String, Database>,
     default: Option<String>,
-    write_transactions: Arc<AtomicUsize>,
+    write_transactions: Arc<Mutex<WriteSlots>>,
 }
-pub(crate) struct WriteSlot(Arc<AtomicUsize>);
+/// How many explicit transactions hold a private writable handle: in total
+/// and per account.
+#[derive(Default)]
+struct WriteSlots {
+    total: usize,
+    by_account: BTreeMap<String, usize>,
+}
+/// One open writing transaction's place under the cap; freed on drop.
+pub(crate) struct WriteSlot {
+    slots: Arc<Mutex<WriteSlots>>,
+    account: String,
+}
 impl Drop for WriteSlot {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        let mut slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slots.total = slots.total.saturating_sub(1);
+        if let Some(held) = slots.by_account.get_mut(&self.account) {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                slots.by_account.remove(&self.account);
+            }
+        }
     }
+}
+/// The most write slots one account may hold when the server allows `max`
+/// in total: half of them (at least one), so that a single account can
+/// never keep every other account from writing in explicit transactions.
+pub(crate) fn account_write_slots(max: usize) -> usize {
+    (max / 2).max(1)
 }
 impl Registry {
     /// `(reader, writer)`: how often each kind of handle of `name` was
@@ -222,15 +249,34 @@ impl Registry {
         }
         Ok(world)
     }
-    pub fn write_slot(&self, max: usize) -> Result<WriteSlot, Failure> {
-        self.write_transactions
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < max).then_some(n + 1)
-            })
-            .map_err(|_| {
-                Failure::new(crate::write::CONFLICT, "too many open write transactions")
-            })?;
-        Ok(WriteSlot(Arc::clone(&self.write_transactions)))
+    /// Takes a slot for an explicit transaction that starts writing, for
+    /// `account` (the authenticated `user@host`). Refused, with a code
+    /// drivers retry, when `max` are held in total or the account already
+    /// holds its share ([`account_write_slots`]).
+    pub fn write_slot(&self, max: usize, account: &str) -> Result<WriteSlot, Failure> {
+        let mut slots = self
+            .write_transactions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held = slots.by_account.get(account).copied().unwrap_or(0);
+        if slots.total >= max {
+            return Err(Failure::new(
+                crate::write::CONFLICT,
+                "too many open write transactions",
+            ));
+        }
+        if held >= account_write_slots(max) {
+            return Err(Failure::new(
+                crate::write::CONFLICT,
+                "too many open write transactions for this account",
+            ));
+        }
+        slots.total += 1;
+        slots.by_account.insert(account.to_owned(), held + 1);
+        Ok(WriteSlot {
+            slots: Arc::clone(&self.write_transactions),
+            account: account.to_owned(),
+        })
     }
     /// Causal reads share the normal stamped snapshot refresh, with a bounded wait.
     pub fn at_least(&self, name: &str, tx: u64, busy: Duration) -> Result<Arc<World>, Failure> {
@@ -291,7 +337,7 @@ impl Registry {
         Ok(Self {
             databases,
             default,
-            write_transactions: Arc::new(AtomicUsize::new(0)),
+            write_transactions: Arc::default(),
         })
     }
     /// Resolve the name before loading a world, so authorization precedes I/O.

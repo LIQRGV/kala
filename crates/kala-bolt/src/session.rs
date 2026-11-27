@@ -551,12 +551,15 @@ impl Session<'_> {
             _ => Err(Failure::invalid()),
         }
     }
+    /// BEGIN, in any mode: pins the shared read snapshot (after any
+    /// bookmark wait) and nothing else. Whether the transaction may write
+    /// is decided when a write form arrives (`write_allowed`), and the
+    /// writable handle and its slot are taken then (`Transaction::writer`):
+    /// drivers begin in write mode by default, also for reads, on `system`
+    /// and against a read-only server.
     fn begin(&mut self, extra: &Map) -> Result<Value, Failure> {
         let name = self.registry.name(self.requested(extra)?)?.to_owned();
         let options = Options::parse(extra, &name, self.config)?;
-        if !options.read_only && (self.config.read_only || name == "system") {
-            self.write_allowed(&name, false)?;
-        }
         let identity = self.identity.as_ref().ok_or_else(Failure::invalid)?;
         if !identity.permits_read(&name) && !identity.permits_write(&name) {
             return Err(Failure::new(
@@ -566,45 +569,22 @@ impl Session<'_> {
         }
         self.registry.require(&name)?;
         let now = Instant::now();
-        let snapshot = if !options.read_only && identity.permits_write(&name) {
-            let slot = self
-                .registry
-                .write_slot(self.config.max_write_transactions)?;
-            self.registry.at_least(
-                &name,
-                options.bookmark,
-                self.config.busy_timeout.min(options.timeout),
-            )?;
-            let mut tx = self
-                .registry
-                .open_writer(&name, self.config.busy_timeout.min(options.timeout))?
-                .into_transaction();
-            if tx.snapshot_tx().0 < options.bookmark {
-                return Err(Failure::new(
-                    write::CONFLICT,
-                    "bookmark snapshot changed; retry the transaction",
-                ));
-            }
-            tx.with(|tx| {
-                tx.set_concurrency(options.concurrency);
-                tx.set_deadline(now + options.timeout);
-            });
-            Snapshot::Write(Box::new(tx), slot)
-        } else {
-            Snapshot::Read(self.registry.at_least(
-                &name,
-                options.bookmark,
-                self.config.busy_timeout.min(options.timeout),
-            )?)
-        };
+        let snapshot = Snapshot::Read(self.registry.at_least(
+            &name,
+            options.bookmark,
+            self.config.busy_timeout.min(options.timeout),
+        )?);
         self.transaction = Some(Transaction {
             snapshot,
             db: name,
             read_only: options.read_only,
+            concurrency: options.concurrency,
             forms: Vec::new(),
             bytes: 0,
             queried: false,
             server_statement: false,
+            pending: crate::reads::Reads::default(),
+            stale: None,
             deadline: now + options.timeout,
             idle_deadline: Instant::now() + self.config.tx_idle_timeout,
         });
@@ -640,6 +620,15 @@ impl Session<'_> {
                     ("type", Value::String("r".into())),
                     ("bookmark", Value::String(format!("kala:{db}:{txid}"))),
                 ]));
+            }
+            if transaction.stale.is_some()
+                && tx.with(|t| t.concurrency()) == kala_core::Concurrency::Optimistic
+            {
+                self.log_refused(&db, "conflict");
+                return Err(Failure::new(
+                    write::CONFLICT,
+                    "conflict: another transaction committed between this transaction's queries and its first write; nothing was written; run it again",
+                ));
             }
             tx.with(|t| t.set_deadline(deadline));
             let (world, result) = tx.commit();
@@ -831,8 +820,11 @@ impl Session<'_> {
                         self.config.max_depth,
                         tx.deadline,
                     )?;
-                    if let Snapshot::Write(owned, _) = &mut tx.snapshot {
-                        owned.with(|t| output.reads.note(t));
+                    match &mut tx.snapshot {
+                        Snapshot::Write(owned, _) => owned.with(|t| output.reads.note(t)),
+                        // Kept for the writable handle, if one ever opens.
+                        Snapshot::Read(_) if !tx.read_only => tx.pending.merge(&output.reads),
+                        Snapshot::Read(_) => {}
                     }
                     tx.queried = true;
                     output
@@ -906,6 +898,13 @@ impl Session<'_> {
             ));
         }
         let forms = kala_lang::write::write_forms(text).map_err(write::parse_error)?;
+        // Write slots are counted per authenticated account (user and the
+        // host selector that matched), as the identity names it.
+        let account = self
+            .identity
+            .as_ref()
+            .map(|id| format!("{}@{}", id.principal, id.host))
+            .ok_or_else(Failure::invalid)?;
         let mut output = write::output();
         let max_message = self.config.max_message_bytes;
         let max_depth = self.config.max_depth;
@@ -919,12 +918,12 @@ impl Session<'_> {
                 })?;
             for (index, form) in forms.enumerate() {
                 let form = form.map_err(write::parse_error)?;
-                let prior = tx.forms.len();
+                write::admit(&form, tx.forms.len(), read)?;
                 let expires = tx.deadline;
-                let owned = tx.write()?;
+                let owned = tx.writer(self.registry, self.config, &account)?;
                 let staged = owned.with(|t| {
                     t.set_deadline(expires);
-                    write::stage(t, &form, prior, read)
+                    write::stage(t, &form, read)
                 })?;
                 // Label using the transaction so provisional node types resolve.
                 self.output_ids |= owned.with(|t| {
@@ -957,10 +956,11 @@ impl Session<'_> {
                                 return Err(write::timeout());
                             }
                             let form = form.map_err(write::parse_error)?;
+                            write::admit(&form, 0, read)?;
                             let mut tx = world.begin();
                             tx.set_concurrency(options.concurrency);
                             tx.set_deadline(deadline);
-                            let staged = write::stage(&mut tx, &form, 0, read)?;
+                            let staged = write::stage(&mut tx, &form, read)?;
                             // Check record size before durable append; final IDs have fixed encoding bounds.
                             let mut preview = write::output();
                             let mut preview_ops = staged.ops.clone();
@@ -1081,7 +1081,9 @@ impl Session<'_> {
                 && exposes
                 && let Some(tx) = &mut self.transaction
             {
-                tx.write()?.with(|t| t.set_ids_exposed(true));
+                tx.written()
+                    .ok_or_else(Failure::invalid)?
+                    .with(|t| t.set_ids_exposed(true));
             }
             if let Some(bytes) = output.rows.pop_front()
                 && !discard

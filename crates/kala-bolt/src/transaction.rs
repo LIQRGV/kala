@@ -3,7 +3,8 @@ use crate::{
     error::{Failure, INVALID},
     message::Map,
     packstream::{self, Value},
-    registry::WriteSlot,
+    reads::Reads,
+    registry::{Registry, WriteSlot},
     server::ServerConfig,
     write,
 };
@@ -113,18 +114,36 @@ fn bookmark_tx(bookmark: &str, db: &str) -> Result<Option<u64>, Failure> {
     let tx = tx.parse::<u64>().map_err(|_| bad())?;
     Ok((name == db).then_some(tx))
 }
+/// What an explicit transaction reads and, once it writes, stages into.
 pub(crate) enum Snapshot {
+    /// The registry's shared read snapshot, pinned when the transaction
+    /// began. Every transaction starts here, whatever its mode, and one
+    /// that never writes stays here: it costs no replay and no slot.
     Read(Arc<World>),
+    /// A private writable handle and the transaction staged on it, opened
+    /// at the transaction's first write form, with its slot under the
+    /// write-transaction cap.
     Write(Box<OwnedTxn>, WriteSlot),
 }
 pub(crate) struct Transaction {
     pub snapshot: Snapshot,
     pub db: String,
     pub read_only: bool,
+    /// The mode BEGIN asked for; set on the writable handle when it opens.
+    pub concurrency: Concurrency,
     pub forms: Vec<StagedWrite>,
     pub bytes: usize,
     pub queried: bool,
     pub server_statement: bool,
+    /// What the queries run so far depend on, kept until the writable
+    /// handle exists to record it on.
+    pub pending: Reads,
+    /// Set when the transaction queried the pinned read snapshot and its
+    /// writable handle then opened on a newer world (see
+    /// [`Transaction::writer`]): the snapshot its queries saw, which its
+    /// later queries keep reading so that one transaction never shows two
+    /// worlds.
+    pub stale: Option<Arc<World>>,
     /// The end of the transaction's total time (`--tx-timeout`, or the
     /// client's shorter `tx_timeout`). It bounds all server-side work:
     /// queries, staging, the commit and sending responses.
@@ -135,20 +154,78 @@ pub(crate) struct Transaction {
     pub idle_deadline: Instant,
 }
 impl Transaction {
+    /// The committed world this transaction's queries read: one snapshot
+    /// for its whole life, never showing its own staged writes.
     pub fn world(&self) -> &World {
-        match &self.snapshot {
-            Snapshot::Read(w) => w,
-            Snapshot::Write(tx, _) => tx.world(),
+        match (&self.stale, &self.snapshot) {
+            (Some(pinned), _) => pinned,
+            (None, Snapshot::Read(w)) => w,
+            (None, Snapshot::Write(tx, _)) => tx.world(),
         }
     }
-    pub fn write(&mut self) -> Result<&mut OwnedTxn, Failure> {
+    /// The transaction's writable handle, if it has written.
+    pub fn written(&mut self) -> Option<&mut OwnedTxn> {
         match &mut self.snapshot {
-            Snapshot::Write(tx, _) => Ok(tx),
-            _ => Err(Failure::new(
-                crate::error::FORBIDDEN,
-                "write privilege is required",
-            )),
+            Snapshot::Write(tx, _) => Some(tx),
+            Snapshot::Read(_) => None,
         }
+    }
+    /// The writable transaction, opened now if this is the first write.
+    ///
+    /// Opening takes a slot under the write-transaction cap (for `account`)
+    /// and replays the world into a private handle, so it happens here, at
+    /// the first write form, and never at BEGIN: drivers begin every
+    /// transaction in write mode, and most of them only read.
+    ///
+    /// **The snapshot rule.** The handle opens on the world as it is now,
+    /// which may be newer than the read snapshot pinned at BEGIN. If the
+    /// transaction has run no query yet, nothing depended on the older
+    /// snapshot and the newer one simply becomes the transaction's. If it
+    /// has, and the two are the same tx, the queries' dependencies are
+    /// recorded on the handle and checked precisely at commit. If it has
+    /// and another transaction committed in between, the queries saw a
+    /// world the commit can no longer be checked against: the transaction
+    /// is marked [`stale`](Transaction::stale) (and as having read
+    /// everything), its queries keep reading the snapshot they began on,
+    /// and its COMMIT is refused as a conflict that drivers retry, unless
+    /// it runs in weak mode. In short: the snapshot a transaction's queries
+    /// saw must still be current when it starts writing.
+    pub fn writer(
+        &mut self,
+        registry: &Registry,
+        config: &ServerConfig,
+        account: &str,
+    ) -> Result<&mut OwnedTxn, Failure> {
+        if let Snapshot::Read(world) = &self.snapshot {
+            let read_snapshot = Arc::clone(world);
+            let pinned = world.latest_tx();
+            let slot = registry.write_slot(config.max_write_transactions, account)?;
+            let remaining = self.deadline.saturating_duration_since(Instant::now());
+            let mut owned = registry
+                .open_writer(&self.db, config.busy_timeout.min(remaining))?
+                .into_transaction();
+            if owned.snapshot_tx() < pinned {
+                // The file no longer holds what the read snapshot showed.
+                return Err(Failure::new(
+                    write::CONFLICT,
+                    "the world changed; run the transaction again",
+                ));
+            }
+            let moved = owned.snapshot_tx() != pinned;
+            owned.with(|tx| {
+                tx.set_concurrency(self.concurrency);
+                tx.set_deadline(self.deadline);
+                if self.queried && moved {
+                    tx.note_read_all();
+                } else if self.queried {
+                    self.pending.note(tx);
+                }
+            });
+            self.stale = (self.queried && moved).then_some(read_snapshot);
+            self.pending = Reads::default();
+            self.snapshot = Snapshot::Write(Box::new(owned), slot);
+        }
+        self.written().ok_or_else(Failure::invalid)
     }
     /// When to give up waiting for the client's next request.
     pub fn idle_expires(&self) -> Instant {

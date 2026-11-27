@@ -464,3 +464,224 @@ fn sequential_auto_commit_writes_replay_the_log_once_not_once_per_write() {
     assert!(client.pull(-1).0.contains(&vec![string("Write 11")]));
     assert_eq!(counts.reader("varrow"), 1);
 }
+
+// ---------------------------------------------------------------- E
+
+const TOO_MANY: &str = "too many open write transactions";
+
+#[test]
+fn default_mode_transactions_that_only_query_take_no_slot_and_open_no_handle() {
+    let (server, counts) = counted_server(ServerConfig::default());
+    // Drivers begin every transaction in write mode unless told otherwise.
+    // Nine of them, all reading: one more than the write-transaction cap.
+    let mut clients: Vec<_> = (0..9).map(|_| login(&server, "both")).collect();
+    for client in &mut clients {
+        client.send(0x11, vec![map(&[("mode", string("w"))])]);
+        let response = client.recv();
+        assert!(
+            matches!(response, Value::Structure(0x70, _)),
+            "{response:?}"
+        );
+        assert_eq!(client.query(client::ALLIES).len(), 2);
+    }
+    assert_eq!(
+        counts.writer("varrow"),
+        0,
+        "a transaction that never writes must not replay a private handle"
+    );
+    for client in &mut clients {
+        let summary = commit(client);
+        assert_eq!(summary.get("type"), Some(&string("r")));
+    }
+}
+
+#[test]
+fn write_slots_are_taken_at_the_first_write_and_capped_per_account() {
+    let server = server();
+    let staged = |client: &mut Client, n: usize| {
+        begin(client);
+        send_run(
+            client,
+            &datalog(&format!("[:create :CHARACTER :slot_{n}]")),
+            map(&[]),
+        );
+        client.recv()
+    };
+    // The cap is 8, so one account may hold 4.
+    let mut first: Vec<_> = (0..5).map(|_| login(&server, "both")).collect();
+    for (n, client) in first.iter_mut().enumerate().take(4) {
+        let response = staged(client, n);
+        assert!(
+            matches!(response, Value::Structure(0x70, _)),
+            "{response:?}"
+        );
+        client.pull(-1);
+    }
+    let refused = client::metadata(staged(&mut first[4], 4), 0x7f);
+    assert!(transient(&refused), "{refused:?}");
+    assert!(text(&refused).contains(TOO_MANY), "{refused:?}");
+    assert!(text(&refused).contains("account"), "{refused:?}");
+    first[4].reset();
+    // Another account is not locked out by the first one.
+    let mut second: Vec<_> = (0..4).map(|_| login(&server, "both2")).collect();
+    for (n, client) in second.iter_mut().enumerate() {
+        let response = staged(client, 10 + n);
+        assert!(
+            matches!(response, Value::Structure(0x70, _)),
+            "{response:?}"
+        );
+        client.pull(-1);
+    }
+    // All 8 slots are held: the ninth writing transaction is refused,
+    // whoever it is, while a ninth reading one is not.
+    let mut root = Client::ready(&server);
+    let refused = client::metadata(staged(&mut root, 20), 0x7f);
+    assert!(transient(&refused), "{refused:?}");
+    assert!(text(&refused).contains(TOO_MANY), "{refused:?}");
+    root.reset();
+    begin(&mut root);
+    assert_eq!(root.query(client::ALLIES).len(), 2);
+    commit(&mut root);
+    // A slot is free again as soon as its transaction ends.
+    commit(&mut second[0]);
+    let response = staged(&mut root, 21);
+    assert!(
+        matches!(response, Value::Structure(0x70, _)),
+        "{response:?}"
+    );
+    root.pull(-1);
+    commit(&mut root);
+    assert!(world(&server).entity_by_handle("slot_10").is_some());
+    assert!(world(&server).entity_by_handle("slot_21").is_some());
+    assert!(world(&server).entity_by_handle("slot_0").is_none());
+}
+
+#[test]
+fn a_transaction_that_queried_before_another_commit_conflicts_when_it_then_writes() {
+    let server = server();
+    let mut a = login(&server, "both");
+    let mut b = login(&server, "both2");
+    let names = "// kala:datalog\n[:find ?n :at -210 :where [:edwin :name ?n]]";
+    for weak in [false, true] {
+        a.send(
+            0x11,
+            vec![if weak {
+                map(&[("tx_metadata", map(&[("concurrency_mode", string("weak"))]))])
+            } else {
+                map(&[])
+            }],
+        );
+        a.success();
+        assert!(!a.query(names).is_empty());
+        // Another connection commits something the query did not read. The
+        // writable handle is opened at A's first write, on the newer world:
+        // what A's queries saw is no longer what its writes are checked
+        // against, so the commit is refused (and retried by drivers).
+        write(
+            &mut b,
+            &format!("[:assert :mara :alias \"Elsewhere {weak}\" :at 300]"),
+        );
+        write(
+            &mut a,
+            &format!("[:assert :greg :alias \"After reading {weak}\" :at 300]"),
+        );
+        a.send(0x12, vec![]);
+        if weak {
+            a.success();
+            continue;
+        }
+        let failure = any_failure(&mut a);
+        assert!(transient(&failure), "{failure:?}");
+        assert!(
+            text(&failure).contains("nothing was written"),
+            "{failure:?}"
+        );
+        a.reset();
+        let greg = world(&server).entity_by_handle("greg").unwrap();
+        let held = |server: &Running| {
+            world(server)
+                .as_of(greg, "alias", kala_core::Tick(300))
+                .unwrap()
+        };
+        assert!(!held(&server).contains(&kala_core::Value::Str("After reading false".into())));
+        // The retry reads the newer world and commits.
+        begin(&mut a);
+        assert!(!a.query(names).is_empty());
+        write(
+            &mut a,
+            "[:assert :greg :alias \"After reading false\" :at 300]",
+        );
+        commit(&mut a);
+        assert!(held(&server).contains(&kala_core::Value::Str("After reading false".into())));
+    }
+    // A transaction that has not queried is not affected: its snapshot is
+    // simply the world at its first write.
+    begin(&mut a);
+    write(&mut b, "[:assert :mara :alias \"Elsewhere again\" :at 300]");
+    write(&mut a, "[:assert :greg :alias \"Blind\" :at 300]");
+    commit(&mut a);
+}
+
+#[test]
+fn default_mode_begin_is_refused_only_when_a_write_form_arrives() {
+    // An admin on `system`: drivers' execute_query("SHOW DATABASES",
+    // database_="system") begins a default (write) mode transaction.
+    let server = server();
+    let system = std::fs::read(server.dir.path().join("system.kala")).unwrap();
+    let mut root = Client::ready(&server);
+    root.send(0x11, vec![map(&[("db", string("system"))])]);
+    let response = root.recv();
+    assert!(
+        matches!(response, Value::Structure(0x70, _)),
+        "{response:?}"
+    );
+    assert!(root.query("SHOW DATABASES").len() >= 3);
+    commit(&mut root);
+    root.send(0x11, vec![map(&[("db", string("system"))])]);
+    root.success();
+    send_run(
+        &mut root,
+        &datalog("[:create :ACCOUNT :backdoor]"),
+        map(&[]),
+    );
+    let failure = root.failure(FORBIDDEN);
+    assert!(text(&failure).contains("kala user"), "{failure:?}");
+    root.reset();
+    assert_eq!(
+        std::fs::read(server.dir.path().join("system.kala")).unwrap(),
+        system
+    );
+    // A read-only identity.
+    let mut reader = login(&server, "reader");
+    begin(&mut reader);
+    assert_eq!(reader.query(client::ALLIES).len(), 2);
+    send_run(&mut reader, WRITE, map(&[]));
+    let failure = reader.failure(FORBIDDEN);
+    assert!(text(&failure).contains("write privilege"), "{failure:?}");
+    reader.reset();
+    // A read-only server.
+    let server = server_with(ServerConfig {
+        read_only: true,
+        ..ServerConfig::default()
+    });
+    let before = std::fs::read(server.dir.path().join("varrow.kala")).unwrap();
+    let mut client = Client::ready(&server);
+    client.send(0x11, vec![map(&[("mode", string("w"))])]);
+    let response = client.recv();
+    assert!(
+        matches!(response, Value::Structure(0x70, _)),
+        "{response:?}"
+    );
+    assert_eq!(client.query(client::ALLIES).len(), 2);
+    send_run(&mut client, WRITE, map(&[]));
+    let failure = client.failure(FORBIDDEN);
+    assert!(
+        text(&failure).contains("this server is read-only"),
+        "{failure:?}"
+    );
+    client.reset();
+    assert_eq!(
+        std::fs::read(server.dir.path().join("varrow.kala")).unwrap(),
+        before
+    );
+}

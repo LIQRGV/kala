@@ -1,6 +1,9 @@
 //! Conservative query dependencies, extracted from the shared prepared IR.
 use kala_core::{Txn, World};
 use kala_query::{AttrRef, Op, Plan, RowAction};
+/// Most attribute and type names a merged read set keeps (see
+/// [`Reads::merge`]).
+const MAX_PENDING: usize = 256;
 #[derive(Default)]
 pub(crate) struct Reads {
     attributes: Vec<String>,
@@ -81,6 +84,29 @@ impl Reads {
             }
         }
         reads
+    }
+    /// Adds another query's dependencies to these. A transaction that has
+    /// not written yet keeps one merged set for all its queries; past
+    /// [`MAX_PENDING`] names it is coarsened to "everything", so the set
+    /// stays small however many queries a long transaction runs.
+    pub fn merge(&mut self, other: &Self) {
+        self.all |= other.all;
+        self.definitions |= other.definitions;
+        for (mine, theirs) in [
+            (&mut self.attributes, &other.attributes),
+            (&mut self.types, &other.types),
+        ] {
+            for name in theirs {
+                if !mine.contains(name) {
+                    mine.push(name.clone());
+                }
+            }
+        }
+        if self.all || self.attributes.len() + self.types.len() > MAX_PENDING {
+            self.all = true;
+            self.attributes.clear();
+            self.types.clear();
+        }
     }
     pub fn note(&self, tx: &Txn<'_>) {
         if self.all {
