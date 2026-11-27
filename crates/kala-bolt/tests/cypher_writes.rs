@@ -647,3 +647,30 @@ fn a_stale_reader_whose_set_is_now_a_noop_still_conflicts() {
     reader.failure(CONFLICT);
     assert_eq!(world(&server).latest_tx(), after_write);
 }
+
+#[test]
+fn a_first_blind_create_keeps_the_begin_snapshot_for_later_match() {
+    let server = writable_server();
+    let mut a = Client::ready(&server);
+    let mut b = Client::ready(&server);
+    b.query("MATCH (m {kala_handle:'mara'}) SET m.disguised = false AT TICK 690");
+    begin(&mut a);
+    b.query("MATCH (m {kala_handle:'mara'}) SET m.disguised = true AT TICK 695");
+    let after_b = world(&server).latest_tx();
+    assert!(
+        a.query("CREATE (:CHARACTER {kala_handle:'independent'})")
+            .is_empty()
+    );
+    let read = "MATCH (m {kala_handle:'mara'}) AT TICK 700 RETURN m.disguised";
+    assert_eq!(
+        a.query(read),
+        vec![vec![Value::Bool(false)]],
+        "MATCH must read BEGIN"
+    );
+    assert_eq!(b.query(read), vec![vec![Value::Bool(true)]]);
+    a.send(0x12, vec![]);
+    a.failure(CONFLICT);
+    let committed = world(&server);
+    assert_eq!(committed.latest_tx(), after_b);
+    assert!(committed.entity_by_handle("independent").is_none());
+}

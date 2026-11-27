@@ -169,6 +169,11 @@ impl Transaction {
     }
     /// Attach dependencies before opening a writer or directly to a live transaction.
     pub fn record(&mut self, reads: &Reads, include_in_summary: bool) {
+        self.queried = true;
+        self.summary_reads |= include_in_summary;
+        if reads.is_empty() {
+            return;
+        }
         match &mut self.snapshot {
             Snapshot::Write(owned, _) => owned.with(|tx| {
                 if tx.schema_changes().is_empty() {
@@ -180,8 +185,6 @@ impl Transaction {
             Snapshot::Read(_) if !self.read_only => self.pending.merge(reads),
             _ => {}
         }
-        self.queried = true;
-        self.summary_reads |= include_in_summary;
     }
     /// The transaction's writable handle, if it has written.
     pub fn written(&mut self) -> Option<&mut OwnedTxn> {
@@ -201,8 +204,9 @@ impl Transaction {
     /// which may be newer than the read snapshot pinned at BEGIN (tx
     /// `pinned`).
     ///
-    /// - If the transaction has run no query yet, nothing depended on the
-    ///   older snapshot and the newer one simply becomes the transaction's.
+    /// - A Datalog write opened before any query can adopt the newer
+    ///   snapshot. Cypher pins BEGIN when it evaluates its input, including
+    ///   the single, empty row for a blind CREATE.
     /// - If it has, the read keys its queries recorded (`pending`) are
     ///   noted on the handle, and when other transactions committed in
     ///   between, the handle is told that those reads were made at
@@ -250,7 +254,7 @@ impl Transaction {
             let moved = owned.snapshot_tx() != pinned;
             // The pending keys are names: exact only if every name means
             // on the handle what it meant on the BEGIN snapshot.
-            let stable_names = !moved || {
+            let stable_names = !moved || self.pending.is_empty() || {
                 let now = owned.world();
                 // Attribute IDs are append-only. New names can be recorded
                 // on the newer handle: reading the new attribute conflicts

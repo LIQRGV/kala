@@ -1028,9 +1028,9 @@ impl Session<'_> {
                     .len();
             write::charge(&mut tx.bytes, text_len.saturating_add(param_size))?;
             let (params, input) = prepare(tx.world())?;
-            if statement.requires_read() {
-                tx.record(input.reads(), rw);
-            }
+            // Pin BEGIN even for the one empty input row of a blind CREATE.
+            // A later MATCH reads that same snapshot.
+            tx.record(input.reads(), rw);
             let owned = tx.writer(self.registry, self.config, &account, held.admin)?;
             let (output, staged, retained_bytes) = owned.with(|t| {
                 let result = stage_statement(t, statement, input, &params)

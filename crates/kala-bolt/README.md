@@ -520,8 +520,9 @@ bookmark wait) and costs nothing else: drivers begin in write mode by default,
 also for reads. The private writable handle is opened, and a write slot taken, at
 the transaction's **first write form**, on the world as it is then:
 
-- a transaction that has run no query yet simply takes that world as its
-  snapshot;
+- an initial Datalog write can adopt that world if it ran before any query.
+  A Cypher update pins its input to BEGIN, including the single empty row
+  of a blind CREATE. Its later MATCH clauses keep reading BEGIN's snapshot.
 - a transaction that queried first has its queries' read keys recorded on the
   handle. If **other transactions committed in between**, those keys are
   checked at COMMIT against everything committed since BEGIN's snapshot, not
