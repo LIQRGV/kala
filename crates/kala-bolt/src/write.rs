@@ -171,6 +171,56 @@ pub(crate) fn stage(
     }
     Ok(staged)
 }
+/// Whether an op of this kind writes data (an op that only edits the schema
+/// does not): what tells a `w` summary from an `s` one.
+pub(crate) fn writes_data(kind: &str) -> bool {
+    matches!(
+        kind,
+        "assert" | "retract" | "set" | "create" | "correct" | "migrate"
+    )
+}
+/// The failure of form `form` (1-based) of a multi-form auto-commit RUN,
+/// where each form is its own transaction. `prior` forms before it were
+/// committed and `committed` are committed now (the failing form included,
+/// if it failed after its own commit); `last_tx` is the newest of them.
+///
+/// Once anything is committed the message must not say otherwise and the
+/// failure must not invite a retry: a driver that retried the RUN would
+/// apply the committed forms a second time. So the sentence "nothing was
+/// written" is narrowed to the failing form, "run it again" is dropped, a
+/// transient code becomes a plain client error, and the last commit's tx
+/// and bookmark are named so the client can read its own writes.
+pub(crate) fn form_failed(
+    mut failure: Failure,
+    form: usize,
+    prior: usize,
+    committed: usize,
+    db: &str,
+    last_tx: u64,
+) -> Failure {
+    if prior > 0 {
+        let mut detail = failure
+            .message
+            .replace("nothing was written", "this form wrote nothing")
+            .replace("; run it again", "")
+            .replace("; run the transaction again", "");
+        if committed == prior && !detail.contains("this form wrote nothing") {
+            detail.push_str("; this form wrote nothing");
+        }
+        failure.message = format!(
+            "form {form} failed; {prior} prior forms committed, the last as tx {last_tx} (bookmark kala:{db}:{last_tx}): {detail}"
+        );
+    } else if form > 1 {
+        failure.message = format!(
+            "form {form} failed; 0 prior forms committed: {}",
+            failure.message
+        );
+    }
+    if committed > 0 && failure.code.starts_with("Neo.TransientError") {
+        failure.code = crate::error::EXECUTION;
+    }
+    failure
+}
 pub(crate) fn parse_error(error: impl std::fmt::Display) -> Failure {
     Failure::new(SYNTAX, error.to_string())
 }
@@ -336,10 +386,7 @@ impl Summary {
         for form in forms {
             for op in &form.ops {
                 self.nodes += usize::from(op.created == Some(true));
-                self.data |= matches!(
-                    op.kind,
-                    "assert" | "retract" | "set" | "create" | "correct" | "migrate"
-                );
+                self.data |= writes_data(op.kind);
             }
         }
         for id in &result.entries {

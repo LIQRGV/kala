@@ -77,3 +77,69 @@ fn the_request_path_spawns_no_thread() {
         }
     }
 }
+
+#[test]
+fn a_failure_after_committed_forms_never_says_nothing_was_written_or_invites_a_retry() {
+    let lock = || store_error(Error::WorldLocked, true);
+    assert_eq!(lock().code, LOCK);
+    assert!(lock().message.contains("nothing was written"));
+    // The first form: reported as it is, and retryable.
+    let first = form_failed(lock(), 1, 0, 0, "varrow", 12);
+    assert_eq!(first.code, LOCK);
+    assert_eq!(first.message, lock().message);
+    // A later form with nothing committed before it (the earlier forms
+    // changed nothing): still true that nothing was written, still safe to
+    // retry.
+    let none = form_failed(lock(), 3, 0, 0, "varrow", 12);
+    assert_eq!(none.code, LOCK);
+    assert!(
+        none.message
+            .starts_with("form 3 failed; 0 prior forms committed: ")
+    );
+    assert!(none.message.contains("nothing was written"));
+    // After commits: never "nothing was written", the last commit and its
+    // bookmark are named, and no code a driver would retry (a retry of the
+    // RUN would apply the committed forms a second time).
+    for failure in [
+        lock(),
+        timeout(),
+        store_error(Error::LogDiverged, true),
+        Failure::new(
+            CONFLICT,
+            "conflict: op 1 (:set) read :greg :alias, which another transaction changed; nothing was written; run it again",
+        ),
+    ] {
+        let was_transient = failure.code.starts_with("Neo.TransientError");
+        let failed = form_failed(failure, 3, 2, 2, "varrow", 15);
+        assert!(
+            failed
+                .message
+                .starts_with("form 3 failed; 2 prior forms committed, the last as tx 15 (bookmark kala:varrow:15): "),
+            "{}",
+            failed.message
+        );
+        assert!(
+            !failed.message.contains("nothing was written"),
+            "{}",
+            failed.message
+        );
+        assert!(!failed.message.contains("again"), "{}", failed.message);
+        assert!(
+            failed.message.contains("this form wrote nothing"),
+            "{}",
+            failed.message
+        );
+        assert!(
+            !failed.code.starts_with("Neo.TransientError"),
+            "{}",
+            failed.code
+        );
+        if was_transient {
+            assert_eq!(failed.code, crate::error::EXECUTION);
+        }
+    }
+    // The failing form itself committed (its result could not be encoded):
+    // a retryable code must not survive that either.
+    let own = form_failed(lock(), 1, 0, 1, "varrow", 15);
+    assert_eq!(own.code, crate::error::EXECUTION);
+}

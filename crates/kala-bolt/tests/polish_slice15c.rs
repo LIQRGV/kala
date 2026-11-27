@@ -949,3 +949,65 @@ fn a_query_after_schema_edits_in_its_transaction_still_conflicts_with_writes_it_
         }
     }
 }
+
+// ---------------------------------------------------------------- K
+
+#[test]
+fn a_write_run_inside_a_transaction_reports_its_own_summary_type() {
+    let server = server();
+    let mut client = Client::ready(&server);
+    begin(&mut client);
+    // No record of this RUN carries an entity; it is a write all the same.
+    let (_, summary) = write(&mut client, "[:assert :greg :alias \"Typed\" :at 300]");
+    assert_eq!(summary.get("type"), Some(&string("w")));
+    let (_, summary) = write(&mut client, "[:attribute :k_declared :string]");
+    assert_eq!(summary.get("type"), Some(&string("s")));
+    client.run_empty(client::ALLIES);
+    let (_, summary) = client.pull(-1);
+    assert_eq!(summary.get("type"), Some(&string("r")));
+    // Once the transaction has also queried, its writes report `rw`, as
+    // its COMMIT does.
+    let (_, summary) = write(&mut client, "[:assert :greg :alias \"Typed too\" :at 300]");
+    assert_eq!(summary.get("type"), Some(&string("rw")));
+    assert_eq!(commit(&mut client).get("type"), Some(&string("rw")));
+}
+
+#[test]
+fn a_multi_form_failure_after_commits_names_the_last_commit_and_its_bookmark() {
+    let server = server();
+    let mut client = Client::ready(&server);
+    let before = world(&server).latest_tx().0;
+    send_run(
+        &mut client,
+        &datalog(
+            "[:assert :greg :alias \"Partial 1\" :at 300]\n\
+             [:assert :greg :alias \"Partial 2\" :at 300]\n\
+             [:assert :nobody_here :alias \"x\" :at 300]\n\
+             [:assert :greg :alias \"Never reached\" :at 300]",
+        ),
+        map(&[]),
+    );
+    let failure = any_failure(&mut client);
+    assert!(!transient(&failure), "{failure:?}");
+    let message = text(&failure).to_owned();
+    assert!(
+        message.contains("form 3 failed; 2 prior forms committed"),
+        "{message}"
+    );
+    let last = world(&server).latest_tx().0;
+    assert_eq!(last, before + 2);
+    // The client can read its own writes: the failure names the bookmark.
+    let bookmark = format!("kala:varrow:{last}");
+    assert!(message.contains(&bookmark), "{message}");
+    assert!(!message.contains("nothing was written"), "{message}");
+    client.reset();
+    send_run(
+        &mut client,
+        ALIASES,
+        map(&[("bookmarks", Value::List(vec![string(&bookmark)]))]),
+    );
+    client.success();
+    let rows = client.pull(-1).0;
+    assert!(rows.contains(&vec![string("Partial 2")]));
+    assert!(!rows.contains(&vec![string("Never reached")]));
+}

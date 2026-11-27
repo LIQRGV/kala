@@ -59,7 +59,10 @@ struct Session<'a> {
     started: Instant,
     transaction: Option<Transaction>,
     summary: Option<Map>,
-    output_ids: bool,
+    /// The summary type of the last RUN, for a PULL that has no commit
+    /// summary of its own (`r`; inside a transaction a write is `w`, `s`
+    /// when it only edited the schema, `rw` once the transaction queried).
+    run_type: &'static str,
     /// The open transaction expired while the next request was awaited.
     expired: bool,
     /// The accounts file as it was when `identity`'s grants were read.
@@ -117,7 +120,7 @@ pub(crate) fn serve(
         started: Instant::now(),
         transaction: None,
         summary: None,
-        output_ids: false,
+        run_type: "r",
         expired: false,
         grants_seen: None,
     };
@@ -768,7 +771,7 @@ impl Session<'_> {
         };
         self.started = Instant::now();
         self.summary = None;
-        self.output_ids = false;
+        self.run_type = "r";
         let output = match statement {
             kala_lang::Statement::Writes => {
                 // An explicit transaction's grants were refreshed at BEGIN.
@@ -993,6 +996,7 @@ impl Session<'_> {
                 .ok_or_else(|| {
                     Failure::new(INVALID, "transaction exceeds the staged-text byte limit")
                 })?;
+            let mut data = false;
             for (index, form) in forms.enumerate() {
                 let form = form.map_err(write::parse_error)?;
                 write::admit(&form, tx.forms.len(), held)?;
@@ -1002,8 +1006,9 @@ impl Session<'_> {
                     t.set_deadline(expires);
                     write::stage(t, &form, read)
                 })?;
+                data |= staged.ops.iter().any(|op| write::writes_data(op.kind));
                 // Label using the transaction so provisional node types resolve.
-                self.output_ids |= owned.with(|t| {
+                owned.with(|t| {
                     write::rows(
                         &mut output,
                         &staged.ops,
@@ -1016,6 +1021,13 @@ impl Session<'_> {
                 })?;
                 tx.forms.push(staged);
             }
+            self.run_type = if tx.queried {
+                "rw"
+            } else if data {
+                "w"
+            } else {
+                "s"
+            };
         } else {
             let deadline = self.started + options.timeout;
             let mut summary = write::Summary::new(self.config.max_message_bytes);
@@ -1028,6 +1040,7 @@ impl Session<'_> {
                 |world| {
                     let mut committed = 0;
                     for (index, form) in forms.enumerate() {
+                        let prior = committed;
                         let result = (|| {
                             if Instant::now() >= deadline {
                                 return Err(write::timeout());
@@ -1096,20 +1109,15 @@ impl Session<'_> {
                             })?;
                             Ok(())
                         })();
-                        if let Err(mut failure) = result {
-                            if index > 0 {
-                                failure.message = format!(
-                                    "form {} failed; {} prior forms committed: {}",
-                                    index + 1,
-                                    committed,
-                                    failure.message
-                                );
-                                // Retrying this RUN would replay already committed forms.
-                                if failure.code.starts_with("Neo.TransientError") {
-                                    failure.code = crate::error::EXECUTION;
-                                }
-                            }
-                            return Err(failure);
+                        if let Err(failure) = result {
+                            return Err(write::form_failed(
+                                failure,
+                                index + 1,
+                                prior,
+                                committed,
+                                db,
+                                summary.tx,
+                            ));
                         }
                     }
                     Ok(())
@@ -1177,10 +1185,7 @@ impl Session<'_> {
             };
             let mut summary = self.summary.take().unwrap_or_else(|| {
                 [
-                    (
-                        "type".into(),
-                        Value::String(if self.output_ids { "w" } else { "r" }.into()),
-                    ),
+                    ("type".into(), Value::String(self.run_type.into())),
                     ("db".into(), Value::String(self.db.clone())),
                 ]
                 .into()
