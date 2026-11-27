@@ -437,22 +437,31 @@ impl Registry {
             ))
         }
     }
+    /// The database's reader snapshot slot. A poisoned mutex (a session
+    /// thread panicked while it held the slot or a reload) is recovered as
+    /// [`Registry::lock_writer`] recovers the writer: the cached snapshot is
+    /// discarded and the next read reloads it from the log, instead of the
+    /// database refusing reads until the server restarts.
+    fn lock_cached(db: &Database) -> std::sync::MutexGuard<'_, Option<(Stamp, Arc<World>)>> {
+        db.cached.lock().unwrap_or_else(|poisoned| {
+            let mut lock = poisoned.into_inner();
+            *lock = None;
+            db.cached.clear_poison();
+            lock
+        })
+    }
     pub fn get(&self, requested: Option<&str>) -> Result<(String, Arc<World>), Failure> {
         let name = self.name(requested)?;
         let db = self
             .databases
             .get(name)
             .ok_or_else(|| Failure::new(DATABASE, format!("database {name:?} was not found")))?;
-        let lock = || {
-            db.cached
-                .lock()
-                .map_err(|_| Failure::new(crate::error::STORE, "the world could not be read"))
-        };
+        let lock = || Self::lock_cached(db);
         // Take the stamp BEFORE loading: a commit after this observation
         // changes the stamp again and forces another refresh, so a snapshot
         // is never labelled with a newer stamp than its own.
         let stamp = stamp(&db.path)?;
-        if let Some((s, world)) = lock()?.as_ref()
+        if let Some((s, world)) = lock().as_ref()
             && *s == stamp
         {
             return Ok((name.into(), Arc::clone(world)));
@@ -460,12 +469,15 @@ impl Registry {
         // Single-flight: one thread replays, the others wait for it and then
         // find the fresh snapshot. Queries whose stamp matches (above) never
         // wait behind a reload.
-        let _loading = db
-            .loading
-            .lock()
-            .map_err(|_| Failure::new(crate::error::STORE, "the world could not be read"))?;
+        let _loading = db.loading.lock().unwrap_or_else(|poisoned| {
+            // A reload panicked: whatever it left is not trusted either.
+            let lock = poisoned.into_inner();
+            *Self::lock_cached(db) = None;
+            db.loading.clear_poison();
+            lock
+        });
         let stamp = self::stamp(&db.path)?;
-        if let Some((s, world)) = lock()?.as_ref()
+        if let Some((s, world)) = lock().as_ref()
             && *s == stamp
         {
             return Ok((name.into(), Arc::clone(world)));
@@ -481,7 +493,7 @@ impl Registry {
             "event=bolt_database_loaded db={name} canon={}",
             world.latest_tx().0
         );
-        *lock()? = Some((stamp, Arc::clone(&world)));
+        *lock() = Some((stamp, Arc::clone(&world)));
         Ok((name.into(), world))
     }
 }
@@ -535,6 +547,40 @@ mod tests {
         assert!(!registry.databases["varrow"].writer.is_poisoned());
         registry.write("varrow", busy, tx.0, |_| Ok(())).unwrap();
         assert_eq!(registry.opens("varrow").1, 2);
+    }
+
+    #[test]
+    fn poisoned_reader_mutexes_are_recovered_by_reloading_the_snapshot() {
+        let (_dir, registry) = registry();
+        registry.get(Some("varrow")).unwrap();
+        assert_eq!(registry.opens("varrow").0, 1);
+        let db = &registry.databases["varrow"];
+        // A session thread panics while it holds each of the reader's
+        // mutexes (a reload, and the snapshot slot).
+        for poison_cached in [false, true] {
+            let panicked = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let _loading = (!poison_cached).then(|| db.loading.lock().unwrap());
+                        let _cached = poison_cached.then(|| db.cached.lock().unwrap());
+                        panic!("a session thread panicked while holding a reader mutex")
+                    })
+                    .join()
+            });
+            assert!(panicked.is_err());
+        }
+        assert!(db.cached.is_poisoned() && db.loading.is_poisoned());
+        // The snapshot the panic may have interrupted is discarded, not
+        // trusted: the next read reloads it from the log, and the database
+        // stays readable without a restart.
+        let (_, world) = registry.get(Some("varrow")).unwrap();
+        assert!(world.entity_by_handle("greg").is_some());
+        assert_eq!(registry.opens("varrow").0, 2);
+        assert!(!db.cached.is_poisoned() && !db.loading.is_poisoned());
+        // Recovered once: later reads share the reloaded snapshot.
+        registry.get(Some("varrow")).unwrap();
+        registry.at_least("varrow", 0, Duration::from_secs(1)).unwrap();
+        assert_eq!(registry.opens("varrow").0, 2);
     }
 
     #[test]
