@@ -216,7 +216,9 @@ never acknowledged) is cut without asking.
 
 The damaged bytes stay in the file until some command is run with
 `--acknowledge-recovery`: no process cuts them on its own, so none can write
-over the lost transaction's entry IDs unasked. A write session that was
+over the lost transaction's entry IDs unasked. (The one process that can be
+told to, in advance, is a server started as `kala serve DIR
+--acknowledge-recovery`; see "Bolt write limits".) A write session that was
 already open when the damage appeared is refused at its next write (`the last
 transaction is damaged … rerun with --acknowledge-recovery`): quit it and
 start it again with the flag. Entry IDs noted from the lost transaction must
@@ -864,11 +866,28 @@ server components and database listings report "only over Bolt".
 ### Bolt write limits
 
 `kala serve` accepts Datalog writes through accounts with `write` grants.
-`--read-only` restores read-only server behavior and refuses BEGIN in write mode.
-`--max-write-transactions` defaults to 8; `--tx-timeout` to 60s;
-`--tx-idle-timeout` to 30s; `--busy-timeout` to 5s. Duration flags accept `ms`,
+`--read-only` restores read-only server behavior: every write form is refused
+(a transaction begun in write mode, the drivers' default, still reads).
+`--max-write-transactions` defaults to 8 and counts explicit transactions that
+have written; one account may hold at most half of them (at least 1).
+`--tx-timeout` defaults to 60s and bounds a transaction's whole life, including
+the server's own work in it; `--tx-idle-timeout` defaults to 30s and bounds
+only the time the client stays silent between a response and its next request.
+`--busy-timeout` defaults to 5s. Duration flags accept `ms`,
 `s`, `m` and bare seconds. The busy timeout applies to writer locks and causal
 bookmark waits. `--auth none` remains read-only. The system world is written
 only through `kala user`, including when the caller is an administrator.
+Over Bolt, `[:world-setting …]`, `[:rename …]`, `[:deprecate …]`,
+`[:cardinality …]` and `[:migrate …]` need `admin` on the database;
+declarations need only `write`.
+
+`--acknowledge-recovery` (off by default) lets the server cut a world's damaged
+last transaction by itself, to a `<world>.torn-N` quarantine file, and go on
+writing, instead of refusing writes until an operator runs a write command with
+that flag. It prints `event=recovery_acknowledged db=… bytes=… quarantine=…`
+for each cut and a warning at startup. It accepts a risk: the cut transaction's
+entry IDs are issued again, so a client still holding one could `:correct` the
+wrong fact. It never applies to `system`, and a `--read-only` server ignores it
+(and says so).
 See [Bolt transactions, reports and limits](../kala-bolt/README.md#writing-and-transactions)
 for driver examples and error codes.

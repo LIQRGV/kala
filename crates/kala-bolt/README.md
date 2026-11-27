@@ -5,7 +5,7 @@ and shared query executor. `kala serve DIR` exposes each regular
 `DIR/<name>.kala` file as a database (`[a-z0-9_-]+` names only). Symlinks and
 invalid names are skipped with a startup diagnostic. Files are discovered at
 startup; readers open immutable snapshots on first RUN. File stamps (length, modification time, file identity and commit tail) trigger a reload of
-committed transactions; each result pins one snapshot. A damaged tail is never acknowledged or cut by this server; an operator must acknowledge recovery through the CLI. The served directory and its files
+committed transactions; each result pins one snapshot. A damaged tail is never acknowledged or cut by this server unless it was started with `--acknowledge-recovery` (see "Damaged tails"); otherwise an operator must acknowledge recovery through the CLI. The served directory and its files
 are trusted local input: concurrent replacement of directory entries is outside
 the network security boundary.
 
@@ -211,9 +211,14 @@ transactions on increasing logical ticks, so their audit history is retained.
 Only `kala user` commands may write this world through the CLI; renamed copies
 are protected by the marker too. A user world cannot be named `system`.
 
-Account snapshots reload using the same file-stamp cache as worlds. Grants and
-password changes take effect at the next login; an existing session retains its
-identity until LOGOFF or disconnect. `kala user` takes a writer lock only for its
+Account snapshots reload using the same file-stamp cache as worlds. Password
+changes take effect at the next login. Grants are captured at login and
+re-read, if any account changed since, whenever the connection sends BEGIN or
+an auto-commit write: a revoked `write` (or a dropped account, which is then
+refused everything) stops a pooled connection's next transaction or write
+instead of lasting until its next login, and a new grant is picked up the same
+way. Plain auto-commit reads don't check: for them a session keeps the grants
+of its login (or of its last BEGIN or write) until LOGOFF or disconnect. `kala user` takes a writer lock only for its
 command and works while the server is running. The last `admin:*` account cannot
 be dropped or have that grant revoked.
 
@@ -450,12 +455,17 @@ for the full explicit result, and `session.last_bookmarks()` for its bookmark.
 
 COMMIT/ROLLBACK outside a transaction, nested BEGIN and COMMIT while streaming
 are invalid requests. RESET, GOODBYE, disconnect, timeout and server shutdown
-discard staged writes and release the write slot. There is one open result:
+discard staged writes and release the write slot. After a transaction timed
+out, RESET still answers SUCCESS and GOODBYE still closes; any other request
+gets the `TransactionTimedOut` failure. There is one open result:
 `qid` must be `0` or `-1`. RUN commits an auto-commit write before sending its
 SUCCESS, even if the client never pulls. Several top-level forms commit
 individually, in order. A later failure reports `form N failed; K prior forms
-committed`; after a partial commit it is never a transient error that invites
-the driver to replay the whole RUN. Inside BEGIN, all forms across RUNs commit
+committed`. Once K > 0 the message also names the last commit (`the last as
+tx T (bookmark kala:<db>:T)`, so the client can read its own writes), says
+only that *this form* wrote nothing, and is never a transient error that
+invites the driver to replay the whole RUN. With K = 0 the original failure
+and its code stand. Inside BEGIN, all forms across RUNs commit
 as one transaction; any failed form discards everything and enters Failed.
 
 BEGIN and auto-commit RUN accept `db`, `mode` (`r`/`w`, default `w`),
@@ -466,14 +476,33 @@ A leading `[:concurrency :weak]` or `:optimistic` overrides this default, but on
 the first write form may set it inside an explicit transaction.
 Notification preferences are accepted and ignored. Impersonation is refused.
 
-Queries read the committed snapshot at BEGIN. They do **not** see the transaction's
+**Snapshots.** Every BEGIN, in any mode, pins the shared read snapshot (after any
+bookmark wait) and costs nothing else: drivers begin in write mode by default,
+also for reads. The private writable handle is opened, and a write slot taken, at
+the transaction's **first write form**, on the world as it is then:
+
+- a transaction that has run no query yet simply takes that world as its
+  snapshot (a tick-less write lands on its latest tick);
+- a transaction that queried first, with nothing committed in between, has its
+  queries' read keys recorded on the handle and checked at COMMIT as usual;
+- a transaction that queried first and then starts writing after **another
+  transaction committed** can no longer be checked (its queries saw an older
+  world than its writes are applied to): its COMMIT fails with the transient
+  conflict code and drivers' `execute_write` retries it. In short, the snapshot
+  a transaction's queries saw must still be current when it starts writing.
+  Its later queries keep reading the snapshot they began on. Weak mode skips
+  this check too.
+
+Queries read the transaction's committed snapshot. They do **not** see the transaction's
 own writes. Later write forms can resolve handles created by earlier forms and
 `:set`/`:if-missing` see staged writes through the native transaction. Optimistic
 queries record coarse attribute, node-type and entity-definition dependencies;
 unknown labels also record the absent node type. Graph-result enrichment
 conservatively records a whole-world read. This prevents write skew while scalar
-queries on unrelated attributes can commit independently. Weak mode skips conflict
-checks. Sending a provisional entity ID pins it: a commit that would renumber it
+queries on unrelated attributes can commit independently. A query that runs after
+its transaction staged a schema change (a rename, a declaration, also an inferred
+one) records a whole-world read: its names might mean other attributes in the
+transaction's provisional schema. Weak mode skips conflict checks. Sending a provisional entity ID pins it: a commit that would renumber it
 fails transiently. Discarding the record does not expose that ID.
 
 ### Write privileges
@@ -481,24 +510,41 @@ fails transiently. Discarding the record does not expose that ID.
 | Operation | Privilege on the selected user database |
 | --- | --- |
 | Query | read |
-| Assert, retract, plain create, schema declarations | write |
-| Set, create with `:if-missing`, correct, migrate | read and write |
+| `[:assert …]`, `[:retract …]`, plain `[:create …]`, declarations (`[:attribute …]`, `[:node-type …]`, names a write declares by inference) | write |
+| `[:set …]`, `[:create … :if-missing]`, `[:correct …]` | read and write |
+| `[:world-setting …]`, `[:rename …]`, `[:deprecate …]`, `[:cardinality …]`, `[:migrate …]` | admin (`admin:<db>` or `admin:*`) |
 | ROUTE | read or write |
 | Any write to system, including as admin | Always forbidden |
 
-Admin implies read and write on user databases. `--auth none` grants `read:*`
-only. `--read-only` refuses all writes and BEGIN in write mode before world I/O.
-A read-mode transaction cannot write. Form permissions are checked before staging.
-A reader-only identity can open a default-mode transaction backed by a read snapshot.
+Admin implies read and write on user databases. The admin row is policy for
+remote writers, not a store rule: those forms change what existing data or the
+world's rules mean for everyone else. It lives in one function (`write::admit`)
+and the CLI is not affected (`kala transact` is bounded by file permissions).
+`[:world-setting …]` accepts only the keys Kala knows (`:schema`,
+`:concurrency`, `:tick_unit`), in the CLI too; another key is an error that
+lists them. `--auth none` grants `read:*`
+only. `--read-only` refuses every write form before world I/O. BEGIN itself is
+never refused for being in write mode: on a read-only server, on `system` (for
+an admin) and for an identity without `write`, a default-mode transaction reads
+normally and the refusal comes when a write form arrives.
+A read-mode transaction cannot write. Form permissions are checked before a
+writable handle is opened or anything is staged.
 
 Write-only reports retain form/op/kind/tick/changed/entries and newly created
 entity identities. Existing entity details and non-true `created` fields are null;
 write-result nodes contain identity/type but no stored properties or handle.
-Store-rule error details are replaced by `write failed; details require read privilege`.
+Every store-rule failure (an existing or unknown handle, a held value, a wrong
+type, a same-tick conflict …) is the same code, `Neo.ClientError.Statement.ExecutionFailed`,
+with the same message, `write failed; details require read privilege`, so the
+failures can't be told apart; syntax errors and privilege refusals, which
+describe the request and not the data, keep their own codes.
 Overlap descriptions contain only `overlap details require read privilege`.
 No held values appear in these records, errors or notifications. Changed counts
 remain visible, as do commit IDs and counts. Inferred declaration names and
-latest-tick movement remain visible. Queries retain their ordinary property-rich
+latest-tick movement remain visible. **Write-only access limits what is
+returned; it is not a confidentiality boundary**: a changed count of 0 or 1 and
+the latest tick still tell a determined writer something about what is held.
+Queries retain their ordinary property-rich
 Node/Relationship mapping for identities with read access.
 
 ### Write records and summaries
@@ -517,7 +563,8 @@ for create operations, null for other operations. Plain create reports true.
 
 The final auto-commit PULL or explicit COMMIT summary contains `db`,
 `bookmark: "kala:<db>:<tx>"`, `type` (`w`, `rw` when queries also ran, or `s`
-for schema-only forms), and:
+for schema-only forms; the PULL summary of a write RUN inside a transaction
+carries the same `type` for that RUN), and:
 
 - `stats`: `nodes-created`, `relationships-created`, `properties-set` (non-ref
   asserted fact/revision entries), and `contains-updates`. Counters describe
@@ -541,9 +588,13 @@ This ensures a durable commit still returns SUCCESS. Fetch complete history with
 least a 1024-byte message limit and nesting depth 8.
 
 Bookmarks on BEGIN and auto-commit reads/writes must be lists of at most 64
-strings, each at most 256 bytes, matching the selected database. Readers refresh
-before pinning their snapshot and wait at most the busy timeout for the highest
-requested transaction. Future bookmarks fail transiently after that bound.
+strings, each at most 256 bytes and of the form `kala:<db>:<tx>`. A bookmark
+that names **another database is ignored** (drivers' bookmark managers send
+every bookmark they hold with every request); only a malformed one is refused.
+Readers refresh before pinning their snapshot and wait at most the busy timeout
+for the highest requested transaction of the selected database; an auto-commit
+write checks its bookmark against the writable handle instead (no reader
+refresh). Future bookmarks fail transiently after that bound.
 
 ### Errors and limits
 
@@ -553,45 +604,89 @@ requested transaction. Future bookmarks fail transiently after that bound.
 | Write syntax | Neo.ClientError.Statement.SyntaxError |
 | Wrong value type | Neo.ClientError.Statement.TypeError |
 | Same-tick conflict, duplicate handle/type mismatch | Neo.ClientError.Schema.ConstraintValidationFailed |
-| Unknown handle/attribute, deprecated attribute, strict schema, event retract, other store-rule errors | Neo.ClientError.Statement.SemanticError |
-| Missing privilege, system write, read-only server | Neo.ClientError.Security.Forbidden |
+| Unknown handle/attribute, deprecated attribute, strict schema, event retract, unknown world setting, other store-rule errors | Neo.ClientError.Statement.SemanticError |
+| Any of the three rows above, for an identity without `read` | Neo.ClientError.Statement.ExecutionFailed |
+| A form after committed forms of the same auto-commit RUN that would otherwise be transient | Neo.ClientError.Statement.ExecutionFailed |
+| Missing privilege (`write`, `read` or `admin`), revoked grant or dropped account, system write, read-only server | Neo.ClientError.Security.Forbidden |
 | Write in read transaction | Neo.ClientError.Transaction.ForbiddenDueToTransactionType |
-| Optimistic conflict, diverged handle, future bookmark, write-slot cap | Neo.TransientError.Transaction.DeadlockDetected |
+| Optimistic conflict (also: queried before another commit, then wrote), diverged handle, future bookmark, write-slot cap (total or per account) | Neo.TransientError.Transaction.DeadlockDetected |
 | Writer lock busy timeout | Neo.TransientError.Transaction.LockAcquisitionTimeout |
 | Transaction expiry | Neo.ClientError.Transaction.TransactionTimedOut |
-| Malformed or wrong-database bookmark | Neo.ClientError.Transaction.InvalidBookmark |
+| Malformed bookmark | Neo.ClientError.Transaction.InvalidBookmark |
 | Recovery required or store I/O failure | Neo.DatabaseError.General.UnknownError |
 
 The pinned Python driver marks generic transient errors retryable; neither
 Outdated nor DeadlockDetected has a specialized entry, so Kala uses the familiar
 DeadlockDetected fallback. The read-mode code is explicitly listed by that driver.
 ConstraintValidationFailed uses Neo4j's Schema namespace. Recovery failures direct
-an operator to a CLI write with `--acknowledge-recovery`; the server never does it.
-A diverged cached writer is dropped, so retry opens a fresh handle.
+an operator to a CLI write with `--acknowledge-recovery`; the server does it
+itself only when started with that flag (see "Damaged tails").
+The cached writer is dropped, so that the retry opens a fresh handle, only after
+an error that leaves it unusable (a diverged or corrupt log, an I/O error, a
+recovery error); an ordinary failed write keeps it, so a client repeating a bad
+request can't make every writer replay the log.
 
 | Serve flag | Default | Meaning |
 | --- | --- | --- |
-| `--read-only` | false | Refuse write forms and BEGIN w |
-| `--max-write-transactions` | 8 | Open explicit writable snapshots |
-| `--tx-timeout` | 60s | Maximum transaction lifetime |
-| `--tx-idle-timeout` | 30s | Time between messages, including slow response delivery |
+| `--read-only` | false | Refuse write forms (transactions may still read) |
+| `--max-write-transactions` | 8 | Explicit transactions that have written and not ended; one account may hold at most half of them (at least 1) |
+| `--tx-timeout` | 60s | Maximum transaction lifetime; bounds all server-side work in it (queries, staging, COMMIT, sending responses) |
+| `--tx-idle-timeout` | 30s | How long the client may stay silent between a response and its next request |
 | `--busy-timeout` | 5s | Writer mutex/file lock or bookmark wait |
+| `--acknowledge-recovery` | false | Cut a world's damaged last transaction without an operator (see "Damaged tails") |
 
 Durations accept `ms`, `s`, `m` or bare seconds. Native defaults live in
 `ServerConfig`. Each transaction accepts at most 256 forms, retains at most
 16 MiB of write text, and observes the existing Datalog per-form limits.
 Materialized write records are capped at 16 MiB per RUN. Socket messages remain
-bounded by `max_message_bytes` and `max_depth`. Transaction expiry also releases
+bounded by `max_message_bytes` and `max_depth`. The idle clock starts when a
+response has been sent and stops when the next request has arrived: a statement
+or COMMIT that takes longer than `--tx-idle-timeout` is not idle and is bounded
+by `--tx-timeout` (or the client's shorter `tx_timeout`) only. A request's
+deadline is checked inside the executor, where the cancel flag is; no thread is
+started per query. Transaction expiry also releases
 an idle or trickling client's slot; partial outbound responses close the connection.
 The durable append/fsync cannot be interrupted: once appended, the server reports
 success, even if completion crosses the deadline.
 
-Each explicit writable transaction owns one replayed world handle and reserves
-a slot at BEGIN; read-mode and reader-only transactions pin cached snapshots.
-Writable BEGIN is eager to preserve its snapshot and enforce the cap before the
-first RUN. Auto-commit uses one mutex-protected writable handle per database,
-caught up on each use. The mutex is never held across client I/O. Reader file
-stamps make subsequent connections see committed writes.
+Each explicit transaction that writes owns one replayed world handle and holds
+a slot from its first write form until it ends; a transaction that only reads,
+in any mode, pins the cached read snapshot and holds no slot. The cap is
+`--max-write-transactions` in total and half of it (at least 1) per account
+(`user@host`), so one account cannot keep every other from writing; over either
+bound the write form fails with the transient code. Auto-commit uses one
+mutex-protected writable handle per database, caught up on each use (it takes no
+slot and never reloads the reader snapshot). The mutex is never held across
+client I/O, and a panic while it was held costs only that handle, which is
+rebuilt from the log. Reader file stamps make subsequent connections see
+committed writes.
+
+### Damaged tails
+
+A *damaged* last transaction (all its bytes are in the file but its checksum
+fails, and nothing valid follows) may have been acknowledged to a client before
+a crash, so no Kala process cuts one unasked. By default the server serves reads
+of such a world and refuses its writes with the database-class error until an
+operator runs a write command with `--acknowledge-recovery`
+(`kala transact WORLD --acknowledge-recovery …`); the file stays byte-identical.
+
+`kala serve DIR --acknowledge-recovery` is the opt-in for deployments whose
+worlds can be rebuilt: when a writable handle meets a damaged tail (when it is
+opened, or later under the cached handle), the server acknowledges it, saves
+the bytes to a quarantine file (`<world>.kala.torn-<offset>`), cuts them under
+the writer lock and carries on with the write. Each cut prints one line on
+stderr, `event=recovery_acknowledged db=<name> bytes=<n> quarantine=<file name>`,
+and startup prints a WARNING that the flag is on.
+
+**What the flag accepts:** the cut transaction's entry IDs and tx number are
+issued again to the next commit. A client that still holds an entry ID from the
+cut transaction and sends `[:correct <id> …]` would correct a *different* fact.
+Without the flag an operator decides what the lost transaction means first.
+
+The flag never applies to `system` (a damaged `system.kala` is always manual:
+`kala user … --acknowledge-recovery`), is ignored by a `--read-only` server
+(which says so at startup), and is not needed for a *torn* tail (a transaction
+cut short, never acknowledged), which is cut automatically as before.
 
 Writes have **at-least-once** delivery under a lost connection: the log may commit
 before SUCCESS reaches the client. Do not blindly retry non-idempotent creates
