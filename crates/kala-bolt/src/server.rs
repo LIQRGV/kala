@@ -58,18 +58,24 @@ pub struct ServerConfig {
     pub busy_timeout: Duration,
     /// PackStream nesting limit (at most 32).
     pub max_depth: usize,
-    /// Test instrumentation, `None` in every real server: called by an
-    /// auto-commit Cypher write after its reading part ran and before it
-    /// waits for the database's writer, so a test can commit in between.
+    /// Test hook, compiled only with the crate's `test-hooks` feature (no
+    /// release build of the library or of `kala` has it): called by an
+    /// auto-commit Cypher write after its reading part ran off the writer
+    /// mutex and before it waits for the database's writer, so a test can
+    /// commit in between.
+    #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub after_statement_read: Option<Hook>,
 }
-/// A callback for [`ServerConfig::after_statement_read`].
+/// A callback for `ServerConfig::after_statement_read`. Unwind-safe, so a
+/// configuration that carries one can still cross `catch_unwind`.
+#[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct Hook(
     pub Arc<dyn Fn() + Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe>,
 );
+#[cfg(feature = "test-hooks")]
 impl std::fmt::Debug for Hook {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Hook")
@@ -95,6 +101,7 @@ impl Default for ServerConfig {
             tx_timeout: Duration::from_secs(60),
             tx_idle_timeout: Duration::from_secs(30),
             busy_timeout: Duration::from_secs(5),
+            #[cfg(feature = "test-hooks")]
             after_statement_read: None,
         }
     }

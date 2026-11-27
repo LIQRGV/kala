@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-# Test-only observation points (how often a world was opened); never enabled
+# Test-only observation points and hooks (how often a world was opened, a
+# callback between an auto-commit write's read and its stage); never enabled
 # by another crate.
 test-hooks = []
 
