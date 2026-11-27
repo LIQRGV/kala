@@ -968,7 +968,16 @@ impl Writer<'_, '_> {
             let mut wanted = values(self.eval(e, row, false)?)?;
             self.handles(id, key, &mut wanted)?;
             for v in wanted {
-                self.fact(id, key, v, Op::Assert)?;
+                // A ref-valued key is a relationship type: an inverse name
+                // writes the stored attribute with the endpoints flipped,
+                // exactly as `SET n.key = m` and `CREATE (n)-[:key]->(m)`.
+                if let Value::Ref(to) = v {
+                    let (src, kind, tgt) = self.tx.relationship(id, key, to);
+                    let kind = kind.to_owned();
+                    self.fact(src, &kind, Value::Ref(tgt), Op::Assert)?;
+                } else {
+                    self.fact(id, key, v, Op::Assert)?;
+                }
             }
         }
         Ok(())

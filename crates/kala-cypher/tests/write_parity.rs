@@ -388,3 +388,16 @@ fn parallel_list_index_nulls_and_type_errors_are_atomic() {
         }
     }
 }
+
+#[test]
+fn an_inverse_name_in_a_create_property_map_is_the_flipped_stored_relationship() {
+    let setup = "[:attribute :parent_of :ref :state :many :directed :inverse :child_of]";
+    let datalog = "[:at 700 [:create :CHARACTER :kid] [:assert :mara :parent_of :kid]]";
+    for cypher in [
+        "MATCH (p {kala_handle:'mara'}) CREATE (c:CHARACTER {kala_handle:'kid', child_of: p}) AT TICK 700",
+        "MATCH (p {kala_handle:'mara'}) CREATE (c:CHARACTER {kala_handle:'kid'}) SET c.child_of = p AT TICK 700",
+        "MATCH (p {kala_handle:'mara'}) CREATE (c:CHARACTER {kala_handle:'kid'})-[:child_of]->(p) AT TICK 700",
+    ] {
+        with_setup(Some(setup), cypher, datalog);
+    }
+}
