@@ -525,3 +525,75 @@ fn other_schema_statements_are_refused_by_name() {
         assert!(error.contains(hint), "{text}: {error}");
     }
 }
+
+// ---- Second review, 3: constraints only ever add a declaration ----
+
+#[test]
+fn if_not_exists_on_a_declared_name_writes_nothing_whatever_its_definition() {
+    let mut world = varrow();
+    // A new name still declares, with or without the flag.
+    let report = ok(
+        &mut world,
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (n:CHARACTER) REQUIRE n.rank IS :: INTEGER",
+    );
+    assert_eq!((report.changed, report.declared), (0, 1));
+    // The name exists: another type, another kind of attribute (a ref with
+    // a direction), an unknown label — nothing is written, nothing declared.
+    let schema = |world: &World| format!("{:?}", world.attributes().collect::<Vec<_>>());
+    for text in [
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (n:CHARACTER) REQUIRE n.rank IS :: STRING",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (n:CHARACTER) REQUIRE n.ally_of IS :: BOOLEAN",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (n:NEWTYPE) REQUIRE n.name IS :: INTEGER",
+    ] {
+        let (tx, before) = (world.latest_tx(), schema(&world));
+        let report = ok(&mut world, text);
+        assert_eq!((report.changed, report.declared), (0, 0), "{text}");
+        assert_eq!(world.latest_tx(), tx, "{text}");
+        assert_eq!(schema(&world), before, "{text}");
+        assert!(!world.node_types().any(|t| t == "NEWTYPE"));
+    }
+}
+
+#[test]
+fn a_constraint_never_redefines_an_attribute_that_exists() {
+    let mut world = varrow();
+    ok(
+        &mut world,
+        "CREATE CONSTRAINT FOR (n:CHARACTER) REQUIRE n.rank IS :: INTEGER",
+    );
+    let schema = |world: &World| format!("{:?}", world.attributes().collect::<Vec<_>>());
+    // `rank` has no facts, so the store itself would allow the type change
+    // (and reset its labels to the defaults); `ally_of` is a bidirectional
+    // ref with facts.
+    for (text, name, has) in [
+        (
+            "CREATE CONSTRAINT FOR (n:CHARACTER) REQUIRE n.rank IS :: STRING",
+            "rank",
+            "i64",
+        ),
+        (
+            "CREATE CONSTRAINT FOR (n:CHARACTER) REQUIRE n.ally_of IS :: BOOLEAN",
+            "ally_of",
+            "ref",
+        ),
+    ] {
+        let (tx, before) = (world.latest_tx(), schema(&world));
+        let error = run(&mut world, text).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("attribute :{name} already exists with type {has}"))
+                && error.contains("// kala:datalog")
+                && error.contains("[:attribute")
+                && error.contains("[:migrate"),
+            "{error}"
+        );
+        assert_eq!(world.latest_tx(), tx, "{text}");
+        assert_eq!(schema(&world), before, "{text}");
+    }
+    // The identical definition stays a no-op.
+    let tx = world.latest_tx();
+    let report = ok(
+        &mut world,
+        "CREATE CONSTRAINT FOR (n:CHARACTER) REQUIRE n.rank IS :: INT",
+    );
+    assert_eq!((report.declared, world.latest_tx()), (0, tx));
+}

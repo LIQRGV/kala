@@ -140,7 +140,8 @@ impl Parser<'_> {
         if !self.is_kw("IF") && !self.is_kw("FOR") {
             self.name()?;
         }
-        if self.kw("IF") {
+        let if_not_exists = self.kw("IF");
+        if if_not_exists {
             self.need_kw("NOT")?;
             self.need_kw("EXISTS")?;
         }
@@ -218,6 +219,7 @@ impl Parser<'_> {
                 label,
                 attribute,
                 value_type,
+                if_not_exists,
             }],
             tick: None,
             returns: vec![],

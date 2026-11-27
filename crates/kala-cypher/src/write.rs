@@ -532,10 +532,33 @@ fn apply(
                         label,
                         attribute,
                         value_type,
+                        if_not_exists,
                     } => {
+                        // A constraint only ever ADDS a declaration. A name
+                        // that is already an attribute is left exactly as it
+                        // is: with IF NOT EXISTS the statement does nothing
+                        // at all (no node type either), without it only the
+                        // same type is accepted (the no-op the Datalog form
+                        // makes of it). A type change, which the store
+                        // allows while an attribute has no facts and which
+                        // resets its other labels, is the Datalog form's.
+                        let existing = writer.tx.attribute(attribute).map(|def| def.value_type);
+                        if let Some(has) = existing
+                            && !*if_not_exists
+                            && has != *value_type
+                        {
+                            return Err(invalid(&format!(
+                                "attribute :{attribute} already exists with type {}; change it with // kala:datalog [:attribute …] or [:migrate …]",
+                                has.name()
+                            )));
+                        }
+                        let skip = existing.is_some() && *if_not_exists;
                         // Exactly `[:attribute :prop :type]`; a new label is
                         // a node type declared by the schema-on-write rule.
                         writer.stager.other(writer.tx, "attribute", |tx, tick| {
+                            if skip {
+                                return Ok(native::Effect::schema(tick));
+                            }
                             tx.infer_node_type(label)
                                 .and_then(|()| {
                                     tx.declare_attribute_with(

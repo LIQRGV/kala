@@ -439,7 +439,7 @@ fn an_auto_commit_return_that_cannot_be_rendered_commits_nothing() {
 // ---- J: CREATE CONSTRAINT … IS :: TYPE over a socket ----
 
 #[test]
-fn a_type_constraint_needs_write_and_redefining_needs_admin() {
+fn a_type_constraint_needs_write_and_never_redefines_an_attribute() {
     let server = server();
     let declare = "CREATE CONSTRAINT FOR (n:CHARACTER) REQUIRE n.rank IS :: INTEGER";
     let mut reader = login(&server, "reader");
@@ -469,28 +469,63 @@ fn a_type_constraint_needs_write_and_redefining_needs_admin() {
     assert_eq!(summary["type"], string("s"));
     assert!(log_bytes(&server) == before);
 
-    // Changing what the committed schema has is the administrator's.
+    // A constraint only ever adds a declaration: a different type for a
+    // name that exists is refused for every identity, the administrator
+    // included, although `rank` has no facts and the store would allow it.
     let redefine = "CREATE CONSTRAINT FOR (n:CHARACTER) REQUIRE n.rank IS :: STRING";
+    let mut root = Client::ready(&server);
     for explicit in [false, true] {
         if explicit {
             begin(&mut writer);
+            begin(&mut root);
         }
+        // Without `read`, the refusal doesn't describe the schema.
         let (code, message) = failure(&mut writer, redefine, map(&[]));
-        assert_eq!(code, "Neo.ClientError.Security.Forbidden", "{message}");
-        assert!(message.contains("admin"), "{message}");
+        assert!(code.starts_with("Neo.ClientError."), "{code}: {message}");
+        assert!(!message.contains("rank"), "{message}");
+        let (code, message) = failure(&mut root, redefine, map(&[]));
+        assert!(code.starts_with("Neo.ClientError."), "{code}: {message}");
+        assert!(
+            message.contains("attribute :rank already exists with type i64")
+                && message.contains("// kala:datalog")
+                && message.contains("[:migrate"),
+            "{message}"
+        );
     }
     assert!(log_bytes(&server) == before);
-    let mut root = Client::ready(&server);
-    begin(&mut root);
-    root.run(redefine, map(&[]), map(&[]));
-    let (rows, summary) = root.pull(-1);
-    assert!(rows.is_empty());
-    assert_eq!(summary["type"], string("s"));
-    commit(&mut root);
     assert_eq!(
         world(&server).attribute("rank").unwrap().value_type,
+        kala_core::ValueType::I64
+    );
+
+    // With IF NOT EXISTS an existing name is a no-op whatever its
+    // definition, for an identity that holds only `write` too.
+    let mut writer = login(&server, "writer");
+    let unless = "CREATE CONSTRAINT IF NOT EXISTS FOR (n:FACTION) REQUIRE n.rank IS :: STRING";
+    let summary = write(&mut writer, unless, map(&[]));
+    assert_eq!(summary["type"], string("s"), "{summary:?}");
+    let Value::Map(kala) = &summary["kala"] else {
+        panic!("{summary:?}")
+    };
+    assert_eq!(kala["declared"], Value::Integer(0), "{kala:?}");
+    assert!(log_bytes(&server) == before);
+    assert!(!world(&server).node_types().any(|t| t == "FACTION"));
+    // And a new name still declares with it.
+    let summary = write(
+        &mut writer,
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (n:FACTION) REQUIRE n.motto IS :: STRING",
+        map(&[]),
+    );
+    let Value::Map(kala) = &summary["kala"] else {
+        panic!("{summary:?}")
+    };
+    assert_eq!(kala["declared"], Value::Integer(2), "{kala:?}");
+    let committed = world(&server);
+    assert_eq!(
+        committed.attribute("motto").unwrap().value_type,
         kala_core::ValueType::Str
     );
+    assert!(committed.node_types().any(|t| t == "FACTION"));
 }
 
 // ---- Second review, 1: an auto-commit Cypher write never replays the log ----

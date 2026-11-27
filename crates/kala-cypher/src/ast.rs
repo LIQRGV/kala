@@ -179,6 +179,9 @@ pub(crate) enum Update {
         label: String,
         attribute: String,
         value_type: kala_core::ValueType,
+        /// `IF NOT EXISTS`: a name that is already an attribute, whatever
+        /// its definition, makes the statement a no-op.
+        if_not_exists: bool,
     },
 }
 
