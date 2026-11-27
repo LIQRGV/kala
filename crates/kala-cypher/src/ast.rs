@@ -172,6 +172,14 @@ pub(crate) enum Update {
         names: Vec<String>,
         detach: bool,
     },
+    /// `CREATE CONSTRAINT … FOR (n:Label) REQUIRE n.prop IS :: TYPE`: the
+    /// explicit declaration of attribute `prop` with a value type (and of
+    /// the node type, by the schema-on-write rule, if it is new).
+    Constraint {
+        label: String,
+        attribute: String,
+        value_type: kala_core::ValueType,
+    },
 }
 
 impl Update {
@@ -199,12 +207,23 @@ impl WriteStatement {
     pub fn requires_read(&self) -> bool {
         self.has_reading_part()
             || !self.returns.is_empty()
-            || self.writes.iter().any(|w| !matches!(w, Update::Create(_)))
+            || self
+                .writes
+                .iter()
+                .any(|w| !matches!(w, Update::Create(_) | Update::Constraint { .. }))
             || self.write_expressions().iter().any(|expr| {
                 let mut props = vec![];
                 expr.attributes(&mut props);
                 !props.is_empty()
             })
+    }
+    /// Whether the statement only declares schema (a type constraint): its
+    /// summary type is `s`, and it stores no facts.
+    pub fn schema_only(&self) -> bool {
+        self.writes
+            .iter()
+            .all(|w| matches!(w, Update::Constraint { .. }))
+            && !self.writes.is_empty()
     }
     /// Whether the statement begins with a reading pipeline.
     pub fn has_reading_part(&self) -> bool {
@@ -226,6 +245,9 @@ impl WriteStatement {
                     names.push(edge.kind.as_str());
                     names.extend(edge.props.iter().map(|(key, _)| key.as_str()));
                 }
+            }
+            if let Update::Constraint { attribute, .. } = update {
+                names.push(attribute.as_str());
             }
             for item in update.assignments() {
                 match item {

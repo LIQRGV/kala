@@ -28,10 +28,7 @@ fn supported_write_clauses_parse() {
 #[test]
 fn unsupported_write_shapes_name_the_reason() {
     for (text, hint) in [
-        (
-            "CREATE CONSTRAINT c FOR (n:T) REQUIRE n.id IS :: INTEGER",
-            "datalog",
-        ),
+        ("CREATE INDEX i FOR (n:T) ON (n.id)", "datalog"),
         ("CREATE (a:T)-[:link]-(b:T)", "direction"),
         ("MATCH (n) SET n = {x:1}", "set the properties"),
         ("CREATE (n:T) WITH n MATCH (x) RETURN x", "not supported"),

@@ -314,6 +314,28 @@ mod tests {
     }
 
     #[test]
+    fn a_cypher_type_constraint_classifies_as_a_blind_schema_statement() {
+        use super::{Statement, classify};
+        let cypher = front_end("cypher").unwrap();
+        let text = "CREATE CONSTRAINT c IF NOT EXISTS FOR (n:T) REQUIRE n.rank IS :: INTEGER";
+        let Ok(Statement::CypherWrite(statement)) = classify(cypher, text, &refuse_nothing) else {
+            panic!("expected a write statement")
+        };
+        assert!(statement.schema_only() && !statement.requires_read());
+        // The refusal hook sees the declared name.
+        assert!(matches!(
+            classify(cypher, text, &|a| a == "rank"),
+            Err(e) if e.kind == ErrorKind::Refused
+        ));
+        for refused in ["DROP CONSTRAINT c", "CREATE INDEX FOR (n:T) ON (n.x)"] {
+            assert!(matches!(
+                classify(cypher, refused, &refuse_nothing),
+                Err(e) if e.kind == ErrorKind::Syntax
+            ));
+        }
+    }
+
+    #[test]
     fn names_match_the_front_ends_in_order() {
         let names: Vec<_> = LANGUAGES.iter().map(|l| l.name()).collect();
         assert_eq!(names, NAMES);

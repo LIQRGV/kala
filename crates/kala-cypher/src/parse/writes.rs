@@ -42,6 +42,14 @@ impl Parser<'_> {
             self.write_end()?;
             return Ok(Statement::Concurrency(mode));
         }
+        if clauses.is_empty()
+            && self.is_kw("CREATE")
+            && matches!(self.tokens.get(self.at + 1).map(|t| &t.kind), Some(Kind::Ident(s, false)) if s.eq_ignore_ascii_case("CONSTRAINT"))
+        {
+            self.bump();
+            self.bump();
+            return self.constraint();
+        }
         let mut bindings = read_bindings(&clauses);
         let read_names: Vec<_> = bindings.keys().cloned().collect();
         self.write_values = true;
@@ -124,6 +132,98 @@ impl Parser<'_> {
             params,
         }))
     }
+    /// `[name] [IF NOT EXISTS] FOR (n:Label) REQUIRE n.prop IS :: TYPE`
+    /// (or `IS TYPED TYPE`), after `CREATE CONSTRAINT`. The name is accepted
+    /// and ignored; declaring twice is a no-op with or without IF NOT EXISTS.
+    fn constraint(&mut self) -> Result<Statement, CypherError> {
+        const ONLY: &str = "only property type constraints are supported: CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:Label) REQUIRE n.prop IS :: INTEGER | FLOAT | STRING | BOOLEAN";
+        if !self.is_kw("IF") && !self.is_kw("FOR") {
+            self.name()?;
+        }
+        if self.kw("IF") {
+            self.need_kw("NOT")?;
+            self.need_kw("EXISTS")?;
+        }
+        self.need_kw("FOR")?;
+        self.need("(")?;
+        if matches!(self.token().kind, Kind::Symbol(")")) {
+            return Err(self.err(format!(
+                "relationship constraints are not supported; {ONLY}"
+            )));
+        }
+        let var = self.name()?;
+        if !self.sym(":") {
+            return Err(self.err(ONLY));
+        }
+        let label = self.name()?;
+        if !self.sym(")") {
+            return Err(self.err(ONLY));
+        }
+        if matches!(self.token().kind, Kind::Symbol("-" | "<")) {
+            return Err(self.err(format!(
+                "relationship constraints are not supported; {ONLY}"
+            )));
+        }
+        self.need_kw("REQUIRE")?;
+        if matches!(self.token().kind, Kind::Symbol("(")) {
+            return Err(self.err(format!(
+                "key and composite constraints are not supported; {ONLY}"
+            )));
+        }
+        let subject = self.name()?;
+        if subject != var {
+            return Err(self.err(format!(
+                "Variable `{subject}` not defined (unbound variable)"
+            )));
+        }
+        self.need(".")?;
+        let attribute = self.name()?;
+        self.need_kw("IS")?;
+        if self.kw("UNIQUE") || self.is_kw("NOT") || self.is_kw("NODE") || self.is_kw("KEY") {
+            return Err(self.err(format!(
+                "uniqueness, existence and key constraints are not supported; {ONLY}"
+            )));
+        }
+        if !self.kw("TYPED") {
+            self.need(":")?;
+            self.need(":")?;
+        }
+        let name = self.name()?;
+        let value_type = match name.to_ascii_uppercase().as_str() {
+            "INTEGER" | "INT" => kala_core::ValueType::I64,
+            "FLOAT" => kala_core::ValueType::F64,
+            "STRING" => kala_core::ValueType::Str,
+            "BOOLEAN" | "BOOL" => kala_core::ValueType::Bool,
+            _ => {
+                return Err(
+                    self.err("a property type constraint takes INTEGER, FLOAT, STRING or BOOLEAN")
+                );
+            }
+        };
+        if attribute == "kala_handle" {
+            return Err(self.err("kala_handle is built in and cannot be declared"));
+        }
+        self.write_end()?;
+        Ok(Statement::Write(WriteStatement {
+            read: Query {
+                include_all: false,
+                clauses: vec![],
+                items: vec![],
+                distinct: false,
+                order: vec![],
+                skip: None,
+                limit: None,
+            },
+            writes: vec![Update::Constraint {
+                label,
+                attribute,
+                value_type,
+            }],
+            tick: None,
+            returns: vec![],
+            params: vec![],
+        }))
+    }
     fn update_clauses(
         &mut self,
         bindings: &mut BTreeMap<String, bool>,
@@ -132,9 +232,14 @@ impl Parser<'_> {
         loop {
             self.element()?;
             let clause = if self.kw("CREATE") {
-                if self.is_kw("CONSTRAINT") || self.is_kw("INDEX") {
+                if self.is_kw("CONSTRAINT") {
                     return Err(self.err(
-                        "CREATE schema DDL is not supported; use // kala:datalog [:attribute …]",
+                        "CREATE CONSTRAINT must be a statement of its own (no reading part, no other clause)",
+                    ));
+                }
+                if self.is_kw("INDEX") {
+                    return Err(self.err(
+                        "CREATE INDEX is not supported: Kala indexes every attribute itself (declare one with CREATE CONSTRAINT … IS :: TYPE or // kala:datalog [:attribute …])",
                     ));
                 }
                 let mut paths = vec![];

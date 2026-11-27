@@ -427,3 +427,101 @@ fn a_same_tick_conflict_from_any_clause_names_the_entry_to_correct() {
         assert!(!message.contains("entry#"), "{text}: {message}");
     }
 }
+
+// ---- J: CREATE CONSTRAINT … IS :: TYPE ----
+
+#[test]
+fn a_type_constraint_is_a_schema_statement_that_needs_no_read() {
+    let write = statement("CREATE CONSTRAINT FOR (n:CHARACTER) REQUIRE n.rank IS :: INTEGER");
+    assert!(write.schema_only());
+    assert!(!write.requires_read());
+    assert!(!write.has_reading_part());
+    assert_eq!(write.attributes(), ["rank"]);
+    assert!(!statement("CREATE (:CHARACTER)").schema_only());
+
+    let mut world = varrow();
+    let report = ok(
+        &mut world,
+        "CREATE CONSTRAINT FOR (n:FACTION) REQUIRE n.rank IS :: INTEGER",
+    );
+    assert_eq!((report.changed, report.declared), (0, 2));
+    assert!(world.node_types().any(|t| t == "FACTION"));
+    let rank = world.attribute("rank").unwrap();
+    assert_eq!(rank.value_type, kala_core::ValueType::I64);
+    assert!(!rank.inferred);
+    // Again, under any name, with or without IF NOT EXISTS: nothing.
+    for text in [
+        "CREATE CONSTRAINT FOR (n:FACTION) REQUIRE n.rank IS :: INTEGER",
+        "CREATE CONSTRAINT other IF NOT EXISTS FOR (n:CHARACTER) REQUIRE n.rank IS :: INT",
+    ] {
+        let before = world.latest_tx();
+        assert_eq!(ok(&mut world, text).declared, 0, "{text}");
+        assert_eq!(world.latest_tx(), before);
+    }
+    // A type that stored values contradict is the ordinary refusal.
+    ok(
+        &mut world,
+        "MATCH (g {kala_handle:'greg'}) SET g.rank = 3 AT TICK 900",
+    );
+    let error = run(
+        &mut world,
+        "CREATE CONSTRAINT FOR (n:CHARACTER) REQUIRE n.rank IS :: STRING",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("rank"), "{error}");
+}
+
+#[test]
+fn other_schema_statements_are_refused_by_name() {
+    for (text, hint) in [
+        (
+            "CREATE CONSTRAINT FOR (n:T) REQUIRE n.id IS UNIQUE",
+            "uniqueness, existence and key constraints are not supported",
+        ),
+        (
+            "CREATE CONSTRAINT FOR (n:T) REQUIRE n.id IS NOT NULL",
+            "uniqueness, existence and key constraints are not supported",
+        ),
+        (
+            "CREATE CONSTRAINT FOR (n:T) REQUIRE n.id IS NODE KEY",
+            "uniqueness, existence and key constraints are not supported",
+        ),
+        (
+            "CREATE CONSTRAINT FOR (n:T) REQUIRE (n.a, n.b) IS UNIQUE",
+            "key and composite constraints are not supported",
+        ),
+        (
+            "CREATE CONSTRAINT FOR ()-[r:T]-() REQUIRE r.id IS :: INTEGER",
+            "only property type constraints are supported",
+        ),
+        (
+            "CREATE CONSTRAINT FOR (n:T) REQUIRE n.id IS :: LIST<INTEGER>",
+            "INTEGER, FLOAT, STRING or BOOLEAN",
+        ),
+        (
+            "CREATE CONSTRAINT FOR (n:T) REQUIRE m.id IS :: INTEGER",
+            "not defined",
+        ),
+        (
+            "CREATE CONSTRAINT FOR (n:T) REQUIRE n.kala_handle IS :: STRING",
+            "built in",
+        ),
+        (
+            "CREATE CONSTRAINT FOR (n:T) REQUIRE n.id IS :: INTEGER RETURN 1",
+            "end of write statement",
+        ),
+        (
+            "MATCH (n) CREATE CONSTRAINT FOR (n:T) REQUIRE n.id IS :: INTEGER",
+            "statement of its own",
+        ),
+        (
+            "CREATE INDEX FOR (n:T) ON (n.id)",
+            "CREATE INDEX is not supported",
+        ),
+        ("DROP CONSTRAINT c", "DROP"),
+        ("DROP INDEX i", "DROP"),
+    ] {
+        let error = kala_cypher::parse_statement(text).unwrap_err().to_string();
+        assert!(error.contains(hint), "{text}: {error}");
+    }
+}

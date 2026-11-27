@@ -381,6 +381,7 @@ pub(crate) struct Summary {
     pub tx: u64,
     updates: bool,
     data: bool,
+    schema: bool,
     moved: Option<Value>,
     remaining: usize,
     entries_omitted: usize,
@@ -476,6 +477,7 @@ impl Summary {
             for op in &form.ops {
                 self.nodes += usize::from(op.kind == "create" && op.created != Some(false));
                 self.data |= writes_data(op.kind);
+                self.schema |= !writes_data(op.kind);
             }
         }
         for id in &result.entries {
@@ -638,7 +640,7 @@ impl Summary {
                 Value::String(
                     if queried {
                         "rw"
-                    } else if self.data || self.cypher {
+                    } else if self.data || (self.cypher && !self.schema) {
                         "w"
                     } else {
                         "s"

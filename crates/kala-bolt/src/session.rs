@@ -1036,7 +1036,13 @@ impl Session<'_> {
                 Ok::<_, Failure>((output, result.staged, result.retained_bytes))
             })?;
             write::charge(&mut tx.bytes, retained_bytes)?;
-            self.run_type = if rw { "rw" } else { "w" };
+            self.run_type = if rw {
+                "rw"
+            } else if statement.schema_only() {
+                "s"
+            } else {
+                "w"
+            };
             tx.cypher_forms.push(tx.forms.len());
             tx.forms.push(staged);
             Ok(output)

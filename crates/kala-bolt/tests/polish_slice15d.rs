@@ -413,3 +413,60 @@ fn an_auto_commit_return_that_cannot_be_rendered_commits_nothing() {
     assert_eq!(node[3], string(&committed.format_id(terse)));
     assert_eq!(rows[0][1], string("short"));
 }
+
+// ---- J: CREATE CONSTRAINT … IS :: TYPE over a socket ----
+
+#[test]
+fn a_type_constraint_needs_write_and_redefining_needs_admin() {
+    let server = server();
+    let declare = "CREATE CONSTRAINT FOR (n:CHARACTER) REQUIRE n.rank IS :: INTEGER";
+    let mut reader = login(&server, "reader");
+    let (code, message) = failure(&mut reader, declare, map(&[]));
+    assert_eq!(code, "Neo.ClientError.Security.Forbidden", "{message}");
+    assert!(message.contains("write"), "{message}");
+
+    // A new attribute needs only `write` (no read): a schema statement.
+    let mut writer = login(&server, "writer");
+    let summary = write(&mut writer, declare, map(&[]));
+    assert_eq!(summary["type"], string("s"), "{summary:?}");
+    let Value::Map(kala) = &summary["kala"] else {
+        panic!("{summary:?}")
+    };
+    assert_eq!(kala["declared"], Value::Integer(1));
+    assert_eq!(
+        world(&server).attribute("rank").unwrap().value_type,
+        kala_core::ValueType::I64
+    );
+    // The same declaration again is a no-op for the same identity.
+    let before = log_bytes(&server);
+    let summary = write(
+        &mut writer,
+        "CREATE CONSTRAINT again IF NOT EXISTS FOR (n:CHARACTER) REQUIRE n.rank IS :: INT",
+        map(&[]),
+    );
+    assert_eq!(summary["type"], string("s"));
+    assert!(log_bytes(&server) == before);
+
+    // Changing what the committed schema has is the administrator's.
+    let redefine = "CREATE CONSTRAINT FOR (n:CHARACTER) REQUIRE n.rank IS :: STRING";
+    for explicit in [false, true] {
+        if explicit {
+            begin(&mut writer);
+        }
+        let (code, message) = failure(&mut writer, redefine, map(&[]));
+        assert_eq!(code, "Neo.ClientError.Security.Forbidden", "{message}");
+        assert!(message.contains("admin"), "{message}");
+    }
+    assert!(log_bytes(&server) == before);
+    let mut root = Client::ready(&server);
+    begin(&mut root);
+    root.run(redefine, map(&[]), map(&[]));
+    let (rows, summary) = root.pull(-1);
+    assert!(rows.is_empty());
+    assert_eq!(summary["type"], string("s"));
+    commit(&mut root);
+    assert_eq!(
+        world(&server).attribute("rank").unwrap().value_type,
+        kala_core::ValueType::Str
+    );
+}

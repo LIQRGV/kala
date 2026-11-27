@@ -401,3 +401,30 @@ fn an_inverse_name_in_a_create_property_map_is_the_flipped_stored_relationship()
         with_setup(Some(setup), cypher, datalog);
     }
 }
+
+#[test]
+fn a_type_constraint_declares_the_attribute_as_the_datalog_form_does() {
+    for (ty, datalog) in [
+        ("INTEGER", "i64"),
+        ("INT", "i64"),
+        ("FLOAT", "f64"),
+        ("STRING", "string"),
+        ("BOOLEAN", "bool"),
+        ("BOOL", "bool"),
+    ] {
+        for cypher in [
+            format!("CREATE CONSTRAINT FOR (n:CHARACTER) REQUIRE n.rank IS :: {ty}"),
+            format!(
+                "CREATE CONSTRAINT rank_type IF NOT EXISTS FOR (c:CHARACTER) REQUIRE c.rank IS TYPED {ty};"
+            ),
+        ] {
+            parity(&cypher, &format!("[:attribute :rank :{datalog}]"));
+        }
+    }
+    // Declaring again, and confirming a fixture attribute, appends nothing
+    // in either language.
+    parity(
+        "CREATE CONSTRAINT FOR (n:PLACE) REQUIRE n.name IS :: STRING",
+        "[:attribute :name :string]",
+    );
+}

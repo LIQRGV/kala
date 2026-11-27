@@ -519,6 +519,26 @@ fn apply(
                         writer.assign(if new { created } else { matched }, &row)?;
                     }
                     Update::Assign(assign) => writer.assign(assign, &row)?,
+                    Update::Constraint {
+                        label,
+                        attribute,
+                        value_type,
+                    } => {
+                        // Exactly `[:attribute :prop :type]`; a new label is
+                        // a node type declared by the schema-on-write rule.
+                        writer.stager.other(writer.tx, "attribute", |tx, tick| {
+                            tx.infer_node_type(label)
+                                .and_then(|()| {
+                                    tx.declare_attribute_with(
+                                        attribute,
+                                        *value_type,
+                                        &Default::default(),
+                                    )
+                                })
+                                .map_err(native::Failure::Store)?;
+                            Ok(native::Effect::schema(tick))
+                        })?;
+                    }
                     Update::Delete { names, detach } => {
                         for n in names {
                             writer.delete(n, *detach, &row)?;
