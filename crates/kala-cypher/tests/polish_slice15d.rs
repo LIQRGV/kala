@@ -364,3 +364,66 @@ fn removing_an_undeclared_property_reads_the_absence_of_its_name() {
         );
     }
 }
+
+// ---- G: every same-tick conflict names the entry and the [:correct …] form ----
+
+#[test]
+fn a_same_tick_conflict_from_any_clause_names_the_entry_to_correct() {
+    let mut world = varrow();
+    // Greg's stay in Varrow: asserted at 200, retracted at 250.
+    for (text, hint, replace) in [
+        (
+            "MATCH (g {kala_handle:'greg'})-[r:located_in]->() DELETE r AT TICK 200",
+            "was asserted at that tick by entry#",
+            true,
+        ),
+        (
+            "MATCH (g {kala_handle:'greg'}), (v {kala_handle:'varrow'}) CREATE (g)-[:located_in]->(v) AT TICK 250",
+            "was retracted at that tick by entry#",
+            false,
+        ),
+        (
+            "MATCH (g {kala_handle:'greg'}), (v {kala_handle:'varrow'}) MERGE (g)-[:located_in]->(v) AT TICK 250",
+            "was retracted at that tick by entry#",
+            false,
+        ),
+        (
+            "MATCH (g {kala_handle:'greg'}) DETACH DELETE g AT TICK 200",
+            "was asserted at that tick by entry#",
+            true,
+        ),
+    ] {
+        let message = run(&mut world, text).unwrap_err().to_string();
+        assert!(message.contains("same-tick conflict"), "{text}: {message}");
+        assert!(message.contains(hint), "{text}: {message}");
+        let id: String = message
+            .split("entry#")
+            .nth(1)
+            .unwrap()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        assert!(
+            message.contains(&format!("[:correct {id} :delete]")),
+            "{text}: {message}"
+        );
+        assert_eq!(
+            message.contains(&format!("[:correct {id} :replace")),
+            replace,
+            "{text}: {message}"
+        );
+    }
+    // Labels and property maps: an occupant staged by the same statement is
+    // named by its place, never by a provisional entry ID.
+    for text in [
+        "MATCH (g {kala_handle:'greg'}), (c {kala_handle:'carnath'}) CREATE (g)-[r:present]->(c) DELETE r AT TICK 900",
+        "MATCH (g {kala_handle:'greg'}) SET g:Guide REMOVE g:Guide AT TICK 900",
+    ] {
+        let message = run(&mut world, text).unwrap_err().to_string();
+        assert!(
+            message.contains("of this transaction: change that operation instead"),
+            "{text}: {message}"
+        );
+        assert!(!message.contains("entry#"), "{text}: {message}");
+    }
+}

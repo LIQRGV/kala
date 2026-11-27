@@ -67,8 +67,8 @@ pub struct SameTick {
     pub subject: String,
     pub attr: String,
     pub tick: Tick,
-    /// What holds the tick, when `:set` could find it within its read
-    /// budget. `None` for plain `:assert` / `:retract`.
+    /// What holds the tick, when it could be found within the read budget.
+    /// `None` for a text form's plain `:assert` / `:retract`.
     pub occupant: Option<Occupant>,
 }
 /// The stored op a `:set` collided with at its tick.
@@ -272,6 +272,42 @@ fn fact_failure(tx: &Txn<'_>, subject: EntityId, error: crate::Error) -> Failure
     }
 }
 
+/// What holds `(subject, attr, stored)` at exactly `tick`, to explain a
+/// same-tick conflict; `shown` is the value as the author wrote it.
+///
+/// The lookup only explains the conflict. If it runs out of the form's read
+/// budget (the entry sits in a very large transaction), the conflict is
+/// still the error to report, without the entry detail: a generic limit
+/// error would hide the real cause.
+fn occupant(
+    tx: &Txn<'_>,
+    state: &FormState,
+    subject: EntityId,
+    attr: &str,
+    stored: &Value,
+    shown: &Value,
+    tick: Tick,
+) -> Result<Option<Occupant>, Failure> {
+    let found = match tx.entry_at_tick(subject, attr, stored, tick, &state.read_meter) {
+        Ok(found) => found,
+        Err(crate::Error::WorkInterrupted {
+            reason: crate::WorkInterruptReason::Limit,
+        }) => None,
+        Err(e) => return Err(Failure::Store(e)),
+    };
+    Ok(found.map(|found| {
+        let (op, by) = match found {
+            TickOccupant::Committed { entry, op } => (op, OccupiedBy::Entry(entry)),
+            TickOccupant::Staged { position, op } => (op, state.staged_by(position)),
+        };
+        Occupant {
+            value: value_text(tx, shown),
+            op,
+            by,
+        }
+    }))
+}
+
 /// What staging one op did.
 pub struct Effect {
     pub changed: usize,
@@ -471,9 +507,21 @@ impl Stager {
                 state.charge_value(&value)?;
             }
             let tick = state.fact_tick(tx, at);
-            let result = tx
-                .write_inferring(entity, attr, &value, Some(tick), op, precision)
-                .map_err(|error| fact_failure(tx, entity, error))?;
+            let result = match tx.write_inferring(entity, attr, &value, Some(tick), op, precision) {
+                // A statement has no retcon of its own: say which entry
+                // holds the tick and how to correct it. (A text form's
+                // plain `:assert` / `:retract` keeps its short message.)
+                Err(crate::Error::SameTickConflict { .. }) if state.bounded_statement => {
+                    let occupant = occupant(tx, state, entity, attr, &value, &value, tick)?;
+                    return Err(Failure::SameTick(Box::new(SameTick {
+                        subject: label(tx, entity),
+                        attr: attr.to_owned(),
+                        tick,
+                        occupant,
+                    })));
+                }
+                result => result.map_err(|error| fact_failure(tx, entity, error))?,
+            };
             let changed = result.map_or(0, |r| r.changed);
             Ok(Effect {
                 changed,
@@ -812,35 +860,8 @@ fn stage_set(
         match result {
             Ok(r) => changed += r.changed,
             Err(crate::Error::SameTickConflict { .. }) => {
-                // The lookup only explains the conflict. If it runs out of
-                // the form's read budget (the entry sits in a very large
-                // transaction), the conflict is still the error to report,
-                // without the entry detail: a generic limit error would hide
-                // the real cause.
-                let found = match tx.entry_at_tick(
-                    subject,
-                    stored_attr,
-                    &stored_value,
-                    tick,
-                    &state.read_meter,
-                ) {
-                    Ok(found) => found,
-                    Err(crate::Error::WorkInterrupted {
-                        reason: crate::WorkInterruptReason::Limit,
-                    }) => None,
-                    Err(e) => return Err(Failure::Store(e)),
-                };
-                let occupant = found.map(|found| {
-                    let (op, by) = match found {
-                        TickOccupant::Committed { entry, op } => (op, OccupiedBy::Entry(entry)),
-                        TickOccupant::Staged { position, op } => (op, state.staged_by(position)),
-                    };
-                    Occupant {
-                        value: value_text(tx, &value),
-                        op,
-                        by,
-                    }
-                });
+                let occupant =
+                    occupant(tx, state, subject, stored_attr, &stored_value, &value, tick)?;
                 return Err(Failure::SameTick(Box::new(SameTick {
                     subject: label(tx, entity),
                     attr: attr.to_owned(),
