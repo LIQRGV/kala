@@ -854,6 +854,20 @@ impl Txn<'_> {
             .map_or(0, |v| (self.snapshot_tx().0.saturating_sub(v.0)) as usize)
     }
 
+    /// A no-op can serialize on this handle's snapshot only if reads made
+    /// before the handle opened are also valid there. Its committed tail
+    /// is already in memory, so this check needs no lock or filesystem I/O.
+    pub(super) fn validate_older_reads(&self) -> Result<(), Error> {
+        let behind = self.reads_behind();
+        if behind > 0 {
+            self.s
+                .reads
+                .borrow()
+                .check(self.world, TxId(self.s.tx.0 - behind as u64), behind)?;
+        }
+        Ok(())
+    }
+
     /// The warning of a commit whose tick-less writes landed on the latest
     /// tick the transaction began with (`ops`: its recorded operations)
     /// while the world it is committed over has another latest tick.

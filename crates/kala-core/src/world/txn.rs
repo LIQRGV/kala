@@ -1217,6 +1217,7 @@ impl Txn<'_> {
         self.check_deadline()?;
         self.world.accepts_writes()?;
         if self.s.order.is_empty() {
+            self.validate_older_reads()?;
             return Ok(CommitResult {
                 committed: false,
                 tx: self.world.latest_tx(),
