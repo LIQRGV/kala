@@ -740,7 +740,6 @@ fn bookmarks_are_checked_and_causal_read_sees_commit() {
     commit(&mut reader);
     for bookmarks in [
         Value::List(vec![string("invalid")]),
-        Value::List(vec![string("kala:other:1")]),
         Value::List(vec![string("kala:varrow:-1")]),
         Value::List(vec![Value::Integer(1)]),
         string("kala:varrow:1"),

@@ -612,12 +612,32 @@ class WriteDriverTests(unittest.TestCase):
         with self.driver().session(database="varrow", bookmarks=bookmarks) as second:
             aliases = second.execute_read(lambda tx: [r[0] for r in tx.run(PREFIX + "[:find ?a :where [:greg :alias ?a]]")])
             self.assertIn("Driver causal", aliases)
-        for bookmark in ["not-a-kala-bookmark", "kala:another_database:1"]:
-            with self.subTest(bookmark=bookmark):
-                with self.driver().session(database="varrow", bookmarks=neo4j.Bookmarks.from_raw_values([bookmark])) as session:
-                    with self.assertRaises(ClientError) as error:
-                        session.run(ALLIES).consume()
-                    self.assertEqual(error.exception.code, "Neo.ClientError.Transaction.InvalidBookmark")
+        with self.driver().session(database="varrow", bookmarks=neo4j.Bookmarks.from_raw_values(["not-a-kala-bookmark"])) as session:
+            with self.assertRaises(ClientError) as error:
+                session.run(ALLIES).consume()
+            self.assertEqual(error.exception.code, "Neo.ClientError.Transaction.InvalidBookmark")
+        # A bookmark of another database says nothing about this one: ignored.
+        with self.driver().session(database="varrow", bookmarks=neo4j.Bookmarks.from_raw_values(["kala:another_database:999999"])) as session:
+            self.assertEqual(len(list(session.run(ALLIES))), 2)
+
+    def test_execute_query_across_two_databases_with_the_default_bookmark_manager(self):
+        # The driver's default bookmark manager sends every bookmark it holds
+        # with every request, whatever the target database.
+        driver = self.driver()
+        for round in range(2):
+            for database in ["varrow", "annex"]:
+                with self.subTest(database=database, round=round):
+                    records, summary, _ = driver.execute_query(
+                        PREFIX + f'[:assert :greg :alias "Two databases {round}" :at 310]',
+                        database_=database,
+                    )
+                    self.assertEqual(records[0]["changed"], 1)
+                    self.assertEqual(summary.database, database)
+                    records, _, _ = driver.execute_query(
+                        PREFIX + "[:find ?a :at 310 :where [:greg :alias ?a]]",
+                        database_=database, routing_=neo4j.RoutingControl.READ,
+                    )
+                    self.assertIn(f"Two databases {round}", [r[0] for r in records])
 
     def test_conflicting_execute_write_is_retried_and_both_increments_commit(self):
         driver = self.driver()

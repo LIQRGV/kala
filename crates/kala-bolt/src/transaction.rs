@@ -74,28 +74,15 @@ impl Options {
                 ));
             }
             for item in bookmarks {
-                let bad = || {
-                    Failure::new(
-                        write::BOOKMARK,
-                        "invalid bookmark or bookmark for another database",
-                    )
-                };
                 let Value::String(s) = item else {
-                    return Err(bad());
+                    return Err(Failure::new(write::BOOKMARK, "invalid bookmark"));
                 };
-                if s.len() > 256 {
-                    return Err(bad());
+                // A driver's bookmark manager sends every bookmark it holds,
+                // whatever database the request targets: one that names
+                // another database is skipped, only a malformed one refused.
+                if let Some(tx) = bookmark_tx(s, db)? {
+                    bookmark = bookmark.max(tx);
                 }
-                let parts: Vec<_> = s.split(':').collect();
-                if parts.len() != 3
-                    || parts[0] != "kala"
-                    || parts[1] != db
-                    || parts[2].is_empty()
-                    || !parts[2].bytes().all(|b| b.is_ascii_digit())
-                {
-                    return Err(bad());
-                }
-                bookmark = bookmark.max(parts[2].parse::<u64>().map_err(|_| bad())?);
             }
         }
         Ok(Self {
@@ -105,6 +92,26 @@ impl Options {
             bookmark,
         })
     }
+}
+/// The tx a `kala:<db>:<tx>` bookmark names, or `None` when it is a
+/// well-formed bookmark of another database (which says nothing about `db`).
+fn bookmark_tx(bookmark: &str, db: &str) -> Result<Option<u64>, Failure> {
+    let bad = || Failure::new(write::BOOKMARK, "invalid bookmark");
+    if bookmark.len() > 256 {
+        return Err(bad());
+    }
+    let (name, tx) = bookmark
+        .strip_prefix("kala:")
+        .and_then(|rest| rest.rsplit_once(':'))
+        .ok_or_else(bad)?;
+    if !kala_system::valid_database_name(name)
+        || tx.is_empty()
+        || !tx.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(bad());
+    }
+    let tx = tx.parse::<u64>().map_err(|_| bad())?;
+    Ok((name == db).then_some(tx))
 }
 pub(crate) enum Snapshot {
     Read(Arc<World>),

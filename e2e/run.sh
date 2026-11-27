@@ -41,11 +41,16 @@ export KALA_WORLD="$task_tmp/varrow.kala"
 export KALA_WRITE_DIR="$task_tmp/writes"
 mkdir "$KALA_WRITE_DIR"
 cp "$KALA_WORLD" "$KALA_WRITE_DIR/varrow.kala"
+# A second database on the write server: drivers send every bookmark they hold
+# to every database, so cross-database requests need one.
+cp "$KALA_WORLD" "$KALA_WRITE_DIR/annex.kala"
 for user in writer write-only reader; do
     "$KALA_BINARY" user add "$KALA_WRITE_DIR" "$user@localhost" --trust >> "$task_tmp/user.stdout"
 done
 "$KALA_BINARY" user grant "$KALA_WRITE_DIR" writer@localhost read varrow >> "$task_tmp/user.stdout"
 "$KALA_BINARY" user grant "$KALA_WRITE_DIR" writer@localhost write varrow >> "$task_tmp/user.stdout"
+"$KALA_BINARY" user grant "$KALA_WRITE_DIR" writer@localhost read annex >> "$task_tmp/user.stdout"
+"$KALA_BINARY" user grant "$KALA_WRITE_DIR" writer@localhost write annex >> "$task_tmp/user.stdout"
 "$KALA_BINARY" user grant "$KALA_WRITE_DIR" write-only@localhost write varrow >> "$task_tmp/user.stdout"
 "$KALA_BINARY" user grant "$KALA_WRITE_DIR" reader@localhost read varrow >> "$task_tmp/user.stdout"
 export KALA_SERVER_STDOUT="$task_tmp/server.stdout"
