@@ -393,8 +393,9 @@ pub mod write {
     pub use kala_core::Concurrency;
     pub use kala_core::write::{StagedWrite, WriteOperation, WriteReport};
     pub use kala_cypher::write::{
-        WriteError as StatementError, execute_in as execute_statement,
-        prepare as prepare_statement, stage as stage_statement,
+        CompiledWrite, MAX_WRITE_ROWS, WriteError as StatementError, WriteInput,
+        compile as compile_statement, execute_in as execute_statement,
+        prepare as prepare_statement, run as run_statement, stage as stage_statement,
     };
     pub use kala_cypher::{ast::WriteStatement, statements};
     pub use kala_datalog::apply::{

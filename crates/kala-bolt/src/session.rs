@@ -976,7 +976,7 @@ impl Session<'_> {
         held: write::Privileges,
         flag: &AtomicBool,
     ) -> Result<query::Output, Failure> {
-        use kala_lang::write::{prepare_statement, stage_statement};
+        use kala_lang::write::{compile_statement, run_statement, stage_statement};
         let fields = statement.fields();
         let rw = statement.has_reading_part() || !fields.is_empty();
         let prior = self.transaction.as_ref().map_or(0, |tx| tx.forms.len());
@@ -1000,18 +1000,18 @@ impl Session<'_> {
         ]);
         crate::packstream::encode_with_limits(&header, max, depth)
             .map_err(|_| Failure::new(INVALID, "RETURN column names exceed the message limit"))?;
+        // Parameters take the kinds the reading part's compilation computed,
+        // as for a read query: a handle given for a ref position resolves to
+        // its entity, and a wrongly typed value is refused before evaluation.
         let prepare = |world: &kala_core::World| {
-            let names = statement
-                .parameters()
-                .into_iter()
-                .map(|n| (n, kala_query::ParamKind::Scalar))
-                .collect::<Vec<_>>();
-            let params = query::parameters(world, &names, given, true)?;
+            let compiled = compile_statement(world, statement)
+                .map_err(|e| write::statement_error(e, held.read))?;
+            let params = query::parameters(world, compiled.parameter_kinds(), given, true)?;
             let run = kala_query::RunOptions::default()
                 .with_cancel(flag)
                 .with_deadline(deadline);
             let input = query::until(deadline, |_| {
-                prepare_statement(world, statement, &params, run)
+                run_statement(world, statement, compiled, &params, run)
                     .map_err(|e| write::statement_error(e, held.read))
             })?;
             Ok::<_, Failure>((params, input))
@@ -1051,32 +1051,105 @@ impl Session<'_> {
             tx.forms.push(staged);
             Ok(output)
         } else {
+            // The reading part runs on the shared read snapshot, as a query
+            // does, BEFORE the database's writer is taken: however heavy it
+            // is, it never makes another writer wait. A commit that lands
+            // between this read and the stage below is checked precisely:
+            // staging records the read keys as read at the snapshot's tx
+            // (`Txn::set_read_version`), so only a commit that touched what
+            // was read is a conflict (transient: drivers retry it).
+            let snapshot = self.registry.at_least(
+                db,
+                options.bookmark,
+                self.config.busy_timeout.min(options.timeout),
+            )?;
+            let (params, input) = prepare(&snapshot)?;
+            let pinned = snapshot.latest_tx().0;
+            // A statement that read lands its tick-less writes on the latest
+            // tick its reading part saw; a blind one takes the writer's.
+            let start_tick = statement.requires_read().then(|| snapshot.latest_tick());
+            drop(snapshot);
+            if let Some(hook) = &self.config.after_statement_read {
+                (hook.0)();
+            }
             let (output, summary) = self.registry.write(
-                db, self.config.busy_timeout.min(options.timeout), options.bookmark,
+                db,
+                self.config
+                    .busy_timeout
+                    .min(deadline.saturating_duration_since(Instant::now())),
+                options.bookmark.max(pinned),
                 |world| {
                     let mut tx = world.begin();
                     tx.set_concurrency(options.concurrency);
                     tx.set_schema_additions_only(!held.admin);
                     tx.set_deadline(deadline);
-                    let (params, input) = prepare(tx.base_world())?;
+                    if let Some(tick) = start_tick {
+                        tx.set_start_tick(tick);
+                    }
                     let mut staged = stage_statement(&mut tx, statement, input, &params)
                         .map_err(|e| write::statement_error(e, held.read))?;
+                    // Render RETURN from the staged transaction before the
+                    // durable append, under the limits the real rendering
+                    // has: a result that cannot be sent refuses the
+                    // statement while nothing is committed. Final IDs can
+                    // only be a few digits wider (a commit renumbering over
+                    // another process's writes), hence the margin.
+                    if !fields.is_empty() {
+                        query::render(
+                            query::RenderWorld::Staged(&tx),
+                            fields.clone(),
+                            staged.rows.clone(),
+                            staged.tick,
+                            Default::default(),
+                            query::RenderOptions::write(stop, max.saturating_sub(64), depth)
+                                .preview(),
+                        )?;
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(write::timeout());
+                    }
                     let result = tx.commit().map_err(|e| {
-                        write::commit_error(world, e, std::slice::from_ref(&staged.staged), held.read)
+                        write::commit_error(
+                            world,
+                            e,
+                            std::slice::from_ref(&staged.staged),
+                            held.read,
+                        )
                     })?;
                     self.log_commit(db, &result, 1);
-                    let outcome = if result.committed { "write committed" } else { "write completed without changes" };
-                    let after_commit = || Failure::new(
-                        crate::error::STORE,
-                        format!("{outcome} at tx {} (bookmark kala:{db}:{}); RETURN could not be rendered", result.tx.0, result.tx.0),
-                    );
-                    let rows = staged.committed_rows(world, &result.ids).map_err(|_| after_commit())?;
+                    let outcome = if result.committed {
+                        "write committed"
+                    } else {
+                        "write completed without changes"
+                    };
+                    // Past the append nothing is retryable: a failure the
+                    // preview could not see is reported as committed.
+                    let after_commit = || {
+                        Failure::new(
+                            crate::error::STORE,
+                            format!(
+                                "{outcome} at tx {} (bookmark kala:{db}:{}); RETURN could not be rendered",
+                                result.tx.0, result.tx.0
+                            ),
+                        )
+                    };
+                    let rows = staged
+                        .committed_rows(world, &result.ids)
+                        .map_err(|_| after_commit())?;
                     let output = query::render(
-                        query::RenderWorld::Snapshot(world, result.tx), fields, rows,
-                        staged.tick, Default::default(), query::RenderOptions::write(stop, max, depth),
-                    ).map_err(|_| after_commit())?;
+                        query::RenderWorld::Snapshot(world, result.tx),
+                        fields,
+                        rows,
+                        staged.tick,
+                        Default::default(),
+                        query::RenderOptions::write(stop, max, depth),
+                    )
+                    .map_err(|_| after_commit())?;
                     let ops = staged.staged.clone().complete(&result).ops;
-                    let form = StagedWrite { ops, ..staged.staged };
+                    let form = StagedWrite {
+                        ops,
+                        ..staged.staged
+                    };
                     let mut summary = write::Summary::new(max);
                     summary.add(world, &result, std::slice::from_ref(&form), held.read);
                     summary.operations(1, &form.ops);

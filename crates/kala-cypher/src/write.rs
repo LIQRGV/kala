@@ -117,14 +117,28 @@ impl WriteInput<'_> {
     }
 }
 
-/// Produce one row for a bare write or materialize a MATCH/WITH/UNWIND query
-/// through the same compiled operators as an ordinary read query.
-pub fn prepare<'a>(
-    world: &World,
-    stmt: &WriteStatement,
-    params: &dyn ParameterInput,
-    options: RunOptions<'a>,
-) -> Result<WriteInput<'a>> {
+/// A statement compiled against one snapshot: the reading part's plan, the
+/// property cells the write clauses read from it, and the kind each
+/// parameter must have. An adapter converts its parameters with
+/// [`CompiledWrite::parameter_kinds`] before [`run`], so a handle given for a
+/// ref-typed position of the reading part resolves exactly as in a read query.
+pub struct CompiledWrite {
+    prepared: Prepared,
+    property_columns: BTreeMap<(String, String), usize>,
+    kinds: Vec<(String, kala_query::ParamKind)>,
+}
+
+impl CompiledWrite {
+    /// Every parameter of the statement, in lexical order, with the kind the
+    /// reading part's compilation computed for it. A parameter used only as
+    /// a write value is a scalar (or NULL / a list); a write tick is a tick.
+    pub fn parameter_kinds(&self) -> &[(String, kala_query::ParamKind)] {
+        &self.kinds
+    }
+}
+
+/// Compile the reading part (a bare write has one empty row) without running it.
+pub fn compile(world: &World, stmt: &WriteStatement) -> Result<CompiledWrite> {
     if world.is_system() {
         return Err(native::WriteError {
             operation: None,
@@ -132,26 +146,6 @@ pub fn prepare<'a>(
         }
         .into());
     }
-    for name in &stmt.params {
-        if !params.contains_key(name) {
-            return Err(QueryError::MissingParam(name.clone()).into());
-        }
-    }
-    let tick = match &stmt.tick {
-        None => None,
-        Some(Term::Const(Value::I64(t))) => Some(Tick(*t)),
-        Some(Term::Param(p)) => match params.get(p) {
-            Some(Value::I64(t)) => Some(Tick(*t)),
-            _ => {
-                return Err(QueryError::ParamType {
-                    name: p.clone(),
-                    expected: "an integer tick".into(),
-                }
-                .into());
-            }
-        },
-        _ => return Err(invalid("integer tick required")),
-    };
     let mut read = stmt.read.clone();
     let mut props = BTreeMap::new();
     let bound: std::collections::BTreeSet<_> = read.items.iter().map(|i| i.name.clone()).collect();
@@ -189,9 +183,84 @@ pub fn prepare<'a>(
         });
     }
     let prepared = crate::compile::compile(world, "", &read)?;
-    let (result, usage) = kala_query::run_with(world, &prepared.plan, params, options)?;
+    let kinds = stmt
+        .params
+        .iter()
+        .map(|name| {
+            let kind = prepared
+                .params
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, kind)| kind.clone())
+                .unwrap_or_else(|| {
+                    if matches!(&stmt.tick, Some(Term::Param(p)) if p == name) {
+                        kala_query::ParamKind::Tick
+                    } else {
+                        kala_query::ParamKind::Scalar
+                    }
+                });
+            (name.clone(), kind)
+        })
+        .collect();
+    Ok(CompiledWrite {
+        prepared,
+        property_columns: props,
+        kinds,
+    })
+}
+
+/// Run a compiled reading part on the snapshot it was compiled against. It is
+/// refused, before its answer is built, when more rows than a write statement
+/// may take reach the final projection.
+pub fn run<'a>(
+    world: &World,
+    stmt: &WriteStatement,
+    compiled: CompiledWrite,
+    params: &dyn ParameterInput,
+    options: RunOptions<'a>,
+) -> Result<WriteInput<'a>> {
+    for name in &stmt.params {
+        if !params.contains_key(name) {
+            return Err(QueryError::MissingParam(name.clone()).into());
+        }
+    }
+    let tick = match &stmt.tick {
+        None => None,
+        Some(Term::Const(Value::I64(t))) => Some(Tick(*t)),
+        Some(Term::Param(p)) => match params.get(p) {
+            Some(Value::I64(t)) => Some(Tick(*t)),
+            _ => {
+                return Err(QueryError::ParamType {
+                    name: p.clone(),
+                    expected: "an integer tick".into(),
+                }
+                .into());
+            }
+        },
+        _ => return Err(invalid("integer tick required")),
+    };
+    let CompiledWrite {
+        prepared,
+        property_columns,
+        ..
+    } = compiled;
+    // The 10,000-row limit is on the rows that reach the write clauses: the
+    // run is refused before it builds a larger answer. Intermediate
+    // operators keep the caller's own row limit, so a selective MATCH over
+    // a type with more nodes than that still works.
+    let bounded = options.with_result_rows(
+        options
+            .result_rows
+            .map_or(MAX_WRITE_ROWS, |rows| rows.min(MAX_WRITE_ROWS)),
+    );
+    let (result, usage) = match kala_query::run_with(world, &prepared.plan, params, bounded) {
+        Err(QueryError::RowLimit { limit }) if limit == MAX_WRITE_ROWS => {
+            return Err(row_limit());
+        }
+        other => other?,
+    };
     if result.rows.len() > MAX_WRITE_ROWS {
-        return Err(invalid("statement exceeds the 10000-row write limit"));
+        return Err(row_limit());
     }
     let reads = kala_query::reads::Reads::plan(&prepared.plan, world);
     let defined_names = reads.defined_names(world);
@@ -201,12 +270,27 @@ pub fn prepare<'a>(
         defined_names,
         depends_on_snapshot: stmt.requires_read(),
         result,
-        property_columns: props,
+        property_columns,
         tick,
         options,
         bytes: usage.peak_bytes,
         steps: usage.steps,
     })
+}
+
+fn row_limit() -> WriteError {
+    invalid("statement exceeds the 10000-row write limit")
+}
+
+/// [`compile`] then [`run`], for a caller whose parameters are already typed.
+pub fn prepare<'a>(
+    world: &World,
+    stmt: &WriteStatement,
+    params: &dyn ParameterInput,
+    options: RunOptions<'a>,
+) -> Result<WriteInput<'a>> {
+    let compiled = compile(world, stmt)?;
+    run(world, stmt, compiled, params, options)
 }
 
 /// A staged write and its explicit-transaction projection. Nodes and
@@ -672,6 +756,38 @@ impl Writer<'_, '_> {
             .stager
             .fact(self.tx, id, key, value, op, None, Precision::Exact)?)
     }
+    /// A string written to a ref attribute names an entity by its handle, as
+    /// a Datalog form's `:handle` does (entities created earlier in the
+    /// transaction included). A handle nobody holds is the ordinary
+    /// unknown-entity error. An undeclared attribute keeps the string: it
+    /// is inferred as a string property.
+    fn handles(&mut self, id: EntityId, key: &str, values: &mut [Value]) -> Result<()> {
+        if !values.iter().any(|v| matches!(v, Value::Str(_))) {
+            return Ok(());
+        }
+        let stored = self.tx.relationship(id, key, id).1;
+        if !self
+            .tx
+            .attribute(stored)
+            .is_some_and(|def| def.value_type == kala_core::ValueType::Ref)
+        {
+            return Ok(());
+        }
+        for value in values {
+            if let Value::Str(handle) = value {
+                let Some(entity) = self.tx.entity_by_handle(handle) else {
+                    self.tx.abort();
+                    return Err(native::WriteError {
+                        operation: None,
+                        cause: native::Failure::UnknownEntity(std::mem::take(handle)),
+                    }
+                    .into());
+                };
+                *value = Value::Ref(entity);
+            }
+        }
+        Ok(())
+    }
     fn assign(&mut self, items: &[Assignment], row: &Row) -> Result<()> {
         for item in items {
             self.step()?;
@@ -693,11 +809,12 @@ impl Writer<'_, '_> {
                         return Err(invalid("kala_handle is permanent"));
                     }
                     let id = reference(row.get(var))?;
-                    let wanted = if let Some(e) = expr {
+                    let mut wanted = if let Some(e) = expr {
                         values(self.eval(e, row, false)?)?
                     } else {
                         vec![]
                     };
+                    self.handles(id, key, &mut wanted)?;
                     self.stager
                         .set(self.tx, id, key, &wanted, None, Precision::Exact)?;
                     if !self.cols.is_empty() {
@@ -780,7 +897,9 @@ impl Writer<'_, '_> {
             if node && key == "kala_handle" {
                 continue;
             }
-            for v in values(self.eval(e, row, false)?)? {
+            let mut wanted = values(self.eval(e, row, false)?)?;
+            self.handles(id, key, &mut wanted)?;
+            for v in wanted {
                 self.fact(id, key, v, Op::Assert)?;
             }
         }

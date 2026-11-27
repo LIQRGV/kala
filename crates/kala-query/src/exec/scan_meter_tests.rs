@@ -22,6 +22,7 @@ fn execute_inner(
         limits,
         cancel,
         deadline: None,
+        result_rows: None,
     };
     request.execute_inner(view, meter)
 }

@@ -169,6 +169,7 @@ fn execute(
             max_depth,
             system,
             result_bytes: limits.max_bytes,
+            preview: false,
         },
     )
 }
@@ -244,8 +245,17 @@ pub(crate) struct RenderOptions<'a> {
     max_depth: usize,
     system: bool,
     result_bytes: usize,
+    /// A size check before a commit: nothing is sent, so nothing is read on
+    /// the client's behalf and no read is recorded on the transaction.
+    preview: bool,
 }
 impl<'a> RenderOptions<'a> {
+    pub fn preview(self) -> Self {
+        Self {
+            preview: true,
+            ..self
+        }
+    }
     pub fn write(stop: Stop<'a>, max_message: usize, max_depth: usize) -> Self {
         Self {
             stop,
@@ -253,6 +263,7 @@ impl<'a> RenderOptions<'a> {
             max_depth,
             system: false,
             result_bytes: crate::write::MAX_STAGED_BYTES,
+            preview: false,
         }
     }
 }
@@ -270,6 +281,7 @@ pub(crate) fn render(
         max_depth,
         system,
         result_bytes,
+        preview,
     } = options;
     let limits = Limits {
         max_bytes: result_bytes,
@@ -297,7 +309,9 @@ pub(crate) fn render(
             // Graph-value enrichment reads properties beyond those explicitly named.
             visit_ids(&datum, &mut |id| {
                 reads.rendered(id);
-                if let Graph::Staged(tx) = &view {
+                if let Graph::Staged(tx) = &view
+                    && !preview
+                {
                     tx.note_read_entity(id);
                     provisional |= tx.is_provisional(id);
                 }
