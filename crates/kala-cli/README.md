@@ -455,21 +455,20 @@ backups because they retain old password hashes too.
 
 See [Bolt accounts and listen rules](../kala-bolt/README.md) for host precedence,
 database authorization and the explicit plaintext opt-in needed for a
-non-loopback listener. `--auth none` remains loopback-only.
+non-loopback plaintext listener. `--auth none` accepts loopback and Unix listeners.
 
 `--listen` is repeatable (at most 16 distinct addresses), with no DNS lookup:
 
 - `IP:PORT`, `[IPv6]:PORT`, or `localhost:PORT` (`localhost` means `127.0.0.1`).
-- `bolt://HOST:PORT`, using those same host forms.
+- `bolt://HOST:PORT` or `bolt+s://HOST:PORT` (TLS), using those same host forms.
 - `unix:///absolute/path` on Unix platforms; the path must fit `sun_path`.
 
 No `--listen` still binds `127.0.0.1:7687`. Unsupported URI schemes fail rather
 than selecting another transport. `neo4j://` is a client routing URI and cannot
 be a listener. All listeners share `--max-connections` and stop on Ctrl-C
-(SIGINT) or SIGTERM; SIGHUP does the same. Each of them runs the same clean
-shutdown: connections are closed, queries cancelled, Unix socket files removed
-and the exit status is 0, so `systemctl stop` and `docker stop` need no special
-handling.
+(SIGINT) or SIGTERM. Both close connections, cancel queries, remove Unix socket
+files and exit with status 0. SIGHUP reloads the certificate and key for new
+TLS connections and has no effect when all listeners use plaintext.
 
 ```sh
 kala serve worlds --listen bolt://127.0.0.1:7687 \
@@ -505,7 +504,7 @@ shutdown and may remain after a crash, which is harmless.
 See [transport lifecycle and platform rules](../kala-bolt/README.md#transports-and-multiple-listeners).
 
 Unix listeners count as local for auth and plaintext rules; adding a
-non-loopback TCP listener still requires the usual opt-in. Official Neo4j
+non-loopback plaintext TCP listener still requires the usual opt-in. Official Neo4j
 drivers cannot connect to the Unix socket.
 
 Startup prints one line per bound listener in the requested order, only after
@@ -528,6 +527,45 @@ an internal address); `kala serve` warns on stderr for each such listener when
 it is missing. Over a Unix socket, `SHOW DATABASES` instead reports `unix:///path`
 and `ROUTE` requires `--advertised-address`; an explicit address is used by both.
 
+### Encrypted Bolt connections
+
+Supply `--tls.cert FILE` and `--tls.key FILE` whenever you configure a
+`bolt+s://` listener. All TLS listeners use the same identity. Supply the PEM
+certificate chain with the leaf first, followed by any intermediates. The key
+must be an unencrypted PKCS#8, RSA PKCS#1 or EC SEC1 PEM file. Each file may be up to 1 MiB. On Unix,
+remove group and other read permissions with `chmod 600 key.pem`. Kala checks
+that the key matches the leaf and the leaf is currently valid. A warning on
+stderr reports expiry within 14 days.
+
+With a certificate issued by a CA the driver trusts, connect to
+`bolt+s://HOST:PORT` or use `neo4j+s://HOST:PORT` for routing. Set the
+advertised host and port to an endpoint reachable over TLS, with a host name
+or IP address in the certificate SANs. Remote logins require a password account.
+
+For a local self-signed development certificate, run these commands in a
+private directory. The server prints `kala serve: listening on bolt+s://127.0.0.1:7687`.
+
+```sh
+openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 30 \
+  -subj /CN=localhost -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' \
+  -keyout key.pem -out cert.pem
+chmod 600 key.pem
+kala serve worlds --listen bolt+s://127.0.0.1:7687 --tls.cert cert.pem --tls.key key.pem
+```
+
+Connect from a Python driver using the local trust account.
+
+```python
+from neo4j import GraphDatabase
+
+with GraphDatabase.driver("bolt+ssc://localhost:7687", auth=("root", "")) as driver:
+    driver.verify_connectivity()
+```
+
+The client-side `+ssc` scheme accepts a self-signed certificate without verifying
+the server’s identity. For rotation, replace both PEM files and send SIGHUP to
+the server process. It validates the new pair before swapping it in. Existing
+sessions continue, and a failed reload logs the error and keeps the old pair.
 
 ## Changing and inspecting the schema
 

@@ -95,8 +95,9 @@ The server defaults to account authentication. First startup creates
 `worlds/system.kala` with `root@localhost`, a loopback-only `trust` account,
 so the example's `auth=None` works locally. Use `kala user set worlds
 root@localhost --password-stdin` to switch root to a password, and `kala user`
-to manage per-database grants. Password accounts use Argon2id; non-loopback
-listeners require `--insecure-allow-plaintext` until TLS is available.
+to manage per-database grants. Password accounts use Argon2id. Use a
+`bolt+s://` listener with `--tls.cert` and `--tls.key` for remote connections.
+Non-loopback plaintext listeners require `--insecure-allow-plaintext`.
 `--auth none` remains a loopback-only development option. Use `--read-only` to refuse writes; `--auth none` grants read access only.
 Changes committed by `kala transact` become visible on the next query.
 Ctrl-C (SIGINT) or SIGTERM stops the server cleanly. Cypher and Datalog share the native transaction path for writes over Bolt. See the
@@ -212,5 +213,7 @@ The native Rust API (`kala-core`) can also write directly. See
 - [x] Cypher CREATE, SET, REMOVE, DELETE, DETACH DELETE and handle-based MERGE over Bolt and the CLI (slice 15 complete)
 - [ ] Web clients (WebSocket and remaining Browser stubs), then Gremlin when requested
 - [x] Accounts, host matching, Argon2id passwords and database privileges
-- [ ] TLS for encrypted Bolt connections
+- [x] TLS for encrypted Bolt connections, with certificate reload on SIGHUP (slice 17)
 - [ ] On-disk indexes with checkpoints
+
+After slices 11–17, Kala is a complete database for its purpose.
