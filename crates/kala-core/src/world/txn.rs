@@ -220,6 +220,11 @@ pub(super) struct TxnState {
     pub(super) staged: Index,
     /// The staged entries in write order: the order of their log entries.
     pub(super) entries: Vec<Staged>,
+    /// For each entity, the `(source, attribute)` of every staged entry
+    /// whose ref value points at it (duplicates removed): the staged side of
+    /// the `R` index, so a read of "what points at X" costs what it finds
+    /// instead of a walk of every staged entry.
+    pub(super) incoming: BTreeMap<EntityId, std::collections::BTreeSet<(EntityId, AttrId)>>,
     /// Entities created and edges interned by this transaction.
     pub(super) ids: StagedIds,
     /// Set by the first failed write; the transaction then applies nothing.
@@ -452,13 +457,12 @@ impl Txn<'_> {
                     }
                 },
             );
-            for entry in &self.s.entries {
+            for (source, attr) in self.s.incoming.get(&entity).into_iter().flatten() {
                 if !work.add(1) {
                     break;
                 }
-                let (fact, _) = entry.key_and_mark();
-                if fact.attr == attr_id && fact.target == Some(entity) {
-                    reverse(fact.entity);
+                if *attr == attr_id {
+                    reverse(*source);
                 }
             }
         }
@@ -1114,6 +1118,13 @@ impl Txn<'_> {
             self.s.tx,
         );
         self.s.staged.insert(k, mark);
+        if let Some(target) = fact.target {
+            self.s
+                .incoming
+                .entry(target)
+                .or_default()
+                .insert((fact.entity, fact.attr));
+        }
         self.s.order.push(OrderedEntry::Fact(self.s.entries.len()));
         self.s.entries.push(entry);
     }
@@ -1927,6 +1938,7 @@ impl World {
             tx,
             staged: OrderedMap::new(),
             entries: Vec::new(),
+            incoming: BTreeMap::new(),
             ids: StagedIds::default(),
             poisoned: false,
             schema_before: None,

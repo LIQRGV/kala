@@ -5,7 +5,9 @@ use super::*;
 impl Txn<'_> {
     /// The node's state at a tick, including earlier staged writes, in
     /// deterministic stored-key order. Ref states are returned in their stored
-    /// orientation, including incoming references. Events are retained.
+    /// orientation, including incoming references. Events are retained, and
+    /// so are the values of deprecated attributes: both are skipped, as
+    /// states to retract and as relationships that block a plain delete.
     ///
     /// A plain delete refuses any held relationship. The operation count,
     /// value bytes, key work and deadline bound this read before staging.
@@ -33,7 +35,11 @@ impl Txn<'_> {
         // entries) is judged against the same committed + staged E layers.
         let mut visit = |source, attr: AttrId, prefix: &mut Vec<u8>| {
             let def = &self.world.catalog.attributes[attr.0 as usize];
-            if def.kind == Kind::Event && (detach || def.value_type != ValueType::Ref) {
+            // Events are never retracted in story time and a deprecated
+            // attribute's values are frozen (its retract would be refused):
+            // neither is a state to end, and neither blocks a plain delete,
+            // which could otherwise never succeed for such a node.
+            if def.kind == Kind::Event || def.deprecated {
                 return Ok(());
             }
             if facts.contains_key(prefix.as_slice())
@@ -109,16 +115,16 @@ impl Txn<'_> {
                 incoming(source, attr)
             },
         )?;
-        // The private overlay has a forward index only. Its write-order list
-        // also includes corrections and retractions, so consult holds for each.
-        for entry in &self.s.entries {
+        // The private overlay has a forward index only; the staged refs
+        // that point at this node are found through `incoming` (kept as
+        // entries are staged), so the cost is theirs, not the size of the
+        // transaction. They include corrections and retractions, so consult
+        // holds for each.
+        for (source, attr) in self.s.incoming.get(&entity).into_iter().flatten() {
             if !work.add(1) {
                 break;
             }
-            let (fact, _) = entry.key_and_mark();
-            if fact.target == Some(entity) {
-                incoming(fact.entity, fact.attr)?;
-            }
+            incoming(*source, *attr)?;
         }
         meter.check()?;
         Ok(facts.into_values().collect())
