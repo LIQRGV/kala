@@ -909,3 +909,43 @@ fn a_revoked_write_grant_or_dropped_account_stops_writes_on_open_connections() {
         "[:assert :greg :alias \"Granted later\" :at 300]",
     );
 }
+
+// ---------------------------------------------------------------- J
+
+#[test]
+fn a_query_after_schema_edits_in_its_transaction_still_conflicts_with_writes_it_read() {
+    let server = server();
+    let mut a = Client::ready(&server);
+    let mut b = Client::ready(&server);
+    for skewed in [true, false] {
+        begin(&mut a);
+        // In A's provisional schema `:alias` now names a brand-new
+        // attribute; the committed `:alias` is `:alias_was`.
+        write(
+            &mut a,
+            "[[:rename :alias :alias_was] [:attribute :alias :string]]",
+        );
+        // The query reads the COMMITTED world, where `:alias` is still the
+        // old attribute: that is what A depends on.
+        a.query(ALIASES);
+        if skewed {
+            write(&mut b, "[:assert :greg :alias \"Written under A\" :at 300]");
+        }
+        write(&mut a, "[:assert :mara :j_depends_on_aliases true :at 300]");
+        a.send(0x12, vec![]);
+        if skewed {
+            let failure = any_failure(&mut a);
+            assert!(transient(&failure), "{failure:?}");
+            a.reset();
+            let w = world(&server);
+            assert!(w.entity_by_handle("mara").is_some());
+            assert!(
+                w.attributes().all(|def| def.name != "alias_was"),
+                "the conflicting transaction must have written nothing"
+            );
+        } else {
+            // Without the concurrent write the same transaction commits.
+            a.success();
+        }
+    }
+}

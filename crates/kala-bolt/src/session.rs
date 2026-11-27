@@ -877,7 +877,21 @@ impl Session<'_> {
                         tx.deadline,
                     )?;
                     match &mut tx.snapshot {
-                        Snapshot::Write(owned, _) => owned.with(|t| output.reads.note(t)),
+                        // The query read the COMMITTED world, but its read
+                        // keys are recorded by name on the transaction,
+                        // whose schema is provisional: after a rename or a
+                        // new declaration a name can mean another attribute
+                        // there (or only there). Once the transaction has
+                        // edited the schema, a query counts as having read
+                        // everything instead of being recorded under the
+                        // wrong attribute.
+                        Snapshot::Write(owned, _) => owned.with(|t| {
+                            if t.schema_changes().is_empty() {
+                                output.reads.note(t);
+                            } else {
+                                t.note_read_all();
+                            }
+                        }),
                         // Kept for the writable handle, if one ever opens.
                         Snapshot::Read(_) if !tx.read_only => tx.pending.merge(&output.reads),
                         Snapshot::Read(_) => {}
