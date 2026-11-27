@@ -108,3 +108,56 @@ proptest! {
         prop_assert_eq!(actual.columns, expected.columns);
     }
 }
+
+#[test]
+fn a_deadline_stops_a_run_like_the_flag_and_a_later_one_does_not() {
+    use std::time::{Duration, Instant};
+    let mut world = World::in_memory(Schema::new().node_type("N")).unwrap();
+    for _ in 0..200 {
+        world.create_entity("N", None).unwrap();
+    }
+    // A cross product of 200^3 rows: far more work than the deadline allows,
+    // most of it in the executor (not in kala-core scans).
+    let root = node_scan(node_scan(node_scan(Op::Unit, "a", "N"), "b", "N"), "c", "N");
+    let p = plan(&["a", "b", "c"], project(root, &["a", "b", "c"]));
+    let limits = Limits {
+        max_rows: 100_000_000,
+        max_steps: 1_000_000_000,
+        max_bytes: 512 * 1024 * 1024,
+    };
+    let passed = Instant::now();
+    let result = run_with(
+        &world,
+        &p,
+        &Params::new(),
+        RunOptions::new(limits).with_deadline(passed),
+    )
+    .map(|(rs, _)| rs.rows.len());
+    assert!(matches!(result, Err(QueryError::Cancelled)), "{result:?}");
+    let started = Instant::now();
+    let result = run_with(
+        &world,
+        &p,
+        &Params::new(),
+        RunOptions::new(limits).with_deadline(started + Duration::from_millis(50)),
+    )
+    .map(|(rs, _)| rs.rows.len());
+    assert!(matches!(result, Err(QueryError::Cancelled)), "{result:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the deadline must stop the run while it works, not after: {:?}",
+        started.elapsed()
+    );
+    // A deadline that is not reached changes nothing.
+    let small = plan(&["a"], project(node_scan(Op::Unit, "a", "N"), &["a"]));
+    let expected = run(&world, &small, &Params::new(), &Limits::default()).unwrap();
+    let actual = run_with(
+        &world,
+        &small,
+        &Params::new(),
+        RunOptions::new(Limits::default()).with_deadline(Instant::now() + Duration::from_secs(60)),
+    )
+    .unwrap()
+    .0;
+    assert_eq!(actual.rows, expected.rows);
+}

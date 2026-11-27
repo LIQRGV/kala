@@ -151,6 +151,10 @@ pub(super) enum Step {
     Seed,
     /// A `Not` ends: keep the input rows (its seed) whose values in `key`
     /// (every slot the input binds) match no row of the body (on top).
+    OptionalEnd {
+        key: Vec<usize>,
+        added: Vec<usize>,
+    },
     NotEnd {
         key: Vec<usize>,
     },

@@ -73,6 +73,8 @@ fn system_error(dir: &Path, e: SystemError) -> CliError {
         SystemError::NoSuchDirectory => {
             CliError::User(format!("{}: no such directory", escape::path(dir)))
         }
+        // A foreign log is a store error, as for any other world.
+        e @ SystemError::OldFormat { .. } => CliError::Store(e.to_string()),
         e => CliError::User(e.to_string()),
     }
 }
@@ -98,6 +100,20 @@ fn warn_recovered(dir: &Path, applied: &Applied) {
         escape::path(&dir.join("system.kala")),
         report.bytes_cut,
     );
+}
+
+/// Applies one account change as the write flags say: what a damaged tail
+/// may do, and how long to wait for `system.kala`'s writer lock
+/// (`--busy-timeout`; kala-core's default, 5 s, without it).
+fn apply(dir: &Path, change: Change<'_>, write: &UserWrite) -> Applied {
+    system::apply_waiting(
+        dir,
+        change,
+        recovery(write),
+        write
+            .busy_timeout
+            .unwrap_or(kala_core::log::DEFAULT_BUSY_TIMEOUT),
+    )
 }
 
 fn recovery(write: &UserWrite) -> Recovery {
@@ -162,7 +178,7 @@ fn add(
     let report = {
         let password = password(credentials)?;
         let password = password.as_ref().map(Credentials::expose);
-        system::apply(dir, Change::Add { account, password }, recovery(write))
+        apply(dir, Change::Add { account, password }, write)
     };
     applied(dir, report)
 }
@@ -177,7 +193,7 @@ fn set(
     let report = {
         let password = password(credentials)?;
         let password = password.as_ref().map(Credentials::expose);
-        system::apply(dir, Change::Set { account, password }, recovery(write))
+        apply(dir, Change::Set { account, password }, write)
     };
     applied(dir, report)
 }
@@ -189,14 +205,14 @@ fn grant(
     database: &str,
     write: &UserWrite,
 ) -> Result<String, CliError> {
-    let report = system::apply(
+    let report = apply(
         dir,
         Change::Grant {
             account,
             privilege,
             db: database,
         },
-        recovery(write),
+        write,
     );
     applied(dir, report)
 }
@@ -208,20 +224,20 @@ fn revoke(
     database: &str,
     write: &UserWrite,
 ) -> Result<String, CliError> {
-    let report = system::apply(
+    let report = apply(
         dir,
         Change::Revoke {
             account,
             privilege,
             db: database,
         },
-        recovery(write),
+        write,
     );
     applied(dir, report)
 }
 
 fn drop_account(dir: &Path, account: &str, write: &UserWrite) -> Result<String, CliError> {
-    let report = system::apply(dir, Change::Drop { account }, recovery(write));
+    let report = apply(dir, Change::Drop { account }, write);
     applied(dir, report)
 }
 

@@ -50,19 +50,24 @@
 //! struct: read-only and recovery state). The rest of the module is split by
 //! concern into submodules that share its scope: `ids` (node types, entities,
 //! handles, edges), `open` (replaying a log), `txn` (the write path and
-//! [`Txn`]), `meter` (bounded reads), `view` ([`View`]), `schema_ops` and
-//! `migration`. The indexes themselves sit behind the `store` module's
+//! [`Txn`]), `sync` (catching up with other handles on the same log file and
+//! committing under its lock), `meter` (bounded reads), `view` ([`View`]),
+//! `schema_ops` and `migration`. The indexes themselves sit behind the `store` module's
 //! ordered-map seam. Every hook of the `test-hooks` feature is in the
 //! `test_hooks` submodule.
 
 mod catalog;
+mod concurrency;
+mod delete;
 mod ids;
 mod index;
 mod journal;
 mod meter;
 mod migration;
 mod open;
+mod owned;
 mod schema_ops;
+mod sync;
 #[cfg(feature = "test-hooks")]
 mod test_hooks;
 mod txn;
@@ -74,10 +79,11 @@ use crate::id::{AttrId, EdgeId, EntityId, IdError, MAX_NODE_TYPE, NodeTypeId};
 use crate::interval::IntervalSet;
 use crate::key::{self, ValueRef};
 use crate::log::{
-    self, EncodedTxn, EntryBody, EntryId, LogEntry, LogWriter, NewEntry, SurveyedTxn,
+    self, EncodedTxn, EntryBody, EntryId, LogEntry, LogWriter, NewEntry, SurveyedTxn, Tail,
+    WriterLock,
 };
 use crate::overlap::{
-    Overlap, Side, Warnings, find_overlaps, find_overlaps_touching, value_intervals,
+    Interval, Overlap, Side, Warnings, find_overlaps, find_overlaps_touching, value_intervals,
 };
 use crate::schema::{AttrDef, Cardinality, Kind, RefDirection, Schema};
 use crate::schema::{
@@ -87,18 +93,19 @@ use crate::store::{OrderedKv, OrderedMap};
 use crate::tick::{Precision, Tick};
 use crate::value::{Value, ValueType, fold_for_search};
 use crate::value_table::{ContentHash, ValueTable, fnv1a64};
+pub use concurrency::{Concurrency, Finalized, FinalizedOp, IdMap, MAX_READ_KEYS, TickMoved};
 pub use index::IndexDump;
 pub(crate) use index::{Index, decode_e_row, decode_v_row, decode_vfold_row};
 pub use meter::{MeteredView, WorkMeter};
 pub(crate) use open::ReplayFault;
+pub use owned::OwnedTxn;
 use schema_ops::{OrderedEntry, SchemaSnapshot};
 use std::borrow::Cow;
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering as AtomicOrdering};
-pub use txn::{CommitResult, Txn};
+pub use txn::{CommitResult, HeldValues, TickOccupant, Txn};
 pub use view::View;
 use {catalog::*, ids::*, index::*, journal::*, meter::*, open::*, txn::*, write_gate::*};
 
@@ -299,8 +306,8 @@ impl FactDef {
     }
 }
 
-/// Why [`World::open`] cut a tail off the log (recovery rules in
-/// [`crate::log`]).
+/// Why a tail is cut off the log, by [`World::open`] or by a commit
+/// (recovery rules in [`crate::log`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CutCause {
     /// The last transaction was cut short (or is a zero-filled tail).
@@ -310,15 +317,23 @@ pub enum CutCause {
     Damaged,
 }
 
-/// What [`World::open`] did to recover the log: how many bytes of a torn or
-/// damaged tail it cut off, why, and where it saved them. A clean open, a
-/// new world ([`World::create`]) and an in-memory world report the default:
-/// nothing cut, no quarantine file, no cause. A world from
-/// [`World::open_read_only`] reports what `World::open` would cut, with no
+/// What recovering the log took: how many bytes of a torn or damaged tail
+/// were (or are to be) cut off, why, and where they were saved. A clean
+/// open, a new world ([`World::create`]) and an in-memory world report the
+/// default: nothing cut, no quarantine file, no cause.
+///
+/// [`World::open`] cuts a torn tail itself and reports it with its
+/// quarantine file. A damaged tail it only reports (`cause` and
+/// `bytes_cut`, `quarantine: None`): the bytes stay in the file until a
+/// commit made after [`World::acknowledge_recovery`] cuts them, and the
+/// report then names the quarantine file. A commit that cuts a tail another
+/// writer left behind replaces the report the same way. A world from
+/// [`World::open_read_only`] reports what a writer would cut, with no
 /// quarantine file (nothing is written).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RecoveryReport {
-    /// Bytes cut off the end of the log (0 if the log was clean).
+    /// Bytes of the incomplete tail: cut off the end of the log, or (no
+    /// quarantine file yet) still to be cut. 0 if the log was clean.
     pub bytes_cut: u64,
     /// The quarantine file holding exactly the cut bytes, if any were cut
     /// (always `None` for [`World::open_read_only`]).
@@ -443,6 +458,7 @@ impl World {
     /// transaction, and returns it with that transaction encoded (what
     /// [`World::create`] writes after the file header).
     fn with_genesis(schema: Schema) -> Result<(World, EncodedTxn), Error> {
+        schema.check_setting_keys()?;
         let mut world = World {
             catalog: Catalog::from_schema(&schema)?,
             indexes: Indexes::new(fnv1a64),
@@ -496,6 +512,7 @@ impl World {
         log::encode_txn(
             EntryId(1),
             TxId(0),
+            log::header_checksum(),
             node_types
                 .chain(attrs)
                 .chain(settings.iter().map(NewEntry::Schema)),
@@ -556,31 +573,59 @@ impl World {
     }
 
     /// `Err(ReadOnly)` for a world from [`World::open_read_only`], else
-    /// `Err(RecoveryUnacknowledged)` until a damaged-tail cut is
+    /// `Err(RecoveryUnacknowledged)` until a damaged tail is
     /// acknowledged (see [`World::acknowledge_recovery`]).
     fn accepts_writes(&self) -> Result<(), Error> {
         self.gate.accepts_writes()
     }
 
-    /// Acknowledges what [`World::open`] cut off the log, allowing writes
-    /// again.
+    /// Acknowledges a damaged last transaction this handle reported,
+    /// allowing writes again and licensing the cut.
     ///
-    /// After an open that cut a damaged tail ([`CutCause::Damaged`]: bytes
-    /// that look committed but fail their checksum, saved to the quarantine
-    /// file), every write fails with [`Error::RecoveryUnacknowledged`]
-    /// until this is called, so the author decides what the lost canon
-    /// means before writing on top of it. [`World::recovery`] keeps
-    /// reporting the cut afterwards. On any other world (torn cut, clean
-    /// open, [`World::create`], [`World::in_memory`]) and when called again
-    /// this does nothing. On a world from [`World::open_read_only`] it does
-    /// nothing either: writes stay refused with [`Error::ReadOnly`].
+    /// A damaged tail ([`CutCause::Damaged`]: bytes that look committed but
+    /// fail their checksum) may be a write that was acknowledged to someone,
+    /// and cutting it frees its entry IDs for reuse. So it is never cut
+    /// behind the caller's back, by any handle in any process:
+    ///
+    /// - [`World::open`] reports it ([`World::recovery`]), leaves it in the
+    ///   file and out of the world, and every write then fails with
+    ///   [`Error::RecoveryUnacknowledged`];
+    /// - a handle that was already open finds it when a commit takes the
+    ///   writer lock: that commit fails with [`Error::RecoveryRequired`],
+    ///   the file untouched.
+    ///
+    /// Either way, after this call the handle's next commit (or
+    /// [`World::cut_acknowledged_tail`]) saves the damaged bytes to a
+    /// quarantine file, cuts them under the lock and goes ahead;
+    /// [`World::recovery`] then names the quarantine file. The author
+    /// decides what the lost canon means before writing on top of it, and
+    /// an entry ID noted from the lost transaction must not be used in a
+    /// `correct` afterwards. An acknowledgement covers the damaged tail the
+    /// handle has reported, never one it hasn't seen.
+    ///
+    /// On any other world (torn cut, clean open, [`World::create`],
+    /// [`World::in_memory`]) and when called again this does nothing. On a
+    /// world from [`World::open_read_only`] it does nothing either: writes
+    /// stay refused with [`Error::ReadOnly`].
     pub fn acknowledge_recovery(&mut self) {
         self.gate.acknowledge_recovery();
     }
 
-    /// What opening the log did to recover it (see [`RecoveryReport`]).
+    /// What recovering the log took, at open or in a later commit of this
+    /// handle (see [`RecoveryReport`]).
     pub fn recovery(&self) -> &RecoveryReport {
         self.gate.recovery()
+    }
+
+    /// Where this handle's log stands in the file: the last committed
+    /// transaction it has applied, with its byte range and its chained
+    /// checksum. [`log::chain_tip_holds`] re-reads just that transaction to
+    /// tell whether another Kala writer cut and rewrote the history this
+    /// handle applied (it does not notice later damage to an earlier
+    /// transaction: opening the world or `kala doctor` does). `None` for an
+    /// in-memory world. A failed commit doesn't move it.
+    pub fn chain_tip(&self) -> Option<log::ChainTip> {
+        self.journal.chain_tip()
     }
 
     /// The last committed transaction. Every write that stores a fact
@@ -716,7 +761,7 @@ impl World {
     /// (judged as for a write; for the current value only reachable
     /// through a crafted log).
     pub fn correct(&mut self, entry: EntryId, c: Correction) -> Result<WriteResult, Error> {
-        let mut txn = self.begin();
+        let mut txn = self.begin_locked()?;
         let mut res = txn.correct(entry, c)?;
         let commit = txn.commit()?;
         res.entries = commit.entries;
@@ -884,6 +929,17 @@ impl World {
     /// the schema declares no attribute with that ID.
     pub fn attr_name(&self, id: AttrId) -> Option<&str> {
         self.catalog.attr_name(id)
+    }
+
+    /// Whether this is Kala's own `system` (accounts) world: its schema
+    /// declares the [`SYSTEM_NODE_TYPE`](crate::SYSTEM_NODE_TYPE) marker.
+    /// Recognized by content, never by file name, so a renamed copy is still
+    /// a system world. Shared write appliers refuse such a world unless
+    /// their caller explicitly allows it (account management and restores).
+    pub fn is_system(&self) -> bool {
+        self.catalog
+            .node_type_by_name
+            .contains_key(crate::SYSTEM_NODE_TYPE)
     }
 
     /// Every declared node type name, in ID (= declaration) order.

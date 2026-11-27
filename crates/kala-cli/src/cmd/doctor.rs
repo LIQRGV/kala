@@ -492,7 +492,9 @@ fn message(n: &dyn Names, f: &Finding) -> String {
              opening the world would cut it there"
         ),
         Finding::ChecksumMismatch { tx, offset } => format!(
-            "tx#{} at byte offset {offset}: checksum mismatch; the transaction is skipped",
+            "tx#{} at byte offset {offset}: checksum mismatch (its bytes are damaged, or it \
+             doesn't continue the log before it: an earlier transaction was changed); the \
+             transaction is skipped",
             tx.0
         ),
         Finding::MissingCommit { tx, offset } => format!(

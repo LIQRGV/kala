@@ -162,8 +162,8 @@ fn precision_has_six_distinct_copy_hashable_variants_and_defaults_to_exact() {
 }
 
 #[test]
-fn log_format_version_is_five() {
-    assert_eq!(LOG_FORMAT_VERSION, 5);
+fn log_format_version_is_six() {
+    assert_eq!(LOG_FORMAT_VERSION, 6);
 }
 
 // ================================================================ defaults
@@ -1295,7 +1295,12 @@ impl Crafted {
             body.extend(frame(*k, id, p));
             id += 1;
         }
-        body.extend(commit_frame(&body.clone(), id, self.next_tx));
+        body.extend(commit_frame(
+            common::link(&l),
+            &body.clone(),
+            id,
+            self.next_tx,
+        ));
         l.extend(txn(self.next_tx, &body));
         l
     }

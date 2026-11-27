@@ -43,8 +43,10 @@ In the REPL, ask:
 [:find ?n ?p :at 800 :where [:nerys :name ?n] [:nerys :located_in ?p]]
 ```
 
-The row is `"Nerys"  varrow`. `.quit` releases the writer lock. While this session
-is open, other writers are blocked. Queries see commits immediately. A failed op
+The row is `"Nerys"  varrow`. The session takes the writer lock only while one
+of its transactions commits, so other writers (a `kala transact` in a second
+terminal) can commit while it is open, and its next command sees their commits.
+Queries see commits immediately. A failed op
 aborts its whole transaction; the error names the op, and the REPL stays open.
 
 You can enter that same transaction vector directly in the write REPL. Use
@@ -227,6 +229,126 @@ for "at the same time", use `during` and `intersect` as in the last example.
 clauses inside a branch. A sixth history position binds precision as a keyword:
 `[?e :name ?v ?t ?op ?prec]`. `:exact` is the default precision.
 
+## Replace a value and rerun a script
+
+Start on a fresh copy of the sample world. Greg is in Varrow from tick 200
+until tick 250, so moving him at 225 replaces one held location with another.
+Put this in `move.edn`:
+
+```clojure
+[:set :greg :located_in :ashford :at 225]
+```
+
+```sh
+kala transact varrow.kala move.edn
+kala history varrow.kala greg located_in
+```
+
+The write reports `2 changed` with no overlap warning: one explicit Varrow
+retraction and one Ashford assertion, both at 225. History keeps the existing
+change points too, including the later Varrow retraction at 250. Running the
+same set again reports `0 changed`. Reads at 224 still put Greg in Varrow.
+
+For a script you can rerun, put this in `rerunnable.edn`:
+
+```clojure
+[:at 800 [:create :CHARACTER :kael2 :if-missing] [:assert :kael2 :name "Kael"] [:assert :kael2 :located_in :varrow]]
+```
+
+```sh
+kala transact varrow.kala rerunnable.edn
+kala transact varrow.kala rerunnable.edn
+```
+
+The first run creates Kael. The second reports `exists`, `0 changed` and
+`nothing committed`; it appends no log entries. A handle belonging to another
+node type is an error. For several aliases, use a vector with `:set`; `[]`
+clears the set. Use `:assert` when you only want to add one member.
+
+## Two terminals, one world
+
+You don't have to close a write session to write from somewhere else. Kala
+takes the world's writer lock only while one transaction commits, so two
+terminals (or a session and a script) can work on the same file. Start on a
+fresh copy of the sample world and open a write session in the first terminal:
+
+```sh
+kala repl varrow.kala --write
+```
+
+Leave it open. In the second terminal, put a new arrival in `arrival.edn`:
+
+```clojure
+[:at 900 [:create :CHARACTER :ilse] [:assert :ilse :located_in :varrow]]
+```
+
+```sh
+kala transact varrow.kala arrival.edn
+```
+
+It commits as tx#13 (`form 1: committed tx#13: 1 changed`) although the session
+is open. Back in the first terminal, the session catches up before every
+command, so it already knows Ilse:
+
+```clojure
+[:find ?p :at 900 :where [:ilse :located_in ?p]]
+```
+
+The row is `varrow`. Now move her from the session:
+
+```clojure
+[:set :ilse :located_in :ashford :at 910]
+```
+
+It reports `2 changed` at tx#14, and the second terminal sees it at once,
+because reads never wait for anyone:
+
+```sh
+kala asof varrow.kala ilse located_in @910
+```
+
+**What each terminal sees.** A write session sees every commit, its own and
+others', from its next command on. A read-only `kala repl varrow.kala` is a
+snapshot of the moment it opened until you type `.reload`. One-shot commands
+(`kala asof`, `kala query`, `kala transact`) read the file as it is when they
+run.
+
+**When both write at once.** Two writers only wait for each other during the
+instant of a commit (up to 5 seconds by default; `--busy-timeout 30s` waits
+longer, `--busy-timeout 0` not at all). Facts you simply add never clash. What
+can clash is a form that *looks before it writes*: `:set` reads what the
+attribute holds to know what to retract, and `:if-missing` reads whether the
+handle is free. If the other terminal changes exactly that between your form's
+start and its commit, Kala refuses your form rather than write a move that was
+decided from stale information:
+
+```text
+error: conflict: op 1 (:set) read :ilse :located_in, which another transaction changed; nothing was written; run it again
+```
+
+Nothing of the form was written, so do what it says: run the same form again.
+It now reads the other terminal's result and retracts that. (`kala transact`
+prints the same message with the form's number and exits with code 4, so a
+script can retry; with several forms in a file it also says which form to
+start again from, because the ones before it are already committed.)
+
+If the other writer moved the story's latest tick while your form ran, a write
+with no tick stays where it was when the form started, and the report says so:
+`warning: latest tick moved 900 → 910 while this transaction ran`. Give the
+write an `:at` if you meant the new end of history.
+
+If you would rather have the last write win than be asked to run a form again,
+say so for one transaction, for a session (`.concurrency weak`) or for a
+script (`kala transact varrow.kala script.edn --concurrency weak`):
+
+```clojure
+[[:concurrency :weak] [:set :ilse :located_in :carnath :at 920]]
+```
+
+Kala's own rules still hold in weak mode, but two overlapping `:set`s can then
+leave Ilse in two places; the write reports that as an overlap warning, and
+`kala doctor` lists it.
+
 ## Correct a mistake and read the older draft
 
 Save `leave.edn`:
@@ -402,3 +524,79 @@ Missing properties return NULL; WHERE keeps only true, and duplicates remain
 unless RETURN DISTINCT is specified. Neo4j drivers use Cypher by default over
 Bolt; prefix Datalog text with `// kala:datalog` and a newline. See the
 [subset and known differences](crates/kala-cypher/README.md).
+
+### Count allies and follow bounded paths
+
+Cypher aggregates count matched rows, including duplicates. Edwin has three
+allies at tick -208:
+
+```sh
+kala query varrow.kala --lang cypher "MATCH (e {kala_handle: 'edwin'})-[:ally_of]->(a) AT TICK -208 RETURN count(*) AS allies"
+```
+
+A bounded path carries its traversal history. This returns greg, mara and tomas,
+each at length 1; a two-hop return to Edwin would reuse an edge and is excluded:
+
+```sh
+kala query varrow.kala --lang cypher "MATCH p = (e {kala_handle: 'edwin'})-[:ally_of*1..2]-(a) AT TICK -208 RETURN a.kala_handle, length(p) ORDER BY a.kala_handle"
+```
+
+Variable-length patterns require an upper bound of at most 10 hops. Exceeding a
+query resource limit reports an error rather than a partial result.
+
+## Move Greg and import a character with Cypher
+
+Save this statement in `move.cypher` and run it on the Varrow fixture.
+
+```cypher
+MATCH (g {kala_handle:'greg'}), (a {kala_handle:'ashford'})
+SET g.located_in = a AT TICK 225;
+```
+
+```sh
+kala transact --lang cypher varrow.kala move.cypher
+```
+
+At tick 225 Greg leaves Varrow and enters Ashford. The two changes produce
+no overlap warning. Running it again reports zero changes.
+
+Save the following import in `import.cypher`. The permanent handle makes
+it safe to run the file again.
+
+```cypher
+MERGE (n:CHARACTER {kala_handle:'kael2'})
+ON CREATE SET n.name = 'Kael' AT TICK 700;
+```
+
+```sh
+kala transact --lang cypher varrow.kala import.cypher
+```
+
+The first run creates the character and asserts the name. The second finds
+the character and appends nothing.
+
+## Write through a Neo4j driver
+
+With `kala serve worlds --default-db varrow`, a local bootstrap root account can
+use `auth=None`; other accounts need a `write` grant (and `read` for `:set`).
+Send Datalog write text with the first-line prefix and no parameters:
+
+```python
+from neo4j import GraphDatabase
+
+with GraphDatabase.driver("bolt://localhost:7687", auth=None) as driver:
+    with driver.session(database="varrow") as session:
+        result = session.run('// kala:datalog\n[:assert :greg :alias "Ned" :at 300]')
+        print(result.data())
+        print(result.consume().metadata["kala"])
+```
+
+Use `session.execute_write(callback)` for an optimistic transaction that the
+driver can retry, or `begin_transaction()` followed by `commit()`/`rollback()`.
+Queries within a transaction read its starting snapshot, so they do not see its
+own staged writes. Several write forms within one transaction do see each
+other's created handles. See the [driver tests](e2e/test_python_driver.py) for
+executable write, retry, bookmark and rollback examples, and the
+[Bolt README](crates/kala-bolt/README.md#writing-and-transactions) for permissions
+and result fields. This Python example is covered by the driver suite rather
+than the Rust `guide.rs` CLI tests.

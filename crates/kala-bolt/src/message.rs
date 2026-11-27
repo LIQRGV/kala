@@ -17,10 +17,16 @@ pub(crate) enum Message {
         qid: i64,
         discard: bool,
     },
+    Route {
+        db: Option<String>,
+        impersonate: bool,
+    },
     Reset,
     Goodbye,
     Telemetry,
-    Unsupported,
+    Begin(Map),
+    Commit,
+    Rollback,
 }
 impl Message {
     pub fn parse(value: Value) -> Result<Self, Failure> {
@@ -64,14 +70,42 @@ impl Message {
             (0x0f, 0) => Self::Reset,
             (0x02, 0) => Self::Goodbye,
             (0x54, 1) if matches!(fields.next(), Some(Value::Integer(0..=3))) => Self::Telemetry,
-            (0x11, 1) => {
-                map(fields.next())?;
-                Self::Unsupported
+            (0x11, 1) => Self::Begin(map(fields.next())?),
+            (0x66, 3) => {
+                let context = map(fields.next())?;
+                if context.values().any(|v| !matches!(v, Value::String(_))) {
+                    return Err(Failure::invalid());
+                }
+                let Some(Value::List(bookmarks)) = fields.next() else {
+                    return Err(Failure::invalid());
+                };
+                if bookmarks.iter().any(|v| !matches!(v, Value::String(_))) {
+                    return Err(Failure::invalid());
+                }
+                let extra = map(fields.next())?;
+                let db = match extra.get("db") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(s)) => Some(s.clone()),
+                    _ => return Err(Failure::invalid()),
+                };
+                let impersonate = impersonated(&extra)?;
+                Self::Route { db, impersonate }
             }
-            (0x12 | 0x13, 0) | (0x66, 3) => Self::Unsupported,
+            (0x12, 0) => Self::Commit,
+            (0x13, 0) => Self::Rollback,
             _ => return Err(Failure::invalid()),
         };
         Ok(msg)
+    }
+}
+/// Whether a ROUTE or RUN `extra` map asks to act as another user
+/// (`imp_user`). Absent or null is no; anything but a string is invalid.
+/// One check for both messages, so neither can accept what the other refuses.
+pub(crate) fn impersonated(extra: &Map) -> Result<bool, Failure> {
+    match extra.get("imp_user") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::String(_)) => Ok(true),
+        _ => Err(Failure::invalid()),
     }
 }
 fn map(value: Option<Value>) -> Result<Map, Failure> {

@@ -94,6 +94,14 @@ impl JValue {
                 ty: "list",
                 value: JInner::List(values.iter().map(|v| Self::datum_with(v, entity)).collect()),
             },
+            Datum::Path(p) => JValue {
+                ty: "path",
+                value: JInner::Path {
+                    nodes: p.nodes().iter().map(|id| entity(*id)).collect(),
+                    relationships: p.edges().iter().map(|id| entity((*id).into())).collect(),
+                    forward: p.forward().to_vec(),
+                },
+            },
             Datum::Value(v) => JValue::new(v, entity),
             Datum::Precision(p) => JValue {
                 ty: "precision",
@@ -123,6 +131,11 @@ impl JValue {
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub enum JInner {
+    Path {
+        nodes: Vec<JEntity>,
+        relationships: Vec<JEntity>,
+        forward: Vec<bool>,
+    },
     Null,
     List(Vec<JValue>),
     Bool(bool),
@@ -371,6 +384,23 @@ pub fn entity_text(e: &JEntity) -> String {
 /// A value for text: strings quoted, refs by label.
 pub fn value_text(v: &JValue) -> String {
     match &v.value {
+        JInner::Path {
+            nodes,
+            relationships,
+            forward,
+        } => {
+            let mut text = format!("({})", entity_text(&nodes[0]));
+            for (i, rel) in relationships.iter().enumerate() {
+                let edge = entity_text(rel);
+                let node = entity_text(&nodes[i + 1]);
+                if forward[i] {
+                    text.push_str(&format!("-[{edge}]->({node})"));
+                } else {
+                    text.push_str(&format!("<-[{edge}]-({node})"));
+                }
+            }
+            text
+        }
         JInner::Null => "NULL".into(),
         JInner::List(values) => format!(
             "[{}]",

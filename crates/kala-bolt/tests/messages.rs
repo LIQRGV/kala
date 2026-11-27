@@ -124,21 +124,21 @@ fn invalid_state_is_failed_then_ignored_until_reset() {
 }
 
 #[test]
-fn unsupported_transactions_and_routing_fail_cleanly() {
+fn explicit_read_transactions_and_invalid_endings_fail_cleanly() {
     let server = Running::start();
     let mut client = Client::ready(&server);
-    for (tag, fields) in [
-        (0x11, vec![map(&[])]),
-        (0x12, vec![]),
-        (0x13, vec![]),
-        (0x66, vec![map(&[]), Value::List(vec![]), map(&[])]),
-    ] {
-        client.send(tag, fields);
-        let failure = client.failure("Neo.ClientError.Request.Invalid");
-        assert!(
-            matches!(failure.get("message"), Some(Value::String(text)) if text.contains("not supported yet"))
-        );
+    for tag in [0x12, 0x13] {
+        client.send(tag, vec![]);
+        client.failure("Neo.ClientError.Request.Invalid");
         client.reset();
+        assert_eq!(client.query(ALLIES).len(), 2);
+    }
+    for tag in [0x12, 0x13] {
+        client.send(0x11, vec![map(&[("mode", string("r"))])]);
+        client.success();
+        assert_eq!(client.query(ALLIES).len(), 2);
+        client.send(tag, vec![]);
+        client.success();
         assert_eq!(client.query(ALLIES).len(), 2);
     }
 }

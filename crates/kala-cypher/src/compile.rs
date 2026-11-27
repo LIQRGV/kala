@@ -16,22 +16,22 @@ pub(crate) fn compile(world: &World, text: &str, q: &Query) -> Result<Prepared, 
         serial: 0,
         canon: CanonSource::Latest,
         bound: BTreeSet::new(),
-        used: q
-            .matches
-            .iter()
-            .flat_map(|m| &m.paths)
-            .flat_map(|p| {
-                p.nodes
-                    .iter()
-                    .filter_map(|n| n.name.clone())
-                    .chain(p.edges.iter().filter_map(|e| e.name.clone()))
-            })
-            .collect(),
+        used: BTreeSet::new(),
+        ordinal: None,
+        nullable: false,
+        unwind_params: BTreeMap::new(),
+        list_params: BTreeSet::new(),
+        loose: BTreeSet::new(),
+        untyped: BTreeSet::new(),
     }
     .run(q)
 }
 struct Compiler<'a> {
     world: &'a World,
+    ordinal: Option<Var>,
+    nullable: bool,
+    unwind_params: BTreeMap<String, String>,
+    list_params: BTreeSet<String>,
     text: &'a str,
     root: Op,
     bindings: BTreeMap<String, (Var, TickSource, bool)>,
@@ -39,8 +39,16 @@ struct Compiler<'a> {
     serial: usize,
     used: BTreeSet<String>,
     canon: CanonSource,
-    /// Node variables some earlier operator already binds.
+    /// Variables some earlier operator already binds.
     bound: BTreeSet<Var>,
+    /// Bound variables that may hold NULL or something that is not a node:
+    /// whatever WITH computed, UNWIND or YIELD produced, a path, and what an
+    /// OPTIONAL MATCH bound. A node pattern checks one before reading from it.
+    loose: BTreeSet<Var>,
+    /// The loose variables whose kind is only known at run time (a WITH
+    /// expression, an UNWIND or YIELD value): a pattern may use one as a node
+    /// or as a relationship.
+    untyped: BTreeSet<Var>,
 }
 impl Compiler<'_> {
     fn error(&self, s: impl Into<String>) -> CypherError {
@@ -131,7 +139,7 @@ impl Compiler<'_> {
     ) -> Result<Var, CypherError> {
         if let Some(name) = name {
             if let Some((v, _, is_edge)) = self.bindings.get(name) {
-                if *is_edge != edge {
+                if *is_edge != edge && !self.untyped.contains(v) {
                     return Err(self.error("a variable cannot be both a node and a relationship"));
                 }
                 return Ok(v.clone());
@@ -149,21 +157,40 @@ impl Compiler<'_> {
             Expr::Var(n) => Expr::Var(
                 self.bindings
                     .get(n)
-                    .ok_or_else(|| self.error(format!("unbound variable {n}")))?
+                    .ok_or_else(|| {
+                        self.error(format!("Variable `{n}` not defined (unbound variable)"))
+                    })?
                     .0
                     .clone(),
             ),
             Expr::Value(v) => Expr::Value(v.clone()),
             Expr::Null => Expr::Null,
+            Expr::Function(f, e) => Expr::Function(*f, Box::new(self.expr(e)?)),
+            Expr::ListIndex(list, index) => {
+                Expr::ListIndex(Box::new(self.expr(list)?), Box::new(self.expr(index)?))
+            }
+            Expr::Disjoint(a, b) => {
+                Expr::Disjoint(Box::new(self.expr(a)?), Box::new(self.expr(b)?))
+            }
+            Expr::Path { .. } => {
+                return Err(self.error("path expressions must originate in a pattern"));
+            }
+            Expr::List(xs) => {
+                Expr::List(xs.iter().map(|e| self.expr(e)).collect::<Result<_, _>>()?)
+            }
+            Expr::Aggregate { .. } => {
+                return Err(self.error("aggregates are only allowed as projection items"));
+            }
             Expr::Param(p) => {
                 self.param(p, ParamKind::Scalar)?;
                 Expr::Param(p.clone())
             }
             Expr::Property { entity, key, .. } => {
-                let (var, tick, _) = self
-                    .bindings
-                    .get(entity)
-                    .ok_or_else(|| self.error(format!("unbound variable {entity}")))?;
+                let (var, tick, _) = self.bindings.get(entity).ok_or_else(|| {
+                    self.error(format!(
+                        "Variable `{entity}` not defined (unbound variable)"
+                    ))
+                })?;
                 Expr::Property {
                     entity: var.clone(),
                     key: key.clone(),
@@ -183,7 +210,12 @@ impl Compiler<'_> {
         })
     }
     fn infer_comparison(&mut self, a: &Expr<String>, b: &Expr<String>) -> Result<(), CypherError> {
-        if let Expr::Param(p) = b {
+        let parameter = match b {
+            Expr::Param(p) => Some(p.clone()),
+            Expr::Var(v) => self.unwind_params.get(v).cloned(),
+            _ => None,
+        };
+        if let Some(p) = parameter {
             let ty = match a {
                 Expr::Property { key, .. } => {
                     if key == "kala_handle" {
@@ -196,7 +228,7 @@ impl Compiler<'_> {
                 _ => None,
             };
             if let Some(ty) = ty {
-                self.param(p, ParamKind::Value(ty))?;
+                self.param(&p, ParamKind::Value(ty))?;
             }
         }
         Ok(())
@@ -208,7 +240,12 @@ impl Compiler<'_> {
         props: &[(String, Expr<String>)],
     ) -> Result<(), CypherError> {
         for (key, value) in props {
-            if let Expr::Param(p) = value {
+            let parameter = match value {
+                Expr::Param(p) => Some(p.clone()),
+                Expr::Var(v) => self.unwind_params.get(v).cloned(),
+                _ => None,
+            };
+            if let Some(p) = parameter {
                 let kind = if key == "kala_handle" {
                     ParamKind::Value(ValueType::Str)
                 } else {
@@ -216,7 +253,7 @@ impl Compiler<'_> {
                         .attribute(key)
                         .map_or(ParamKind::Scalar, |d| ParamKind::Value(d.value_type))
                 };
-                self.param(p, kind)?;
+                self.param(&p, kind)?;
             }
             let rhs = self.expr(value)?;
             self.row(RowAction::Select(Expr::Compare(
@@ -234,19 +271,82 @@ impl Compiler<'_> {
     /// Compile the query clause by clause, then wrap the row pipeline in its
     /// output operator.
     fn run(mut self, q: &Query) -> Result<Prepared, CypherError> {
-        let default_tick = match q.matches.first() {
-            Some(first) => self.clause_tick(first)?,
-            None => TickSource::Default,
+        // Reserve every authored name, including quoted NUL-prefixed ones.
+        self.reserve_names(q);
+        if q.clauses.iter().any(|c| {
+            matches!(
+                c,
+                Clause::With(..) | Clause::Unwind(..) | Clause::Source(..)
+            )
+        }) {
+            let ordinal = self.bind_fresh(Expr::Value(Value::I64(0)));
+            self.ordinal = Some(ordinal);
+        }
+        let first_tick = q
+            .clauses
+            .iter()
+            .find_map(|c| match c {
+                Clause::Match(m) => Some(m.tick.as_ref()),
+                Clause::Source(s) => Some(s.tick.as_ref()),
+                _ => None,
+            })
+            .flatten();
+        let default_tick = if let Some(t) = first_tick {
+            self.time(t, ParamKind::Tick)?
+        } else {
+            TickSource::Default
         };
         self.resolve_canon(q)?;
-        for (index, m) in q.matches.iter().enumerate() {
-            self.match_clause(index, m)?;
+        let mut match_index = 0;
+        for clause in &q.clauses {
+            match clause {
+                Clause::Match(m) => {
+                    self.match_clause(match_index, m)?;
+                    match_index += 1;
+                }
+                Clause::With(q, predicate) => self.with_clause(q, predicate.as_ref())?,
+                Clause::Source(s) => {
+                    self.source_clause(s)?;
+                    match_index += 1;
+                }
+                Clause::Unwind(e, name) => {
+                    if self.bindings.contains_key(name) {
+                        return Err(self.error("UNWIND variable already declared"));
+                    }
+                    let expr = self.expr(e)?;
+                    let var = self.fresh();
+                    self.row(RowAction::Unwind {
+                        expr,
+                        var: var.clone(),
+                        ordinal: self.ordinal.clone().expect("pipeline ordinal"),
+                    });
+                    self.mark_computed(&var);
+                    self.bindings
+                        .insert(name.clone(), (var, TickSource::Default, false));
+                    let parameter = match e {
+                        Expr::Param(p) => Some(p.clone()),
+                        Expr::Var(v) => self.unwind_params.get(v).cloned(),
+                        _ => None,
+                    };
+                    if let Some(p) = parameter {
+                        self.list_params.insert(p.clone());
+                        self.unwind_params.insert(name.clone(), p);
+                    }
+                }
+            }
         }
         let returned = self.return_items(q)?;
         let order = self.order_keys(q, &returned)?;
         for t in [&q.skip, &q.limit].into_iter().flatten() {
             if let Term::Param(p) = t {
                 self.param(p, ParamKind::Value(ValueType::I64))?;
+            }
+        }
+        for (name, kind) in self.params.clone() {
+            if let ParamKind::Value(expected) = kind
+                && self.list_params.contains(&name)
+            {
+                self.row(RowAction::CheckParameter { name, expected });
             }
         }
         self.output(q, returned.find, order);
@@ -264,6 +364,158 @@ impl Compiler<'_> {
             params: self.params,
         })
     }
+    /// Record a variable an UNWIND, YIELD or WITH expression bound: any
+    /// value, known only at run time.
+    fn mark_computed(&mut self, var: &Var) {
+        self.bound.insert(var.clone());
+        self.loose.insert(var.clone());
+        self.untyped.insert(var.clone());
+    }
+    fn reserve_names(&mut self, q: &Query) {
+        for clause in &q.clauses {
+            match clause {
+                Clause::Match(m) => {
+                    for p in &m.paths {
+                        self.used.extend(p.name.clone());
+                        self.used
+                            .extend(p.nodes.iter().filter_map(|n| n.name.clone()));
+                        self.used
+                            .extend(p.edges.iter().filter_map(|n| n.name.clone()));
+                    }
+                }
+                Clause::With(q, _) => self.reserve_names(q),
+                Clause::Source(s) => self.used.extend(s.yields.iter().map(|(_, n)| n.clone())),
+                Clause::Unwind(_, n) => {
+                    self.used.insert(n.clone());
+                }
+            }
+        }
+        self.used.extend(q.items.iter().map(|i| i.name.clone()));
+    }
+    fn source_clause(&mut self, source: &Source) -> Result<(), CypherError> {
+        let columns: Vec<_> = source
+            .source
+            .columns()
+            .iter()
+            .map(|_| self.fresh())
+            .collect();
+        let tick = if let Some(t) = &source.tick {
+            self.time(t, ParamKind::Tick)?
+        } else {
+            TickSource::Default
+        };
+        self.row(RowAction::Source {
+            source: source.source.clone(),
+            columns: columns.clone(),
+            tick: tick.clone(),
+            ordinal: self.ordinal.clone().expect("source ordinal"),
+        });
+        for (name, alias) in &source.yields {
+            let i = source
+                .source
+                .columns()
+                .iter()
+                .position(|n| *n == name)
+                .ok_or_else(|| self.error(format!("unknown YIELD column {name}")))?;
+            if self.bindings.contains_key(alias) {
+                return Err(self.error("YIELD variable already declared"));
+            }
+            self.mark_computed(&columns[i]);
+            self.bindings
+                .insert(alias.clone(), (columns[i].clone(), tick.clone(), false));
+        }
+        if let Some(e) = &source.predicate {
+            let e = self.expr(e)?;
+            self.row(RowAction::Select(e));
+        }
+        Ok(())
+    }
+    fn with_clause(
+        &mut self,
+        projection: &Query,
+        predicate: Option<&Expr<String>>,
+    ) -> Result<(), CypherError> {
+        let mut expanded;
+        let q = if projection.include_all {
+            expanded = projection.clone();
+            expanded.items = self
+                .bindings
+                .keys()
+                .map(|n| Item {
+                    name: n.clone(),
+                    expr: Expr::Var(n.clone()),
+                })
+                .collect();
+            for item in &projection.items {
+                if expanded.items.iter().any(|i| i.name == item.name) {
+                    return Err(
+                        self.error("Multiple result columns with the same name are not supported")
+                    );
+                }
+                expanded.items.push(item.clone());
+            }
+            &expanded
+        } else {
+            projection
+        };
+        let returned = self.return_items(q)?;
+        let order = self.order_keys(q, &returned)?;
+        for t in [&q.skip, &q.limit].into_iter().flatten() {
+            if let Term::Param(p) = t {
+                self.param(p, ParamKind::Value(ValueType::I64))?;
+            }
+        }
+        let mut bindings = BTreeMap::new();
+        let mut unwind_params = BTreeMap::new();
+        let (mut loose, mut untyped) = (BTreeSet::new(), BTreeSet::new());
+        for (item, var) in q.items.iter().zip(&returned.find) {
+            // A variable passed through keeps what is known about it; any
+            // other expression can produce NULL or a value of any kind.
+            let source = match &item.expr {
+                Expr::Var(n) => self.bindings.get(n).map(|(v, _, _)| v),
+                _ => None,
+            };
+            if source.is_none_or(|v| self.loose.contains(v)) {
+                loose.insert(var.clone());
+            }
+            if source.is_none_or(|v| self.untyped.contains(v)) {
+                untyped.insert(var.clone());
+            }
+            if let Expr::Param(p) = &item.expr {
+                unwind_params.insert(item.name.clone(), p.clone());
+            }
+            let (tick, edge) = if let Expr::Var(n) = &item.expr {
+                if let Some(p) = self.unwind_params.get(n) {
+                    unwind_params.insert(item.name.clone(), p.clone());
+                }
+                self.bindings
+                    .get(n)
+                    .map(|(_, t, e)| (t.clone(), *e))
+                    .unwrap_or((TickSource::Default, false))
+            } else {
+                (TickSource::Default, false)
+            };
+            bindings.insert(item.name.clone(), (var.clone(), tick, edge));
+        }
+        self.row(RowAction::Project {
+            vars: returned.find.clone(),
+            distinct: q.distinct,
+            order,
+            skip: q.skip.clone(),
+            limit: q.limit.clone(),
+            ordinal: self.ordinal.clone().expect("WITH ordinal"),
+        });
+        self.bindings = bindings;
+        self.unwind_params = unwind_params;
+        self.bound = returned.find.into_iter().collect();
+        self.loose = loose;
+        self.untyped = untyped;
+        if let Some(e) = predicate {
+            let e = self.expr(e)?;
+            self.row(RowAction::Select(e));
+        }
+        Ok(())
+    }
     /// A MATCH clause's own `AT TICK`, or the query default when it has none.
     fn clause_tick(&mut self, m: &Match) -> Result<TickSource, CypherError> {
         Ok(match &m.tick {
@@ -273,8 +525,13 @@ impl Compiler<'_> {
     }
     /// The query's canon: the `CANON` of whichever MATCH carries one.
     fn resolve_canon(&mut self, q: &Query) -> Result<(), CypherError> {
-        for m in &q.matches {
-            if let Some(t) = &m.canon {
+        for clause in &q.clauses {
+            let canon = match clause {
+                Clause::Match(m) => m.canon.as_ref(),
+                Clause::Source(s) => s.canon.as_ref(),
+                _ => None,
+            };
+            if let Some(t) = canon {
                 self.canon = match t {
                     Term::Const(Value::I64(n)) => CanonSource::Const(*n as u64),
                     Term::Param(p) => {
@@ -295,9 +552,29 @@ impl Compiler<'_> {
         } else {
             self.clause_tick(m)?
         };
+        self.nullable |= m.optional;
+        let input = if m.optional {
+            Some(Box::new(std::mem::replace(&mut self.root, Op::Unit)))
+        } else {
+            None
+        };
+        // A check inside an OPTIONAL MATCH body proves nothing about the
+        // rows the clause keeps, and what the body binds is NULL on them.
+        let outer = m.optional.then(|| {
+            let known: BTreeSet<Var> = self.bindings.values().map(|b| b.0.clone()).collect();
+            (self.loose.clone(), self.untyped.clone(), known)
+        });
         let mut scope = MatchScope {
             tick,
-            edge_count: m.paths.iter().map(|p| p.edges.len()).sum(),
+            edge_count: if m
+                .paths
+                .iter()
+                .any(|p| p.name.is_some() || p.edges.iter().any(|e| e.bounds.is_some()))
+            {
+                2
+            } else {
+                m.paths.iter().map(|p| p.edges.len()).sum()
+            },
             previous_edges: Vec::new(),
         };
         for path in &m.paths {
@@ -306,6 +583,18 @@ impl Compiler<'_> {
         if let Some(e) = &m.predicate {
             let e = self.expr(e)?;
             self.row(RowAction::Select(e));
+        }
+        if let Some(input) = input {
+            self.root = Op::Optional {
+                input,
+                body: Box::new(std::mem::replace(&mut self.root, Op::Unit)),
+            };
+        }
+        if let Some((loose, untyped, known)) = outer {
+            self.loose = loose;
+            self.untyped = untyped;
+            let new = self.bindings.values().map(|b| b.0.clone());
+            self.loose.extend(new.filter(|v| !known.contains(v)));
         }
         Ok(())
     }
@@ -317,11 +606,107 @@ impl Compiler<'_> {
             .iter()
             .map(|n| self.bind_name(&n.name, &scope.tick, false))
             .collect::<Result<Vec<_>, _>>()?;
+        let checked = self.loose_node_checks(path, &vars, &scope.tick);
         let handles = self.handle_lookups(path, &vars)?;
+        let mut segments = Vec::new();
         for (i, edge) in path.edges.iter().enumerate() {
-            self.edge(edge, &vars[i], &vars[i + 1], scope)?;
+            if let Some((min, max)) = edge.bounds {
+                if !self.bound.contains(&vars[i]) {
+                    self.row(RowAction::Nodes {
+                        var: vars[i].clone(),
+                        labels: path.nodes[i].labels.clone(),
+                        tick: scope.tick.clone(),
+                    });
+                    self.bound.insert(vars[i].clone());
+                }
+                let history = self.fresh();
+                let properties = edge
+                    .props
+                    .iter()
+                    .map(|(k, e)| Ok((k.clone(), self.expr(e)?)))
+                    .collect::<Result<_, CypherError>>()?;
+                self.row(RowAction::Trail {
+                    source: vars[i].clone(),
+                    target: vars[i + 1].clone(),
+                    path: history.clone(),
+                    attr: edge.kind.clone(),
+                    direction: edge.direction,
+                    tick: scope.tick.clone(),
+                    min,
+                    max,
+                    excluded: scope.previous_edges.clone(),
+                    properties,
+                });
+                let rels = self.bind_name(&edge.name, &scope.tick, true)?;
+                let expr = Expr::Function(
+                    kala_query::RowFn::Relationships,
+                    Box::new(Expr::Var(history.clone())),
+                );
+                if self.bound.contains(&rels) {
+                    self.row(RowAction::Select(Expr::Compare(
+                        CmpOp::Eq,
+                        Box::new(Expr::Var(rels.clone())),
+                        Box::new(expr),
+                    )));
+                } else {
+                    self.row(RowAction::Bind {
+                        var: rels.clone(),
+                        expr,
+                    });
+                }
+                self.bound.extend([vars[i + 1].clone(), rels.clone()]);
+                scope.previous_edges.push(rels);
+                segments.push(history);
+            } else if self.is_simple_edge(edge, scope.edge_count) {
+                self.simple_edge(edge, &vars[i], &vars[i + 1], &scope.tick);
+                self.bound.extend([vars[i].clone(), vars[i + 1].clone()]);
+            } else {
+                let r = self.general_edge(edge, &vars[i], &vars[i + 1], scope)?;
+                self.bound
+                    .extend([vars[i].clone(), vars[i + 1].clone(), r.clone()]);
+                segments.push(r);
+            }
         }
-        self.node_filters(path, &vars, &handles, &scope.tick)
+        self.node_filters(path, &vars, &handles, &checked, &scope.tick)?;
+        if let Some(name) = &path.name {
+            if self.bindings.contains_key(name) {
+                return Err(self.error("path variable already declared"));
+            }
+            let var = self.bind_fresh(Expr::Path {
+                start: vars[0].clone(),
+                segments,
+            });
+            // A path is a bound value that is never a node.
+            self.bound.insert(var.clone());
+            self.loose.insert(var.clone());
+            self.bindings
+                .insert(name.clone(), (var, scope.tick.clone(), false));
+        }
+        Ok(())
+    }
+    /// Constrain every already-bound node variable of the path that may hold
+    /// NULL or a non-node (see `loose`) before anything reads from it: NULL
+    /// matches nothing and a non-node is a type error, so the seeks after it
+    /// only see nodes. Returns the node positions whose labels it checked.
+    fn loose_node_checks(
+        &mut self,
+        path: &Path,
+        vars: &[Var],
+        tick: &TickSource,
+    ) -> BTreeSet<usize> {
+        let mut checked = BTreeSet::new();
+        for (position, (node, var)) in path.nodes.iter().zip(vars).enumerate() {
+            if self.bound.contains(var) && self.loose.remove(var) {
+                self.untyped.remove(var);
+                self.row(RowAction::Nodes {
+                    var: var.clone(),
+                    labels: node.labels.clone(),
+                    tick: tick.clone(),
+                });
+                checked.insert(position);
+            }
+        }
+        checked
     }
     /// Turn each `{kala_handle: …}` property into a handle seek, and return
     /// the `(node position, property index)` pairs it consumed.
@@ -335,6 +720,9 @@ impl Compiler<'_> {
         // keeps every other occurrence's property filters.
         let mut handles = BTreeSet::new();
         for (position, (n, v)) in path.nodes.iter().zip(vars).enumerate() {
+            if self.nullable && self.bound.contains(v) {
+                continue;
+            }
             for (i, (key, value)) in n.props.iter().enumerate() {
                 if key != "kala_handle" {
                     continue;
@@ -344,6 +732,26 @@ impl Compiler<'_> {
                     Expr::Param(p) => {
                         self.param(p, ParamKind::Value(ValueType::Str))?;
                         Term::Param(p.clone())
+                    }
+                    // A value an earlier clause bound: seek the node by it.
+                    // A node that is already bound is compared instead.
+                    Expr::Var(name) => {
+                        let seek = self
+                            .bindings
+                            .get(name)
+                            .map(|(h, _, _)| h.clone())
+                            .filter(|h| self.bound.contains(h) && !self.bound.contains(v));
+                        let Some(handle) = seek else { continue };
+                        if let Some(p) = self.unwind_params.get(name).cloned() {
+                            self.param(&p, ParamKind::Value(ValueType::Str))?;
+                        }
+                        self.row(RowAction::NodeByHandle {
+                            var: v.clone(),
+                            handle,
+                        });
+                        self.bound.insert(v.clone());
+                        handles.insert((position, i));
+                        continue;
                     }
                     // Other values stay ordinary (never-equal) property filters.
                     _ => continue,
@@ -361,22 +769,6 @@ impl Compiler<'_> {
         }
         Ok(handles)
     }
-    /// One relationship pattern between two bound node variables.
-    fn edge(
-        &mut self,
-        edge: &Edge,
-        source: &Var,
-        target: &Var,
-        scope: &mut MatchScope,
-    ) -> Result<(), CypherError> {
-        if self.is_simple_edge(edge, scope.edge_count) {
-            self.simple_edge(edge, source, target, &scope.tick);
-        } else {
-            self.general_edge(edge, source, target, scope)?;
-        }
-        self.bound.extend([source.clone(), target.clone()]);
-        Ok(())
-    }
     /// Whether an edge compiles to the same plain `Expand` Datalog emits: the
     /// clause's only edge, anonymous, outgoing, without properties, over a
     /// ref attribute known at a canon fixed at compile time.
@@ -385,7 +777,8 @@ impl Compiler<'_> {
             CanonSource::Const(n) => kala_core::TxId(n),
             _ => self.world.latest_tx(),
         });
-        edge_count == 1
+        !self.nullable
+            && edge_count == 1
             && edge.name.is_none()
             && edge.props.is_empty()
             && edge.direction == Orientation::Out
@@ -419,7 +812,7 @@ impl Compiler<'_> {
         source: &Var,
         target: &Var,
         scope: &mut MatchScope,
-    ) -> Result<(), CypherError> {
+    ) -> Result<Var, CypherError> {
         let var = self.bind_name(&edge.name, &scope.tick, true)?;
         self.row(RowAction::Edge {
             source: source.clone(),
@@ -430,14 +823,14 @@ impl Compiler<'_> {
             tick: scope.tick.clone(),
         });
         for old in &scope.previous_edges {
-            self.row(RowAction::Select(Expr::Compare(
-                CmpOp::Ne,
+            self.row(RowAction::Select(Expr::Disjoint(
                 Box::new(Expr::Var(var.clone())),
                 Box::new(Expr::Var(old.clone())),
             )));
         }
         scope.previous_edges.push(var.clone());
-        self.property_map(&var, &scope.tick, &edge.props)
+        self.property_map(&var, &scope.tick, &edge.props)?;
+        Ok(var)
     }
     /// Scan the path's nodes that are still unbound or carry labels, and
     /// filter every node on the properties no handle seek consumed.
@@ -446,10 +839,12 @@ impl Compiler<'_> {
         path: &Path,
         vars: &[Var],
         handles: &BTreeSet<(usize, usize)>,
+        checked: &BTreeSet<usize>,
         tick: &TickSource,
     ) -> Result<(), CypherError> {
         for (position, (node, var)) in path.nodes.iter().zip(vars).enumerate() {
-            if !self.bound.contains(var) || !node.labels.is_empty() {
+            let labelled = !node.labels.is_empty() && !checked.contains(&position);
+            if !self.bound.contains(var) || labelled {
                 self.row(RowAction::Nodes {
                     var: var.clone(),
                     labels: node.labels.clone(),
@@ -471,6 +866,9 @@ impl Compiler<'_> {
     /// Give every RETURN item an execution slot: a returned variable keeps its
     /// own unless an alias renames it; anything else is bound to a fresh one.
     fn return_items(&mut self, q: &Query) -> Result<Returned, CypherError> {
+        if q.items.iter().any(|i| crate::parse::has_aggregate(&i.expr)) {
+            return self.aggregate_items(q);
+        }
         let mut returned = Returned::default();
         for item in &q.items {
             let expr = self.expr(&item.expr)?;
@@ -484,6 +882,42 @@ impl Compiler<'_> {
         }
         Ok(returned)
     }
+    fn aggregate_items(&mut self, q: &Query) -> Result<Returned, CypherError> {
+        let mut returned = Returned::default();
+        let mut keys = Vec::new();
+        let mut aggregates = Vec::new();
+        for item in &q.items {
+            let v = if let Expr::Aggregate {
+                function,
+                distinct,
+                argument,
+            } = &item.expr
+            {
+                let argument = argument.as_deref().map(|e| self.expr(e)).transpose()?;
+                let output = self.fresh();
+                aggregates.push(kala_query::BagAggregate {
+                    output: output.clone(),
+                    function: *function,
+                    distinct: *distinct,
+                    argument,
+                });
+                output
+            } else {
+                let expr = self.expr(&item.expr)?;
+                let v = match expr {
+                    Expr::Var(v) => v,
+                    e => self.bind_fresh(e),
+                };
+                keys.push(v.clone());
+                v
+            };
+            returned.aliases.insert(item.name.clone(), v.clone());
+            returned.items.push((item.expr.clone(), v.clone()));
+            returned.find.push(v);
+        }
+        self.row(RowAction::Group { keys, aggregates });
+        Ok(returned)
+    }
     /// The ORDER BY keys: a returned item (by alias or by expression) sorts on
     /// its slot; any other expression is bound to a fresh one.
     fn order_keys(
@@ -491,6 +925,24 @@ impl Compiler<'_> {
         q: &Query,
         returned: &Returned,
     ) -> Result<Vec<(Var, bool)>, CypherError> {
+        let original = self.bindings.clone();
+        // ORDER BY sees projected aliases. After grouping it can only read
+        // retained keys/aggregate outputs, not pre-group bindings.
+        if q.items.iter().any(|i| crate::parse::has_aggregate(&i.expr)) {
+            self.bindings
+                .retain(|_, (v, _, _)| returned.find.contains(v));
+        }
+        for (item, var) in q.items.iter().zip(&returned.find) {
+            let (tick, edge) = match &item.expr {
+                Expr::Var(name) => original
+                    .get(name)
+                    .map(|(_, tick, edge)| (tick.clone(), *edge))
+                    .unwrap_or((TickSource::Default, false)),
+                _ => (TickSource::Default, false),
+            };
+            self.bindings
+                .insert(item.name.clone(), (var.clone(), tick, edge));
+        }
         let mut order = Vec::new();
         for (e, desc) in &q.order {
             let known = if let Expr::Var(v) = e {
@@ -516,6 +968,7 @@ impl Compiler<'_> {
             };
             order.push((var, *desc));
         }
+        self.bindings = original;
         Ok(order)
     }
     /// Wrap the pipeline in its result operator. A plain `RETURN DISTINCT` of

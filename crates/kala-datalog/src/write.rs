@@ -5,8 +5,8 @@ use crate::lex::{Bracket, Lexer, Tok};
 use crate::parse::{Form, item, read_form};
 use crate::{MAX_QUERY_BYTES, MAX_WRITE_FORMS, MAX_WRITE_OPS};
 use kala_core::{
-    AttributeOptions, Cardinality, EntryId, Kind, MigrationOptions, Op, Precision, RefDirection,
-    Tick, ValueType,
+    AttributeOptions, Cardinality, Concurrency, EntryId, Kind, MigrationOptions, Op, Precision,
+    RefDirection, Tick, ValueType,
 };
 
 /// The first element of a form selects its language operation.
@@ -48,7 +48,9 @@ pub fn form_kind(text: &str) -> Result<FormKind, DatalogError> {
                 if matches!(
                     k.as_str(),
                     "genesis"
+                        | "concurrency"
                         | "create"
+                        | "set"
                         | "assert"
                         | "retract"
                         | "correct"
@@ -281,7 +283,9 @@ fn tagged_scalar(items: &[Form]) -> Option<WriteValue> {
     }
 }
 /// One transaction form: a single op `[:assert …]`, or a vector of ops with
-/// an optional leading `:at tick` (or, in a restore script, `:genesis`).
+/// an optional leading `:at tick` (or, in a restore script, `:genesis`). The
+/// first op of a vector may be `[:concurrency :weak]` or `[:concurrency
+/// :optimistic]`: the transaction's own concurrency mode, not an op.
 fn transaction(f: Form, restore: bool) -> Result<WriteTxn, DatalogError> {
     let (mut items, span) = vector(f)?;
     let genesis =
@@ -305,19 +309,24 @@ fn transaction(f: Form, restore: bool) -> Result<WriteTxn, DatalogError> {
     if single {
         return Ok(WriteTxn {
             genesis: false,
+            concurrency: None,
             at: None,
-            ops: vec![operation(items, span)?],
+            ops: vec![operation(items, span, restore)?],
             span,
         });
     }
-    let (at, ops) = transaction_ops(items, span, restore)?;
+    let Parts {
+        at,
+        concurrency,
+        ops,
+    } = transaction_ops(items, span, restore)?;
     if ops.is_empty() && !genesis {
         return Err(DatalogError::syntax(
             span,
             "a transaction needs at least one op",
         ));
     }
-    if genesis && (at.is_some() || !ops.iter().all(is_genesis_op)) {
+    if genesis && (at.is_some() || concurrency.is_some() || !ops.iter().all(is_genesis_op)) {
         return Err(DatalogError::syntax(
             span,
             "genesis accepts only declared schema forms and world settings",
@@ -325,30 +334,32 @@ fn transaction(f: Form, restore: bool) -> Result<WriteTxn, DatalogError> {
     }
     Ok(WriteTxn {
         genesis,
+        concurrency,
         at,
         ops,
         span,
     })
 }
-/// A multi-op transaction's default tick (a leading `:at tick`) and its ops.
-fn transaction_ops(
-    items: Vec<Form>,
-    span: Span,
-    restore: bool,
-) -> Result<(Option<Tick>, Vec<WriteOp>), DatalogError> {
-    let mut it = items.into_iter();
+/// What a multi-op transaction vector holds.
+struct Parts {
+    /// A leading `:at tick`: the transaction's default tick.
+    at: Option<Tick>,
+    /// A `[:concurrency …]` as the first op.
+    concurrency: Option<Concurrency>,
+    ops: Vec<WriteOp>,
+}
+/// The parts of a multi-op transaction.
+fn transaction_ops(items: Vec<Form>, span: Span, restore: bool) -> Result<Parts, DatalogError> {
+    let mut it = items.into_iter().peekable();
     let mut at = None;
+    let mut concurrency = None;
     let mut ops = Vec::new();
-    if let Some(first) = it.next() {
-        if matches!(&first,Form::Atom{tok:Tok::Keyword(k),..} if k=="at") {
-            at =
-                Some(tick(it.next().ok_or_else(|| {
-                    DatalogError::syntax(span, ":at needs a tick")
-                })?)?);
-        } else {
-            let (items, s) = vector(first)?;
-            ops.push(operation(items, s)?);
-        }
+    if matches!(it.peek(), Some(Form::Atom{tok:Tok::Keyword(k),..}) if k=="at") {
+        it.next();
+        at =
+            Some(tick(it.next().ok_or_else(|| {
+                DatalogError::syntax(span, ":at needs a tick")
+            })?)?);
     }
     for f in it {
         if !restore && ops.len() >= MAX_WRITE_OPS {
@@ -358,9 +369,59 @@ fn transaction_ops(
             ));
         }
         let (items, s) = vector(f)?;
-        ops.push(operation(items, s)?);
+        if is_concurrency(&items) {
+            if !ops.is_empty() || concurrency.is_some() {
+                return Err(DatalogError::syntax(
+                    s,
+                    "[:concurrency …] must be the first op of a transaction, once: \
+                     [[:concurrency :weak] [:set …]]",
+                ));
+            }
+            concurrency = Some(concurrency_mode(items, s)?);
+            continue;
+        }
+        ops.push(operation(items, s, restore)?);
     }
-    Ok((at, ops))
+    Ok(Parts {
+        at,
+        concurrency,
+        ops,
+    })
+}
+/// Whether an op vector is a `[:concurrency …]` (well-formed or not).
+fn is_concurrency(items: &[Form]) -> bool {
+    matches!(items.first(), Some(Form::Atom { tok: Tok::Keyword(k), .. }) if k == "concurrency")
+}
+/// The mode of a `[:concurrency :weak]` / `[:concurrency :optimistic]`.
+/// Pessimistic locking is a planned mode, so it gets its own message.
+fn concurrency_mode(items: Vec<Form>, span: Span) -> Result<Concurrency, DatalogError> {
+    let shape = "expected :weak or :optimistic: [:concurrency :weak]";
+    let mut it = items.into_iter().skip(1);
+    let (Some(mode), None) = (it.next(), it.next()) else {
+        return Err(DatalogError::syntax(span, shape));
+    };
+    let Form::Atom {
+        tok: Tok::Keyword(mode),
+        span,
+    } = mode
+    else {
+        return Err(DatalogError::syntax(mode.span(), shape));
+    };
+    match mode.as_str() {
+        "weak" => Ok(Concurrency::Weak),
+        "optimistic" => Ok(Concurrency::Optimistic),
+        "pessimistic" => Err(DatalogError::syntax(
+            span,
+            "concurrency mode :pessimistic is not supported yet; expected :weak or :optimistic",
+        )),
+        _ => Err(DatalogError::syntax(
+            span,
+            format!(
+                "unknown concurrency mode :{}; expected :weak or :optimistic",
+                show(&mode)
+            ),
+        )),
+    }
 }
 /// Whether a genesis transaction may hold `op`: a declared (not inferred)
 /// schema form or a world setting.
@@ -391,7 +452,7 @@ impl Args {
     }
 }
 /// One write operation `[:keyword …]`: the keyword selects the form.
-fn operation(items: Vec<Form>, span: Span) -> Result<WriteOp, DatalogError> {
+fn operation(items: Vec<Form>, span: Span, restore: bool) -> Result<WriteOp, DatalogError> {
     let mut args = Args {
         it: items.into_iter(),
         span,
@@ -407,14 +468,20 @@ fn operation(items: Vec<Form>, span: Span) -> Result<WriteOp, DatalogError> {
             span,
             ":genesis must be the first top-level form of kala transact --create",
         )),
-        "create" => create_op(args),
+        "concurrency" => Err(DatalogError::syntax(
+            span,
+            "[:concurrency …] is not a transaction by itself; put it first in a vector of \
+             ops: [[:concurrency :weak] [:set …]]",
+        )),
+        "create" => create_op(args, restore),
+        "set" => set_op(args),
         "assert" => fact_op(Op::Assert, args),
         "retract" => fact_op(Op::Retract, args),
         "correct" => correct_op(args),
         _ => Err(DatalogError::syntax(
             ks,
             format!(
-                "unknown write op :{}; expected :create, :assert, :retract or :correct",
+                "unknown write op :{}; expected :create, :assert, :retract, :set or :correct",
                 show(&kind)
             ),
         )),
@@ -500,19 +567,100 @@ fn schema_op(kind: &str, mut args: Args) -> Result<WriteOp, DatalogError> {
     Ok(op)
 }
 /// `[:create TYPE]` or `[:create TYPE handle]`.
-fn create_op(mut args: Args) -> Result<WriteOp, DatalogError> {
+fn create_op(mut args: Args, restore: bool) -> Result<WriteOp, DatalogError> {
     let (node_type, _) = named(args.required()?)?;
-    let handle = args.it.next().map(named).transpose()?.map(|(name, _)| name);
+    let handle_form = args.it.next();
+    // Restore preserves the historic plain-create spelling of a handle named
+    // `if-missing`. In ordinary input that keyword alone is the missing option
+    // argument; a quoted handle remains an unambiguous literal.
+    if !restore
+        && matches!(&handle_form, Some(Form::Atom { tok: Tok::Keyword(k), .. }) if k == "if-missing")
+    {
+        return Err(DatalogError::syntax(
+            args.span,
+            ":if-missing requires a handle",
+        ));
+    }
+    let handle = handle_form.map(named).transpose()?.map(|(name, _)| name);
+    let if_missing = if let Some(f) = args.it.next() {
+        let (option, span) = keyword(f)?;
+        if option != "if-missing" {
+            return Err(DatalogError::syntax(
+                span,
+                ":create takes only a type and handle (optionally :if-missing)",
+            ));
+        }
+        true
+    } else {
+        false
+    };
     if let Some(f) = args.it.next() {
         return Err(DatalogError::syntax(
             f.span(),
-            ":create takes only a type and handle",
+            ":create takes only a type and handle (optionally :if-missing)",
         ));
     }
     Ok(WriteOp::Create {
         node_type,
         handle,
+        if_missing,
         span: args.span,
+    })
+}
+/// `[:set subject attribute value-or-members option…]`.
+///
+/// The value position takes every single value `:assert` takes, or a member
+/// list:
+/// - a literal, a handle, or a vector that is a tagged scalar (`[:id "…"]`,
+///   `[:f64 :inf]`, exactly what [`tagged_scalar`] recognises) is ONE value:
+///   the one-member set;
+/// - any other vector is the complete set of members (`[]` = none), each
+///   parsed like an `:assert` value, so tagged scalars and edge triples work
+///   as members.
+///
+/// So an edge triple as the single value must be wrapped
+/// (`[[:edwin :ally_of :mara]]`): a bare `[:edwin :ally_of :mara]` is three
+/// members.
+fn set_op(mut args: Args) -> Result<WriteOp, DatalogError> {
+    let span = args.span;
+    let subject = value(args.required()?)?;
+    if let WriteValue::Scalar(i) = &subject
+        && !matches!(i, Item::Keyword(..) | Item::Id(..))
+    {
+        return Err(DatalogError::syntax(
+            i.span(),
+            "subject must be a handle, ID or edge triple",
+        ));
+    }
+    let (name, aspan) = named(args.required()?)?;
+    let members = args.required()?;
+    let values = match members {
+        Form::Seq {
+            items,
+            bracket: Bracket::Square,
+            ..
+        } if tagged_scalar(&items).is_none() => {
+            if items.len() > MAX_WRITE_OPS {
+                return Err(DatalogError::limit(
+                    Some(span),
+                    format!(":set exceeds {MAX_WRITE_OPS} values"),
+                ));
+            }
+            items
+                .into_iter()
+                .map(value)
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        scalar => vec![value(scalar)?],
+    };
+    let options = options(args.it, false, span)?;
+    Ok(WriteOp::Set {
+        subject,
+        attr: Attr { name, span: aspan },
+        values,
+        at: options.at,
+        precision: options.precision.unwrap_or(Precision::Exact),
+        span,
     })
 }
 /// `[:assert subject attribute value option…]`, or the same with `:retract`.

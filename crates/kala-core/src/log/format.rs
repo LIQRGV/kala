@@ -28,6 +28,9 @@ pub(super) const EDIT_MIGRATION: u8 = 3;
 /// Length of a transaction's begin record.
 pub(super) const BEGIN_LEN: usize = 25;
 
+/// Length of a `Commit` frame: length prefix, kind, entry ID, tx, checksum.
+pub(super) const COMMIT_FRAME_LEN: usize = 4 + 1 + 8 + 8 + 4;
+
 /// Tag byte of a begin record.
 pub(super) const BEGIN_TAG: u8 = 0x07;
 

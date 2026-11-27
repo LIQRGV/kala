@@ -395,10 +395,13 @@ pub(crate) struct EncodedTxn {
 /// frames, then its `Commit` for `tx`), numbering entries from `first_id`.
 /// Encoding touches no file, so an in-memory world numbers and checksums
 /// its entries exactly as a file-backed one. Fails only for an entry too
-/// large for its length fields.
+/// large for its length fields. `previous_checksum` is the link the
+/// transaction chains from: the `Commit` checksum of the transaction before
+/// it, or [`header_checksum`](super::header_checksum) for genesis.
 pub(crate) fn encode_txn<'a>(
     first_id: EntryId,
     tx: TxId,
+    previous_checksum: u32,
     entries: impl IntoIterator<Item = NewEntry<'a>>,
 ) -> Result<EncodedTxn, Error> {
     let mut bytes = vec![0; BEGIN_LEN]; // the begin record, patched once the body is known
@@ -412,7 +415,7 @@ pub(crate) fn encode_txn<'a>(
         entry.push_frame(&mut bytes, id)?;
         id += 1;
     }
-    let checksum = push_commit(&mut bytes, id, tx)?;
+    let checksum = push_commit(&mut bytes, id, tx, previous_checksum)?;
     listed.push(LogEntry {
         id: EntryId(id),
         body: EntryBody::Commit { tx, checksum },
@@ -427,15 +430,16 @@ pub(crate) fn encode_txn<'a>(
 
 /// Appends the `Commit` frame, as entry `id` of transaction `tx`, to `buf`
 /// (a begin record's bytes, then every other frame of the body) and returns
-/// its checksum: CRC32 over the whole body up to the checksum field.
-fn push_commit(buf: &mut Vec<u8>, id: u64, tx: TxId) -> Result<u32, Error> {
+/// its checksum: the chained checksum of `previous_checksum` and the whole
+/// body up to the checksum field.
+fn push_commit(buf: &mut Vec<u8>, id: u64, tx: TxId, previous_checksum: u32) -> Result<u32, Error> {
     push_frame(buf, KIND_COMMIT, id, |b| {
         b.extend_from_slice(&tx.0.to_le_bytes());
         b.extend_from_slice(&[0; 4]); // checksum, patched below
         Ok(())
     })?;
     let end = buf.len();
-    let checksum = crc32fast::hash(&buf[BEGIN_LEN..end - 4]);
+    let checksum = super::chained_checksum(previous_checksum, &buf[BEGIN_LEN..end - 4]);
     buf[end - 4..].copy_from_slice(&checksum.to_le_bytes());
     Ok(checksum)
 }

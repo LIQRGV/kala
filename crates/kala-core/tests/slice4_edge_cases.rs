@@ -331,10 +331,12 @@ fn damaged_world() -> (tempfile::TempDir, PathBuf, World) {
 
 fn faulted_append_after_acknowledgement(fault: LogFault) {
     let (_d, path, mut w) = damaged_world();
-    let report = w.recovery().clone();
     let greg = w.entity_by_handle("greg").unwrap();
+    // The open reported the damaged tail and left it in the file; the
+    // acknowledgement licenses the cut, made here before the faulted write.
+    common::acknowledge_and_cut(&mut w, &path, &bytes(&path));
+    let report = w.recovery().clone();
     let file_after_open = bytes(&path);
-    w.acknowledge_recovery();
     w.inject_log_fault(fault);
     // acknowledged, so the failure is the fault's, not the gate's
     let err = w
@@ -401,13 +403,20 @@ fn rewrite_genesis_ids(path: &Path, f: impl Fn(usize, usize, u64) -> u64) {
             let id = f(j, n, old);
             if j + 1 == n {
                 assert_eq!(*kind, 5);
-                body.extend(common::commit_frame(&body.clone(), id, s.tx));
+                body.extend(common::commit_frame(
+                    common::link(&out),
+                    &body.clone(),
+                    id,
+                    s.tx,
+                ));
             } else {
                 body.extend(common::frame(*kind, id, &src[start + 13..*end]));
             }
         }
         out.extend(common::txn(s.tx, &body));
     }
+    // Later transactions chain from the rewritten genesis (format 6).
+    common::rechain(&mut out, 1);
     std::fs::write(path, &out).unwrap();
 }
 

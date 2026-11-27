@@ -122,7 +122,7 @@ impl Base {
             body.extend(frame(*k, id, p));
             id += 1;
         }
-        let c = commit_frame(&body, id, self.next_tx);
+        let c = commit_frame(common::link(&self.bytes), &body, id, self.next_tx);
         body.extend(c);
         let mut f = self.bytes.clone();
         f.extend(txn(self.next_tx, &body));

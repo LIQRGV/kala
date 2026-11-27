@@ -319,6 +319,10 @@ pub struct Pred {
 pub struct WriteTxn {
     /// True only for a top-level restore-mode `[:genesis ...]`.
     pub genesis: bool,
+    /// The mode a leading `[:concurrency :weak]` / `[:concurrency
+    /// :optimistic]` op names for this transaction; `None` if the form
+    /// doesn't say (the caller's default applies). Never written by a dump.
+    pub concurrency: Option<kala_core::Concurrency>,
     pub at: Option<kala_core::Tick>,
     pub ops: Vec<WriteOp>,
     pub span: Span,
@@ -380,6 +384,7 @@ pub enum WriteOp {
     Create {
         node_type: String,
         handle: Option<String>,
+        if_missing: bool,
         span: Span,
     },
     Fact {
@@ -387,6 +392,15 @@ pub enum WriteOp {
         subject: WriteValue,
         attr: Attr,
         value: WriteValue,
+        at: Option<kala_core::Tick>,
+        precision: kala_core::Precision,
+        span: Span,
+    },
+    /// Replace the whole value set at a tick, lowered to retract/assert differences.
+    Set {
+        subject: WriteValue,
+        attr: Attr,
+        values: Vec<WriteValue>,
         at: Option<kala_core::Tick>,
         precision: kala_core::Precision,
         span: Span,

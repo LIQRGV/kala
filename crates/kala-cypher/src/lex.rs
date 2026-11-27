@@ -16,9 +16,9 @@ pub(crate) struct Token {
     pub end: usize,
 }
 /// Symbols in match order: every two-character symbol comes before its prefix.
-const SYMBOLS: [&str; 22] = [
-    "<>", "<=", ">=", "->", "<-", "(", ")", "[", "]", "{", "}", ":", ",", ".", ";", "=", "<", ">",
-    "-", "+", "*", "|",
+const SYMBOLS: [&str; 23] = [
+    "..", "<>", "<=", ">=", "->", "<-", "(", ")", "[", "]", "{", "}", ":", ",", ".", ";", "=", "<",
+    ">", "-", "+", "*", "|",
 ];
 /// Most tokens one query may hold.
 const MAX_TOKENS: usize = 8192;
@@ -291,4 +291,59 @@ impl Lexer<'_> {
         self.i += symbol.len();
         Ok(Kind::Symbol(symbol))
     }
+}
+
+/// Split a script on semicolons outside strings, identifiers and comments. Each
+/// item is limited separately, so earlier statements can commit before a later
+/// syntax error is reported.
+pub fn statements(mut script: &str) -> impl Iterator<Item = Result<&str, CypherError>> {
+    std::iter::from_fn(move || {
+        loop {
+            if script.is_empty() {
+                return None;
+            }
+            let end = script.floor_char_boundary(script.len().min(MAX_QUERY_BYTES));
+            let text = &script[..end];
+            let mut lexer = Lexer { text, i: 0 };
+            let mut nonempty = false;
+            let mut terminated = false;
+            while let Some(c) = lexer.peek() {
+                let scanned = if lexer.rest().starts_with("//") {
+                    lexer.skip_line_comment();
+                    Ok(())
+                } else if lexer.rest().starts_with("/*") {
+                    lexer.skip_block_comment()
+                } else if c == ';' {
+                    lexer.i += 1;
+                    terminated = true;
+                    break;
+                } else if matches!(c, '\'' | '"' | '`') {
+                    nonempty = true;
+                    lexer.quoted(c).map(|_| ())
+                } else {
+                    nonempty |= !c.is_whitespace();
+                    lexer.i += c.len_utf8();
+                    Ok(())
+                };
+                if let Err(e) = scanned {
+                    script = "";
+                    return Some(Err(e));
+                }
+            }
+            if lexer.i == end && script.len() > end && !terminated {
+                script = "";
+                return Some(Err(CypherError::new(
+                    text,
+                    0,
+                    ErrorKind::Limit,
+                    "statement byte limit exceeded",
+                )));
+            }
+            let (part, remaining) = script.split_at(lexer.i);
+            script = remaining;
+            if nonempty {
+                return Some(Ok(part));
+            }
+        }
+    })
 }

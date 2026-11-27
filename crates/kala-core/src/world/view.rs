@@ -1162,6 +1162,23 @@ impl View<'_> {
         self.overlaps_of_touching(entity, attr, side, None)
     }
 
+    /// Interval snapshot for bounded commit warning comparison.
+    pub(super) fn warning_intervals(
+        &self,
+        entity: EntityId,
+        attr: AttrId,
+        side: Side,
+    ) -> Vec<(Value, Vec<Interval>)> {
+        if !self.is_checked(attr, side) {
+            return Vec::new();
+        }
+        let changes = match side {
+            Side::Forward => self.changes(entity, attr),
+            Side::Reverse => self.reverse_changes(entity, attr),
+        };
+        value_intervals(&changes)
+    }
+
     /// [`View::overlaps_of`] restricted, when `touched` is given, to the
     /// overlaps in which one value is among `touched` (value encodings,
     /// ascending and deduplicated), in the same order.

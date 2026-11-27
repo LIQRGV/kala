@@ -19,6 +19,8 @@ pub enum Datum {
     Null,
     /// Sorted property values; lists preserve their supplied order.
     List(Vec<Datum>),
+    /// A traversal, in node and edge order.
+    Path(PathValue),
     /// A stored value.
     Value(Value),
     /// A change point's op.
@@ -36,6 +38,7 @@ impl Datum {
             Datum::Value(v) => Some(v),
             Datum::Null
             | Datum::List(_)
+            | Datum::Path(_)
             | Datum::Op(_)
             | Datum::Precision(_)
             | Datum::Intervals(_) => None,
@@ -45,6 +48,7 @@ impl Datum {
     /// The kind's rank in the cross-kind order.
     fn rank(&self) -> u8 {
         match self {
+            Datum::Path(_) => 6,
             Datum::Null => 5,
             Datum::List(_) => 4,
             Datum::Value(_) => 0,
@@ -66,6 +70,7 @@ pub(crate) fn op_rank(op: Op) -> u8 {
 impl Ord for Datum {
     fn cmp(&self, other: &Datum) -> Ordering {
         match (self, other) {
+            (Datum::Path(a), Datum::Path(b)) => a.cmp(b),
             (Datum::List(a), Datum::List(b)) => a.cmp(b),
             (Datum::Value(a), Datum::Value(b)) => a.cmp(b),
             (Datum::Precision(a), Datum::Precision(b)) => (*a as u8).cmp(&(*b as u8)),
@@ -88,6 +93,7 @@ impl Hash for Datum {
         self.rank().hash(state);
         match self {
             Datum::Null => {}
+            Datum::Path(v) => v.hash(state),
             Datum::List(v) => v.hash(state),
             Datum::Value(v) => v.hash(state),
             Datum::Op(op) => op_rank(*op).hash(state),
@@ -124,5 +130,51 @@ impl PartialEq<Value> for Datum {
 impl PartialEq<Datum> for Value {
     fn eq(&self, other: &Datum) -> bool {
         other == self
+    }
+}
+
+/// A path's traversal history. Equality and ordering compare the node sequence,
+/// then the edge sequence, then stored-direction flags, lexicographically.
+/// Fields are private so every constructed path has exactly one more node than
+/// relationships and one direction flag per relationship.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PathValue {
+    nodes: Vec<kala_core::EntityId>,
+    edges: Vec<kala_core::EdgeId>,
+    forward: Vec<bool>,
+}
+impl PathValue {
+    /// Construct a consistent history; `forward` is relative to stored endpoints.
+    pub fn new(
+        nodes: Vec<kala_core::EntityId>,
+        edges: Vec<kala_core::EdgeId>,
+        forward: Vec<bool>,
+    ) -> Result<Self, crate::QueryError> {
+        if nodes.len() != edges.len().saturating_add(1) || forward.len() != edges.len() {
+            return Err(crate::QueryError::TypeMismatch(
+                "invalid path history".into(),
+            ));
+        }
+        Ok(Self {
+            nodes,
+            edges,
+            forward,
+        })
+    }
+    /// Nodes in traversal order, including the start (nodes may repeat).
+    pub fn nodes(&self) -> &[kala_core::EntityId] {
+        &self.nodes
+    }
+    /// Relationship identities in traversal order.
+    pub fn edges(&self) -> &[kala_core::EdgeId] {
+        &self.edges
+    }
+    /// Whether each hop follows the edge's stored source-to-target direction.
+    pub fn forward(&self) -> &[bool] {
+        &self.forward
+    }
+    /// Heap bytes used by the three history buffers.
+    pub fn heap_bytes(&self) -> usize {
+        self.nodes.len().saturating_mul(8) + self.edges.len().saturating_mul(9)
     }
 }

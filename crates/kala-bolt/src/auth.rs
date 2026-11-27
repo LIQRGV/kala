@@ -4,7 +4,9 @@
 use crate::registry::{Registry, SystemDb};
 use kala_system::auth::AccountVerifier;
 pub(crate) use kala_system::auth::Plugin;
-pub use kala_system::auth::{AuthFailure, AuthToken, Credentials, Identity, VerificationStats};
+pub use kala_system::auth::{
+    AuthFailure, AuthToken, Credentials, Identity, Peer, VerificationStats,
+};
 use kala_system::system::{self, SystemError};
 use std::{net::IpAddr, path::Path};
 
@@ -12,6 +14,24 @@ use std::{net::IpAddr, path::Path};
 pub trait Authenticator: Send + Sync {
     /// Authenticate a token without retaining its credentials.
     fn authenticate(&self, token: &AuthToken, peer: IpAddr) -> Result<Identity, AuthFailure>;
+    /// Authenticate a transport origin. Existing IP-only policies fail closed
+    /// on local sockets unless they explicitly implement this method.
+    fn authenticate_peer(&self, token: &AuthToken, peer: Peer) -> Result<Identity, AuthFailure> {
+        match peer {
+            Peer::Ip(ip) => self.authenticate(token, ip),
+            Peer::Local => Err(AuthFailure),
+        }
+    }
+    /// The current form of an identity this policy issued earlier: its
+    /// grants as they are stored now, or `None` if its account is gone.
+    /// The server asks before a connection begins a transaction or writes,
+    /// when the accounts changed since the connection's grants were read,
+    /// so a revoked privilege doesn't survive on a pooled connection. A
+    /// policy without stored accounts keeps the identity as it is (the
+    /// default).
+    fn refresh(&self, identity: &Identity) -> Result<Option<Identity>, AuthFailure> {
+        Ok(Some(identity.clone()))
+    }
 }
 /// Accept every well-formed token. Server listeners are restricted to loopback.
 /// A development mode, not an administrator: the identity may read every
@@ -20,10 +40,14 @@ pub trait Authenticator: Send + Sync {
 pub struct NoAuth;
 impl Authenticator for NoAuth {
     fn authenticate(&self, _token: &AuthToken, _peer: IpAddr) -> Result<Identity, AuthFailure> {
+        self.authenticate_peer(_token, Peer::Ip(_peer))
+    }
+    fn authenticate_peer(&self, _token: &AuthToken, _peer: Peer) -> Result<Identity, AuthFailure> {
         Ok(Identity {
             principal: String::new(),
             host: String::new(),
             grants: vec!["read:*".into()],
+            generation: 0,
         })
     }
 }
@@ -48,9 +72,16 @@ impl Accounts {
 }
 impl Authenticator for Accounts {
     fn authenticate(&self, token: &AuthToken, peer: IpAddr) -> Result<Identity, AuthFailure> {
-        self.verifier.authenticate(token, peer, || {
+        self.authenticate_peer(token, Peer::Ip(peer))
+    }
+    fn authenticate_peer(&self, token: &AuthToken, peer: Peer) -> Result<Identity, AuthFailure> {
+        self.verifier.authenticate_peer(token, peer, || {
             let (_, world) = self.registry.get(Some("system")).map_err(|_| AuthFailure)?;
             Ok(world)
         })
+    }
+    fn refresh(&self, identity: &Identity) -> Result<Option<Identity>, AuthFailure> {
+        let (_, world) = self.registry.get(Some("system")).map_err(|_| AuthFailure)?;
+        kala_system::auth::current_identity(&world, identity).map_err(|_| AuthFailure)
     }
 }

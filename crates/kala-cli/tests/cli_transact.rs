@@ -50,6 +50,22 @@ fn locations(f: &Fx, tick: i64) -> Vec<String> {
 }
 
 #[test]
+fn set_moves_greg_without_an_overlap_warning() {
+    let f = varrow();
+    // Verify the fixture through the real binary before pinning the replacement.
+    assert_eq!(locations(&f, 224), ["varrow"]);
+    let output = ok(&f, "[:set :greg :located_in :ashford :at 225]");
+    assert!(output.contains("2 changed"), "{output}");
+    assert!(warning_lines(&output).is_empty(), "{output}");
+    assert_eq!(locations(&f, 224), ["varrow"]);
+    assert_eq!(locations(&f, 225), ["ashford"]);
+    let before = fs::read(&f.path).unwrap();
+    let output = ok(&f, "[:set :greg :located_in :ashford :at 225]");
+    assert!(output.contains("nothing committed: 0 changed"), "{output}");
+    assert_eq!(fs::read(&f.path).unwrap(), before);
+}
+
+#[test]
 fn greg_overlap_warning_appears_and_resolves() {
     let f = build(EMPTY);
     let first = ok(&f, "[:assert :greg :located_in :varrow :at 200]");
@@ -438,21 +454,149 @@ fn dry_run_refuses_damaged_tail_needing_acknowledgement_without_touching_it() {
     assert_eq!(damage::dir_snapshot(f.dir.path()), before);
 }
 
+/// `kala transact --busy-timeout <busy_ms>ms` (how long a write waits for
+/// the writer lock).
+fn transact_waiting(f: &Fx, text: &str, busy_ms: &str) -> Output {
+    let input = f.dir.path().join("writes.edn");
+    fs::write(&input, text).unwrap();
+    std::process::Command::new(env!("CARGO_BIN_EXE_kala"))
+        .arg("transact")
+        .arg(&f.path)
+        .arg(&input)
+        .arg(format!("--busy-timeout={busy_ms}ms"))
+        .output()
+        .unwrap()
+}
+
+/// Slice 15b: the lock is held per transaction, so "held" is a commit in
+/// progress elsewhere (here: the lock itself, held by this process), and a
+/// write waits for it up to the busy timeout before exit 3.
 #[test]
 fn held_write_lock_is_exit_three() {
+    let f = build(EMPTY);
+    let before = fs::read(&f.path).unwrap();
+    let held = fs::File::open(&f.path).unwrap();
+    held.try_lock().expect("the lock is free");
+    for busy_ms in ["0", "150"] {
+        let started = std::time::Instant::now();
+        let o = transact_waiting(&f, "[:assert :greg :age 18]", busy_ms);
+        assert_eq!(code(&o), 3, "{}", stderr(&o));
+        assert!(stderr(&o).to_lowercase().contains("lock"), "{}", stderr(&o));
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(busy_ms.parse().unwrap()),
+            "gave up before the busy timeout"
+        );
+        assert_eq!(fs::read(&f.path).unwrap(), before);
+    }
+    drop(held);
+    // Free again: the same write commits.
+    let o = transact_waiting(&f, "[:assert :greg :age 18]", "0");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+}
+
+/// An idle writable world elsewhere holds no lock (slice 15b).
+#[test]
+fn an_idle_writer_elsewhere_does_not_block_transact() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("w.kala");
-    // Retain the fixture writer: no unlock/reopen window while other test
-    // threads spawn children, briefly inheriting a file descriptor at fork.
-    let _held = kala_fixture::load_fixture_to(EMPTY, &path).unwrap();
+    let mut idle = kala_fixture::load_fixture_to(EMPTY, &path).unwrap();
     let f = Fx {
         dir,
         path,
         mem: kala_fixture::load_fixture(EMPTY).unwrap(),
     };
-    let o = transact(&f, "[:assert :greg :age 18]", &[]);
-    assert_eq!(code(&o), 3, "{}", stderr(&o));
-    assert!(stderr(&o).to_lowercase().contains("lock"), "{}", stderr(&o));
+    let o = transact_waiting(&f, "[:assert :greg :age 18 :at 5]", "0");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(idle.catch_up().unwrap(), 1);
+    assert_eq!(
+        idle.as_of(f.id("greg"), "age", Tick(5)).unwrap(),
+        [Value::I64(18)]
+    );
+}
+
+/// Two `kala transact` processes writing one world at the same time, form
+/// by form: nothing is lost, nothing interleaves, tx numbers are
+/// consecutive and doctor is clean (slice 15b).
+#[test]
+fn two_processes_transacting_on_one_world_lose_nothing() {
+    const FORMS: usize = 20;
+    const TAGS: &str = r#"
+schema:
+  node_types: [CHARACTER]
+  attributes:
+    - { name: tag, type: string, cardinality: many }
+    - { name: alias, type: string, cardinality: many }
+entities:
+  CHARACTER: [greg, edwin]
+"#;
+    let f = build(TAGS);
+    let base_tx = World::open_read_only(&f.path).unwrap().latest_tx().0;
+    let writers: Vec<_> = ["greg", "edwin"]
+        .into_iter()
+        .map(|who| {
+            let path = f.path.clone();
+            let dir = f.dir.path().to_owned();
+            std::thread::spawn(move || {
+                // Each process is one form: the two loops interleave their
+                // opens and commits as two terminals would.
+                for i in 0..FORMS {
+                    let input = dir.join(format!("{who}-{i}.edn"));
+                    fs::write(&input, format!("[:assert :{who} :tag \"t{i}\" :at {i}]")).unwrap();
+                    let o = std::process::Command::new(env!("CARGO_BIN_EXE_kala"))
+                        .arg("transact")
+                        .arg(&path)
+                        .arg(&input)
+                        .arg("--json")
+                        .output()
+                        .unwrap();
+                    assert_eq!(code(&o), 0, "{who} form {i}: {}", stderr(&o));
+                    let report: Json = serde_json::from_slice(&o.stdout).unwrap();
+                    assert_eq!(report["changed"], 1, "{who} form {i}");
+                }
+            })
+        })
+        .collect();
+    // And a third writer with all its forms in one process: one world
+    // handle kept open across the others' commits.
+    let many: String = (0..FORMS)
+        .map(|i| format!("[:assert :greg :alias \"a{i}\" :at {i}]\n"))
+        .collect();
+    let o = transact(&f, &many, &["--json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    for w in writers {
+        w.join().unwrap();
+    }
+
+    let w = World::open_read_only(&f.path).unwrap();
+    assert_eq!(w.latest_tx().0, base_tx + 3 * FORMS as u64, "a lost commit");
+    let txs: Vec<u64> = kala_core::log::read_log(&f.path)
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e.body {
+            kala_core::log::EntryBody::Commit { tx, .. } => Some(tx.0),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(txs, (0..=base_tx + 3 * FORMS as u64).collect::<Vec<_>>());
+    for (who, attr) in [("greg", "tag"), ("edwin", "tag"), ("greg", "alias")] {
+        assert_eq!(
+            w.as_of(f.id(who), attr, Tick(i64::MAX)).unwrap().len(),
+            FORMS,
+            "{who}.{attr}"
+        );
+    }
+    assert!(
+        kala_core::doctor::doctor_log(&f.path, &Default::default())
+            .unwrap()
+            .is_clean()
+    );
+    assert_eq!(
+        dir_names(f.dir.path())
+            .iter()
+            .filter(|n| n.contains(".torn-"))
+            .count(),
+        0
+    );
 }
 
 #[test]

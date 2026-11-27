@@ -31,6 +31,19 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo doc --workspace --no-deps --locked
 
+  macos:
+    name: macOS ARM transport check
+    # ring compiles target C and assembly and needs the Apple SDK headers.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p kala-bolt --tests --locked --target aarch64-apple-darwin
+      - run: cargo check -p kala-cli --locked --target aarch64-apple-darwin
+
   test:
     name: test
     runs-on: ubuntu-latest

@@ -28,11 +28,7 @@ fn keywords_comments_backticks_escapes_and_literal_values() {
 fn unsupported_constructs_are_named_and_errors_are_located() {
     let w = load_fixture(VARROW).unwrap();
     for (text, construct) in [
-        ("OPTIONAL MATCH (n) RETURN n", "OPTIONAL"),
-        ("MATCH (n) WITH n RETURN n", "WITH"),
         ("CREATE (n)", "CREATE"),
-        ("MATCH (n)-[*1..3]->(m) RETURN m", "variable"),
-        ("MATCH (n) RETURN count(*)", "count"),
         ("MATCH (n)-[:ally_of|present]->(m) RETURN m", "type"),
         ("MATCH (n)-[]->(m) RETURN m", "type"),
         ("MATCH (n) RETURN n.name STARTS WITH 'a'", "STARTS"),

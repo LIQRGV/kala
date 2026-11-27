@@ -4155,3 +4155,54 @@ mod txn_corrections {
         assert_eq!(again.seq(), g.seq() + 1);
     }
 }
+
+// Slice 15a: a handle catalogue model includes find-or-create, dropped creates,
+// same-transaction reuse and wrong-type errors without consuming sequence IDs.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+    #[test]
+    fn find_or_create_matches_handle_catalogue_model(
+        actions in prop::collection::vec((0usize..2, 0u8..8, any::<bool>()), 1..80),
+    ) {
+        let mut w = World::in_memory(Schema::new().node_type("CHARACTER").node_type("PLACE")).unwrap();
+        let mut model: std::collections::BTreeMap<String, (usize, EntityId)> = std::collections::BTreeMap::new();
+        let mut sequences = [0u64; 2];
+        for (ty, handle, commit) in actions {
+            let name = ["CHARACTER", "PLACE"][ty];
+            let handle = format!("h{handle}");
+            let before = w.latest_tx();
+            let existing = model.get(&handle).copied();
+            {
+            let mut tx = w.begin();
+            let result = tx.find_or_create_entity(name, &handle);
+            match existing {
+                Some((old_type, id)) if old_type == ty => {
+                    prop_assert_eq!(result.unwrap(), (id, false));
+                    prop_assert_eq!(tx.find_or_create_entity(name, &handle).unwrap(), (id, false));
+                    if commit { prop_assert_eq!(tx.commit().unwrap().tx, before); }
+                }
+                Some(_) => {
+                    prop_assert!(result.is_err());
+                    prop_assert!(matches!(tx.commit(), Err(Error::TransactionAborted)));
+                }
+                None => {
+                    let (id, created) = result.unwrap();
+                    prop_assert!(created);
+                    prop_assert_eq!(id.seq(), sequences[ty] + 1);
+                    prop_assert_eq!(tx.find_or_create_entity(name, &handle).unwrap(), (id, false));
+                    if commit {
+                        prop_assert_eq!(tx.commit().unwrap().tx.0, before.0 + 1);
+                        sequences[ty] += 1;
+                        model.insert(handle.clone(), (ty, id));
+                    }
+                }
+            }
+            }
+            for h in 0..8 {
+                let handle = format!("h{h}");
+                prop_assert_eq!(w.entity_by_handle(&handle), model.get(&handle).map(|(_, id)| *id));
+            }
+            prop_assert!(doctor(&w, &DoctorOptions::default()).is_clean());
+        }
+    }
+}

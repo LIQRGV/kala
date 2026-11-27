@@ -1,4 +1,5 @@
-//! Byte-level helpers for the log framing (docs/slice-2-decisions.md, Item 1; unchanged in v4).
+//! Byte-level helpers for the log framing (docs/slice-2-decisions.md, Item 1; format 6 chains
+//! the Commit checksums: see `link`, `chained`, `commit_frame`).
 //! Built only from the documented layout; no private code is called. Headers must use `LOG_FORMAT_VERSION`.
 //!
 //! ```text
@@ -61,20 +62,68 @@ pub fn frame(kind: u8, id: u64, body: &[u8]) -> Vec<u8> {
     f
 }
 
-/// A Commit frame with a correct checksum over `prior` (the txn's frames
-/// before the Commit; the begin record is not covered).
-pub fn commit_frame(prior: &[u8], entry_id: u64, tx: u64) -> Vec<u8> {
+/// The link a transaction appended to `prefix` chains from (format 6):
+/// `prefix` is a well-formed file's bytes up to where the transaction
+/// starts, so the link is the checksum field of the Commit that ends it
+/// (its last 4 bytes), or CRC32 of the header if `prefix` is only the
+/// header.
+pub fn link(prefix: &[u8]) -> u32 {
+    assert!(prefix.len() >= HEADER_LEN, "no header");
+    if prefix.len() == HEADER_LEN {
+        return crc(prefix);
+    }
+    u32::from_le_bytes(prefix[prefix.len() - 4..].try_into().unwrap())
+}
+
+/// The chained checksum of a transaction after `previous`: CRC32 over
+/// `previous` (LE) and `covered`, the body up to the Commit's checksum field.
+pub fn chained(previous: u32, covered: &[u8]) -> u32 {
+    let mut h = crc32fast::Hasher::new();
+    h.update(&previous.to_le_bytes());
+    h.update(covered);
+    h.finalize()
+}
+
+/// A Commit frame with a correct chained checksum: over `previous` (the
+/// link the transaction chains from, see [`link`]), then `prior` (the txn's
+/// frames before the Commit; the begin record is not covered), then the
+/// Commit frame up to its checksum field.
+pub fn commit_frame(previous: u32, prior: &[u8], entry_id: u64, tx: u64) -> Vec<u8> {
     let mut f = Vec::new();
     f.extend_from_slice(&21u32.to_le_bytes());
     f.push(5);
     f.extend_from_slice(&entry_id.to_le_bytes());
     f.extend_from_slice(&tx.to_le_bytes());
-    let mut h = crc32fast::Hasher::new();
-    h.update(prior);
-    h.update(&f);
-    f.extend_from_slice(&h.finalize().to_le_bytes());
+    let covered = [prior, &f].concat();
+    f.extend_from_slice(&chained(previous, &covered).to_le_bytes());
     assert_eq!(f.len(), COMMIT_FRAME);
     f
+}
+
+/// The tx of the first transaction of a well-formed file whose Commit
+/// checksum isn't the chained checksum the layout documents; `None` if the
+/// whole chain holds.
+pub fn first_broken_link(bytes: &[u8]) -> Option<u64> {
+    let mut previous = crc(&bytes[..HEADER_LEN]);
+    for s in spans(bytes) {
+        let stored = u32::from_le_bytes(bytes[s.end - 4..s.end].try_into().unwrap());
+        if chained(previous, &bytes[s.body_start..s.end - 4]) != stored {
+            return Some(s.tx);
+        }
+        previous = stored;
+    }
+    None
+}
+
+/// Recomputes the Commit checksum (and begin record) of every transaction
+/// from index `from` on, so the chain holds again after an edit that is
+/// meant to model a log a writer could have produced byte for byte.
+pub fn rechain(bytes: &mut [u8], from: usize) {
+    for s in spans(bytes).into_iter().skip(from) {
+        let c = chained(link(&bytes[..s.start]), &bytes[s.body_start..s.end - 4]);
+        bytes[s.end - 4..s.end].copy_from_slice(&c.to_le_bytes());
+        reseal(bytes, s);
+    }
 }
 
 /// Location of one transaction in a well-formed v2 file.
@@ -140,4 +189,33 @@ pub fn replace_last_body(bytes: &mut Vec<u8>, body: &[u8]) {
     let s = *spans(bytes).last().unwrap();
     bytes.truncate(s.start);
     bytes.extend_from_slice(&txn(s.tx, body));
+}
+
+/// What an author does after `World::open` reported a damaged last
+/// transaction on `w` (the log at `path`, whose bytes are `damaged`):
+/// acknowledges it and has it cut. First proves what the open must
+/// guarantee: the file is exactly as it was, nothing is quarantined, and
+/// nothing is cut for a caller who hasn't acknowledged.
+pub fn acknowledge_and_cut(w: &mut kala_core::World, path: &std::path::Path, damaged: &[u8]) {
+    let unchanged = || {
+        assert!(
+            std::fs::read(path).unwrap() == damaged,
+            "a damaged tail is left in the file until it is acknowledged"
+        );
+    };
+    unchanged();
+    assert_eq!(
+        w.recovery().quarantine,
+        None,
+        "nothing is quarantined before the cut"
+    );
+    assert_eq!(
+        w.cut_acknowledged_tail().err(),
+        Some(kala_core::Error::RecoveryUnacknowledged)
+    );
+    unchanged();
+    w.acknowledge_recovery();
+    let report = w.cut_acknowledged_tail().unwrap();
+    assert_eq!(report.cause, Some(kala_core::CutCause::Damaged));
+    assert!(report.quarantine.is_some(), "cut bytes are quarantined");
 }

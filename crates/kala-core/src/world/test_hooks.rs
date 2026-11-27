@@ -6,12 +6,30 @@ use super::*;
 use crate::doctor::{IndexName, Tamper};
 
 impl World {
+    /// What a world-scope commit (a rename, cardinality change or migration)
+    /// keeps in ONE of its two warning snapshots of this world, as
+    /// `(sides, values)`. A side with fewer than two values can form no
+    /// overlap pair and must not be kept. Not part of the supported API.
+    #[doc(hidden)]
+    pub fn world_warning_snapshot_size(&self) -> (usize, usize) {
+        let snapshot = txn::WarningScope::World.intervals(self);
+        (snapshot.len(), snapshot.values().map(Vec::len).sum())
+    }
+
     /// Makes the next log append fail as `fault` says, to test failure
     /// handling. An in-memory world has no log and ignores it. Not part of
     /// the supported API.
     #[doc(hidden)]
     pub fn inject_log_fault(&mut self, fault: log::LogFault) {
         self.journal.inject_log_fault(fault);
+    }
+
+    /// How many bytes of the log file this handle has read since it was
+    /// opened (catch-ups and the checks a commit makes), for tests of what a
+    /// catch-up costs. Not part of the supported API.
+    #[doc(hidden)]
+    pub fn log_bytes_read(&self) -> u64 {
+        self.journal.bytes_read
     }
 
     /// Like [`World::at_canon`], but always reading the main indexes with
@@ -42,11 +60,13 @@ impl World {
         // The rebuild holds the same schema, IDs and entries; what is kept
         // from this World is what isn't derived from the log: the log file
         // and the write gate.
+        let reader = self.journal.reader.clone();
         let log = self.journal.detach_log();
         let gate = std::mem::take(&mut self.gate);
         *self = rebuilt;
-        if let Some(log) = log {
-            self.journal.attach_log(log);
+        match log {
+            Some(log) => self.journal.attach_log(log),
+            None => self.journal.set_reader(reader),
         }
         self.gate = gate;
     }

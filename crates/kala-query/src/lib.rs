@@ -12,7 +12,7 @@ pub mod datum;
 pub mod exec;
 pub mod ir;
 
-pub use datum::Datum;
+pub use datum::{Datum, PathValue};
 pub use exec::{
     Limits, MAX_PLAN_DEPTH, Params, QueryError, ResultSet, RunOptions, Usage, execute, run,
     run_with,
@@ -25,8 +25,14 @@ pub use ir::{
 mod prepared;
 pub use prepared::{ParamKind, Prepared};
 
+pub mod reads;
 pub mod rows;
-pub use rows::{Expr, Orientation, OutputSpec, RowAction};
+pub use rows::{
+    BagAggregate, BagFn, Expr, MAX_VAR_LENGTH, Orientation, OutputSpec, RowAction, RowFn,
+};
 
 mod params;
 pub use params::{ParameterInput, ParameterValue, QueryParams};
+
+mod sources;
+pub use sources::{DatabaseSelection, RowSource, SERVER_ROWS_PARAMETER, ServerRequest};

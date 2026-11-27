@@ -16,6 +16,9 @@ use kala_lang::{Cypher, Datalog, ErrorKind, FrontEnd, LangError};
 impl From<LangError> for Failure {
     fn from(e: LangError) -> Self {
         match e.kind {
+            ErrorKind::Procedure => {
+                Failure::new("Neo.ClientError.Procedure.ProcedureNotFound", e.message)
+            }
             ErrorKind::Syntax => Failure::new(SYNTAX, e.message),
             ErrorKind::Type => Failure::new(TYPE, e.message),
             ErrorKind::Refused => crate::query::protected(),

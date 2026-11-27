@@ -1,7 +1,11 @@
 //! The `kala` command line: a thin layer over the public kala-core API.
 //!
 //! Exit codes: 0 ok; 1 user error or findings; 2 usage error; 3 store error
-//! or a failed write to stdout/stderr (a closed pipe is not a failure).
+//! (a broken or unreadable world, a writer lock held through the busy
+//! timeout, a world file replaced under the command) or a failed write to
+//! stdout/stderr (a closed pipe is not a failure); 4 a conflict: another
+//! writer changed something a write form had read, nothing was written and
+//! running the form again is safe.
 //! Every human-readable line goes through [`escape`] before it is printed.
 
 mod cli;

@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod apply;
 pub mod ast;
 mod checks;
 mod compile;

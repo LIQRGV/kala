@@ -4,6 +4,7 @@ use std::fmt;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
     Syntax,
+    Procedure,
     Type,
     Limit,
 }
@@ -25,12 +26,17 @@ impl CypherError {
     ) -> Self {
         let offset = offset.min(text.len());
         let prefix = text.get(..offset).unwrap_or("");
+        let message = message.into();
+        let mut bounded: String = message.chars().take(512).collect();
+        if bounded.len() < message.len() {
+            bounded.push('…');
+        }
         Self {
             kind,
             offset,
             line: prefix.bytes().filter(|b| *b == b'\n').count() + 1,
             column: prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1,
-            message: message.into(),
+            message: bounded,
         }
     }
 }

@@ -28,6 +28,16 @@ impl Language {
     /// Parses and compiles `text` against `world`. Front-end messages escape
     /// the input they echo; `main` escapes the whole line again.
     pub(crate) fn prepare(&self, world: &World, text: &str) -> Result<Prepared, CliError> {
+        if self
+            .0
+            .prepare_server(text, &kala_lang::refuse_nothing)
+            .map_err(|e| CliError::User(format!("query: {e}")))?
+            .is_some()
+        {
+            return Err(CliError::User(
+                "query: server metadata is available only over Bolt".into(),
+            ));
+        }
         self.0
             .prepare(world, text, &kala_lang::refuse_nothing)
             .map_err(|e| CliError::User(format!("query: {e}")))

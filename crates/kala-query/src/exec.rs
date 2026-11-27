@@ -56,7 +56,7 @@ use crate::ParameterInput;
 use crate::datum::Datum;
 use crate::ir::{CanonSource, Plan, TickSource, Var};
 
-use budget::{Budget, check_cancel};
+use budget::{Budget, check_cancel, check_deadline};
 use compile::{CompileEnv, compile, plan_depth};
 use eval::Exec;
 use program::{Program, Slots};
@@ -154,6 +154,19 @@ pub struct RunOptions<'a> {
     /// Set to `true` (from any thread) to stop the run with
     /// [`QueryError::Cancelled`]; `None` runs to the end.
     pub cancel: Option<&'a AtomicBool>,
+    /// Stop the run with [`QueryError::Cancelled`] once this moment has
+    /// passed; `None` sets no deadline. Checked where the flag is checked
+    /// (in kala-core's scans and in the executor), with the clock read only
+    /// every few dozen checks, so a deadline needs no watchdog thread and
+    /// costs a query next to nothing.
+    pub deadline: Option<std::time::Instant>,
+    /// Refuse the run with [`QueryError::RowLimit`] (carrying this number)
+    /// when more rows than this reach the final projection, before the
+    /// answer is built. Unlike [`Limits::max_rows`] it does not bound
+    /// intermediate operators: a caller that accepts only so many answer
+    /// rows (a write statement's reading part) can still scan and filter
+    /// more. `None` sets no such bound.
+    pub result_rows: Option<usize>,
 }
 
 impl<'a> RunOptions<'a> {
@@ -162,6 +175,24 @@ impl<'a> RunOptions<'a> {
         RunOptions {
             limits,
             cancel: None,
+            deadline: None,
+            result_rows: None,
+        }
+    }
+
+    /// The same options, refusing an answer of more than `rows` rows.
+    pub fn with_result_rows(self, rows: usize) -> RunOptions<'a> {
+        RunOptions {
+            result_rows: Some(rows),
+            ..self
+        }
+    }
+
+    /// The same options, stopping once `deadline` has passed.
+    pub fn with_deadline(self, deadline: std::time::Instant) -> RunOptions<'a> {
+        RunOptions {
+            deadline: Some(deadline),
+            ..self
         }
     }
 
@@ -192,8 +223,11 @@ pub fn run_with(
         params,
         limits: &options.limits,
         cancel: options.cancel.unwrap_or(&never),
+        deadline: options.deadline,
+        result_rows: options.result_rows,
     };
     check_cancel(request.cancel)?;
+    check_deadline(request.deadline)?;
     let canon = request.canon()?;
     request.execute_on(&world.at_canon(canon))
 }
@@ -224,6 +258,8 @@ pub fn execute(
         params,
         limits,
         cancel: &AtomicBool::new(false),
+        deadline: None,
+        result_rows: None,
     };
     request.execute_on(view).map(|(rows, _)| rows)
 }
@@ -235,6 +271,8 @@ struct Request<'a> {
     params: &'a dyn ParameterInput,
     limits: &'a Limits,
     cancel: &'a AtomicBool,
+    deadline: Option<std::time::Instant>,
+    result_rows: Option<usize>,
 }
 
 impl Request<'_> {
@@ -262,7 +300,8 @@ impl Request<'_> {
     /// reporting an interrupted kala-core read as the budget or the
     /// cancellation that stopped it.
     fn execute_on(&self, view: &View) -> Result<(ResultSet, Usage), QueryError> {
-        let meter = WorkMeter::bounded(self.limits.max_steps, Some(self.cancel));
+        let meter = WorkMeter::bounded(self.limits.max_steps, Some(self.cancel))
+            .with_deadline(self.deadline);
         self.execute_inner(view, &meter)
             .map_err(|error| match error {
                 QueryError::Core(CoreError::WorkInterrupted { reason }) => match reason {
@@ -296,6 +335,7 @@ impl Request<'_> {
             root => (root, None),
         };
         let mut budget = Budget::new(self.cancel, *self.limits);
+        budget.deadline = self.deadline;
         let env = CompileEnv {
             world: self.world,
             canon: view.canon(),
@@ -310,11 +350,17 @@ impl Request<'_> {
         // The default tick's read (a walk of the E index at an older canon).
         ex.charge_index_work()?;
         let rows = ex.eval(&prog.steps)?;
+        if let Some(limit) = self.result_rows
+            && rows.len() > limit
+        {
+            return Err(QueryError::RowLimit { limit });
+        }
         let rows = match output {
             Some(spec) => output_rows(&rows, &find, spec, &slots, self.params, &mut ex.budget)?,
             None => set_rows(&rows, &find, &mut ex.budget)?,
         };
         check_cancel(self.cancel)?;
+        check_deadline(self.deadline)?;
         Ok((
             ResultSet {
                 columns: plan.find.clone(),

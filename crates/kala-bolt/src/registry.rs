@@ -1,10 +1,15 @@
 //! Immutable database names and lazily cached, committed read-only snapshots.
 use crate::error::{DATABASE, Failure, escape};
+use crate::log::logln;
 use kala_core::World;
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
+use std::time::{Duration, Instant};
 struct Database {
     path: PathBuf,
     cached: Mutex<Option<(Stamp, Arc<World>)>>,
@@ -12,6 +17,12 @@ struct Database {
     /// new snapshot share one replay instead of each replaying the world
     /// (peak memory stays at about two snapshots, not one per connection).
     loading: Mutex<()>,
+    writer: Mutex<Option<World>>,
+    /// How often the reader snapshot was replayed from the file, and how
+    /// often a writable handle was. Each is a replay of the whole log, so
+    /// tests pin how many a sequence of requests may cost.
+    reader_opens: AtomicUsize,
+    writer_opens: AtomicUsize,
 }
 
 /// What a cached snapshot was loaded from. The length alone is not enough:
@@ -20,7 +31,7 @@ struct Database {
 /// transaction's commit checksum, so they change with any different last
 /// transaction; the modification time covers the rest.
 #[derive(Clone, PartialEq, Eq)]
-struct Stamp {
+pub(crate) struct Stamp {
     len: u64,
     modified: Option<std::time::SystemTime>,
     /// `(dev, ino)` of the file the tail was read from (Unix).
@@ -69,6 +80,12 @@ fn stamp(path: &Path) -> Result<Stamp, Failure> {
         tail,
     })
 }
+fn bookmark_unavailable() -> Failure {
+    Failure::new(
+        crate::write::CONFLICT,
+        "bookmark is not available within the busy timeout",
+    )
+}
 /// Whether a registry serves the reserved `system` database.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SystemDb {
@@ -81,8 +98,348 @@ pub(crate) enum SystemDb {
 pub(crate) struct Registry {
     databases: BTreeMap<String, Database>,
     default: Option<String>,
+    write_transactions: Arc<Mutex<WriteSlots>>,
+    /// `kala serve --acknowledge-recovery`: see [`Registry::recover`].
+    acknowledge_recovery: bool,
+}
+/// How many explicit transactions hold a private writable handle: in total
+/// and per account.
+#[derive(Default)]
+struct WriteSlots {
+    total: usize,
+    by_account: BTreeMap<String, usize>,
+}
+/// One open writing transaction's place under the cap; freed on drop.
+pub(crate) struct WriteSlot {
+    slots: Arc<Mutex<WriteSlots>>,
+    account: String,
+}
+impl Drop for WriteSlot {
+    fn drop(&mut self) {
+        let mut slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slots.total = slots.total.saturating_sub(1);
+        if let Some(held) = slots.by_account.get_mut(&self.account) {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                slots.by_account.remove(&self.account);
+            }
+        }
+    }
+}
+/// The most write slots one account may hold when the server allows `max`
+/// in total: half of them (at least one), so that a single account can
+/// never keep every other account from writing in explicit transactions.
+pub(crate) fn account_write_slots(max: usize) -> usize {
+    (max / 2).max(1)
 }
 impl Registry {
+    /// `(reader, writer)`: how often each kind of handle of `name` was
+    /// replayed from its file.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn opens(&self, name: &str) -> (usize, usize) {
+        let db = &self.databases[name];
+        (
+            db.reader_opens.load(Ordering::Relaxed),
+            db.writer_opens.load(Ordering::Relaxed),
+        )
+    }
+    /// Whether this registry's writable handles cut a damaged tail by
+    /// themselves (`kala serve --acknowledge-recovery`); off unless set.
+    pub fn acknowledging_recovery(mut self, on: bool) -> Self {
+        self.acknowledge_recovery = on;
+        self
+    }
+    /// With `--acknowledge-recovery`: if `world` (a writable handle of
+    /// `name`) has met a damaged last transaction, acknowledges it and cuts
+    /// it to a quarantine file under the writer lock, as an operator's
+    /// `kala transact --acknowledge-recovery` would, and logs one line per
+    /// cut. Without the flag this does nothing: the handle keeps refusing
+    /// writes and the bytes stay in the file.
+    ///
+    /// Called when a handle is opened (the open reports a damaged tail) and
+    /// before each use of the cached handle (a tail that appeared since:
+    /// the file is then longer than the log the handle has applied; that
+    /// costs one `stat`, and only then is the lock taken to look). A torn
+    /// tail needs none of this: a commit cuts it by itself. `system` never
+    /// gets here: no writable handle of it is ever opened.
+    fn recover(&self, name: &str, world: &mut World) -> Result<(), Failure> {
+        use kala_core::{CutCause, Error};
+        if !self.acknowledge_recovery {
+            return Ok(());
+        }
+        let reported = {
+            let report = world.recovery();
+            report.cause == Some(CutCause::Damaged) && report.quarantine.is_none()
+        };
+        let unapplied = world.chain_tip().is_some_and(|tip| {
+            std::fs::metadata(&self.databases[name].path).map_or(true, |m| m.len() > tip.end)
+        });
+        if !reported && !unapplied {
+            return Ok(());
+        }
+        let mut acknowledged = false;
+        let report = loop {
+            match world.cut_acknowledged_tail() {
+                Ok(report) => break report.clone(),
+                Err(Error::RecoveryRequired { .. } | Error::RecoveryUnacknowledged)
+                    if !acknowledged =>
+                {
+                    world.acknowledge_recovery();
+                    acknowledged = true;
+                }
+                Err(error) => return Err(crate::write::store_error(error, true)),
+            }
+        };
+        if acknowledged
+            && report.cause == Some(CutCause::Damaged)
+            && let Some(quarantine) = &report.quarantine
+        {
+            logln!(
+                "event=recovery_acknowledged db={name} bytes={} quarantine={}",
+                report.bytes_cut,
+                escape(&quarantine.file_name().unwrap_or_default().to_string_lossy()),
+            );
+        }
+        Ok(())
+    }
+    /// Runs `f` on the database's cached writable handle, caught up with
+    /// the file and holding at least tx `at_least` (a bookmark; 0 for none).
+    ///
+    /// The handle is borrowed only while one statement stages and commits,
+    /// never across client I/O. It is opened on first use and kept: an
+    /// ordinary failed write (a store rule, a conflict, a syntax error in a
+    /// later form) leaves it valid, and only an error that breaks the handle
+    /// (`write::leaves_handle_unusable`, or a failed catch-up) drops it, so
+    /// that a client repeating a bad request can't make every writer replay
+    /// the log under this mutex.
+    ///
+    /// A bookmark the file hasn't reached yet is waited for, up to `busy`,
+    /// with the mutex released between looks. The reader snapshot is not
+    /// touched: a write neither needs nor refreshes it.
+    pub fn write<R>(
+        &self,
+        name: &str,
+        busy: Duration,
+        at_least: u64,
+        f: impl FnOnce(&mut World) -> Result<R, Failure>,
+    ) -> Result<R, Failure> {
+        self.require(name)?;
+        let db = &self.databases[name];
+        let until = Instant::now() + busy;
+        let mut cached = loop {
+            let mut cached = Self::lock_writer(db, until)?;
+            if cached.is_none() {
+                *cached = Some(self.open_writer(name, busy)?);
+            }
+            let world = cached.as_mut().ok_or_else(Failure::invalid)?;
+            world.set_busy_timeout(busy);
+            if let Err(error) = world.catch_up() {
+                *cached = None;
+                return Err(crate::write::store_error(error, true));
+            }
+            if let Err(failure) = self.recover(name, world) {
+                *cached = None;
+                return Err(failure);
+            }
+            if world.latest_tx().0 >= at_least {
+                break cached;
+            }
+            drop(cached);
+            if Instant::now() >= until {
+                return Err(bookmark_unavailable());
+            }
+            std::thread::sleep(
+                Duration::from_millis(5).min(until.saturating_duration_since(Instant::now())),
+            );
+        };
+        let result = f(cached.as_mut().ok_or_else(Failure::invalid)?);
+        if result.as_ref().is_err_and(|failure| failure.handle_lost) {
+            *cached = None;
+        }
+        result
+    }
+    /// The database's writer slot, waiting for another statement until
+    /// `until`. A poisoned mutex (a session thread panicked while it held
+    /// the writer) is recovered by discarding the handle that thread was
+    /// using: the next statement rebuilds one from the log, which is the
+    /// source of truth, instead of the database refusing writes until the
+    /// server restarts.
+    fn lock_writer(
+        db: &Database,
+        until: Instant,
+    ) -> Result<std::sync::MutexGuard<'_, Option<World>>, Failure> {
+        loop {
+            match db.writer.try_lock() {
+                Ok(lock) => return Ok(lock),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    let mut lock = poisoned.into_inner();
+                    *lock = None;
+                    db.writer.clear_poison();
+                    return Ok(lock);
+                }
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < until => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err(crate::write::store_error(
+                        kala_core::Error::WorldLocked,
+                        true,
+                    ));
+                }
+            }
+        }
+    }
+    pub fn open_writer(&self, name: &str, busy: Duration) -> Result<World, Failure> {
+        self.require(name)?;
+        if name == "system" {
+            return Err(Failure::new(
+                crate::error::FORBIDDEN,
+                "the system database is written only with kala user",
+            ));
+        }
+        let path = &self.databases[name].path;
+        stamp(path)?;
+        self.databases[name]
+            .writer_opens
+            .fetch_add(1, Ordering::Relaxed);
+        let mut world =
+            World::open_waiting(path, busy).map_err(|e| crate::write::store_error(e, true))?;
+        if crate::system::is_system(&world) {
+            return Err(Failure::new(
+                crate::error::FORBIDDEN,
+                "the system database is written only with kala user",
+            ));
+        }
+        self.recover(name, &mut world)?;
+        Ok(world)
+    }
+    /// What the `system` database's file looks like now, or `None` when
+    /// this server doesn't serve one (`--auth none`). A connection compares
+    /// it with the stamp taken when its grants were read: equal means no
+    /// account changed since.
+    pub fn accounts_stamp(&self) -> Option<Result<Stamp, Failure>> {
+        self.databases.get("system").map(|db| stamp(&db.path))
+    }
+    /// Takes a slot for an explicit transaction that starts writing, for
+    /// `account` (the authenticated `user@host`). Refused, with a code
+    /// drivers retry, when `max` are held in total or the account already
+    /// holds its share ([`account_write_slots`]).
+    pub fn write_slot(&self, max: usize, account: &str) -> Result<WriteSlot, Failure> {
+        let mut slots = self
+            .write_transactions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held = slots.by_account.get(account).copied().unwrap_or(0);
+        if slots.total >= max {
+            return Err(Failure::new(
+                crate::write::CONFLICT,
+                "too many open write transactions",
+            ));
+        }
+        if held >= account_write_slots(max) {
+            return Err(Failure::new(
+                crate::write::CONFLICT,
+                "too many open write transactions for this account",
+            ));
+        }
+        slots.total += 1;
+        slots.by_account.insert(account.to_owned(), held + 1);
+        Ok(WriteSlot {
+            slots: Arc::clone(&self.write_transactions),
+            account: account.to_owned(),
+        })
+    }
+    /// Causal reads share the normal stamped snapshot refresh, with a bounded wait.
+    pub fn at_least(&self, name: &str, tx: u64, busy: Duration) -> Result<Arc<World>, Failure> {
+        let deadline = Instant::now() + busy;
+        loop {
+            let (_, world) = self.get(Some(name))?;
+            if world.latest_tx().0 >= tx {
+                return Ok(world);
+            }
+            if Instant::now() >= deadline {
+                return Err(bookmark_unavailable());
+            }
+            std::thread::sleep(
+                Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+
+    /// The cached reader snapshot of `name`, but only if it is the current
+    /// committed state (its stamp is the file's) and holds at least tx
+    /// `at_least` (a bookmark; 0 for none). **Never replays the log**: this
+    /// is what the write path asks, and a write must not cost a replay.
+    ///
+    /// A cached snapshot that is behind the file is brought up to date in
+    /// place by [`World::catch_up`], which costs the transactions committed
+    /// since (plus one re-read of the snapshot's last transaction), when no
+    /// query holds it and no reload is in flight; under the `loading`
+    /// mutex, so a reader that finds the slot empty meanwhile waits for
+    /// this instead of replaying. `None` in every other case (nothing
+    /// cached, a query still reading the stale snapshot, a reload in
+    /// flight, a commit landing during the catch-up, a bookmark the
+    /// snapshot hasn't reached): the caller then reads on the writer.
+    pub fn cached_at_least(
+        &self,
+        name: &str,
+        at_least: u64,
+    ) -> Result<Option<Arc<World>>, Failure> {
+        self.require(name)?;
+        let db = &self.databases[name];
+        let reached = |world: Arc<World>| (world.latest_tx().0 >= at_least).then_some(world);
+        let now = stamp(&db.path)?;
+        match Self::lock_cached(db).as_ref() {
+            None => return Ok(None),
+            Some((s, world)) if *s == now => return Ok(reached(Arc::clone(world))),
+            Some(_) => {}
+        }
+        // Never wait behind a reload: that reader replays the log anyway.
+        let Ok(_loading) = db.loading.try_lock() else {
+            return Ok(None);
+        };
+        let before = stamp(&db.path)?;
+        let Some((labelled, shared)) = Self::lock_cached(db).take() else {
+            return Ok(None);
+        };
+        if labelled == before {
+            *Self::lock_cached(db) = Some((labelled, Arc::clone(&shared)));
+            return Ok(reached(shared));
+        }
+        let mut world = match Arc::try_unwrap(shared) {
+            Ok(world) => world,
+            Err(shared) => {
+                // A query is still reading it; it stays what it was.
+                *Self::lock_cached(db) = Some((labelled, shared));
+                return Ok(None);
+            }
+        };
+        if world.catch_up().is_err() {
+            // The file is no longer the log this snapshot applied: the
+            // next reader replays it, as after any other change.
+            return Ok(None);
+        }
+        // The label is the stamp taken BEFORE the catch-up, as in `get`: a
+        // commit that landed since changes the stamp again, so a snapshot
+        // is never labelled with a newer stamp than its own.
+        let current = stamp(&db.path)? == before
+            && world.chain_tip().is_some_and(|tip| tip.end == before.len);
+        if !current {
+            // The catch-up did not reach the file's end as stamped (a writer
+            // still held its lock, or a commit landed meanwhile). Caching
+            // the snapshot under `before` would hand later readers an older
+            // world as current, because releasing a lock doesn't change the
+            // stamp. The slot stays empty: the next reader replays.
+            return Ok(None);
+        }
+        let world = Arc::new(world);
+        *Self::lock_cached(db) = Some((before, Arc::clone(&world)));
+        Ok(reached(world))
+    }
+
     pub fn open(directory: &Path, default: Option<String>, system: SystemDb) -> io::Result<Self> {
         let mut databases = BTreeMap::new();
         for entry in std::fs::read_dir(directory)? {
@@ -92,7 +449,7 @@ impl Registry {
             let db = text.strip_suffix(".kala");
             if system == SystemDb::Skip && db == Some("system") {
                 // Decided by name only, before any metadata or content is read.
-                eprintln!(
+                logln!(
                     "kala serve: skipping system.kala: the system database is never served without account authentication"
                 );
             } else if entry.file_type()?.is_file()
@@ -104,10 +461,13 @@ impl Registry {
                         path: entry.path(),
                         cached: Mutex::new(None),
                         loading: Mutex::new(()),
+                        writer: Mutex::new(None),
+                        reader_opens: AtomicUsize::new(0),
+                        writer_opens: AtomicUsize::new(0),
                     },
                 );
             } else {
-                eprintln!("event=bolt_database_skipped name={:?}", escape(&text));
+                logln!("event=bolt_database_skipped name={:?}", escape(&text));
             }
         }
         if default.as_ref().is_some_and(|d| !databases.contains_key(d)) {
@@ -119,7 +479,12 @@ impl Registry {
         // The reserved system world is never an implicit user database.
         let user_names: Vec<_> = databases.keys().filter(|name| *name != "system").collect();
         let default = default.or_else(|| (user_names.len() == 1).then(|| user_names[0].clone()));
-        Ok(Self { databases, default })
+        Ok(Self {
+            databases,
+            default,
+            write_transactions: Arc::default(),
+            acknowledge_recovery: false,
+        })
     }
     /// Resolve the name before loading a world, so authorization precedes I/O.
     pub fn name<'a>(&'a self, requested: Option<&'a str>) -> Result<&'a str, Failure> {
@@ -127,22 +492,48 @@ impl Registry {
             .or(self.default.as_deref())
             .ok_or_else(|| Failure::new(DATABASE, "no default database; specify a database name"))
     }
+    /// Registry names only: does not open any world.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.databases.keys().map(String::as_str)
+    }
+    pub fn default_name(&self) -> Option<&str> {
+        self.default.as_deref()
+    }
+    pub fn require(&self, name: &str) -> Result<(), Failure> {
+        if self.databases.contains_key(name) {
+            Ok(())
+        } else {
+            Err(Failure::new(
+                DATABASE,
+                format!("database {name:?} was not found"),
+            ))
+        }
+    }
+    /// The database's reader snapshot slot. A poisoned mutex (a session
+    /// thread panicked while it held the slot or a reload) is recovered as
+    /// [`Registry::lock_writer`] recovers the writer: the cached snapshot is
+    /// discarded and the next read reloads it from the log, instead of the
+    /// database refusing reads until the server restarts.
+    fn lock_cached(db: &Database) -> std::sync::MutexGuard<'_, Option<(Stamp, Arc<World>)>> {
+        db.cached.lock().unwrap_or_else(|poisoned| {
+            let mut lock = poisoned.into_inner();
+            *lock = None;
+            db.cached.clear_poison();
+            lock
+        })
+    }
     pub fn get(&self, requested: Option<&str>) -> Result<(String, Arc<World>), Failure> {
         let name = self.name(requested)?;
         let db = self
             .databases
             .get(name)
             .ok_or_else(|| Failure::new(DATABASE, format!("database {name:?} was not found")))?;
-        let lock = || {
-            db.cached
-                .lock()
-                .map_err(|_| Failure::new(crate::error::STORE, "the world could not be read"))
-        };
+        let lock = || Self::lock_cached(db);
         // Take the stamp BEFORE loading: a commit after this observation
         // changes the stamp again and forces another refresh, so a snapshot
         // is never labelled with a newer stamp than its own.
         let stamp = stamp(&db.path)?;
-        if let Some((s, world)) = lock()?.as_ref()
+        if let Some((s, world)) = lock().as_ref()
             && *s == stamp
         {
             return Ok((name.into(), Arc::clone(world)));
@@ -150,27 +541,253 @@ impl Registry {
         // Single-flight: one thread replays, the others wait for it and then
         // find the fresh snapshot. Queries whose stamp matches (above) never
         // wait behind a reload.
-        let _loading = db
-            .loading
-            .lock()
-            .map_err(|_| Failure::new(crate::error::STORE, "the world could not be read"))?;
+        let _loading = db.loading.lock().unwrap_or_else(|poisoned| {
+            // A reload panicked: whatever it left is not trusted either.
+            let lock = poisoned.into_inner();
+            *Self::lock_cached(db) = None;
+            db.loading.clear_poison();
+            lock
+        });
         let stamp = self::stamp(&db.path)?;
-        if let Some((s, world)) = lock()?.as_ref()
+        if let Some((s, world)) = lock().as_ref()
             && *s == stamp
         {
             return Ok((name.into(), Arc::clone(world)));
         }
+        db.reader_opens.fetch_add(1, Ordering::Relaxed);
         let world = Arc::new(World::open_read_only(&db.path).map_err(Failure::store)?);
         // Content, not a filename, identifies privileged worlds. A renamed
         // system file must never become readable using an ordinary read grant.
         if crate::system::is_system(&world) != (name == "system") {
             return Err(Failure::store("reserved system database marker mismatch"));
         }
-        eprintln!(
+        logln!(
             "event=bolt_database_loaded db={name} canon={}",
             world.latest_tx().0
         );
-        *lock()? = Some((stamp, Arc::clone(&world)));
+        *lock() = Some((stamp, Arc::clone(&world)));
         Ok((name.into(), world))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registry() -> (tempfile::TempDir, Registry) {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = include_str!("../../kala-core/tests/fixtures/varrow.yaml");
+        drop(kala_fixture::load_fixture_to(fixture, &dir.path().join("varrow.kala")).unwrap());
+        let registry = Registry::open(dir.path(), None, SystemDb::Skip).unwrap();
+        (dir, registry)
+    }
+
+    #[test]
+    fn a_poisoned_writer_mutex_is_recovered_by_reopening_the_writer() {
+        let (_dir, registry) = registry();
+        let busy = Duration::from_secs(1);
+        registry.write("varrow", busy, 0, |_| Ok(())).unwrap();
+        let panicked = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    registry.write("varrow", busy, 0, |_| -> Result<(), Failure> {
+                        panic!("a session thread panicked while holding the writer")
+                    })
+                })
+                .join()
+        });
+        assert!(panicked.is_err());
+        assert!(registry.databases["varrow"].writer.is_poisoned());
+        // The handle the panic interrupted is discarded, not trusted; the
+        // next write rebuilds one from the log and the database stays
+        // writable without a restart.
+        let tx = registry
+            .write("varrow", busy, 0, |world| {
+                let greg = world.entity_by_handle("greg").unwrap();
+                let mut tx = world.begin();
+                tx.assert(
+                    greg,
+                    "alias",
+                    kala_core::Value::Str("After the panic".into()),
+                    Some(kala_core::Tick(300)),
+                )
+                .unwrap();
+                Ok(tx.commit().unwrap().tx)
+            })
+            .unwrap();
+        assert_eq!(registry.opens("varrow").1, 2);
+        assert!(!registry.databases["varrow"].writer.is_poisoned());
+        registry.write("varrow", busy, tx.0, |_| Ok(())).unwrap();
+        assert_eq!(registry.opens("varrow").1, 2);
+    }
+
+    #[test]
+    fn poisoned_reader_mutexes_are_recovered_by_reloading_the_snapshot() {
+        let (_dir, registry) = registry();
+        registry.get(Some("varrow")).unwrap();
+        assert_eq!(registry.opens("varrow").0, 1);
+        let db = &registry.databases["varrow"];
+        // A session thread panics while it holds each of the reader's
+        // mutexes (a reload, and the snapshot slot).
+        for poison_cached in [false, true] {
+            let panicked = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let _loading = (!poison_cached).then(|| db.loading.lock().unwrap());
+                        let _cached = poison_cached.then(|| db.cached.lock().unwrap());
+                        panic!("a session thread panicked while holding a reader mutex")
+                    })
+                    .join()
+            });
+            assert!(panicked.is_err());
+        }
+        assert!(db.cached.is_poisoned() && db.loading.is_poisoned());
+        // The snapshot the panic may have interrupted is discarded, not
+        // trusted: the next read reloads it from the log, and the database
+        // stays readable without a restart.
+        let (_, world) = registry.get(Some("varrow")).unwrap();
+        assert!(world.entity_by_handle("greg").is_some());
+        assert_eq!(registry.opens("varrow").0, 2);
+        assert!(!db.cached.is_poisoned() && !db.loading.is_poisoned());
+        // Recovered once: later reads share the reloaded snapshot.
+        registry.get(Some("varrow")).unwrap();
+        registry
+            .at_least("varrow", 0, Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(registry.opens("varrow").0, 2);
+    }
+
+    #[test]
+    fn the_write_path_gets_a_current_snapshot_without_ever_replaying_the_log() {
+        let (_dir, registry) = registry();
+        let busy = Duration::from_secs(1);
+        let commit = |alias: &str| {
+            registry
+                .write("varrow", busy, 0, |world| {
+                    let greg = world.entity_by_handle("greg").unwrap();
+                    let mut tx = world.begin();
+                    tx.assert(
+                        greg,
+                        "alias",
+                        kala_core::Value::Str(alias.into()),
+                        Some(kala_core::Tick(300)),
+                    )
+                    .unwrap();
+                    Ok(tx.commit().unwrap().tx.0)
+                })
+                .unwrap()
+        };
+        // Nothing cached: nothing is loaded for a write.
+        assert!(registry.cached_at_least("varrow", 0).unwrap().is_none());
+        assert_eq!(registry.opens("varrow").0, 0);
+        // A reader loaded it and it is current.
+        let (_, held) = registry.get(Some("varrow")).unwrap();
+        let loaded = held.latest_tx().0;
+        let current = registry.cached_at_least("varrow", 0).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&current, &held));
+        // A bookmark it hasn't reached is the writer's to wait for.
+        assert!(
+            registry
+                .cached_at_least("varrow", loaded + 1)
+                .unwrap()
+                .is_none()
+        );
+        drop(current);
+        // Behind the file while a query still reads it: left alone.
+        let first = commit("One");
+        assert!(registry.cached_at_least("varrow", 0).unwrap().is_none());
+        assert_eq!(held.latest_tx().0, loaded);
+        drop(held);
+        let original = std::fs::read(&registry.databases["varrow"].path).unwrap();
+        // Behind the file and unused: the log's tail is applied to it.
+        let second = commit("Two");
+        assert!(second > first);
+        let caught_up = registry.cached_at_least("varrow", second).unwrap().unwrap();
+        assert_eq!(caught_up.latest_tx().0, second);
+        // And that is the snapshot readers get, with no reload.
+        let (_, read) = registry.get(Some("varrow")).unwrap();
+        assert!(Arc::ptr_eq(&read, &caught_up));
+        assert_eq!(registry.opens("varrow").0, 1);
+        // A log that is no longer the one the snapshot applied drops it:
+        // the write path loads nothing, the next reader replays.
+        drop((read, caught_up));
+        std::fs::write(&registry.databases["varrow"].path, &original[..]).unwrap();
+        assert!(registry.cached_at_least("varrow", 0).unwrap().is_none());
+        assert_eq!(registry.opens("varrow").0, 1);
+        let (_, reloaded) = registry.get(Some("varrow")).unwrap();
+        assert_eq!(reloaded.latest_tx().0, first);
+        assert_eq!(registry.opens("varrow").0, 2);
+    }
+
+    #[test]
+    fn a_catch_up_that_could_not_read_the_tail_never_labels_the_snapshot_current() {
+        // A commit is in the file but its writer still holds the lock (its
+        // fsync is in flight), so the cached snapshot's catch-up applies
+        // nothing. The snapshot must not then be cached under the file's
+        // stamp: the stamp doesn't change when the lock is released, and
+        // every later reader would be handed the older world as current.
+        let (_dir, registry) = registry();
+        let (_, held) = registry.get(Some("varrow")).unwrap();
+        let loaded = held.latest_tx().0;
+        drop(held);
+        let committed = registry
+            .write("varrow", Duration::from_secs(1), 0, |world| {
+                let greg = world.entity_by_handle("greg").unwrap();
+                let mut tx = world.begin();
+                tx.assert(
+                    greg,
+                    "alias",
+                    kala_core::Value::Str("One".into()),
+                    Some(kala_core::Tick(300)),
+                )
+                .unwrap();
+                Ok(tx.commit().unwrap().tx.0)
+            })
+            .unwrap();
+        assert!(committed > loaded);
+        let writer = std::fs::File::open(&registry.databases["varrow"].path).unwrap();
+        writer.lock().unwrap();
+        assert!(registry.cached_at_least("varrow", 0).unwrap().is_none());
+        writer.unlock().unwrap();
+        let (_, read) = registry.get(Some("varrow")).unwrap();
+        assert_eq!(
+            read.latest_tx().0,
+            committed,
+            "a reader was handed a snapshot older than the file it is labelled with"
+        );
+    }
+
+    #[test]
+    fn only_errors_that_break_the_handle_drop_the_cached_writer() {
+        use kala_core::Error;
+        for (error, lost) in [
+            (Error::LogDiverged, true),
+            (Error::Corrupt("x".into()), true),
+            (Error::BadMagic, true),
+            (Error::UnsupportedVersion(9), true),
+            (Error::RecoveryUnacknowledged, true),
+            (Error::WorldLocked, false),
+            (Error::TransactionAborted, false),
+            (Error::DuplicateHandle("greg".into()), false),
+            (Error::UnknownAttribute("nope".into()), false),
+        ] {
+            assert_eq!(
+                crate::write::leaves_handle_unusable(&error),
+                lost,
+                "{error:?}"
+            );
+            let (_dir, registry) = registry();
+            let busy = Duration::from_secs(1);
+            let failed = registry.write("varrow", busy, 0, |_| -> Result<(), Failure> {
+                Err(crate::write::store_error(error.clone(), true))
+            });
+            assert!(failed.is_err());
+            registry.write("varrow", busy, 0, |_| Ok(())).unwrap();
+            assert_eq!(
+                registry.opens("varrow").1,
+                1 + usize::from(lost),
+                "{error:?}"
+            );
+        }
     }
 }
