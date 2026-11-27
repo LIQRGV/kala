@@ -11,7 +11,8 @@ use kala_core::{Tick, World};
 
 const TYPE: &str = "Neo.ClientError.Statement.TypeError";
 
-fn server_with(configure: impl FnOnce(&mut ServerConfig)) -> Running {
+/// A server and the counters of how often it replayed a world's log.
+fn counted_with(configure: impl FnOnce(&mut ServerConfig)) -> (Running, kala_bolt::OpenCounts) {
     let dir = tempfile::tempdir().unwrap();
     drop(kala_fixture::load_fixture_to(VARROW, &dir.path().join("varrow.kala")).unwrap());
     for (user, privilege) in [("reader", "read"), ("writer", "write")] {
@@ -26,7 +27,12 @@ fn server_with(configure: impl FnOnce(&mut ServerConfig)) -> Running {
     };
     configure(&mut config);
     let server = Server::bind_accounts(dir.path(), config).unwrap();
-    Running::from_server(dir, server)
+    let counts = server.open_counts();
+    (Running::from_server(dir, server), counts)
+}
+
+fn server_with(configure: impl FnOnce(&mut ServerConfig)) -> Running {
+    counted_with(configure).0
 }
 
 fn server() -> Running {
@@ -239,6 +245,19 @@ fn a_handle_string_written_to_a_ref_attribute_resolves_to_the_entity() {
 
 const DECLARE_HP: &str = "// kala:datalog\n[:attribute :hp :i64]";
 
+/// Loads the server's reader snapshot with a read query, as any session
+/// that has queried does. An auto-commit write reads off the writer mutex
+/// only on a reader snapshot that is already there and current (it never
+/// replays the log for one), and the hook below is called only then.
+fn warm(client: &mut Client) {
+    assert_eq!(
+        client
+            .query("MATCH (g {kala_handle:'greg'}) RETURN g.name")
+            .len(),
+        1
+    );
+}
+
 /// A hook that blocks the first statement reaching it until released.
 fn gate() -> (
     kala_bolt::Hook,
@@ -269,6 +288,7 @@ fn another_writer_commits_while_an_auto_commit_reading_part_is_in_flight() {
     });
     let mut first = Client::ready(&server);
     let mut second = Client::ready(&server);
+    warm(&mut second);
     first.send(
         0x10,
         vec![
@@ -317,6 +337,7 @@ fn a_commit_between_the_read_and_the_stage_conflicts_only_on_what_was_read() {
         // `hp` is declared up front: reading an undeclared name and then
         // seeing it declared is a conflict of its own.
         write(&mut second, DECLARE_HP, map(&[]));
+        warm(&mut second);
         let statement = if other.starts_with("CREATE") {
             "MATCH (c:CHARACTER) SET c.hp = 7 AT TICK 901"
         } else {
@@ -346,6 +367,7 @@ fn a_tick_less_write_lands_on_the_latest_tick_its_reading_part_saw() {
     let mut first = Client::ready(&server);
     let mut second = Client::ready(&server);
     write(&mut second, DECLARE_HP, map(&[]));
+    warm(&mut second);
     let read_tick = world(&server).latest_tick();
     first.send(
         0x10,
@@ -469,4 +491,125 @@ fn a_type_constraint_needs_write_and_redefining_needs_admin() {
         world(&server).attribute("rank").unwrap().value_type,
         kala_core::ValueType::Str
     );
+}
+
+// ---- Second review, 1: an auto-commit Cypher write never replays the log ----
+
+/// A hook that counts the statements whose reading part ran off the
+/// writer mutex (the only place the hook is called).
+fn counter() -> (
+    kala_bolt::Hook,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = std::sync::Arc::clone(&count);
+    let hook = kala_bolt::Hook(std::sync::Arc::new(move || {
+        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    (hook, count)
+}
+
+/// Runs `statements` one after another in one session, each naming the
+/// previous one's bookmark as a driver session does.
+fn chained(client: &mut Client, statements: impl Iterator<Item = String>) -> Value {
+    let mut bookmark = None;
+    for statement in statements {
+        let extra = bookmark
+            .take()
+            .map_or_else(|| map(&[]), |b| map(&[("bookmarks", Value::List(vec![b]))]));
+        client.run(&statement, map(&[]), extra);
+        let (_, summary) = client.pull(-1);
+        bookmark = Some(summary["bookmark"].clone());
+    }
+    bookmark.unwrap()
+}
+
+#[test]
+fn sequential_blind_cypher_creates_replay_the_log_once_and_never_reload_the_reader() {
+    let (server, counts) = counted_with(|_| {});
+    let mut client = Client::ready(&server);
+    chained(
+        &mut client,
+        (0..12).map(|n| format!("CREATE (:CHARACTER {{n: {n}}}) AT TICK 300")),
+    );
+    assert_eq!(counts.writer("varrow"), 1);
+    assert_eq!(
+        counts.reader("varrow"),
+        0,
+        "a blind auto-commit Cypher write must not reload the reader snapshot"
+    );
+}
+
+#[test]
+fn sequential_match_set_writes_replay_the_log_once_and_never_reload_the_reader() {
+    let (hook, off_mutex) = counter();
+    let (server, counts) = counted_with(|config| config.after_statement_read = Some(hook));
+    let mut client = Client::ready(&server);
+    write(&mut client, DECLARE_HP, map(&[]));
+    // No reader snapshot is cached: each reading part runs on the writer.
+    let set = |n: i64| {
+        format!(
+            "MATCH (g {{kala_handle:'greg'}}) SET g.hp = {n} AT TICK {}",
+            900 + n
+        )
+    };
+    chained(&mut client, (0..12).map(set));
+    assert_eq!(counts.writer("varrow"), 1);
+    assert_eq!(
+        counts.reader("varrow"),
+        0,
+        "an auto-commit Cypher write must not reload the reader snapshot"
+    );
+    assert_eq!(off_mutex.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    // A read query loads the reader snapshot (the one replay a reader
+    // costs). From then on the write path keeps it current by applying the
+    // log's tail to it, never by replaying the log: every reading part runs
+    // off the writer mutex and the reader is not reloaded.
+    warm(&mut client);
+    assert_eq!(counts.reader("varrow"), 1);
+    let bookmark = chained(&mut client, (12..24).map(set));
+    assert_eq!(counts.writer("varrow"), 1);
+    assert_eq!(counts.reader("varrow"), 1);
+    assert_eq!(off_mutex.load(std::sync::atomic::Ordering::SeqCst), 12);
+    let committed = world(&server);
+    let greg = committed.entity_by_handle("greg").unwrap();
+    assert_eq!(
+        committed.as_of(greg, "hp", Tick(923)).unwrap(),
+        [kala_core::Value::I64(23)]
+    );
+    // A reader given the last write's bookmark sees it.
+    client.run(
+        "MATCH (g {kala_handle:'greg'}) AT TICK 923 RETURN g.hp",
+        map(&[]),
+        map(&[("bookmarks", Value::List(vec![bookmark]))]),
+    );
+    assert_eq!(client.pull(-1).0.len(), 1);
+}
+
+#[test]
+fn a_weak_mode_statement_reads_on_the_writer_not_on_the_cached_snapshot() {
+    let (hook, off_mutex) = counter();
+    let (server, counts) = counted_with(|config| config.after_statement_read = Some(hook));
+    let mut client = Client::ready(&server);
+    write(&mut client, DECLARE_HP, map(&[]));
+    warm(&mut client);
+    let weak = map(&[("tx_metadata", map(&[("concurrency_mode", string("weak"))]))]);
+    client.run(
+        "MATCH (g {kala_handle:'greg'}) SET g.hp = 1 AT TICK 901",
+        map(&[]),
+        weak,
+    );
+    assert_eq!(changed(&client.pull(-1).1), 1);
+    // Weak mode checks no reads, so it never reads a snapshot that a commit
+    // could have overtaken: the reading part ran under the writer mutex.
+    assert_eq!(off_mutex.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // The same statement in the default mode reads off the mutex.
+    write(
+        &mut client,
+        "MATCH (g {kala_handle:'greg'}) SET g.hp = 2 AT TICK 902",
+        map(&[]),
+    );
+    assert_eq!(off_mutex.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!((counts.reader("varrow"), counts.writer("varrow")), (1, 1));
 }

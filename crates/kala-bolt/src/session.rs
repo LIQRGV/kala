@@ -993,11 +993,11 @@ impl Session<'_> {
         // Parameters take the kinds the reading part's compilation computed,
         // as for a read query: a handle given for a ref position resolves to
         // its entity, and a wrongly typed value is refused before evaluation.
-        let prepare = |world: &kala_core::World| {
+        let prepare = |world: &kala_core::World, limits: kala_query::Limits| {
             let compiled = compile_statement(world, statement)
                 .map_err(|e| write::statement_error(e, held.read))?;
             let params = query::parameters(world, compiled.parameter_kinds(), given, true)?;
-            let run = kala_query::RunOptions::default()
+            let run = kala_query::RunOptions::new(limits)
                 .with_cancel(flag)
                 .with_deadline(deadline);
             let input = query::until(deadline, |_| {
@@ -1006,6 +1006,7 @@ impl Session<'_> {
             })?;
             Ok::<_, Failure>((params, input))
         };
+        let full = kala_query::Limits::default();
         if let Some(tx) = &mut self.transaction {
             let account = self
                 .identity
@@ -1017,7 +1018,7 @@ impl Session<'_> {
                     .map_err(|_| Failure::new(INVALID, "parameter limit exceeded"))?
                     .len();
             write::charge(&mut tx.bytes, text_len.saturating_add(param_size))?;
-            let (params, input) = prepare(tx.world())?;
+            let (params, input) = prepare(tx.world(), full)?;
             // Pin BEGIN even for the one empty input row of a blind CREATE.
             // A later MATCH reads that same snapshot.
             tx.record(input.reads(), rw);
@@ -1047,27 +1048,48 @@ impl Session<'_> {
             tx.forms.push(staged);
             Ok(output)
         } else {
-            // The reading part runs on the shared read snapshot, as a query
-            // does, BEFORE the database's writer is taken: however heavy it
-            // is, it never makes another writer wait. A commit that lands
-            // between this read and the stage below is checked precisely:
-            // staging records the read keys as read at the snapshot's tx
-            // (`Txn::set_read_version`), so only a commit that touched what
-            // was read is a conflict (transient: drivers retry it).
-            let snapshot = self.registry.at_least(
-                db,
-                options.bookmark,
-                self.config.busy_timeout.min(options.timeout),
-            )?;
-            let (params, input) = prepare(&snapshot)?;
-            let pinned = snapshot.latest_tx().0;
-            // A statement that read lands its tick-less writes on the latest
-            // tick its reading part saw; a blind one takes the writer's.
-            let start_tick = statement.requires_read().then(|| snapshot.latest_tick());
-            drop(snapshot);
-            if let Some(hook) = &self.config.after_statement_read {
-                (hook.0)();
-            }
+            // Where the reading part runs. A write never replays the log to
+            // get a snapshot (`Registry::cached_at_least` only ever applies
+            // the log's tail to the cached one):
+            //
+            // - A blind statement (nothing but CREATE or a constraint, no
+            //   RETURN) has no reading part to speak of, one empty row: it
+            //   takes no snapshot and is compiled on the writer.
+            // - A statement that reads, in the default mode, reads the
+            //   cached reader snapshot BEFORE the database's writer is
+            //   taken, when that snapshot is the current committed state:
+            //   however heavy the reading part is, no other writer waits
+            //   for it. A commit that lands between this read and the stage
+            //   below is checked precisely: staging records the read keys
+            //   as read at the snapshot's tx (`Txn::set_read_version`), so
+            //   only a commit that touched what was read is a conflict
+            //   (transient: drivers retry it).
+            // - Otherwise (no current snapshot to be had without a replay,
+            //   or weak mode, which checks no reads and so must not read a
+            //   state a commit may have overtaken) the reading part runs on
+            //   the writer, under the mutex, within `UNDER_WRITER_STEPS`.
+            let reads = statement.requires_read();
+            let snapshot = if reads && options.concurrency != kala_core::Concurrency::Weak {
+                self.registry.cached_at_least(db, options.bookmark)?
+            } else {
+                None
+            };
+            let early = match snapshot {
+                Some(snapshot) => {
+                    let (params, input) = prepare(&snapshot, full)?;
+                    // A statement that read lands its tick-less writes on
+                    // the latest tick its reading part saw.
+                    let seen = (snapshot.latest_tx().0, snapshot.latest_tick());
+                    drop(snapshot);
+                    #[cfg(feature = "test-hooks")]
+                    if let Some(hook) = &self.config.after_statement_read {
+                        (hook.0)();
+                    }
+                    Some((params, input, seen))
+                }
+                None => None,
+            };
+            let pinned = early.as_ref().map_or(0, |(_, _, (tx, _))| *tx);
             let (output, summary) = self.registry.write(
                 db,
                 self.config
@@ -1079,9 +1101,24 @@ impl Session<'_> {
                     tx.set_concurrency(options.concurrency);
                     tx.set_schema_additions_only(!held.admin);
                     tx.set_deadline(deadline);
-                    if let Some(tick) = start_tick {
-                        tx.set_start_tick(tick);
-                    }
+                    let (params, input) = match early {
+                        Some((params, input, (_, tick))) => {
+                            tx.set_start_tick(tick);
+                            (params, input)
+                        }
+                        None => {
+                            // Other writers wait while this runs, so a
+                            // reading part gets a tenth of a query's steps;
+                            // staging then has the whole statement's budget
+                            // again, as on the other path.
+                            let limits = kala_query::Limits {
+                                max_steps: if reads { UNDER_WRITER_STEPS } else { full.max_steps },
+                                ..full
+                            };
+                            let (params, input) = prepare(tx.base_world(), limits)?;
+                            (params, input.with_stage_limits(full))
+                        }
+                    };
                     let mut staged = stage_statement(&mut tx, statement, input, &params)
                         .map_err(|e| write::statement_error(e, held.read))?;
                     // Render RETURN from the staged transaction before the
@@ -1409,6 +1446,13 @@ impl Session<'_> {
 }
 /// The `reason=` of a refused write's log line: never the statement's text
 /// or values, only which kind of refusal it was.
+/// The step budget of an auto-commit Cypher write's reading part when it
+/// has to run on the writable handle, i.e. while every other writer of the
+/// database waits: a tenth of a query's default (10,000,000). The rows it
+/// may hand to the write clauses (10,000) and the statement's deadline bound
+/// it as everywhere else.
+const UNDER_WRITER_STEPS: u64 = 1_000_000;
+
 fn refusal_reason(failure: &Failure) -> &'static str {
     if failure.code == crate::error::FORBIDDEN {
         "privilege"

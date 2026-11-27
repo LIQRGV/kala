@@ -105,6 +105,15 @@ impl WriteInput<'_> {
         &self.reads
     }
 
+    /// The limits staging runs under, when they differ from those the
+    /// reading part ran under (an adapter that gave the reading part a
+    /// smaller step budget than the statement as a whole). What the reading
+    /// part used still counts against them.
+    pub fn with_stage_limits(mut self, limits: kala_query::Limits) -> Self {
+        self.options.limits = limits;
+        self
+    }
+
     fn note_reads(&self, tx: &mut Txn<'_>) -> Result<()> {
         if !self.depends_on_snapshot {
             return Ok(());

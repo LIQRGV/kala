@@ -368,6 +368,69 @@ impl Registry {
         }
     }
 
+    /// The cached reader snapshot of `name`, but only if it is the current
+    /// committed state (its stamp is the file's) and holds at least tx
+    /// `at_least` (a bookmark; 0 for none). **Never replays the log**: this
+    /// is what the write path asks, and a write must not cost a replay.
+    ///
+    /// A cached snapshot that is behind the file is brought up to date in
+    /// place by [`World::catch_up`], which costs the transactions committed
+    /// since (plus one re-read of the snapshot's last transaction), when no
+    /// query holds it and no reload is in flight; under the `loading`
+    /// mutex, so a reader that finds the slot empty meanwhile waits for
+    /// this instead of replaying. `None` in every other case (nothing
+    /// cached, a query still reading the stale snapshot, a reload in
+    /// flight, a commit landing during the catch-up, a bookmark the
+    /// snapshot hasn't reached): the caller then reads on the writer.
+    pub fn cached_at_least(
+        &self,
+        name: &str,
+        at_least: u64,
+    ) -> Result<Option<Arc<World>>, Failure> {
+        self.require(name)?;
+        let db = &self.databases[name];
+        let reached = |world: Arc<World>| (world.latest_tx().0 >= at_least).then_some(world);
+        let now = stamp(&db.path)?;
+        match Self::lock_cached(db).as_ref() {
+            None => return Ok(None),
+            Some((s, world)) if *s == now => return Ok(reached(Arc::clone(world))),
+            Some(_) => {}
+        }
+        // Never wait behind a reload: that reader replays the log anyway.
+        let Ok(_loading) = db.loading.try_lock() else {
+            return Ok(None);
+        };
+        let before = stamp(&db.path)?;
+        let Some((labelled, shared)) = Self::lock_cached(db).take() else {
+            return Ok(None);
+        };
+        if labelled == before {
+            *Self::lock_cached(db) = Some((labelled, Arc::clone(&shared)));
+            return Ok(reached(shared));
+        }
+        let mut world = match Arc::try_unwrap(shared) {
+            Ok(world) => world,
+            Err(shared) => {
+                // A query is still reading it; it stays what it was.
+                *Self::lock_cached(db) = Some((labelled, shared));
+                return Ok(None);
+            }
+        };
+        if world.catch_up().is_err() {
+            // The file is no longer the log this snapshot applied: the
+            // next reader replays it, as after any other change.
+            return Ok(None);
+        }
+        // The label is the stamp taken BEFORE the catch-up, as in `get`: a
+        // commit that landed since changes the stamp again, so a snapshot
+        // is never labelled with a newer stamp than its own.
+        let current = stamp(&db.path)? == before
+            && world.chain_tip().is_some_and(|tip| tip.end == before.len);
+        let world = Arc::new(world);
+        *Self::lock_cached(db) = Some((before, Arc::clone(&world)));
+        Ok(if current { reached(world) } else { None })
+    }
+
     pub fn open(directory: &Path, default: Option<String>, system: SystemDb) -> io::Result<Self> {
         let mut databases = BTreeMap::new();
         for entry in std::fs::read_dir(directory)? {
@@ -582,6 +645,68 @@ mod tests {
         registry
             .at_least("varrow", 0, Duration::from_secs(1))
             .unwrap();
+        assert_eq!(registry.opens("varrow").0, 2);
+    }
+
+    #[test]
+    fn the_write_path_gets_a_current_snapshot_without_ever_replaying_the_log() {
+        let (_dir, registry) = registry();
+        let busy = Duration::from_secs(1);
+        let commit = |alias: &str| {
+            registry
+                .write("varrow", busy, 0, |world| {
+                    let greg = world.entity_by_handle("greg").unwrap();
+                    let mut tx = world.begin();
+                    tx.assert(
+                        greg,
+                        "alias",
+                        kala_core::Value::Str(alias.into()),
+                        Some(kala_core::Tick(300)),
+                    )
+                    .unwrap();
+                    Ok(tx.commit().unwrap().tx.0)
+                })
+                .unwrap()
+        };
+        // Nothing cached: nothing is loaded for a write.
+        assert!(registry.cached_at_least("varrow", 0).unwrap().is_none());
+        assert_eq!(registry.opens("varrow").0, 0);
+        // A reader loaded it and it is current.
+        let (_, held) = registry.get(Some("varrow")).unwrap();
+        let loaded = held.latest_tx().0;
+        let current = registry.cached_at_least("varrow", 0).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&current, &held));
+        // A bookmark it hasn't reached is the writer's to wait for.
+        assert!(
+            registry
+                .cached_at_least("varrow", loaded + 1)
+                .unwrap()
+                .is_none()
+        );
+        drop(current);
+        // Behind the file while a query still reads it: left alone.
+        let first = commit("One");
+        assert!(registry.cached_at_least("varrow", 0).unwrap().is_none());
+        assert_eq!(held.latest_tx().0, loaded);
+        drop(held);
+        let original = std::fs::read(&registry.databases["varrow"].path).unwrap();
+        // Behind the file and unused: the log's tail is applied to it.
+        let second = commit("Two");
+        assert!(second > first);
+        let caught_up = registry.cached_at_least("varrow", second).unwrap().unwrap();
+        assert_eq!(caught_up.latest_tx().0, second);
+        // And that is the snapshot readers get, with no reload.
+        let (_, read) = registry.get(Some("varrow")).unwrap();
+        assert!(Arc::ptr_eq(&read, &caught_up));
+        assert_eq!(registry.opens("varrow").0, 1);
+        // A log that is no longer the one the snapshot applied drops it:
+        // the write path loads nothing, the next reader replays.
+        drop((read, caught_up));
+        std::fs::write(&registry.databases["varrow"].path, &original[..]).unwrap();
+        assert!(registry.cached_at_least("varrow", 0).unwrap().is_none());
+        assert_eq!(registry.opens("varrow").0, 1);
+        let (_, reloaded) = registry.get(Some("varrow")).unwrap();
+        assert_eq!(reloaded.latest_tx().0, first);
         assert_eq!(registry.opens("varrow").0, 2);
     }
 
