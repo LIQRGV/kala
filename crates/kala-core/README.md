@@ -438,6 +438,53 @@ rules. Past 1,024 keys (`MAX_READ_KEYS`) a read set is kept per attribute
 (and type scans as "any new entity"), so a very large one conflicts more
 often, never less.
 
+**Reads made before the transaction's handle began.** A caller may have read
+on an older snapshot than the one its transaction began on: a server session
+pins a read snapshot at `BEGIN`, runs queries on it, and opens its writable
+handle only at the first write, when other transactions may have committed.
+It notes the queries' keys on the transaction and calls
+`Txn::set_read_version(tx)` with the tx of the snapshot it read. The commit's
+read-set check then covers **every transaction committed after `tx`**, not
+only those committed after the transaction began: a commit in between that
+wrote through a key the transaction read is a conflict (`Conflict::applied`
+counts from `tx`), and one that touched nothing it read is not, whichever
+side of the handle's snapshot it is on. The version only moves back; one at
+or past the snapshot changes nothing; the transaction's own reads
+(`values_at`, find-or-create, a correction) are checked from it too, which
+can only conflict more often. Keys are recorded by name on the snapshot's
+schema: a caller whose names may mean something else at `tx` (the schema
+changed in between) should note `note_read_all` instead. Weak mode ignores
+it.
+
+`Txn::set_start_tick(tick)` is the same idea for the latest tick: "this
+transaction started at tick T". Tick-less writes land on T (after the write's
+own tick and `set_default_tick`) instead of the latest tick of the world the
+handle began on, and the commit reports `latest_tick_moved` when the world's
+latest tick is another one by then, also when nothing was committed while
+the handle was open.
+
+**A transaction limited to schema additions.**
+`Txn::set_schema_additions_only(true)` lets a transaction declare (and
+infer) new attributes and node types, and revise the ones it declared itself,
+but refuses any edit of what the committed schema already has with
+`Error::SchemaChangeNotPermitted`: a redeclaration with other labels or
+another type, an inferred name confirmed as declared, a rename, a
+deprecation, a cardinality change, a migration, a world setting. Declaring
+again exactly what exists is no edit. It is judged where the edit is made, so
+a commit over a newer transaction that declared the same name differently is
+refused at commit (nothing written). The store itself has no notion of
+privilege; this is the switch an adapter uses for callers that may write but
+not administer (the Bolt server).
+
+**World-setting keys.** A new world's genesis (`Schema::setting`) and a live
+`Txn::world_setting` accept only the keys in `WORLD_SETTING_KEYS` (`schema`,
+`concurrency`, `tick_unit`); another key is the same error in both, listing
+them. Opening a world replays whatever its log holds. A **restore** of a
+world that already holds another key (written before the list was enforced)
+may write it back: `Schema::accepting_unknown_settings()` for the genesis and
+`Txn::set_unknown_settings_allowed(true)` for later transactions (values are
+still validated). Ordinary writes never use either.
+
 **Weak mode.** `Txn::set_concurrency(Concurrency::Weak)` records no reads and
 checks none: the commit still catches up, re-applies, renumbers and warns
 about the latest tick, and the store's rules still refuse a duplicate handle,

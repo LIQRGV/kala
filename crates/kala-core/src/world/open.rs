@@ -220,7 +220,8 @@ fn genesis_schema(entries: &[LogEntry]) -> Result<Schema, Error> {
             }
         }
     }
-    Ok(schema)
+    // A log may hold a setting key this build doesn't know.
+    Ok(schema.accepting_unknown_settings())
 }
 
 impl World {

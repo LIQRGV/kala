@@ -1966,7 +1966,15 @@ fn a_live_write_sets_only_known_world_settings_and_replay_accepts_any() {
     let path = dir.path().join("settings.kala");
     // A genesis schema (and so any older log) may hold a key this build
     // doesn't know: replay must keep opening it.
-    drop(World::create(&path, Schema::new().setting("house_rule", "x")).unwrap());
+    drop(
+        World::create(
+            &path,
+            Schema::new()
+                .setting("house_rule", "x")
+                .accepting_unknown_settings(),
+        )
+        .unwrap(),
+    );
     let mut world = World::open(&path).unwrap();
     assert_eq!(world.world_setting("house_rule"), Some("x"));
     let mut tx = world.begin();

@@ -250,6 +250,14 @@ pub(super) struct TxnState {
     pub(super) snapshot: Snapshot,
     /// Whether a write fell back to `base_tick`.
     pub(super) used_base_tick: Cell<bool>,
+    /// [`Txn::set_read_version`]: the reads were made on the world as of
+    /// this tx, older than the snapshot, so the commit's read-set check
+    /// covers every transaction after it.
+    pub(super) read_version: Option<TxId>,
+    /// [`Txn::set_schema_additions_only`].
+    pub(super) additions_only: bool,
+    /// [`Txn::set_unknown_settings_allowed`].
+    pub(super) unknown_settings: bool,
     /// A read was made under [`Concurrency::Weak`], which records none.
     pub(super) unrecorded_reads: Cell<bool>,
     /// A replay regenerating what a committed transaction staged (a
@@ -584,6 +592,23 @@ impl Txn<'_> {
     /// [`TickMoved`](crate::TickMoved) warning.
     pub fn report_tick(&self, tick: Option<Tick>) -> Tick {
         tick.or(self.s.default_tick).unwrap_or(self.s.base_tick)
+    }
+    /// Says that this transaction **started at latest tick `tick`**: the
+    /// tick its tick-less writes land on (after the write's own tick and
+    /// [`Txn::set_default_tick`]), in place of the latest tick of the world
+    /// its handle began on.
+    ///
+    /// For a caller whose transaction began before its handle did: a
+    /// server session pins a read snapshot at `BEGIN` and opens its
+    /// writable handle at the first write, and the latest tick a
+    /// transaction uses is the one taken when the transaction starts. If
+    /// the world's latest tick is another one when the transaction commits
+    /// and a tick-less write used this one, the commit says so
+    /// ([`CommitResult::latest_tick_moved`]), exactly as for a commit that
+    /// moved it while the transaction ran. Set it before the first write:
+    /// writes already made keep the tick they resolved to.
+    pub fn set_start_tick(&mut self, tick: Tick) {
+        self.s.base_tick = tick;
     }
     /// Number of primitive entries staged so far, for language report offsets.
     pub fn staged_entry_count(&self) -> usize {
@@ -1180,7 +1205,17 @@ impl Txn<'_> {
                 match locked? {
                     Some(held) => {
                         let applied = self.catch_up_under_lock(&held)?;
-                        if applied > 0 {
+                        // Reads made on an older snapshot than the one this
+                        // transaction began on are checked against the
+                        // transactions in between as well, by the same
+                        // path: the world is put back on its committed
+                        // schema and the operations are made again (which,
+                        // with nothing appended since, stages what was
+                        // staged).
+                        if applied > 0 || self.reads_behind() > 0 {
+                            if let Some(before) = self.s.schema_before.take() {
+                                before.restore(&mut self.world.catalog);
+                            }
                             return self.finalize(held, applied, warn);
                         }
                         Some(held)
@@ -1189,6 +1224,7 @@ impl Txn<'_> {
                 }
             }
         };
+        let latest_tick_moved = self.tick_moved(&self.s.ops);
         let encoded = self.encode_ordered()?;
         let scope = self.warning_scope(warn);
         // The staged schema edits were applied provisionally; the world is
@@ -1216,7 +1252,7 @@ impl Txn<'_> {
             warnings,
             schema: std::mem::take(&mut self.s.schema_changes),
             ids: IdMap::default(),
-            latest_tick_moved: None,
+            latest_tick_moved,
             finalized: None,
         })
     }
@@ -1860,6 +1896,9 @@ impl World {
             ids_exposed: false,
             snapshot,
             used_base_tick: Cell::new(false),
+            read_version: None,
+            additions_only: false,
+            unknown_settings: false,
             unrecorded_reads: Cell::new(false),
             replaying: false,
         }

@@ -141,6 +141,8 @@ pub struct Schema {
     node_types: Vec<String>,
     attributes: Vec<AttrDef>,
     settings: Vec<(String, String)>,
+    /// [`Schema::accepting_unknown_settings`].
+    unknown_settings: bool,
 }
 
 impl Schema {
@@ -162,10 +164,35 @@ impl Schema {
     }
 
     /// Sets a world setting in the genesis, after the schema declarations.
-    /// Settings use the same validation as a live transaction.
+    /// Settings use the same validation as a live transaction: the key
+    /// must be one of [`WORLD_SETTING_KEYS`], or creating the world fails
+    /// with the error a live `Txn::world_setting` gives (unless the schema
+    /// is [`accepting_unknown_settings`](Schema::accepting_unknown_settings)).
     pub fn setting(mut self, key: &str, value: &str) -> Schema {
         self.settings.push((key.to_owned(), value.to_owned()));
         self
+    }
+
+    /// Lets this genesis hold settings with keys outside
+    /// [`WORLD_SETTING_KEYS`], exactly as replaying a log does. Only for
+    /// **restoring** a world that already holds such a key (written before
+    /// the list was enforced) from its dump; a new world's schema should
+    /// not use it. See also
+    /// [`Txn::set_unknown_settings_allowed`](crate::Txn::set_unknown_settings_allowed).
+    pub fn accepting_unknown_settings(mut self) -> Schema {
+        self.unknown_settings = true;
+        self
+    }
+
+    /// The first setting whose key a new world may not hold, as the error
+    /// a live write of it gives.
+    pub(crate) fn check_setting_keys(&self) -> Result<(), crate::Error> {
+        if self.unknown_settings {
+            return Ok(());
+        }
+        self.settings
+            .iter()
+            .try_for_each(|(key, _)| check_setting_key(key))
     }
 
     pub(crate) fn settings(&self) -> &[(String, String)] {
@@ -267,13 +294,27 @@ pub struct MigrationOptions {
 /// rename) may introduce one, and replay refuses a log where one does.
 pub const RESERVED_NAME_PREFIX: &str = "_KALA_";
 
-/// The world settings a live write may set (`Txn::world_setting`, the
-/// `[:world-setting …]` form): `schema` (`strict` or `infer`), `concurrency`
-/// (`optimistic`) and `tick_unit` (an opaque label for apps, never
-/// interpreted by the store). Any other key is refused with a list of
-/// these, so a settings log can't be filled with arbitrary keys. Opening a
-/// world replays whatever its log holds.
+/// The world settings a new world's genesis ([`Schema::setting`]) or a live
+/// write (`Txn::world_setting`, the `[:world-setting …]` form) may set:
+/// `schema` (`strict` or `infer`), `concurrency` (`optimistic`) and
+/// `tick_unit` (an opaque label for apps, never interpreted by the store).
+/// Any other key is refused with a list of these, so a settings log can't
+/// be filled with arbitrary keys. Opening a world replays whatever its log
+/// holds, and restoring a dump may write such a key back
+/// ([`Schema::accepting_unknown_settings`],
+/// `Txn::set_unknown_settings_allowed`).
 pub const WORLD_SETTING_KEYS: [&str; 3] = ["schema", "concurrency", "tick_unit"];
+
+/// Refuses a world setting key outside [`WORLD_SETTING_KEYS`], naming them.
+pub(crate) fn check_setting_key(key: &str) -> Result<(), crate::Error> {
+    if WORLD_SETTING_KEYS.contains(&key) {
+        return Ok(());
+    }
+    Err(crate::Error::Schema(format!(
+        "unknown world setting {key:?}; the settings are: {}",
+        WORLD_SETTING_KEYS.map(|k| format!(":{k}")).join(", ")
+    )))
+}
 
 /// The node type that marks Kala's own `system` (accounts) world. It is a
 /// reserved name, so only a genesis schema can carry it: a world either has

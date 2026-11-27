@@ -457,6 +457,7 @@ impl World {
     /// transaction, and returns it with that transaction encoded (what
     /// [`World::create`] writes after the file header).
     fn with_genesis(schema: Schema) -> Result<(World, EncodedTxn), Error> {
+        schema.check_setting_keys()?;
         let mut world = World {
             catalog: Catalog::from_schema(&schema)?,
             indexes: Indexes::new(fnv1a64),

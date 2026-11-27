@@ -141,7 +141,9 @@ impl std::fmt::Display for TickMoved {
 /// ([`CommitResult::finalized`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Finalized {
-    /// How many transactions were committed since this one began.
+    /// How many transactions were committed since this one began (or
+    /// since the older snapshot its reads were made on, see
+    /// [`Txn::set_read_version`]; then possibly none after it began).
     pub applied: usize,
     /// One per operation the transaction made, in order (index =
     /// [`Txn::operation_count`] before the operation).
@@ -171,6 +173,16 @@ pub(super) struct Snapshot {
 }
 
 impl Snapshot {
+    /// Whether the committed schema the transaction began on has `id`.
+    pub(super) fn has_attr(&self, id: AttrId) -> bool {
+        (id.0 as usize) < self.attrs
+    }
+
+    /// Whether the committed schema the transaction began on has `id`.
+    pub(super) fn has_node_type(&self, id: NodeTypeId) -> bool {
+        usize::from(id.0) < self.node_types
+    }
+
     pub(super) fn of(catalog: &Catalog) -> Snapshot {
         Snapshot {
             attrs: catalog.attributes.len(),
@@ -770,6 +782,72 @@ impl Txn<'_> {
         TxId(self.s.tx.0 - 1)
     }
 
+    /// Says that what this transaction read (the `note_*` reads recorded so
+    /// far and every later one) was read on the world **as of `tx`**, an
+    /// older snapshot than the one the transaction began on
+    /// ([`Txn::snapshot_tx`]).
+    ///
+    /// The commit's read-set check then covers every transaction committed
+    /// after `tx`, not only those committed after this transaction began:
+    /// under [`Concurrency::Optimistic`], a transaction in `tx + 1 ..=
+    /// snapshot_tx` that wrote through a key this one read fails the commit
+    /// with [`Error::Conflict`] just as one committed later does
+    /// ([`Conflict::applied`] counts them all). Transactions that touched
+    /// nothing it read don't matter, whichever side of the snapshot they
+    /// are on. [`Concurrency::Weak`] checks nothing, as always.
+    ///
+    /// For a caller that read before it had this transaction: a server
+    /// session queries the read snapshot it pinned at `BEGIN` and opens its
+    /// writable handle at the first write, when other transactions may
+    /// have committed. It notes the queries' keys here and names the
+    /// pinned tx.
+    ///
+    /// The version only moves back (the earliest one named wins), and a
+    /// `tx` at or past the snapshot changes nothing. The one version covers
+    /// the transaction's own reads too ([`Txn::values_at`], find-or-create,
+    /// a correction's entry), which were made on the snapshot: they are
+    /// checked from `tx` as well, which can only conflict more often.
+    /// Keys are recorded by name on the snapshot's schema; a name that
+    /// meant something else at `tx` is covered because the schema edit in
+    /// between conflicts with every read of the attribute.
+    pub fn set_read_version(&mut self, tx: TxId) {
+        if tx < self.snapshot_tx() {
+            self.s.read_version = Some(self.s.read_version.map_or(tx, |v| v.min(tx)));
+        }
+    }
+
+    /// How many committed transactions lie between the version this
+    /// transaction's reads were made on ([`Txn::set_read_version`]) and its
+    /// snapshot, if its commit checks reads at all; else 0.
+    pub(super) fn reads_behind(&self) -> usize {
+        if !self.s.track || self.s.concurrency != Concurrency::Optimistic {
+            return 0;
+        }
+        self.s
+            .read_version
+            .map_or(0, |v| (self.snapshot_tx().0.saturating_sub(v.0)) as usize)
+    }
+
+    /// The warning of a commit whose tick-less writes landed on the latest
+    /// tick the transaction began with (`ops`: its recorded operations)
+    /// while the world it is committed over has another latest tick.
+    pub(super) fn tick_moved(&self, ops: &[Recorded]) -> Option<TickMoved> {
+        let from = self.s.base_tick;
+        let to = self.world.latest_tick();
+        // A transaction that records operations knows whether a write that
+        // fell back to the base tick was actually made (not only resolved).
+        let used = self.s.used_base_tick.get()
+            && (!self.s.track
+                || ops.iter().any(|r| {
+                    matches!(
+                        r.call,
+                        Call::Write { tick, .. } | Call::InferredWrite { tick, .. }
+                            if tick == from
+                    )
+                }));
+        (used && to != from).then_some(TickMoved { from, to })
+    }
+
     /// How many write operations (creates, asserts, retracts, corrections,
     /// schema operations; no-ops included) the transaction has made: the
     /// index the next one gets in [`Finalized::ops`] and
@@ -1147,6 +1225,12 @@ impl<'w> Txn<'w> {
         applied: usize,
         warn: bool,
     ) -> Result<CommitResult, Error> {
+        let reads = std::mem::take(&mut *self.s.reads.borrow_mut());
+        let optimistic = self.s.concurrency == Concurrency::Optimistic;
+        // Reads made on an older snapshot ([`Txn::set_read_version`]) are
+        // checked from there on.
+        let behind = self.reads_behind();
+        let applied = applied + behind;
         let conflict = |key: ConflictKey, operation: usize| {
             Error::Conflict(Conflict {
                 key,
@@ -1154,38 +1238,27 @@ impl<'w> Txn<'w> {
                 applied,
             })
         };
-        let reads = std::mem::take(&mut *self.s.reads.borrow_mut());
-        let optimistic = self.s.concurrency == Concurrency::Optimistic;
         if optimistic {
-            reads.check(self.world, self.s.tx, applied)?;
+            let first = TxId(self.s.tx.0 - behind as u64);
+            reads.check(self.world, first, applied)?;
         }
         let ops = std::mem::take(&mut self.s.ops);
         let exposed = self.s.ids_exposed;
         let base_tick = self.s.base_tick;
-        let moved_to = self.world.latest_tick();
-        let tick_moved = (self.s.used_base_tick.get()
-            && moved_to != base_tick
-            && ops.iter().any(|r| {
-                matches!(
-                    r.call,
-                    Call::Write { tick, .. } | Call::InferredWrite { tick, .. }
-                        if tick == base_tick
-                )
-            }))
-        .then_some(TickMoved {
-            from: base_tick,
-            to: moved_to,
-        });
+        let tick_moved = self.tick_moved(&ops);
         // The edges every handle knows now: one found among them for a
         // triple this transaction interned is a newer commit's.
         let committed_edges = self.world.catalog.edges.len() as u64;
 
         let deadline = self.s.deadline;
+        let (additions_only, unknown_settings) = (self.s.additions_only, self.s.unknown_settings);
         let mut fresh = self.world.begin_without_catch_up();
         fresh.s.deadline = deadline;
         fresh.s.held = Some(held);
         fresh.s.track = false;
         fresh.s.base_tick = base_tick;
+        fresh.s.additions_only = additions_only;
+        fresh.s.unknown_settings = unknown_settings;
         // Provisional ID -> final ID, for every ID this transaction
         // allocated (edges as entity IDs).
         let mut map: HashMap<EntityId, EntityId> = HashMap::new();

@@ -49,6 +49,10 @@ pub enum Error {
     AttributeNotDefined { name: String, canon: crate::TxId },
     /// New writes to a deprecated attribute are forbidden.
     DeprecatedAttribute(String),
+    /// A transaction limited to schema additions
+    /// (`Txn::set_schema_additions_only`) tried to change this attribute,
+    /// node type or world setting, which the committed schema already has.
+    SchemaChangeNotPermitted(String),
     /// A bounded read stopped before producing an answer.
     WorkInterrupted {
         /// Whether the key bound or stop flag interrupted the read.
@@ -284,7 +288,9 @@ pub struct Conflict {
     /// [`ConflictKey::ExposedId`], the index of the operation that
     /// allocated the ID.
     pub operation: usize,
-    /// How many transactions were committed since this one began.
+    /// How many transactions were committed since this one began (or
+    /// since the older snapshot its reads were made on, see
+    /// `Txn::set_read_version`).
     pub applied: usize,
 }
 
@@ -461,6 +467,11 @@ impl fmt::Display for Error {
             Error::DeprecatedAttribute(name) => write!(
                 f,
                 "attribute {} is deprecated; new writes are refused",
+                Quoted(name)
+            ),
+            Error::SchemaChangeNotPermitted(name) => write!(
+                f,
+                "{} already exists; this transaction may declare new names but not change it",
                 Quoted(name)
             ),
             Error::ExpectedScalarAttribute(name) => {

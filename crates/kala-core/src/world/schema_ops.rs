@@ -552,6 +552,23 @@ impl Txn<'_> {
         {
             return Err(migrate_hint(&old.name));
         }
+        if self.s.additions_only {
+            // What the edit revises, if the committed schema already has it.
+            let revised = match &edit {
+                SchemaEdit::Attribute { id, .. } | SchemaEdit::Migration { source: id, .. } => self
+                    .s
+                    .snapshot
+                    .has_attr(*id)
+                    .then(|| self.world.catalog.attributes[id.0 as usize].name.clone()),
+                SchemaEdit::NodeType { id, name, .. } => {
+                    self.s.snapshot.has_node_type(*id).then(|| name.clone())
+                }
+                SchemaEdit::Setting { key, .. } => Some(key.clone()),
+            };
+            if let Some(name) = revised {
+                return Err(Error::SchemaChangeNotPermitted(name));
+            }
+        }
         if self.s.schema_before.is_none() {
             self.s.schema_before = Some(SchemaSnapshot::capture(&self.world.catalog));
         }
@@ -1065,6 +1082,39 @@ impl Txn<'_> {
             )
         })
     }
+    /// Limits this transaction's schema edits to **additions**: it may
+    /// declare (or infer) attributes and node types the committed schema
+    /// doesn't have, and revise those it declared itself, but an edit of
+    /// anything the committed schema already has fails with
+    /// [`Error::SchemaChangeNotPermitted`] and poisons the transaction, like
+    /// every failed write: a redeclared attribute (new labels, an inverse
+    /// name, a new type), an inferred attribute or node type confirmed as
+    /// declared, a rename, a deprecation, a cardinality change, a
+    /// migration, a world setting. Declaring again exactly what exists is
+    /// no edit and stays allowed.
+    ///
+    /// "Committed" is judged where the edit is made: on the world the
+    /// transaction began on while it is staged, and again on the caught-up
+    /// world when its commit makes its operations again over newer
+    /// transactions (so a name that was new when staged, and that a newer
+    /// commit declared differently, is refused at commit; nothing is
+    /// written).
+    ///
+    /// For an adapter that lets some callers add to the schema but not
+    /// change it (the Bolt server: `write` without `admin`). Off by
+    /// default. Set it before the transaction's first schema edit.
+    pub fn set_schema_additions_only(&mut self, only: bool) {
+        self.s.additions_only = only;
+    }
+    /// Lets [`Txn::world_setting`] set a key outside
+    /// [`WORLD_SETTING_KEYS`](crate::WORLD_SETTING_KEYS), exactly as
+    /// replaying a log accepts one. Only for **restoring** a world that
+    /// holds such a key from its dump (see
+    /// [`Schema::accepting_unknown_settings`]); ordinary writes leave it
+    /// off and are refused.
+    pub fn set_unknown_settings_allowed(&mut self, allowed: bool) {
+        self.s.unknown_settings = allowed;
+    }
     /// Changes a generic world setting, effective for the next operation.
     pub fn world_setting(&mut self, key: &str, value: &str) -> Result<(), Error> {
         self.recorded(
@@ -1079,14 +1129,10 @@ impl Txn<'_> {
         self.guard(|txn| {
             // A live write may set only the settings Kala knows. Replay
             // (`Catalog::apply_setting`) accepts whatever a log holds, so a
-            // world written before this check still opens.
-            if !crate::WORLD_SETTING_KEYS.contains(&key) {
-                return Err(Error::Schema(format!(
-                    "unknown world setting {key:?}; the settings are: {}",
-                    crate::WORLD_SETTING_KEYS
-                        .map(|k| format!(":{k}"))
-                        .join(", ")
-                )));
+            // world written before this check still opens, and a restore
+            // of its dump says so (`Txn::set_unknown_settings_allowed`).
+            if !txn.s.unknown_settings {
+                crate::schema::check_setting_key(key)?;
             }
             if txn.world.world_setting(key) == Some(value) {
                 return Ok(());
