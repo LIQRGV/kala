@@ -1,5 +1,9 @@
 //! Terminal writes are adapters over the native transaction API.
-use super::{Done, query::read_text_file, read::core_err as read_core_err};
+use super::{
+    Done,
+    query::{read_text_file, row_text, table},
+    read::core_err as read_core_err,
+};
 use crate::error::{CONFLICT_ADVICE, CliError, Conflicted};
 use crate::{cli::TransactArgs, escape, names, out};
 use kala_core::{Concurrency, Conflict, ConflictKey, EntityId, Tick, Value, World};
@@ -50,6 +54,12 @@ struct TickMoved {
     line: String,
 }
 #[derive(Serialize)]
+struct Returned {
+    columns: Vec<String>,
+    rows: Vec<Vec<out::JValue>>,
+}
+
+#[derive(Serialize)]
 pub struct Report {
     form: usize,
     dry_run: bool,
@@ -70,6 +80,10 @@ pub struct Report {
     schema: Vec<serde_json::Value>,
     #[serde(skip)]
     schema_text: Vec<String>,
+    #[serde(flatten)]
+    returned: Option<Returned>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    return_error: Option<String>,
 }
 
 /// Opens `path` for writing. A damaged last transaction (fully present,
@@ -326,6 +340,8 @@ fn committed_report(w: &World, result: WriteReport) -> Report {
     Report {
         form: 1,
         dry_run: false,
+        returned: None,
+        return_error: None,
         tx: result.tx.map(|tx| tx.0),
         schema: result
             .schema
@@ -446,6 +462,20 @@ pub fn render(report: &Report, json: bool) -> String {
             report.warnings.resolved_omitted
         );
     }
+    if let Some(result) = &report.returned {
+        let columns: Vec<_> = result
+            .columns
+            .iter()
+            .map(|name| escape::value(name))
+            .collect();
+        let _ = writeln!(s, "  {}", columns.join("  "));
+        if result.rows.is_empty() {
+            s.push_str("  (no rows)\n");
+        }
+        for row in &result.rows {
+            let _ = writeln!(s, "  {}", row_text(row));
+        }
+    }
     s
 }
 
@@ -455,7 +485,6 @@ enum Input<'a> {
 }
 impl Input<'_> {
     fn execute(self, world: &mut World, mode: Concurrency) -> Result<Report, CliError> {
-        use kala_lang::write::{StatementError, execute_statement};
         match self {
             Self::Form(form) => execute(world, &form, None, mode),
             Self::Statement(text) => {
@@ -478,22 +507,78 @@ impl Input<'_> {
                         ));
                     }
                 };
-                match execute_statement(
-                    world,
-                    &statement,
-                    &kala_query::QueryParams::new(),
-                    Default::default(),
-                    mode,
-                ) {
-                    Ok(report) => Ok(committed_report(world, report)),
-                    Err(e @ StatementError::Stage(_)) if matches!(&e, StatementError::Stage(err) if matches!(err.cause, kala_lang::write::Failure::SetEvent(_))) => Err(user(e.to_string())),
-                    Err(StatementError::Stage(e)) => committed(world, Err(e)),
-                    Err(StatementError::Store(e)) => Err(core_err(e)),
-                    Err(e) => Err(user(e.to_string())),
-                }
+                execute_cypher(world, &statement, mode)
             }
         }
     }
+}
+
+/// Use the transaction's starting snapshot for input, then project final IDs
+/// and property values from the committed world at the statement's write tick.
+fn execute_cypher(
+    world: &mut World,
+    stmt: &kala_lang::write::WriteStatement,
+    mode: Concurrency,
+) -> Result<Report, CliError> {
+    use kala_lang::write::{Failure, StatementError, prepare_statement, stage_statement};
+    let params = kala_query::QueryParams::new();
+    let staged = (|| {
+        let mut tx = world.begin();
+        tx.set_concurrency(mode);
+        let input = prepare_statement(tx.base_world(), stmt, &params, Default::default())?;
+        let staged = stage_statement(&mut tx, stmt, input, &params)?;
+        let result = tx.commit().map_err(|error| {
+            let operation = match &error {
+                kala_core::Error::Conflict(c) => staged
+                    .staged
+                    .operation_of(c.operation)
+                    .map(|op| (op.position, op.kind)),
+                _ => None,
+            };
+            StatementError::Stage(WriteError {
+                operation,
+                cause: Failure::Store(error),
+            })
+        })?;
+        Ok((staged, result))
+    })();
+    let (mut staged, result) = match staged {
+        Ok(ok) => ok,
+        Err(
+            e @ StatementError::Stage(WriteError {
+                cause: Failure::SetEvent(_),
+                ..
+            }),
+        ) => return Err(user(e.to_string())),
+        Err(StatementError::Stage(e)) => return committed(world, Err(e)),
+        Err(StatementError::Store(e)) => return Err(core_err(e)),
+        Err(e) => return Err(user(e.to_string())),
+    };
+
+    let fields = stmt.fields();
+    let returned = if fields.is_empty() {
+        Ok(None)
+    } else {
+        staged.committed_rows(world, &result.ids).map(|rows| {
+            let (columns, rows) = table(
+                world,
+                &kala_query::ResultSet {
+                    columns: fields.into_iter().map(kala_query::Var).collect(),
+                    rows,
+                    tick: staged.tick,
+                    canon: world.latest_tx(),
+                },
+            );
+            Some(Returned { columns, rows })
+        })
+    };
+    let mut report = committed_report(world, staged.staged.complete(&result));
+    match returned {
+        Ok(rows) => report.returned = rows,
+        // Save the write report even when a bounded post-commit read fails.
+        Err(e) => report.return_error = Some(e.to_string()),
+    }
+    Ok(report)
 }
 
 pub fn run(args: &TransactArgs) -> Result<Done, CliError> {
@@ -543,6 +628,18 @@ pub fn run(args: &TransactArgs) -> Result<Done, CliError> {
         report.form = i + 1;
         report.dry_run = dry_run;
         print(&render(&report, json))?;
+        if let Some(error) = report.return_error {
+            let outcome = match (dry_run, report.tx) {
+                (true, Some(tx)) => format!("previewed tx#{tx}"),
+                (true, None) => "previewed without changes".to_owned(),
+                (false, Some(tx)) => format!("committed tx#{tx}"),
+                (false, None) => "completed without changes".to_owned(),
+            };
+            return Err(CliError::Store(format!(
+                "statement {} {outcome}, but RETURN failed: {error}",
+                i + 1
+            )));
+        }
         count += 1;
     }
     if count == 0 {

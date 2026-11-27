@@ -842,6 +842,11 @@ statement independently. Use `-` for standard input. On an error the CLI
 identifies the failing statement and how many earlier statements committed.
 `--dry-run` applies the script to a discarded copy. `--json`, `--concurrency`
 and `--busy-timeout` use the same reporting and transaction rules as Datalog.
+A `RETURN` clause adds a table to the write report. With `--json`, its
+`columns` and typed `rows` use the same format as `kala query`. Rows show the
+committed IDs and property values at the write tick, or the previewed values
+for `--dry-run`. For example, `CREATE (p:PLACE {name:'Harbor'}) AT TICK 700
+RETURN p AS place, p.name AS name;` returns the new place and its name.
 The default transaction language and the writable REPL use Datalog.
 
 ## Cypher reads
