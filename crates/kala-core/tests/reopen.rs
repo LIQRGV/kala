@@ -440,9 +440,9 @@ fn wrong_magic_is_bad_magic() {
 fn unknown_version_is_unsupported_version() {
     let b = built();
     let mut d = bytes(&b.path);
-    d[8..12].copy_from_slice(&6u32.to_le_bytes());
+    d[8..12].copy_from_slice(&7u32.to_le_bytes());
     std::fs::write(&b.path, &d).unwrap();
-    assert_eq!(open_err(&b.path), Error::UnsupportedVersion(6));
+    assert_eq!(open_err(&b.path), Error::UnsupportedVersion(7));
     assert_eq!(bytes(&b.path), d);
 }
 
@@ -501,10 +501,10 @@ fn append_fact_txn(path: &Path, entity: u64, attr: u32, value: &Value) {
     commit.extend_from_slice(&(last_id + 2).to_le_bytes());
     commit.extend_from_slice(&(last_tx + 1).to_le_bytes());
 
-    let mut h = crc32fast::Hasher::new();
-    h.update(&fact);
-    h.update(&commit);
-    commit.extend_from_slice(&h.finalize().to_le_bytes());
+    // Format 6: the checksum chains from the previous transaction's.
+    let previous = common::link(&std::fs::read(path).unwrap());
+    let covered = [fact.as_slice(), commit.as_slice()].concat();
+    commit.extend_from_slice(&common::chained(previous, &covered).to_le_bytes());
 
     // v2: the txn is framed by a begin record (not part of the Commit checksum).
     let mut body = fact;
@@ -647,10 +647,10 @@ fn append_txn(path: &Path, entries: &[(u8, Vec<u8>)]) {
     commit.push(5);
     commit.extend_from_slice(&next_id.to_le_bytes());
     commit.extend_from_slice(&tx.to_le_bytes());
-    let mut h = crc32fast::Hasher::new();
-    h.update(&out);
-    h.update(&commit);
-    commit.extend_from_slice(&h.finalize().to_le_bytes());
+    // Format 6: the checksum chains from the previous transaction's.
+    let previous = common::link(&std::fs::read(path).unwrap());
+    let covered = [out.as_slice(), commit.as_slice()].concat();
+    commit.extend_from_slice(&common::chained(previous, &covered).to_le_bytes());
     out.extend(commit);
     let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
     use std::io::Write;

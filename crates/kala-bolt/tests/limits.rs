@@ -93,7 +93,7 @@ fn wait_for_slot(server: &Running) {
 fn no_auth_library_binding_refuses_non_loopback() {
     let dir = tempfile::tempdir().unwrap();
     let config = ServerConfig {
-        listen: "0.0.0.0:0".parse().unwrap(),
+        listen: vec!["0.0.0.0:0".parse().unwrap()],
         ..ServerConfig::default()
     };
     assert!(Server::bind(dir.path(), config).is_err());
@@ -113,7 +113,7 @@ fn ipv6_loopback_can_negotiate_when_available() {
     let server = Running::in_dir(
         dir,
         ServerConfig {
-            listen: "[::1]:0".parse().unwrap(),
+            listen: vec!["[::1]:0".parse().unwrap()],
             ..ServerConfig::default()
         },
     );
@@ -142,7 +142,7 @@ fn client_that_never_reads_releases_slot_after_write_timeout() {
     let server = Running::in_dir(
         dir,
         ServerConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: vec!["127.0.0.1:0".parse().unwrap()],
             max_connections: 1,
             write_timeout: Duration::from_millis(80),
             ..ServerConfig::default()

@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a2a008df0f64d10b232053557bea8384ba34cc7190cf1fcab481494a08ae3426 # shrinks to steps = [Op { h: 1, op: Create { ty: 0, handle: None } }, Op { h: 2, op: Create { ty: 0, handle: None } }, Commit { h: 2 }, Commit { h: 1 }]
+cc 87178f509a8dac19f983936567dc5fc881860e5bd6c2bba5b8d25f35b86fcbd8 # shrinks to steps = [Op { h: 0, op: Write { subject: Ent(Base(0)), attr: 0, value: Ref(Made(0)), tick: None, retract: false } }, Op { h: 2, op: Write { subject: Ent(Base(0)), attr: 0, value: Text(0), tick: Some(0), retract: false } }, Op { h: 2, op: Read(Reverse(Made(0), 0)) }, Commit { h: 0 }, Commit { h: 2 }]
+cc e67c22bb69b559daa42604ea94679ccd9ce203bcee0599c1dd65308780ef4e34 # shrinks to steps = [Begin { h: 0, weak: false, exposed: false }, Op { h: 0, op: FindOrCreate { ty: 1, handle: 2 } }, Op { h: 2, op: FindOrCreate { ty: 1, handle: 0 } }, Op { h: 2, op: Write { subject: Ent(Base(0)), attr: 0, value: Ref(Made(0)), tick: None, retract: false } }, Commit { h: 0 }, Commit { h: 2 }]

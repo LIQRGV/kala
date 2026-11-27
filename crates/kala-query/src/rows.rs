@@ -19,6 +19,9 @@ pub enum Expr<V = Var, C = Value> {
         key: String,
         tick: TickSource,
     },
+    /// Select one value from an ordered list. Negative indices count from the end;
+    /// NULL operands and positions outside the list yield NULL.
+    ListIndex(Box<Self>, Box<Self>),
     /// Construct a list in expression order.
     List(Vec<Self>),
     /// A nullable list/path function.
@@ -58,7 +61,7 @@ impl<V, C> Expr<V, C> {
                     todo.push(b);
                 }
                 Self::Not(e) | Self::IsNull(e) | Self::Function(_, e) => todo.push(e),
-                Self::Disjoint(a, b) => {
+                Self::Disjoint(a, b) | Self::ListIndex(a, b) => {
                     todo.push(a);
                     todo.push(b);
                 }
@@ -69,6 +72,17 @@ impl<V, C> Expr<V, C> {
             }
         }
     }
+}
+/// Element at a Cypher integer offset, without truncating a wide positive or
+/// negative index to the host's address size.
+pub fn list_element<T>(values: &[T], index: i64) -> Option<&T> {
+    let magnitude = usize::try_from(index.unsigned_abs()).ok()?;
+    let offset = if index < 0 {
+        values.len().checked_sub(magnitude)?
+    } else {
+        magnitude
+    };
+    values.get(offset)
 }
 /// Direction relative to a relationship's named attribute (inverse names allowed).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

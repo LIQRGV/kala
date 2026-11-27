@@ -16,6 +16,9 @@ pub struct WorkMeter<'a> {
     keys: AtomicU64,
     pub(super) limit: Option<AtomicU64>,
     stop: Option<&'a AtomicBool>,
+    deadline: Option<std::time::Instant>,
+    /// Reads counted since the clock was last looked at (see `count`).
+    polls: AtomicU64,
     interrupted: AtomicU8,
     // ID walks also need a bound when their prefix seeks find no keys.
     // Kept separate to preserve historical index-key accounting.
@@ -23,7 +26,22 @@ pub struct WorkMeter<'a> {
     id_limit: Option<u64>,
 }
 
+/// How many counted reads share one look at the clock.
+const CLOCK_EVERY: u64 = 64;
+
 impl<'a> WorkMeter<'a> {
+    /// Stop reads at an absolute deadline, in addition to work/cancellation limits.
+    ///
+    /// [`WorkMeter::check`] compares the clock every time it is called.
+    /// While a read counts keys, the clock is looked at for the first key
+    /// and then for every 64th, so a deadline costs a long scan next to
+    /// nothing and still stops it within a few dozen keys (the stop flag
+    /// is read for every key, as before).
+    pub fn with_deadline(mut self, deadline: Option<std::time::Instant>) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
     /// An unbounded meter at zero.
     pub fn new() -> Self {
         Self::default()
@@ -69,14 +87,24 @@ impl<'a> WorkMeter<'a> {
         self.keys.swap(0, AtomicOrdering::Relaxed)
     }
 
-    /// Report a latched interruption or a currently set stop flag.
+    /// Report a latched interruption, a currently set stop flag or a
+    /// deadline that has passed.
     pub fn check(&self) -> Result<(), Error> {
+        self.poll(true)
+    }
+
+    /// [`WorkMeter::check`], comparing the clock only if `clock`.
+    fn poll(&self, clock: bool) -> Result<(), Error> {
         let reason = self.interrupted.load(AtomicOrdering::Relaxed);
         let reason = if reason != 0 {
             reason
         } else if self
             .stop
             .is_some_and(|flag| flag.load(AtomicOrdering::Relaxed))
+            || (clock
+                && self
+                    .deadline
+                    .is_some_and(|at| std::time::Instant::now() >= at))
         {
             self.interrupted.store(2, AtomicOrdering::Relaxed);
             2
@@ -93,11 +121,17 @@ impl<'a> WorkMeter<'a> {
     }
 
     fn count(&self, count: &AtomicU64, n: u64, limit: Option<u64>) -> bool {
-        if self.limit.is_none() && self.stop.is_none() {
+        if self.limit.is_none() && self.stop.is_none() && self.deadline.is_none() {
             count.fetch_add(n, AtomicOrdering::Relaxed);
             return true;
         }
-        if self.check().is_err() {
+        // Reading the clock costs about as much as examining a key.
+        let clock = self.deadline.is_some()
+            && self
+                .polls
+                .fetch_add(1, AtomicOrdering::Relaxed)
+                .is_multiple_of(CLOCK_EVERY);
+        if self.poll(clock).is_err() {
             return false;
         }
         let before = count.fetch_add(n, AtomicOrdering::Relaxed);
@@ -131,8 +165,10 @@ impl Work<'_> {
 
     #[inline]
     pub(super) fn id(self) -> bool {
-        self.0
-            .is_none_or(|m| m.limit.is_none() && m.stop.is_none() || m.count(&m.ids, 1, m.id_limit))
+        self.0.is_none_or(|m| {
+            m.limit.is_none() && m.stop.is_none() && m.deadline.is_none()
+                || m.count(&m.ids, 1, m.id_limit)
+        })
     }
 
     pub(super) fn finish<T>(self, answer: Result<T, Error>) -> Result<T, Error> {
@@ -221,6 +257,20 @@ impl MeteredView<'_> {
         entity: EntityId,
         attr: &str,
         t: Tick,
+        visitor: impl FnMut(Value) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        self.visit_non_ref_values_charged(entity, attr, t, |_| Ok(()), visitor)
+    }
+
+    /// As [`Self::visit_non_ref_values`], charging encoded bytes before decoding
+    /// each value. The charge also precedes copying an unindexed string from
+    /// its intern table, so a caller can enforce its remaining memory budget.
+    pub fn visit_non_ref_values_charged(
+        &self,
+        entity: EntityId,
+        attr: &str,
+        t: Tick,
+        mut charge: impl FnMut(usize) -> Result<(), Error>,
         mut visitor: impl FnMut(Value) -> Result<(), Error>,
     ) -> Result<(), Error> {
         let (attr_id, def) = self.view.resolve(entity, attr)?;
@@ -230,11 +280,19 @@ impl MeteredView<'_> {
         self.view.work.finish(Ok(()))?;
         let mut result = Ok(());
         self.view
-            .for_each_e_value_holding(entity, attr_id, t, |encoded| {
-                if result.is_ok()
-                    && let Some(value) = self.view.world.decode_e_part(attr_id, encoded)
-                {
-                    result = visitor(value);
+            .for_each_e_value_holding(entity, attr_id, t, |part| {
+                if result.is_err() {
+                    return;
+                }
+                if let Some(encoded) = self.view.world.e_part_encoding(attr_id, part) {
+                    result = charge(encoded.len()).and_then(|()| {
+                        if let Ok(value) = Value::decode(encoded)
+                            && value.value_type() == def.value_type
+                        {
+                            visitor(value)?;
+                        }
+                        Ok(())
+                    });
                 }
             });
         result?;

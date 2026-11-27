@@ -40,7 +40,7 @@ fn server() -> Running {
     system::add(dir.path(), "carol@127.0.0.1", Some(PASSWORD)).unwrap();
     system::grant(dir.path(), "carol@127.0.0.1", "read", "varrow").unwrap();
     let config = ServerConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
+        listen: vec!["127.0.0.1:0".parse().unwrap()],
         ..ServerConfig::default()
     };
     let auth = Arc::new(Accounts::open(dir.path()).unwrap());

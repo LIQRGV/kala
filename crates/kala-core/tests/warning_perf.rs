@@ -64,8 +64,15 @@ fn a_thousand_overlapping_values_each_commit_under_100ms() {
             assert!(res.warnings.resolved.is_empty(), "commit {k}");
             assert_eq!(
                 res.warnings.introduced,
-                expected_introduced(greg, k),
-                "commit {k}: the k-th assert introduces exactly k overlaps, sorted"
+                expected_introduced(greg, k)
+                    .into_iter()
+                    .take(MAX_COMMIT_WARNINGS)
+                    .collect::<Vec<_>>(),
+                "commit {k}: first capped overlaps retain their original sorted order"
+            );
+            assert_eq!(
+                res.warnings.introduced_omitted,
+                (k as usize).saturating_sub(MAX_COMMIT_WARNINGS) as u128
             );
         }
         if took >= LIMIT {
@@ -108,5 +115,67 @@ fn small_instance_warnings_match_the_item_7_order() {
         assert_eq!(o.b, Value::I64(i as i64 + 1));
         assert_eq!(o.during.until, Some(Tick(20)));
         assert_eq!(o.during.from, Tick(i as i64 + 1));
+    }
+}
+
+/// Run in an isolated process so the peak-memory proxy cannot inherit another
+/// parallel test's allocations. On Linux, 2M materialized overlaps exceed this
+/// generous 128 MiB growth budget; streaming pair counting retains only 100.
+#[test]
+fn two_thousand_overlaps_use_bounded_warning_memory() {
+    const CHILD: &str = "KALA_WARNING_CAP_MEMORY_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "two_thousand_overlaps_use_bounded_warning_memory",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    fn peak_kib() -> Option<usize> {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()?
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("VmHWM:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+    }
+    let mut w = World::in_memory(schema()).unwrap();
+    let e = w.create_entity("CHARACTER", Some("crowded")).unwrap();
+    let mut tx = w.begin();
+    for value in 0..2000 {
+        tx.assert(e, "rank", Value::I64(value), Some(Tick(0)))
+            .unwrap();
+    }
+    let before = peak_kib();
+    let start = Instant::now();
+    let result = tx.commit().unwrap();
+    assert_eq!(result.warnings.introduced.len(), 100);
+    assert_eq!(result.warnings.introduced_omitted, 1_999_000 - 100);
+    assert!(result.warnings.resolved.is_empty());
+    assert!(
+        start.elapsed() < Duration::from_secs(30),
+        "generous pair-counting time limit exceeded"
+    );
+    if let (Some(before), Some(after)) = (before, peak_kib()) {
+        assert!(
+            after.saturating_sub(before) < 128 * 1024,
+            "commit warning memory grew by {} KiB",
+            after.saturating_sub(before)
+        );
     }
 }

@@ -1,5 +1,6 @@
 //! Transactional schema definitions. The mutable borrow hides provisional names;
 //! dropping or failing a transaction restores only its schema metadata.
+use super::concurrency::Call;
 use super::*;
 
 #[derive(Debug)]
@@ -88,6 +89,41 @@ impl SchemaSnapshot {
                     || old.reverse_cardinality != new.reverse_cardinality
             })
     }
+    /// Whether the schema at the snapshot has `name`, as an attribute's
+    /// name or its inverse name.
+    pub(super) fn declares(&self, name: &str) -> bool {
+        self.attributes
+            .iter()
+            .any(|def| def.name == name || def.inverse.as_deref() == Some(name))
+    }
+    /// Sets a transaction's provisional schema aside, for the time nobody
+    /// borrows the transaction ([`OwnedTxn`](super::OwnedTxn)): `catalog`,
+    /// which has the provisional schema applied, gets the committed schema
+    /// this snapshot holds, and the snapshot holds the provisional one until
+    /// [`SchemaSnapshot::resume`] swaps them back. The node types the
+    /// transaction declared go to `types`. Nothing is cloned.
+    pub(super) fn park(&mut self, catalog: &mut Catalog, types: &mut Vec<NodeType>) {
+        debug_assert!(types.is_empty(), "parked twice");
+        self.exchange(catalog);
+        *types = catalog.node_types.split_off(self.node_count);
+        catalog.rebuild_schema_names();
+    }
+    /// Undoes [`SchemaSnapshot::park`]: `catalog` has the transaction's
+    /// provisional schema again and this snapshot the committed one.
+    pub(super) fn resume(&mut self, catalog: &mut Catalog, types: &mut Vec<NodeType>) {
+        debug_assert_eq!(catalog.node_types.len(), self.node_count);
+        self.exchange(catalog);
+        catalog.node_types.append(types);
+        catalog.rebuild_schema_names();
+    }
+    /// Swaps everything [`SchemaSnapshot::restore`] restores, except the
+    /// node types, between this snapshot and `catalog`.
+    fn exchange(&mut self, catalog: &mut Catalog) {
+        std::mem::swap(&mut self.attributes, &mut catalog.attributes);
+        std::mem::swap(&mut self.history, &mut catalog.attribute_history);
+        std::mem::swap(&mut self.origins, &mut catalog.node_origins);
+        std::mem::swap(&mut self.settings, &mut catalog.settings);
+    }
     pub(super) fn restore(self, catalog: &mut Catalog) {
         catalog.attributes = self.attributes;
         catalog.attribute_history = self.history;
@@ -98,8 +134,20 @@ impl SchemaSnapshot {
     }
 }
 
-/// The schema half of the catalog: validating and applying schema edits.
-/// Live edits and replay both go through [`Catalog::apply_schema_edit`].
+/// Scalar attributes infer one value, except node labels, which are a set.
+/// Restore accepts the original label-one default used by older dumps/logs.
+fn inferred_cardinality(name: &str, ty: ValueType, stored: Option<Cardinality>) -> Cardinality {
+    if name == "label" && ty == ValueType::Str {
+        stored.unwrap_or(Cardinality::Many)
+    } else if ty == ValueType::Ref {
+        Cardinality::Many
+    } else {
+        Cardinality::One
+    }
+}
+
+/// The schema half of the catalog. Live edits and replay both go through
+/// [`Catalog::apply_schema_edit`].
 impl Catalog {
     /// Rebuilds the name tables (attributes, inverses, node types) from the
     /// definitions, after an edit or a restore changed them.
@@ -237,11 +285,7 @@ impl Catalog {
                 &def.name,
                 def.value_type,
                 Kind::State,
-                if def.value_type == ValueType::Ref {
-                    Cardinality::Many
-                } else {
-                    Cardinality::One
-                },
+                inferred_cardinality(&def.name, def.value_type, Some(def.cardinality)),
             );
             expected.inferred = true;
             if self.is_strict() || *def != expected {
@@ -361,6 +405,15 @@ impl Catalog {
             || (key == "schema" && value != "strict" && value != "infer")
         {
             return Err(Error::Schema("schema setting must be :strict or :infer; setting keys and values must be nonempty".into()));
+        }
+        // The world's concurrency mode. Optimistic is also what an unset
+        // world uses; weak is chosen per transaction, never here.
+        if key == "concurrency" && value != "optimistic" {
+            return Err(Error::Schema(if value == "pessimistic" {
+                "concurrency setting :pessimistic is not supported yet; the only mode is :optimistic".into()
+            } else {
+                "concurrency setting must be :optimistic (weak is chosen per transaction)".into()
+            }));
         }
         if self.setting(key) == Some(value) {
             return Err(Error::Schema("a setting no-op is not a log entry".into()));
@@ -483,7 +536,7 @@ fn migrate_hint(name: &str) -> Error {
 
 impl Drop for Txn<'_> {
     fn drop(&mut self) {
-        if let Some(before) = self.schema_before.take() {
+        if let Some(before) = self.s.schema_before.take() {
             before.restore(&mut self.world.catalog);
         }
     }
@@ -499,16 +552,37 @@ impl Txn<'_> {
         if let SchemaEdit::Attribute { id, def } = &edit
             && let Some(old) = self.world.catalog.attributes.get(id.0 as usize)
             && structural_change(old, def)
-            && self.entries.iter().any(|e| e.key_and_mark().0.attr == *id)
+            && self
+                .s
+                .entries
+                .iter()
+                .any(|e| e.key_and_mark().0.attr == *id)
         {
             return Err(migrate_hint(&old.name));
         }
-        if self.schema_before.is_none() {
-            self.schema_before = Some(SchemaSnapshot::capture(&self.world.catalog));
+        if self.s.additions_only {
+            // What the edit revises, if the committed schema already has it.
+            let revised = match &edit {
+                SchemaEdit::Attribute { id, .. } | SchemaEdit::Migration { source: id, .. } => self
+                    .s
+                    .snapshot
+                    .has_attr(*id)
+                    .then(|| self.world.catalog.attributes[id.0 as usize].name.clone()),
+                SchemaEdit::NodeType { id, name, .. } => {
+                    self.s.snapshot.has_node_type(*id).then(|| name.clone())
+                }
+                SchemaEdit::Setting { key, .. } => Some(key.clone()),
+            };
+            if let Some(name) = revised {
+                return Err(Error::SchemaChangeNotPermitted(name));
+            }
         }
-        self.world.apply_schema_edit(&edit, self.tx, migration)?;
-        self.order.push(OrderedEntry::Schema(edit));
-        self.schema_changes.push(report);
+        if self.s.schema_before.is_none() {
+            self.s.schema_before = Some(SchemaSnapshot::capture(&self.world.catalog));
+        }
+        self.world.apply_schema_edit(&edit, self.s.tx, migration)?;
+        self.s.order.push(OrderedEntry::Schema(edit));
+        self.s.schema_changes.push(report);
         Ok(())
     }
     /// Shared write inference. An unknown retract in infer mode changes nothing
@@ -519,10 +593,68 @@ impl Txn<'_> {
         value: &Value,
         op: Op,
     ) -> Result<bool, Error> {
+        self.recorded(
+            |_| Call::InferWriteAttribute {
+                name: name.to_owned(),
+                value: value.clone(),
+                op,
+            },
+            |txn| txn.infer_write_attribute_op(name, value, op),
+        )
+    }
+    /// A write through schema-on-write, as one operation: the attribute is
+    /// inferred from `value` if it is undeclared
+    /// ([`Txn::infer_write_attribute`]), then the fact is asserted or
+    /// retracted ([`Txn::assert_with_precision`],
+    /// [`Txn::retract_with_precision`]). `None` if the write was dropped:
+    /// a retract of an attribute that doesn't exist (and isn't inferred
+    /// for it) changes nothing.
+    ///
+    /// Use this, not the two calls, for a write that may be committed over
+    /// newer transactions: the commit then makes the **whole** operation
+    /// again, so a retract dropped here is judged against the attribute if
+    /// a newer commit declared it meanwhile. Made as two calls, only the
+    /// inference would be made again and the dropped retract lost.
+    pub fn write_inferring(
+        &mut self,
+        entity: EntityId,
+        attr: &str,
+        value: &Value,
+        tick: Option<Tick>,
+        op: Op,
+        precision: Precision,
+    ) -> Result<Option<WriteResult>, Error> {
+        let tick = self.write_tick(tick);
+        self.recorded(
+            |_| Call::InferredWrite {
+                entity,
+                attr: attr.to_owned(),
+                value: value.clone(),
+                tick,
+                op,
+                precision,
+            },
+            |txn| {
+                if !txn.infer_write_attribute(attr, value, op)? {
+                    return Ok(None);
+                }
+                txn.write(entity, attr, value, Some(tick), op, precision)
+                    .map(Some)
+            },
+        )
+    }
+    fn infer_write_attribute_op(
+        &mut self,
+        name: &str,
+        value: &Value,
+        op: Op,
+    ) -> Result<bool, Error> {
         if op == Op::Retract
             && self.world.attribute(name).is_none()
             && self.world.world_setting("schema") != Some("strict")
         {
+            // The write is dropped because the name is undeclared: a read.
+            self.note_undeclared_attr(name);
             return self.guard(|_| Ok(false));
         }
         self.infer_attribute(name, value)?;
@@ -531,29 +663,67 @@ impl Txn<'_> {
     /// Schema actions staged so far, in operation order, excluding no-ops.
     /// Includes declarations inferred by writes and each migration action.
     pub fn schema_changes(&self) -> &[SchemaChange] {
-        &self.schema_changes
+        &self.s.schema_changes
     }
     /// The current staged definition, including earlier operations in this transaction.
     pub fn attribute(&self, name: &str) -> Option<&AttrDef> {
-        self.world.attribute(name)
+        let def = self.world.attribute(name);
+        if def.is_none() {
+            self.note_undeclared_attr(name);
+        }
+        def
+    }
+    /// The cardinality used to render a property from this side of a relationship.
+    /// Unlabelled inverses render a single held value as a scalar, like the query executor.
+    pub fn property_cardinality(&self, name: &str) -> Option<Cardinality> {
+        if let Some(id) = self.world.catalog.inverse_by_name.get(name) {
+            Some(
+                self.world.catalog.attributes[id.0 as usize]
+                    .reverse_cardinality
+                    .unwrap_or(Cardinality::One),
+            )
+        } else {
+            self.attribute(name).map(|def| def.cardinality)
+        }
+    }
+
+    /// All attribute definitions, including those staged by this transaction.
+    pub fn attributes(&self) -> impl Iterator<Item = &AttrDef> {
+        self.world.attributes()
+    }
+
+    /// The underlying world for query preparation on a newly opened transaction.
+    /// Read it before staging: schema changes become visible here during staging.
+    pub fn base_world(&self) -> &World {
+        self.world
+    }
+
+    /// Whether the transaction writes a system world ([`World::is_system`]).
+    pub fn is_system(&self) -> bool {
+        self.world.is_system()
     }
     /// Resolves a handle including entities created earlier in this transaction.
+    ///
+    /// Finding no entity is a read the caller may decide from (find-or-
+    /// create): under optimistic concurrency a newer commit that creates
+    /// the handle conflicts with this transaction's commit.
     pub fn entity_by_handle(&self, name: &str) -> Option<EntityId> {
-        self.ids
-            .defs
-            .iter()
-            .find(|d| d.handle.as_deref() == Some(name))
-            .map(|d| d.id)
-            .or_else(|| self.world.entity_by_handle(name))
+        let found = self
+            .s
+            .ids
+            .entity_by_handle(name)
+            .or_else(|| self.world.entity_by_handle(name));
+        if found.is_none() {
+            self.note_free_handle(name);
+        }
+        found
     }
     /// The entity's handle, including entities created earlier in this
     /// transaction (the reverse of [`Txn::entity_by_handle`]).
     pub fn handle_of(&self, id: EntityId) -> Option<&str> {
-        self.ids
-            .defs
-            .iter()
-            .find(|d| d.id == id)
-            .and_then(|d| d.handle.as_deref())
+        self.s
+            .ids
+            .handle_of(id)
             .or_else(|| self.world.handle_of(id))
     }
     /// `CHARACTER#1`, `edge#9`, as [`World::format_id`] formats it, with
@@ -567,13 +737,22 @@ impl Txn<'_> {
     }
     /// Infers a definition from a first value unless the world is strict.
     pub fn infer_attribute(&mut self, name: &str, value: &Value) -> Result<(), Error> {
+        self.recorded(
+            |_| Call::InferAttribute {
+                name: name.to_owned(),
+                value: value.clone(),
+            },
+            |txn| txn.infer_attribute_op(name, value),
+        )
+    }
+    fn infer_attribute_op(&mut self, name: &str, value: &Value) -> Result<(), Error> {
         self.guard(|txn| {
             if txn.world.attribute(name).is_some() { return Ok(()); }
             check_new_name(name)?;
             let ty = value.value_type();
             if txn.world.world_setting("schema") == Some("strict") { return Err(Error::Schema(format!("attribute {:?} is not in the schema; declare it first: [:attribute :{} :{}]", name,name,ty.name()))); }
             if let Value::Str(value) = value && value.len() > crate::MAX_INDEXED_STRING_BYTES { return Err(Error::Schema(format!("string over 256 bytes for an indexed attribute; declare it first: [:attribute :{} :string :unindexed]", name))); }
-            let mut def = AttrDef::new(name,ty,Kind::State,if ty == ValueType::Ref { Cardinality::Many } else { Cardinality::One });
+            let mut def = AttrDef::new(name,ty,Kind::State,inferred_cardinality(name, ty, None));
             def.inferred = true;
             txn.declare_attr_inner(def)
         })
@@ -587,12 +766,23 @@ impl Txn<'_> {
         ty: ValueType,
         options: &AttributeOptions,
     ) -> Result<(), Error> {
+        self.recorded(
+            |_| Call::InferAttributeWith {
+                name: name.to_owned(),
+                value_type: ty,
+                options: options.clone(),
+            },
+            |txn| txn.infer_attribute_with_op(name, ty, options),
+        )
+    }
+    fn infer_attribute_with_op(
+        &mut self,
+        name: &str,
+        ty: ValueType,
+        options: &AttributeOptions,
+    ) -> Result<(), Error> {
         self.guard(|txn| {
-            let cardinality = if ty == ValueType::Ref {
-                Cardinality::Many
-            } else {
-                Cardinality::One
-            };
+            let cardinality = inferred_cardinality(name, ty, options.cardinality);
             if options.kind.is_some_and(|v| v != Kind::State)
                 || options.cardinality.is_some_and(|v| v != cardinality)
                 || options
@@ -607,6 +797,12 @@ impl Txn<'_> {
                     "an inferred declaration must be new and use inference defaults".into(),
                 ));
             }
+            if cardinality != inferred_cardinality(name, ty, None) {
+                // Restore the old inferred label-one declaration verbatim.
+                let mut def = AttrDef::new(name, ty, Kind::State, cardinality);
+                def.inferred = true;
+                return txn.declare_attr_inner(def);
+            }
             let sample = match ty {
                 ValueType::Bool => Value::Bool(false),
                 ValueType::I64 => Value::I64(0),
@@ -620,6 +816,12 @@ impl Txn<'_> {
 
     /// Infers a node type unless the world is strict.
     pub fn infer_node_type(&mut self, name: &str) -> Result<(), Error> {
+        self.recorded(
+            |_| Call::InferNodeType(name.to_owned()),
+            |txn| txn.infer_node_type_op(name),
+        )
+    }
+    fn infer_node_type_op(&mut self, name: &str) -> Result<(), Error> {
         self.guard(|txn| {
             if txn.world.catalog.node_type_by_name.contains_key(name) {
                 return Ok(());
@@ -635,7 +837,14 @@ impl Txn<'_> {
         })
     }
     /// Declares or revises an attribute. Origin and deprecation are managed by the store.
-    pub fn declare_attribute(&mut self, mut def: AttrDef) -> Result<(), Error> {
+    pub fn declare_attribute(&mut self, def: AttrDef) -> Result<(), Error> {
+        let recorded = self.s.track.then(|| def.clone());
+        self.recorded(
+            |_| Call::DeclareAttribute(recorded.expect("recorded only when tracking")),
+            |txn| txn.declare_attribute_op(def),
+        )
+    }
+    fn declare_attribute_op(&mut self, mut def: AttrDef) -> Result<(), Error> {
         self.guard(|txn| {
             if def.deprecated {
                 return Err(Error::Schema(
@@ -654,6 +863,21 @@ impl Txn<'_> {
     /// no facts), starts from the [`AttrDef::new`] defaults. The result is
     /// validated like [`Txn::declare_attribute`].
     pub fn declare_attribute_with(
+        &mut self,
+        name: &str,
+        value_type: ValueType,
+        options: &AttributeOptions,
+    ) -> Result<(), Error> {
+        self.recorded(
+            |_| Call::DeclareAttributeWith {
+                name: name.to_owned(),
+                value_type,
+                options: options.clone(),
+            },
+            |txn| txn.declare_attribute_with_op(name, value_type, options),
+        )
+    }
+    fn declare_attribute_with_op(
         &mut self,
         name: &str,
         value_type: ValueType,
@@ -769,7 +993,10 @@ impl Txn<'_> {
     }
     /// Declares a node type, or confirms an inferred one.
     pub fn declare_node_type(&mut self, name: &str) -> Result<(), Error> {
-        self.guard(|txn| txn.node_type_inner(name, false))
+        self.recorded(
+            |_| Call::DeclareNodeType(name.to_owned()),
+            |txn| txn.guard(|txn| txn.node_type_inner(name, false)),
+        )
     }
     fn node_type_inner(&mut self, name: &str, inferred: bool) -> Result<(), Error> {
         let id = if let Some(id) = self.world.catalog.node_type_by_name.get(name) {
@@ -803,6 +1030,15 @@ impl Txn<'_> {
     }
     /// Changes the name at every canon, preserving the attribute ID.
     pub fn rename_attribute(&mut self, old: &str, new: &str) -> Result<(), Error> {
+        self.recorded(
+            |_| Call::Rename {
+                old: old.to_owned(),
+                new: new.to_owned(),
+            },
+            |txn| txn.rename_attribute_op(old, new),
+        )
+    }
+    fn rename_attribute_op(&mut self, old: &str, new: &str) -> Result<(), Error> {
         self.guard(|txn| {
             check_new_name(new)?;
             let id = txn.attr_id(old)?;
@@ -831,6 +1067,12 @@ impl Txn<'_> {
     }
     /// Refuses subsequent writes while preserving reads.
     pub fn deprecate_attribute(&mut self, name: &str) -> Result<(), Error> {
+        self.recorded(
+            |_| Call::Deprecate(name.to_owned()),
+            |txn| txn.deprecate_attribute_op(name),
+        )
+    }
+    fn deprecate_attribute_op(&mut self, name: &str) -> Result<(), Error> {
         self.guard(|txn| {
             let id = txn.attr_id(name)?;
             let mut def = txn.world.catalog.attributes[id.0 as usize].clone();
@@ -847,6 +1089,15 @@ impl Txn<'_> {
     }
     /// Revises the cardinality label, with overlap warnings at commit.
     pub fn set_cardinality(&mut self, name: &str, cardinality: Cardinality) -> Result<(), Error> {
+        self.recorded(
+            |_| Call::SetCardinality {
+                name: name.to_owned(),
+                cardinality,
+            },
+            |txn| txn.set_cardinality_op(name, cardinality),
+        )
+    }
+    fn set_cardinality_op(&mut self, name: &str, cardinality: Cardinality) -> Result<(), Error> {
         self.guard(|txn| {
             let id = txn.attr_id(name)?;
             let mut def = txn.world.catalog.attributes[id.0 as usize].clone();
@@ -866,9 +1117,58 @@ impl Txn<'_> {
             )
         })
     }
+    /// Limits this transaction's schema edits to **additions**: it may
+    /// declare (or infer) attributes and node types the committed schema
+    /// doesn't have, and revise those it declared itself, but an edit of
+    /// anything the committed schema already has fails with
+    /// [`Error::SchemaChangeNotPermitted`] and poisons the transaction, like
+    /// every failed write: a redeclared attribute (new labels, an inverse
+    /// name, a new type), an inferred attribute or node type confirmed as
+    /// declared, a rename, a deprecation, a cardinality change, a
+    /// migration, a world setting. Declaring again exactly what exists is
+    /// no edit and stays allowed.
+    ///
+    /// "Committed" is judged where the edit is made: on the world the
+    /// transaction began on while it is staged, and again on the caught-up
+    /// world when its commit makes its operations again over newer
+    /// transactions (so a name that was new when staged, and that a newer
+    /// commit declared differently, is refused at commit; nothing is
+    /// written).
+    ///
+    /// For an adapter that lets some callers add to the schema but not
+    /// change it (the Bolt server: `write` without `admin`). Off by
+    /// default. Set it before the transaction's first schema edit.
+    pub fn set_schema_additions_only(&mut self, only: bool) {
+        self.s.additions_only = only;
+    }
+    /// Lets [`Txn::world_setting`] set a key outside
+    /// [`WORLD_SETTING_KEYS`](crate::WORLD_SETTING_KEYS), exactly as
+    /// replaying a log accepts one. Only for **restoring** a world that
+    /// holds such a key from its dump (see
+    /// [`Schema::accepting_unknown_settings`]); ordinary writes leave it
+    /// off and are refused.
+    pub fn set_unknown_settings_allowed(&mut self, allowed: bool) {
+        self.s.unknown_settings = allowed;
+    }
     /// Changes a generic world setting, effective for the next operation.
     pub fn world_setting(&mut self, key: &str, value: &str) -> Result<(), Error> {
+        self.recorded(
+            |_| Call::WorldSetting {
+                key: key.to_owned(),
+                value: value.to_owned(),
+            },
+            |txn| txn.world_setting_op(key, value),
+        )
+    }
+    fn world_setting_op(&mut self, key: &str, value: &str) -> Result<(), Error> {
         self.guard(|txn| {
+            // A live write may set only the settings Kala knows. Replay
+            // (`Catalog::apply_setting`) accepts whatever a log holds, so a
+            // world written before this check still opens, and a restore
+            // of its dump says so (`Txn::set_unknown_settings_allowed`).
+            if !txn.s.unknown_settings {
+                crate::schema::check_setting_key(key)?;
+            }
             if txn.world.world_setting(key) == Some(value) {
                 return Ok(());
             }
@@ -967,27 +1267,19 @@ impl<'w> View<'w> {
     }
 }
 
-impl World {
-    pub(super) fn all_overlaps(&self) -> Vec<Overlap> {
-        self.at_canon(self.latest_tx())
-            .attributes()
-            .flat_map(|def| self.overlaps(&def.name).unwrap_or_default())
-            .collect()
-    }
-}
 impl Txn<'_> {
     pub(super) fn encode_ordered(&self) -> Result<EncodedTxn, Error> {
-        let items = self.order.iter().map(|entry| match entry {
+        let items = self.s.order.iter().map(|entry| match entry {
             OrderedEntry::Schema(edit) => NewEntry::Schema(edit),
             OrderedEntry::Entity(i) => {
-                let d = &self.ids.defs[*i];
+                let d = &self.s.ids.defs[*i];
                 NewEntry::Entity {
                     id: d.id,
                     handle: d.handle.as_deref(),
                 }
             }
             OrderedEntry::Edge(i) => {
-                let d = &self.ids.edges[*i];
+                let d = &self.s.ids.edges[*i];
                 NewEntry::Edge {
                     id: d.id,
                     source: d.source,
@@ -995,7 +1287,7 @@ impl Txn<'_> {
                     target: d.target,
                 }
             }
-            OrderedEntry::Fact(i) => match &self.entries[*i] {
+            OrderedEntry::Fact(i) => match &self.s.entries[*i] {
                 Staged::Fact(f) => NewEntry::Fact {
                     entity: f.entity,
                     attr: f.attr,
@@ -1024,7 +1316,12 @@ impl Txn<'_> {
                 },
             },
         });
-        log::encode_txn(self.world.journal.next_entry(), self.tx, items)
+        log::encode_txn(
+            self.world.journal.next_entry(),
+            self.s.tx,
+            self.world.journal.chain_checksum(),
+            items,
+        )
     }
 }
 
@@ -1043,34 +1340,4 @@ impl World {
     pub(crate) fn schema_matches(&self, other: &Self) -> bool {
         self.catalog.schema_matches(&other.catalog)
     }
-}
-
-pub(super) fn schema_warnings(before: Vec<Vec<Overlap>>, after: Vec<Vec<Overlap>>) -> Warnings {
-    // The ordinary write diff receives one list per touched side. Schema edits
-    // can add/remove entire sides, so align those lists before using that diff.
-    let group = |lists: Vec<Vec<Overlap>>| {
-        let mut groups: BTreeMap<(EntityId, String, u8), Vec<Overlap>> = BTreeMap::new();
-        for overlap in lists.into_iter().flatten() {
-            let key = (
-                overlap.entity,
-                overlap.attr.clone(),
-                if overlap.side == Side::Forward { 0 } else { 1 },
-            );
-            groups.entry(key).or_default().push(overlap);
-        }
-        groups
-    };
-    let mut old = group(before);
-    let mut new = group(after);
-    let keys: std::collections::BTreeSet<_> = old.keys().chain(new.keys()).cloned().collect();
-    let (before, after) = keys
-        .into_iter()
-        .map(|key| {
-            (
-                old.remove(&key).unwrap_or_default(),
-                new.remove(&key).unwrap_or_default(),
-            )
-        })
-        .unzip();
-    overlap_diff(before, after)
 }

@@ -58,7 +58,11 @@ pub(super) struct StagedIds {
     /// Last staged sequence number per node type. Staged sequences of a type
     /// continue the world's without gaps, so `1..=last` are all defined.
     last_seq: HashMap<NodeTypeId, u64>,
-    handles: HashSet<String>,
+    /// Staged handle -> position in `defs`, and staged entity -> position:
+    /// a form that creates many entities and then names them by handle
+    /// resolves each one with a map lookup, as the world's own tables do.
+    handles: HashMap<String, usize>,
+    positions: HashMap<EntityId, usize>,
     /// Edges interned by this transaction, in interning order: their
     /// sequences continue the world's without gaps.
     pub(super) edges: Vec<EdgeDef>,
@@ -73,10 +77,30 @@ pub(super) struct StagedIds {
 impl StagedIds {
     pub(super) fn push(&mut self, def: EntityDef) {
         self.last_seq.insert(def.id.node_type(), def.id.seq());
+        let position = self.defs.len();
         if let Some(h) = &def.handle {
-            self.handles.insert(h.clone());
+            self.handles.insert(h.clone(), position);
         }
+        self.positions.insert(def.id, position);
         self.defs.push(def);
+    }
+
+    /// The entity this transaction created with `handle`, if any.
+    pub(super) fn entity_by_handle(&self, handle: &str) -> Option<EntityId> {
+        self.handles.get(handle).map(|i| self.defs[*i].id)
+    }
+
+    /// The handle this transaction gave entity `id`, if it created `id`
+    /// with one.
+    pub(super) fn handle_of(&self, id: EntityId) -> Option<&str> {
+        self.positions
+            .get(&id)
+            .and_then(|i| self.defs[*i].handle.as_deref())
+    }
+
+    /// Whether this transaction created entity `id`.
+    pub(super) fn created(&self, id: EntityId) -> bool {
+        self.positions.contains_key(&id)
     }
 
     pub(super) fn push_edge(&mut self, def: EdgeDef) {
@@ -251,7 +275,7 @@ impl Catalog {
             if h.is_empty() {
                 return Err(Error::InvalidHandle(h.to_owned()));
             }
-            if self.entity_by_handle.contains_key(h) || staged.handles.contains(h) {
+            if self.entity_by_handle.contains_key(h) || staged.handles.contains_key(h) {
                 return Err(Error::DuplicateHandle(h.to_owned()));
             }
         }
@@ -357,7 +381,7 @@ impl World {
         node_type: &str,
         handle: Option<&str>,
     ) -> Result<EntityId, Error> {
-        let mut txn = self.begin();
+        let mut txn = self.begin_locked()?;
         let id = txn.create_entity(node_type, handle)?;
         txn.commit()?;
         Ok(id)

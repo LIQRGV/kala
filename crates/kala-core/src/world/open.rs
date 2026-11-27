@@ -2,6 +2,11 @@
 //! same validation a live write gets.
 
 use super::*;
+use std::time::Duration;
+
+/// How often a writable open starts over because its path was given another
+/// file between opening and locking it.
+const OPEN_ATTEMPTS: usize = 4;
 
 /// Replay state spanning one transaction after the genesis, for the rules a
 /// single entry can't check on its own.
@@ -215,7 +220,8 @@ fn genesis_schema(entries: &[LogEntry]) -> Result<Schema, Error> {
             }
         }
     }
-    Ok(schema)
+    // A log may hold a setting key this build doesn't know.
+    Ok(schema.accepting_unknown_settings())
 }
 
 impl World {
@@ -228,11 +234,14 @@ impl World {
     /// tx#0, and the file and its directory are fsynced. Like an in-memory
     /// world, the new world's [`latest_tx`](World::latest_tx) is `TxId(0)`.
     ///
-    /// The world holds an exclusive advisory lock on the file for its whole
-    /// lifetime (taken right after creating it, before writing), so a
-    /// [`World::open`] of the same file meanwhile fails with
-    /// [`Error::WorldLocked`]. Advisory means it keeps out other Kala
-    /// worlds, not other programs.
+    /// The file is written under its exclusive advisory lock (taken right
+    /// after creating it, before writing, released when this returns), so a
+    /// [`World::open`] of the same file meanwhile waits for the genesis to
+    /// be whole. Afterwards the world takes the lock only while one of its
+    /// transactions commits (see [`Txn::commit`]): other handles on the
+    /// file, in this process or others, can commit in between, and
+    /// [`World::catch_up`] applies what they wrote. Advisory means it keeps
+    /// out other Kala worlds, not other programs.
     ///
     /// Every later commit is appended to the file and fsynced before it
     /// becomes visible. If an append fails, the commit fails with
@@ -258,7 +267,10 @@ impl World {
     /// but a regular file, such as a directory, FIFO or device, refused
     /// before any read), [`Error::BadMagic`] or
     /// [`Error::UnsupportedVersion`] for a foreign header, or
-    /// [`Error::Corrupt`] if the log has no committed genesis transaction or
+    /// [`Error::Corrupt`] if the log has no committed genesis transaction, a
+    /// transaction whose chained checksum doesn't continue the log before it
+    /// (an earlier transaction was replaced, even by a valid one; see "The
+    /// checksum chain" in [`crate::log`]), or
     /// a committed transaction that a live write could not have produced
     /// (an ID used before its `DEFINE`, a value of the wrong type, a no-op
     /// fact, an edge `DEFINE` with no assert of its triple in its
@@ -270,56 +282,227 @@ impl World {
     /// sits at another key without directly following its rev's `DELETED`
     /// marker, or lands on a key with a current entry, ...).
     ///
-    /// The file is locked exclusively (an advisory lock, held for the
-    /// world's lifetime) before it is read. If another world holds the lock
-    /// this fails with [`Error::WorldLocked`] and the file is untouched: no
-    /// cut, no quarantine.
+    /// The log is read and replayed without the file's lock, so opening a
+    /// large world doesn't keep other handles from committing meanwhile.
+    /// The open then takes the exclusive (advisory) lock for a moment to
+    /// settle what it read, exactly as a commit's catch-up does: the last
+    /// transaction it replayed is re-read, transactions committed
+    /// during the replay are applied, and an incomplete tail is judged
+    /// with no writer in the middle of an append. The world returned is the
+    /// file's state at that moment. The lock is held for longer, for a
+    /// second read and replay of the whole file (other writers wait that
+    /// long, up to their busy timeout), only when the lock-free read can't
+    /// be settled: it failed (it caught the file being created or cut, or
+    /// the file is corrupt), it found no committed transaction, or its
+    /// last transaction is gone or changed (a tail was cut meanwhile). If another handle holds the lock (a
+    /// commit, an open's last step or a cut in progress) this waits for it
+    /// up to 5 seconds (see [`World::open_waiting`]), then fails with
+    /// [`Error::WorldLocked`], the file untouched: no cut, no quarantine.
+    /// The opened world takes the lock again only while one of its
+    /// transactions commits. If the path is given another file while the
+    /// open runs (a `kala load --force`), the open starts over on that
+    /// file.
     ///
     /// A torn tail (a last transaction cut short by a crash mid-append, or a
-    /// zero-filled tail) or a damaged one (a last transaction whose bytes
-    /// are all there but fail its body checksum, with no valid begin record
-    /// after it; exact rules in [`crate::log`]) is cut off the file and
-    /// fsynced once the rest has replayed cleanly; the world then continues
-    /// entry IDs and tx from the last committed transaction. Before the cut,
-    /// the cut bytes are saved and fsynced to `<path>.torn-<valid_len>`
-    /// (with `-1`, `-2`, ... added if that exists); if saving them fails,
-    /// this fails with [`Error::Io`] and the log is not cut.
-    /// [`World::recovery`] reports what was cut, why and where it was saved.
+    /// zero-filled tail) was never acknowledged to anyone: it is cut off
+    /// the file and fsynced once the rest has replayed cleanly; the world
+    /// then continues entry IDs and tx from the last committed transaction.
+    /// Before the cut, the cut bytes are saved and fsynced to
+    /// `<path>.torn-<valid_len>` (with `-1`, `-2`, ... added if that
+    /// exists); if saving them fails, this fails with [`Error::Io`] and the
+    /// log is not cut. [`World::recovery`] reports what was cut, why and
+    /// where it was saved.
+    ///
+    /// A damaged tail (a last transaction whose bytes are all there but
+    /// fail its body checksum, with no valid begin record after it; exact
+    /// rules in [`crate::log`]) may have been acknowledged, so the open
+    /// only reports it: the transaction is left out of the world and **in
+    /// the file**, [`World::recovery`] says how long it is (no quarantine
+    /// file yet), and every write fails with
+    /// [`Error::RecoveryUnacknowledged`] until
+    /// [`World::acknowledge_recovery`] is called. The next commit then
+    /// saves it to the quarantine file and cuts it, under the writer lock.
+    /// Because the bytes stay until then, every other handle on the file,
+    /// in any process, meets the same damaged tail at its own next commit
+    /// and is refused in the same way: none can reuse the lost
+    /// transaction's entry IDs without its own caller's acknowledgement.
+    ///
     /// Any other damage, in any transaction, is [`Error::Corrupt`] instead,
     /// with the file untouched.
     pub fn open(path: &Path) -> Result<World, Error> {
-        Self::open_with(path, true)
+        Self::open_with(path, true, log::DEFAULT_BUSY_TIMEOUT)
     }
 
     /// Like [`World::open`], but a *damaged* last transaction (see
-    /// [`CutCause::Damaged`]) is not cut: the open fails with
-    /// [`Error::RecoveryRequired`] and the file is left untouched (no cut,
-    /// no quarantine file). The check runs under the writer lock, so no
-    /// other open can change the tail in between. Use it where a damaged
-    /// tail must be reviewed before it is cut (it may hold an acknowledged
-    /// write); then [`World::open`] and [`World::acknowledge_recovery`].
+    /// [`CutCause::Damaged`]) fails the open with
+    /// [`Error::RecoveryRequired`] instead of being reported by an opened
+    /// world; the file is left untouched either way. The check runs under
+    /// the writer lock, so no other handle can change the tail in between.
+    /// Use it where a damaged tail must be reviewed before anything is
+    /// written (it may hold an acknowledged write); then [`World::open`]
+    /// and [`World::acknowledge_recovery`].
     /// Clean logs and torn tails open exactly as with [`World::open`].
     pub fn open_refusing_damaged(path: &Path) -> Result<World, Error> {
-        Self::open_with(path, false)
+        Self::open_with(path, false, log::DEFAULT_BUSY_TIMEOUT)
     }
 
-    fn open_with(path: &Path, cut_damaged: bool) -> Result<World, Error> {
-        let (mut world, writer, recovery) = LogWriter::open(path, World::replay, cut_damaged)?;
+    /// [`World::open`], waiting up to `busy_timeout` (instead of the default
+    /// 5 s) for the writer lock the open needs; zero means one attempt. The
+    /// world's commits then wait as long (see
+    /// [`World::set_busy_timeout`]).
+    pub fn open_waiting(path: &Path, busy_timeout: Duration) -> Result<World, Error> {
+        Self::open_with(path, true, busy_timeout)
+    }
+
+    /// [`World::open_refusing_damaged`] with [`World::open_waiting`]'s
+    /// bounded wait for the writer lock.
+    pub fn open_refusing_damaged_waiting(
+        path: &Path,
+        busy_timeout: Duration,
+    ) -> Result<World, Error> {
+        Self::open_with(path, false, busy_timeout)
+    }
+
+    fn open_with(
+        path: &Path,
+        report_damaged: bool,
+        busy_timeout: Duration,
+    ) -> Result<World, Error> {
+        // The path can come to name another file between opening it and
+        // locking it (a `kala load --force` renames a new log over it):
+        // then the open starts over on the file the path names now.
+        for _ in 0..OPEN_ATTEMPTS {
+            if let Some(world) = Self::open_once(path, report_damaged, busy_timeout)? {
+                return Ok(world);
+            }
+        }
+        Err(Error::LogDiverged)
+    }
+
+    /// One attempt of [`World::open_with`]; `None` if the path no longer
+    /// named the opened file once it was locked (nothing was touched).
+    ///
+    /// The log is scanned and replayed **without** the writer lock, so an
+    /// open costs other handles nothing however long the log is. Then,
+    /// under the lock, the open is settled as a commit's catch-up is: the
+    /// handle's last transaction is re-read (which proves the log before it
+    /// is still what was replayed), transactions committed meanwhile are
+    /// applied, and the tail is judged with nobody appending. If the first
+    /// look can't be settled that way (the file changed under it, or it
+    /// caught a file being created or cut), the whole file is scanned and
+    /// replayed again under the lock, which is the open of earlier
+    /// versions: the result is the same either way.
+    fn open_once(
+        path: &Path,
+        report_damaged: bool,
+        busy_timeout: Duration,
+    ) -> Result<Option<World>, Error> {
+        let mut writer = LogWriter::open_file(path, busy_timeout)?;
+        // Errors of the lock-free look are not final: see below.
+        let first = writer.scan().and_then(|scanned| {
+            let world = World::replay(&scanned.entries)?;
+            Ok((world, scanned.tip))
+        });
+        #[cfg(feature = "test-hooks")]
+        log::fire_hook(log::LogHook::OpenReplayed);
+        let held = writer.lock()?;
+        if !writer.path_is_this_file()? {
+            return Ok(None);
+        }
+        let settled = match first {
+            Ok((mut world, Some(tip))) => {
+                writer.stand_at(Some(tip));
+                match writer.read_tail(Some(&held), world.journal.next_entry().0, Duration::ZERO) {
+                    Ok(tail) => world.replay_entries(&tail.entries).map(|()| {
+                        if let Some(tip) = tail.tip {
+                            writer.advance(tip);
+                        }
+                        (world, tail.rest, tail.cause)
+                    }),
+                    Err(Error::LogDiverged) => Self::scan_and_replay(&mut writer),
+                    Err(e) => Err(e),
+                }
+            }
+            _ => Self::scan_and_replay(&mut writer),
+        };
+        let (mut world, rest, cause) = settled?;
+        // An in-memory buffer's length always fits a u64.
+        let rest_len = rest.len() as u64;
+        // The tail starts where the committed log ends.
+        let end = writer.tip().map_or(0, |tip| tip.end);
+        let damaged = (cause == Some(CutCause::Damaged)).then(|| DamagedTail::new(end, &rest));
+        let recovery = match cause {
+            Some(CutCause::Damaged) if !report_damaged => {
+                return Err(Error::RecoveryRequired { bytes: rest_len });
+            }
+            // May have been acknowledged: reported, and left in the file
+            // for every handle on it to see under the lock, until one of
+            // them cuts it with its caller's acknowledgement.
+            Some(CutCause::Damaged) => RecoveryReport {
+                bytes_cut: rest_len,
+                quarantine: None,
+                cause: Some(CutCause::Damaged),
+            },
+            // Never acknowledged to anyone: cut now, under the lock.
+            Some(CutCause::Torn) => writer.cut_tail(&held, &rest, CutCause::Torn)?,
+            None => RecoveryReport::default(),
+        };
+        drop(held);
         world.journal.attach_log(writer);
-        world.gate = WriteGate::after_recovery(recovery);
-        Ok(world)
+        world.gate = WriteGate::after_recovery(recovery, damaged);
+        Ok(Some(world))
+    }
+
+    /// The whole file scanned and replayed, with `writer` put at the end of
+    /// its committed log: the world, the incomplete tail's bytes and why
+    /// they are incomplete. Under the writer lock this is the file's state.
+    fn scan_and_replay(
+        writer: &mut LogWriter,
+    ) -> Result<(World, Vec<u8>, Option<CutCause>), Error> {
+        let scanned = writer.scan()?;
+        let world = World::replay(&scanned.entries)?;
+        writer.stand_at(scanned.tip);
+        Ok((world, scanned.rest, scanned.cause))
+    }
+
+    /// Applies `entries`, the committed transactions that follow the ones
+    /// this world has replayed, as the replay of a longer log would.
+    fn replay_entries(&mut self, entries: &[LogEntry]) -> Result<(), Error> {
+        let mut txn = ReplayTxn::default();
+        entries
+            .iter()
+            .try_for_each(|entry| self.replay_entry(entry, &mut txn))
     }
 
     /// Opens the world in the existing log file at `path` for reading only:
     /// a snapshot of its committed transactions at the moment of the call,
     /// replayed exactly as [`World::open`] replays them, so every read
     /// answers as a `World::open` of the same bytes would. Commits appended
-    /// to the file afterwards (by a writer world) are not seen; open again
-    /// to see them.
+    /// to the file afterwards (by a writer world) are not seen until
+    /// [`World::catch_up`] is called (or the world is opened again).
     ///
-    /// Takes no lock, so it succeeds while another world (from
-    /// [`World::open`] or [`World::create`]) holds the file, and it never
-    /// keeps a writer out. It never modifies the file system: a torn or
+    /// Never takes the writer lock, and succeeds while another handle holds
+    /// it. The log is read and replayed with no lock at all; then that look
+    /// is settled under the file's **shared** lock, so the snapshot holds
+    /// no transaction whose writer was still between its write and its
+    /// fsync: such a transaction is taken back if the fsync fails.
+    /// Normally the shared lock is held only for a re-read of the last
+    /// transaction and of what was appended since, not for the length of
+    /// the log. It is held for a whole second read and replay of the file
+    /// (writers wait that long, up to their busy timeout) only when the
+    /// lock-free look can't be settled: it failed (it caught the file
+    /// being created or cut, or the file is corrupt, which the second look
+    /// then reports), it found no committed transaction, or its last
+    /// transaction is no longer in the file (a failed fsync took it back,
+    /// or a tail was cut, between the look and the lock). The open waits
+    /// for the shared lock at most a tenth of a second, which a commit in
+    /// progress takes to finish. If a writer holds its lock longer than
+    /// that, the
+    /// world is returned as it was read; in the one case where that writer
+    /// then fails its fsync and takes its transaction back, the next
+    /// [`World::catch_up`] of this world reports [`Error::LogDiverged`].
+    ///
+    /// It never modifies the file system: a torn or
     /// damaged tail is left in the file and only left out in memory, and
     /// [`World::recovery`] reports what `World::open` would cut
     /// (`bytes_cut`, `cause`) with `quarantine: None`.
@@ -328,7 +511,8 @@ impl World {
     /// commit, a no-op included) fails with [`Error::ReadOnly`] and appends
     /// nothing; [`World::acknowledge_recovery`] has no effect on that.
     ///
-    /// Fails as [`World::open`] does short of locking and cutting:
+    /// Fails as [`World::open`] does short of cutting, never with
+    /// [`Error::WorldLocked`]:
     /// [`Error::Io`] if the file can't be read (`NotFound` if it doesn't
     /// exist; it is never created; `InvalidInput` for anything but a
     /// regular file, such as a directory, FIFO or device, refused before
@@ -336,7 +520,49 @@ impl World {
     /// [`Error::UnsupportedVersion`] for a foreign header, or
     /// [`Error::Corrupt`] for any damage other than a torn or damaged tail.
     pub fn open_read_only(path: &Path) -> Result<World, Error> {
-        let (mut world, recovery) = LogWriter::read_committed(path, World::replay)?;
+        let file = log::LogFile::open(path)?;
+        let look = |file: &log::LogFile| {
+            let scanned = file.scan()?;
+            let world = World::replay(&scanned.entries)?;
+            Ok::<_, Error>((world, scanned.tip, scanned.rest.len(), scanned.cause))
+        };
+        // First a look with no lock at all (the scan and the replay cost
+        // the length of the log, and a reader must not keep writers out for
+        // that long). Then the look is settled under the shared lock, where
+        // no append is in flight: the last transaction replayed is re-read
+        // (it would be gone if its writer's fsync failed meanwhile) and
+        // what was committed since is applied.
+        let first = look(&file);
+        let (mut world, tip, rest, cause) = match file.settle_lock(log::READ_SETTLE_WAIT)? {
+            Some(shared) => match first {
+                Ok((mut world, Some(tip), ..)) => {
+                    match file.read_tail(&shared, &tip, world.journal.next_entry().0) {
+                        Ok(tail) => {
+                            world.replay_entries(&tail.entries)?;
+                            (world, tail.tip.or(Some(tip)), tail.rest.len(), tail.cause)
+                        }
+                        Err(Error::LogDiverged) => look(&file)?,
+                        Err(e) => return Err(e),
+                    }
+                }
+                // What a lock-free look makes of a file being created or
+                // cut is not final: look again, with nobody writing.
+                _ => look(&file)?,
+            },
+            // A writer has held its lock all this time, which no commit
+            // does: the look stands as it is.
+            None => first?,
+        };
+        let recovery = RecoveryReport {
+            // A buffer's length always fits a u64.
+            bytes_cut: rest as u64,
+            quarantine: None,
+            cause: cause.filter(|_| rest != 0),
+        };
+        world.journal.set_reader(Some(LogReader {
+            path: path.to_owned(),
+            tip,
+        }));
         world.gate = WriteGate::read_only(recovery);
         Ok(world)
     }

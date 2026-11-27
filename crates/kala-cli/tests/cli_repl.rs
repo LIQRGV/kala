@@ -19,7 +19,7 @@ fn repl(fx: &Fx, input: &[u8], flags: &[&str]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(input).unwrap();
+    feed(&mut child, input);
     child.wait_with_output().unwrap()
 }
 

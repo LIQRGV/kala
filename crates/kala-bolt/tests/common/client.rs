@@ -35,10 +35,10 @@ pub fn metadata(value: Value, tag: u8) -> BTreeMap<String, Value> {
     }
 }
 
-pub struct Client {
-    pub stream: TcpStream,
+pub struct Client<S = TcpStream> {
+    pub stream: S,
 }
-impl Client {
+impl Client<TcpStream> {
     pub fn connected(server: &Running, minor: u8) -> Self {
         let mut stream = server.connect();
         handshake(&mut stream, minor);
@@ -52,6 +52,8 @@ impl Client {
         client.success();
         client
     }
+}
+impl<S: Read + Write> Client<S> {
     pub fn hello(&mut self) {
         // Independent, hand-written HELLO bytes rather than our encoder.
         self.raw(&[

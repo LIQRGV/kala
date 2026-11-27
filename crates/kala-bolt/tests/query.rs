@@ -93,7 +93,7 @@ transactions:
     let server = Running::in_dir(
         dir,
         ServerConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: vec!["127.0.0.1:0".parse().unwrap()],
             ..ServerConfig::default()
         },
     );
@@ -199,7 +199,7 @@ transactions:
     let server = Running::in_dir(
         dir,
         ServerConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: vec!["127.0.0.1:0".parse().unwrap()],
             ..ServerConfig::default()
         },
     );
@@ -313,7 +313,7 @@ fn ambiguous_default_is_refused_and_explicit_default_is_honored() {
             );
         }
         let config = ServerConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: vec!["127.0.0.1:0".parse().unwrap()],
             default_db: default.clone(),
             ..ServerConfig::default()
         };
@@ -363,7 +363,7 @@ fn unreadable_world_is_a_generic_store_error_without_paths() {
     let server = Running::in_dir(
         dir,
         ServerConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: vec!["127.0.0.1:0".parse().unwrap()],
             ..ServerConfig::default()
         },
     );
@@ -371,6 +371,50 @@ fn unreadable_world_is_a_generic_store_error_without_paths() {
     client.send(0x10, vec![string(ALLIES), map(&[]), map(&[])]);
     let failure = client.failure("Neo.DatabaseError.General.UnknownError");
     assert_eq!(failure["message"], string("the world could not be read"));
+}
+
+/// A world written by an older log format (here: a real format-5 file,
+/// `kala create` + one transaction under the last build before the checksum
+/// chain) is refused by the server like any unreadable world, and the file
+/// is left as it was. The operator-facing dump-and-reload message is the
+/// CLI's; a Bolt client gets the generic store error, without paths.
+#[test]
+fn an_old_format_world_is_refused_over_bolt_and_left_untouched() {
+    const FORMAT_5_WORLD: &str = "4b414c414c4f47000500000007000000000000000019000000000000001cdf4421cb9434fd1500000005010000000000000000000000000000005f2d05dd070100000000000000a2000000000000001cdf442167522f9d1a00000009020000000000000001000009000000434841524143544552011a00000003030000000000000001000000000000000104000000677265671f0000000904000000000000000000000000040000006e616d6504000001000000010026000000040500000000000000010000000000000000000000d4feffffffffffff000004477265670000150000000506000000000000000100000000000000ae7b0353";
+    let old: Vec<u8> = (0..FORMAT_5_WORLD.len() / 2)
+        .map(|i| u8::from_str_radix(&FORMAT_5_WORLD[2 * i..2 * i + 2], 16).unwrap())
+        .collect();
+    assert_eq!(old[8..12], 5u32.to_le_bytes());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.kala");
+    std::fs::write(&path, &old).unwrap();
+    assert_eq!(
+        kala_core::World::open_read_only(&path).err(),
+        Some(kala_core::Error::UnsupportedVersion(5))
+    );
+    let server = Running::in_dir(
+        dir,
+        ServerConfig {
+            listen: vec!["127.0.0.1:0".parse().unwrap()],
+            ..ServerConfig::default()
+        },
+    );
+    let mut client = Client::ready(&server);
+    for _ in 0..2 {
+        client.send(
+            0x10,
+            vec![
+                string("// kala:datalog\n[:find ?e :where [?e :name \"Greg\"]]"),
+                map(&[]),
+                map(&[]),
+            ],
+        );
+        let failure = client.failure("Neo.DatabaseError.General.UnknownError");
+        assert_eq!(failure["message"], string("the world could not be read"));
+        client.reset();
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), old);
+    assert_eq!(std::fs::read_dir(server.dir.path()).unwrap().count(), 1);
 }
 
 #[test]
@@ -384,7 +428,7 @@ fn node_property_larger_than_wire_budget_fails_before_streaming_and_reset_recove
     let server = Running::in_dir(
         dir,
         ServerConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: vec!["127.0.0.1:0".parse().unwrap()],
             ..ServerConfig::default()
         },
     );

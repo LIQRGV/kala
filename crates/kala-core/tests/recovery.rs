@@ -173,8 +173,9 @@ fn assert_corrupt_untouched(p: &Path) {
 }
 
 /// `p` holds the fixture log with the LAST transaction damaged (all its bytes
-/// present) and no valid begin record after it. open() must cut it exactly
-/// like a torn tail but report `CutCause::Damaged`: file cut back to `keep`,
+/// present) and no valid begin record after it. open() must report it as
+/// `CutCause::Damaged` and leave it out of the world and in the file; once
+/// acknowledged it is cut exactly like a torn tail: file cut back to `keep`,
 /// quarantine `<file>.torn-<keep>` holds exactly the cut bytes, the world is
 /// the one before the last txn (`before`), and a second open is clean.
 /// read_log must ignore the damaged tail without touching the file.
@@ -192,7 +193,14 @@ fn assert_cut_as_damaged(p: &Path, keep: u64, before: &str, e: &Ents) {
             "read_log ignores the damaged tail"
         );
     }
-    let w = open_ok(p);
+    let mut w = open_ok(p);
+    let r = w.recovery().clone();
+    assert_eq!(r.cause, Some(CutCause::Damaged));
+    assert_eq!(r.bytes_cut, damaged.len() as u64 - keep);
+    // The open reports the damaged tail and leaves it out of the world;
+    // the cut takes an acknowledgement.
+    assert_eq!(snapshot(&w, e), before);
+    common::acknowledge_and_cut(&mut w, p, &damaged);
     let r = w.recovery().clone();
     assert_eq!(r.cause, Some(CutCause::Damaged));
     assert_eq!(r.bytes_cut, damaged.len() as u64 - keep);
@@ -670,7 +678,12 @@ fn torn_tail_after_a_checksum_valid_but_replay_invalid_txn_is_corrupt() {
         fr[5..13].copy_from_slice(&(first_id + i as u64).to_le_bytes());
         body.extend_from_slice(&fr);
     }
-    let commit = commit_frame(&body, first_id + kept.len() as u64, tx);
+    let commit = commit_frame(
+        common::link(&d[..a]),
+        &body,
+        first_id + kept.len() as u64,
+        tx,
+    );
     let mut full_body = body.clone();
     full_body.extend_from_slice(&commit);
     let mut bad = d[..a].to_vec();
@@ -713,7 +726,7 @@ fn commit_only_txn_after_a_bad_checksum_txn_is_corrupt() {
     let n = d.len();
     d[n - 1] ^= 0x01; // last txn now has a bad checksum
     // a valid commit-only txn follows it
-    let extra = commit_frame(&[], last_entry + 1, last_tx + 1);
+    let extra = commit_frame(common::link(&d), &[], last_entry + 1, last_tx + 1);
     d.extend_from_slice(&common::txn(last_tx + 1, &extra));
     let p = scratch.path().join("c.kala");
     std::fs::write(&p, &d).unwrap();

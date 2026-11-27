@@ -14,6 +14,32 @@ use std::{
     sync::{Condvar, Mutex},
 };
 
+/// Authenticated transport origin; a local socket is not an IP loopback alias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Peer {
+    /// A TCP peer address.
+    Ip(IpAddr),
+    /// A filesystem socket peer, matched only by `localhost`.
+    Local,
+}
+impl Peer {
+    /// Whether trust authentication may be considered for this origin.
+    pub fn is_loopback(self) -> bool {
+        match self {
+            Self::Ip(ip) => normalize_ip(ip).is_loopback(),
+            Self::Local => true,
+        }
+    }
+}
+impl fmt::Display for Peer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ip(ip) => ip.fmt(f),
+            Self::Local => f.write_str("localhost"),
+        }
+    }
+}
+
 /// Credentials are accessible to authenticators but always redacted when formatted.
 #[derive(Clone)]
 pub struct Credentials(String);
@@ -54,10 +80,49 @@ pub struct Identity {
     pub principal: String,
     /// The host selector that won account selection.
     pub host: String,
-    /// Captured grants; changes apply on the next login.
+    /// Captured grants; a server may re-read them for the same account
+    /// ([`current_identity`]).
     pub grants: Vec<String>,
+    /// Which account of that name this identity was issued for: the tick,
+    /// in the system world's own logical time, at which the account was
+    /// created (`kala user add`). Every account change takes a new tick, so
+    /// an account that was dropped and created again under the same
+    /// `user@host` has another generation: it is another account, and an
+    /// identity issued for the old one gets nothing of it. Changing an
+    /// account's password or grants keeps its generation. 0 for an
+    /// identity that isn't a stored account (`--auth none`).
+    pub generation: i64,
 }
 impl Identity {
+    /// Whether this identity may write the named database (separate from
+    /// read: `write` does not imply `read`, nor the reverse).
+    ///
+    /// `system` is never writable through this check, whatever the grants,
+    /// `admin:system` and `admin:*` included: accounts change only through
+    /// account management (`kala user`). `admin` still implies reading
+    /// `system`; see [`Identity::permits_read`].
+    pub fn permits_write(&self, db: &str) -> bool {
+        db != "system"
+            && self.grants.iter().any(|grant| {
+                grant.split_once(':').is_some_and(|(privilege, target)| {
+                    (target == "*" || target == db)
+                        && (privilege == "admin" || privilege == "write")
+                })
+            })
+    }
+
+    /// Whether this identity administers the named database: `admin:<db>`
+    /// or `admin:*`. `read` and `write` together are not `admin`. (Nothing
+    /// is writable on `system` whatever this answers: see
+    /// [`Identity::permits_write`].)
+    pub fn permits_admin(&self, db: &str) -> bool {
+        self.grants.iter().any(|grant| {
+            grant.split_once(':').is_some_and(|(privilege, target)| {
+                privilege == "admin" && (target == "*" || target == db)
+            })
+        })
+    }
+
     /// Whether this identity has the stored backup privilege. Local file
     /// backups use filesystem permissions; a future server dump will call this.
     /// Like reads, the accounts database (password hashes) is covered only by
@@ -194,7 +259,14 @@ impl HostPattern {
     }
     /// Whether this selector includes a peer; IPv4-mapped IPv6 is normalized.
     pub fn matches(&self, peer: IpAddr) -> bool {
-        let peer = normalize_ip(peer);
+        self.matches_peer(Peer::Ip(peer))
+    }
+    /// Match an origin without treating Unix sockets as an invented IP address.
+    pub fn matches_peer(&self, peer: Peer) -> bool {
+        let peer = match peer {
+            Peer::Local => return matches!(self.kind, HostKind::Localhost),
+            Peer::Ip(ip) => normalize_ip(ip),
+        };
         match (&self.kind, peer) {
             (HostKind::Any, _) => true,
             (HostKind::Localhost, ip) => {
@@ -355,6 +427,15 @@ impl AccountVerifier {
         peer: IpAddr,
         system_world: impl FnOnce() -> Result<W, AuthFailure>,
     ) -> Result<Identity, AuthFailure> {
+        self.authenticate_peer(token, Peer::Ip(peer), system_world)
+    }
+    /// Authenticate an IP or local-socket origin against a committed snapshot.
+    pub fn authenticate_peer<W: AsRef<World>>(
+        &self,
+        token: &AuthToken,
+        peer: Peer,
+        system_world: impl FnOnce() -> Result<W, AuthFailure>,
+    ) -> Result<Identity, AuthFailure> {
         let user = match token.scheme.as_str() {
             "none" => "root",
             "basic" => &token.principal,
@@ -364,12 +445,12 @@ impl AccountVerifier {
         let accounts = system::read_accounts(world.as_ref()).map_err(|_| AuthFailure)?;
         let account = accounts
             .iter()
-            .filter(|a| a.summary.user == user && a.host.matches(peer))
+            .filter(|a| a.summary.user == user && a.host.matches_peer(peer))
             .max_by_key(|a| a.host.specificity());
         if let Some(account) = account
             && account.summary.plugin == Plugin::Trust
             && account.host.permits_trust()
-            && normalize_ip(peer).is_loopback()
+            && peer.is_loopback()
         {
             return Ok(account.identity());
         }
@@ -387,10 +468,40 @@ impl AccountVerifier {
         }
     }
 }
+/// The identity of the account `identity` was issued for, as a system-world
+/// snapshot holds it now: the same user, host selector and
+/// [generation](Identity::generation) with its current grants, or `None` if
+/// that account no longer exists. An account dropped and created again
+/// under the same name is **not** that account (another generation): a
+/// connection authenticated with the old account's credentials must not
+/// pick up the new one's grants. A password change on the same account
+/// keeps it (password changes apply at the next login). No credentials are
+/// involved: this re-reads what an already authenticated connection may do,
+/// it never authenticates one.
+pub fn current_identity(
+    system_world: &World,
+    identity: &Identity,
+) -> Result<Option<Identity>, SystemError> {
+    Ok(system::read_accounts(system_world)?
+        .iter()
+        .find(|a| {
+            a.summary.user == identity.principal
+                && a.summary.host == identity.host
+                && a.generation == identity.generation
+        })
+        .map(system::Account::identity))
+}
+#[cfg(test)]
+thread_local! {
+    /// How many passwords this thread has hashed (see `system::tests`).
+    pub(crate) static HASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 pub(crate) fn hash_password(password: &str) -> Result<Credentials, SystemError> {
     if password.is_empty() {
         return Err(SystemError::EmptyPassword);
     }
+    #[cfg(test)]
+    HASHED.with(|n| n.set(n.get() + 1));
     hash_bytes(password.as_bytes())
 }
 fn hash_bytes(password: &[u8]) -> Result<Credentials, SystemError> {

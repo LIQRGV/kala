@@ -185,6 +185,7 @@ fn warns(introduced: Vec<Overlap>, resolved: Vec<Overlap>) -> Warnings {
     Warnings {
         introduced,
         resolved,
+        ..Warnings::default()
     }
 }
 

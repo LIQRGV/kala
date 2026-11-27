@@ -262,6 +262,10 @@ impl Compiler<'_, '_> {
             Expr::Function(f, e) => {
                 Expr::Function(*f, Box::new(self.row_expr(e, bound, depth + 1)?))
             }
+            Expr::ListIndex(list, index) => Expr::ListIndex(
+                Box::new(self.row_expr(list, bound, depth + 1)?),
+                Box::new(self.row_expr(index, bound, depth + 1)?),
+            ),
             Expr::Disjoint(a, b) => Expr::Disjoint(
                 Box::new(self.row_expr(a, bound, depth + 1)?),
                 Box::new(self.row_expr(b, bound, depth + 1)?),

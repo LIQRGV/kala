@@ -19,7 +19,7 @@ fn account_server() -> Running {
     system::add(dir.path(), "alice@127.0.0.1", Some(PASSWORD)).unwrap();
     system::grant(dir.path(), "alice@127.0.0.1", "read", "varrow").unwrap();
     let config = ServerConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
+        listen: vec!["127.0.0.1:0".parse().unwrap()],
         ..ServerConfig::default()
     };
     let auth = Arc::new(Accounts::open(dir.path()).unwrap());
@@ -319,7 +319,7 @@ fn system_cannot_be_read_through_a_user_database_alias() {
     let server = Server::bind_with_auth(
         dir.path(),
         ServerConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: vec!["127.0.0.1:0".parse().unwrap()],
             default_db: Some("varrow".into()),
             ..ServerConfig::default()
         },
@@ -478,7 +478,7 @@ fn backup_only_grant_never_authorizes_bolt_read() {
     let server = Server::bind_with_auth(
         dir.path(),
         ServerConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: vec!["127.0.0.1:0".parse().unwrap()],
             ..ServerConfig::default()
         },
         auth,
@@ -500,6 +500,7 @@ fn backup_grants_never_cover_the_accounts_database() {
         principal: "bob".into(),
         host: "%".into(),
         grants: grants.iter().map(|g| (*g).to_owned()).collect(),
+        generation: 0,
     };
     let wildcard = id(&["backup:*"]);
     assert!(wildcard.permits_backup("varrow"));

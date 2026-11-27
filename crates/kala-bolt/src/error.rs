@@ -1,4 +1,5 @@
 //! Wire errors and terminal-safe server diagnostics.
+use crate::log::logln;
 use crate::packstream::Value;
 use std::fmt::Write;
 pub(crate) const INVALID: &str = "Neo.ClientError.Request.Invalid";
@@ -13,12 +14,17 @@ pub(crate) const STORE: &str = "Neo.DatabaseError.General.UnknownError";
 pub(crate) struct Failure {
     pub code: &'static str,
     pub message: String,
+    /// The store error behind this failure left its world handle unusable
+    /// (see `write::leaves_handle_unusable`): whoever caches that handle
+    /// must reopen it. Never sent to the client.
+    pub handle_lost: bool,
 }
 impl Failure {
     pub fn new(code: &'static str, message: impl AsRef<str>) -> Self {
         Self {
             code,
             message: escape(message.as_ref()),
+            handle_lost: false,
         }
     }
     pub fn invalid() -> Self {
@@ -42,7 +48,7 @@ impl Failure {
         )
     }
     pub fn store(e: impl std::fmt::Display) -> Self {
-        eprintln!("event=bolt_store_error detail={:?}", escape(&e.to_string()));
+        logln!("event=bolt_store_error detail={:?}", escape(&e.to_string()));
         Self::new(STORE, "the world could not be read")
     }
 }

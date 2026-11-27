@@ -62,8 +62,40 @@ pub struct ServerStatement {
 }
 pub use kala_query::{DatabaseSelection, ServerRequest};
 
+/// Adapter-level statement classification, before opening a writable handle.
+pub enum Statement {
+    /// An ordinary query.
+    Query,
+    /// A server-supplied metadata table.
+    Server(Box<ServerStatement>),
+    /// One or more Datalog transaction forms, parsed incrementally by `write_forms`.
+    Writes,
+    /// A parsed statement over the shared write primitives.
+    CypherWrite(Box<write::WriteStatement>),
+    /// A transaction mode directive, admitted before opening a writer.
+    Concurrency(kala_core::Concurrency),
+}
+
+/// Classifies prefix-stripped text through its selected front-end.
+pub fn classify(
+    front_end: &dyn FrontEnd,
+    text: &str,
+    refuse: &dyn Fn(&str) -> bool,
+) -> Result<Statement, LangError> {
+    front_end.classify(text, refuse)
+}
+
 /// A query language Kala parses: parse, refuse attributes in the AST, compile.
 pub trait FrontEnd: Sync {
+    /// Classify a complete RUN without opening a world. Read-only front-ends
+    /// may supply server metadata through the existing preparation hook.
+    fn classify(&self, text: &str, refuse: &dyn Fn(&str) -> bool) -> Result<Statement, LangError> {
+        Ok(match self.prepare_server(text, refuse)? {
+            Some(statement) => Statement::Server(Box::new(statement)),
+            None => Statement::Query,
+        })
+    }
+
     /// Recognize and prepare a pure server-metadata pipeline without world I/O.
     /// None means ordinary world preparation. The refusal hook still covers
     /// every parsed expression, even when a projection would drop it.
@@ -102,6 +134,18 @@ pub fn refuse_nothing(_attribute: &str) -> bool {
 pub struct Datalog;
 
 impl FrontEnd for Datalog {
+    fn classify(&self, text: &str, _refuse: &dyn Fn(&str) -> bool) -> Result<Statement, LangError> {
+        kala_datalog::form_kind(text)
+            .map(|kind| match kind {
+                kala_datalog::FormKind::Query => Statement::Query,
+                kala_datalog::FormKind::Write => Statement::Writes,
+            })
+            .map_err(|e| LangError {
+                kind: ErrorKind::Syntax,
+                message: e.to_string(),
+            })
+    }
+
     fn name(&self) -> &'static str {
         "datalog"
     }
@@ -129,14 +173,13 @@ impl FrontEnd for Datalog {
 /// Cypher: `$name` parameters, which may also be NULL or lists.
 pub struct Cypher;
 
-impl FrontEnd for Cypher {
-    fn prepare_server(
-        &self,
+impl Cypher {
+    fn server(
         text: &str,
+        query: &kala_cypher::ast::Query,
         refuse: &dyn Fn(&str) -> bool,
     ) -> Result<Option<ServerStatement>, LangError> {
         use kala_cypher::ast::Clause;
-        let query = kala_cypher::parse(text).map_err(cypher_error)?;
         let Some(request) = query.server_request().cloned() else {
             return Ok(None);
         };
@@ -161,10 +204,38 @@ impl FrontEnd for Cypher {
             kind: ErrorKind::Type,
             message: "could not initialize metadata schema".into(),
         })?;
-        let prepared = kala_cypher::prepare_parsed(&empty, text, &query).map_err(cypher_error)?;
+        let prepared = kala_cypher::prepare_parsed(&empty, text, query).map_err(cypher_error)?;
         Ok(Some(ServerStatement { request, prepared }))
     }
+}
 
+impl FrontEnd for Cypher {
+    fn classify(&self, text: &str, refuse: &dyn Fn(&str) -> bool) -> Result<Statement, LangError> {
+        match kala_cypher::parse_statement(text).map_err(cypher_error)? {
+            kala_cypher::ast::Statement::Write(statement) => {
+                if statement.attributes().iter().any(|a| refuse(a)) {
+                    return Err(LangError::refused());
+                }
+                Ok(Statement::CypherWrite(Box::new(statement)))
+            }
+            kala_cypher::ast::Statement::Concurrency(mode) => Ok(Statement::Concurrency(mode)),
+            kala_cypher::ast::Statement::Read(query) => {
+                Ok(match Cypher::server(text, &query, refuse)? {
+                    Some(statement) => Statement::Server(Box::new(statement)),
+                    None => Statement::Query,
+                })
+            }
+        }
+    }
+
+    fn prepare_server(
+        &self,
+        text: &str,
+        refuse: &dyn Fn(&str) -> bool,
+    ) -> Result<Option<ServerStatement>, LangError> {
+        let query = kala_cypher::parse(text).map_err(cypher_error)?;
+        Self::server(text, &query, refuse)
+    }
     fn name(&self) -> &'static str {
         "cypher"
     }
@@ -214,6 +285,57 @@ mod tests {
     use kala_core::{Schema, World};
 
     #[test]
+    fn forms_that_change_existing_schema_or_settings_are_the_admin_ones() {
+        use super::write::{parse_write, requires_admin, requires_read};
+        for (text, admin, read) in [
+            ("[:world-setting :schema :strict]", true, false),
+            ("[:rename :a :b]", true, false),
+            ("[:deprecate :a]", true, false),
+            ("[:cardinality :a :many]", true, false),
+            ("[:migrate :a :i64]", true, true),
+            (
+                "[[:assert :greg :alias \"x\"] [:deprecate :a]]",
+                true,
+                false,
+            ),
+            ("[:attribute :a :string]", false, false),
+            ("[:node-type :FACTION]", false, false),
+            ("[:assert :greg :alias \"x\"]", false, false),
+            ("[:retract :greg :alias \"x\"]", false, false),
+            ("[:create :CHARACTER :x]", false, false),
+            ("[:create :CHARACTER :x :if-missing]", false, true),
+            ("[:set :greg :alias \"x\"]", false, true),
+            ("[:correct 1 :delete]", false, true),
+        ] {
+            let form = parse_write(text).unwrap();
+            assert_eq!(requires_admin(&form), admin, "{text}");
+            assert_eq!(requires_read(&form), read, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_cypher_type_constraint_classifies_as_a_blind_schema_statement() {
+        use super::{Statement, classify};
+        let cypher = front_end("cypher").unwrap();
+        let text = "CREATE CONSTRAINT c IF NOT EXISTS FOR (n:T) REQUIRE n.rank IS :: INTEGER";
+        let Ok(Statement::CypherWrite(statement)) = classify(cypher, text, &refuse_nothing) else {
+            panic!("expected a write statement")
+        };
+        assert!(statement.schema_only() && !statement.requires_read());
+        // The refusal hook sees the declared name.
+        assert!(matches!(
+            classify(cypher, text, &|a| a == "rank"),
+            Err(e) if e.kind == ErrorKind::Refused
+        ));
+        for refused in ["DROP CONSTRAINT c", "CREATE INDEX FOR (n:T) ON (n.x)"] {
+            assert!(matches!(
+                classify(cypher, refused, &refuse_nothing),
+                Err(e) if e.kind == ErrorKind::Syntax
+            ));
+        }
+    }
+
+    #[test]
     fn names_match_the_front_ends_in_order() {
         let names: Vec<_> = LANGUAGES.iter().map(|l| l.name()).collect();
         assert_eq!(names, NAMES);
@@ -242,4 +364,66 @@ mod tests {
             assert_eq!(unrefused.kind, ErrorKind::Syntax, "{name}");
         }
     }
+}
+
+/// Shared write entry point; server adapters need no language-crate dependency.
+///
+/// A form's concurrency mode: [`execute_in`](write::execute_in) takes the
+/// caller's default, [`stage`](write::stage) leaves a caller-owned
+/// transaction's mode alone, and in both a form that begins with
+/// `[:concurrency :weak]` (or `:optimistic`) sets its own.
+/// [`commit`](write::commit) reports a conflict at the op that read.
+pub mod write {
+    /// Whether staging this form reads existing data before writing it.
+    pub fn requires_read(form: &WriteTxn) -> bool {
+        use kala_datalog::ast::WriteOp;
+        form.ops.iter().any(|op| {
+            matches!(
+                op,
+                WriteOp::Set { .. }
+                    | WriteOp::Correct { .. }
+                    | WriteOp::Migrate { .. }
+                    | WriteOp::Create {
+                        if_missing: true,
+                        ..
+                    }
+            )
+        })
+    }
+    /// Whether this form changes what the world's existing data or rules
+    /// mean, rather than adding to them: a world setting, a rename, a
+    /// deprecation, a cardinality change or a migration. Declarations
+    /// (`[:attribute …]`, `[:node-type …]`, and names a write declares by
+    /// inference) are not: they only add.
+    ///
+    /// The helper only classifies. Whether such a form needs a higher
+    /// privilege is the adapter's policy (the Bolt server asks for `admin`;
+    /// the CLI, whose boundary is the file's permissions, asks for nothing).
+    pub fn requires_admin(form: &WriteTxn) -> bool {
+        use kala_datalog::ast::WriteOp;
+        form.ops.iter().any(|op| {
+            matches!(
+                op,
+                WriteOp::WorldSetting { .. }
+                    | WriteOp::Rename { .. }
+                    | WriteOp::Deprecate { .. }
+                    | WriteOp::Cardinality { .. }
+                    | WriteOp::Migrate { .. }
+            )
+        })
+    }
+    pub use kala_core::Concurrency;
+    pub use kala_core::write::{StagedWrite, WriteOperation, WriteReport};
+    pub use kala_cypher::write::{
+        CompiledWrite, MAX_WRITE_ROWS, WriteError as StatementError, WriteInput,
+        compile as compile_statement, execute_in as execute_statement,
+        prepare as prepare_statement, run as run_statement, stage as stage_statement,
+    };
+    pub use kala_cypher::{ast::WriteStatement, statements};
+    pub use kala_datalog::apply::{
+        Failure, Occupant, OccupiedBy, SameTick, WriteError, WritePolicy, commit, execute,
+        execute_in, execute_with, stage, stage_with,
+    };
+    pub use kala_datalog::ast::WriteTxn;
+    pub use kala_datalog::{parse_write, parse_writes, write_forms};
 }

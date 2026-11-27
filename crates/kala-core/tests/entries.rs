@@ -653,6 +653,17 @@ fn assert_cut_txn_invisible(path: &Path, n: u64, snap: &[Option<EntryInfo>]) {
     assert_eq!(read_log(path).unwrap().last().unwrap().id.0, n);
 }
 
+/// After the cut, nothing of the cut transaction is left at any entry ID.
+fn assert_cut_txn_invisible_after_the_cut(path: &Path, n: u64, snap: &[Option<EntryInfo>]) {
+    let w = World::open(path).unwrap();
+    assert_eq!(w.recovery().bytes_cut, 0);
+    for i in 0..=n {
+        assert_eq!(w.entry(EntryId(i)), snap[i as usize], "entry#{i}");
+    }
+    assert_eq!(w.entry(EntryId(n + 1)), None);
+    assert_eq!(read_log(path).unwrap().last().unwrap().id.0, n);
+}
+
 #[test]
 fn entry_after_reopening_a_torn_tail_shows_nothing_of_the_cut_txn() {
     let (_d, path, n, snap) = two_txn_file();
@@ -688,8 +699,14 @@ fn entry_after_reopening_a_damaged_tail_shows_nothing_of_the_cut_txn() {
     file[last.body_start + 6] ^= 0xFF;
     std::fs::write(&path, &file).unwrap();
     assert_cut_txn_invisible(&path, n, &snap);
+    // Reported at every open until acknowledged and cut.
+    let mut w = World::open(&path).unwrap();
+    assert_eq!(w.recovery().cause, Some(CutCause::Damaged));
+    common::acknowledge_and_cut(&mut w, &path, &file);
+    drop(w);
+    assert_cut_txn_invisible_after_the_cut(&path, n, &snap);
     let w = World::open(&path).unwrap();
-    assert_eq!(w.recovery().cause, None, "second open is clean");
+    assert_eq!(w.recovery().cause, None, "the open after the cut is clean");
 }
 
 #[test]

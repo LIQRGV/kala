@@ -3,6 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::time::Instant;
 
 use kala_core::{EntityId, Tick};
 
@@ -17,8 +18,27 @@ pub(super) fn check_cancel(cancel: &AtomicBool) -> Result<(), QueryError> {
     }
 }
 
+/// The deadline form of [`check_cancel`], compared with the clock now.
+pub(super) fn check_deadline(deadline: Option<Instant>) -> Result<(), QueryError> {
+    if deadline.is_some_and(|at| Instant::now() >= at) {
+        Err(QueryError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+/// How many budget checks share one look at the clock: a check is made for
+/// every row and every charge, and reading the clock costs more than most
+/// of them.
+const CLOCK_EVERY: u32 = 64;
+
 pub(super) struct Budget<'a> {
     pub(super) cancel: &'a AtomicBool,
+    /// The run's deadline, if any ([`RunOptions::with_deadline`](super::RunOptions::with_deadline)):
+    /// checked where the cancel flag is, the clock read for the first check
+    /// and then every [`CLOCK_EVERY`]th.
+    pub(super) deadline: Option<Instant>,
+    polls: u32,
     pub(super) peak_bytes: usize,
     pub(super) steps: u64,
     /// Bytes held now: live row sets, held scans, interned strings.
@@ -39,6 +59,8 @@ impl<'a> Budget<'a> {
     pub(super) fn new(cancel: &'a AtomicBool, limits: Limits) -> Budget<'a> {
         Budget {
             cancel,
+            deadline: None,
+            polls: 0,
             peak_bytes: 0,
             steps: 0,
             bytes: 0,
@@ -51,8 +73,21 @@ impl<'a> Budget<'a> {
 
     /// Charges `n` more bytes held. If that exceeds the budget, the memo
     /// (a cache) is dropped first; only then is it an error.
-    pub(super) fn charge_bytes(&mut self, n: usize) -> Result<(), QueryError> {
+    /// Stops the run if its flag is set or its deadline has passed.
+    fn check_stop(&mut self) -> Result<(), QueryError> {
         check_cancel(self.cancel)?;
+        if self.deadline.is_some() {
+            let poll = self.polls;
+            self.polls = poll.wrapping_add(1);
+            if poll.is_multiple_of(CLOCK_EVERY) {
+                check_deadline(self.deadline)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn charge_bytes(&mut self, n: usize) -> Result<(), QueryError> {
+        self.check_stop()?;
         self.bytes = self.bytes.saturating_add(n);
         if self.bytes > self.limits.max_bytes && self.memo.bytes > 0 {
             self.evict_memo();
@@ -129,7 +164,7 @@ impl<'a> Budget<'a> {
     /// Charges the real-order comparison work done since the last charge
     /// (about one step per 64 bytes, per 4 intervals compared).
     pub(super) fn charge_cmp(&mut self) -> Result<(), QueryError> {
-        check_cancel(self.cancel)?;
+        self.check_stop()?;
         let n = self.cmp.take_steps();
         if n == 0 {
             return Ok(());
@@ -138,7 +173,7 @@ impl<'a> Budget<'a> {
     }
 
     pub(super) fn step(&mut self, n: u64) -> Result<(), QueryError> {
-        check_cancel(self.cancel)?;
+        self.check_stop()?;
         self.steps = self.steps.saturating_add(n);
         if self.steps > self.limits.max_steps {
             return Err(QueryError::StepBudget {

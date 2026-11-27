@@ -1,10 +1,16 @@
 //! Bolt 5.0–5.4 version negotiation.
-use crate::chunk::read_exact_until;
-use std::io::{self, Write};
-use std::net::TcpStream;
+use crate::{
+    chunk::{read_exact_until, write_all_until},
+    transport::Transport,
+};
+use std::io;
 use std::time::{Duration, Instant};
 
-pub(crate) fn negotiate(stream: &mut TcpStream, timeout: Duration) -> io::Result<Option<u8>> {
+pub(crate) fn negotiate(
+    stream: &mut dyn Transport,
+    timeout: Duration,
+    write_timeout: Duration,
+) -> io::Result<Option<u8>> {
     let mut bytes = [0; 20];
     read_exact_until(stream, &mut bytes, Instant::now() + timeout)?;
     if bytes[..4] != [0x60, 0x60, 0xb0, 0x17] {
@@ -22,6 +28,10 @@ pub(crate) fn negotiate(stream: &mut TcpStream, timeout: Duration) -> io::Result
             (high >= p[2].saturating_sub(p[1])).then_some(high)
         })
         .max();
-    stream.write_all(&minor.map_or([0; 4], |m| [0, 0, m, 5]))?;
+    write_all_until(
+        stream,
+        &minor.map_or([0; 4], |m| [0, 0, m, 5]),
+        Instant::now() + write_timeout,
+    )?;
     Ok(minor)
 }
