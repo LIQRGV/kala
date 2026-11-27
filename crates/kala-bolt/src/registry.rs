@@ -426,9 +426,17 @@ impl Registry {
         // is never labelled with a newer stamp than its own.
         let current = stamp(&db.path)? == before
             && world.chain_tip().is_some_and(|tip| tip.end == before.len);
+        if !current {
+            // The catch-up did not reach the file's end as stamped (a writer
+            // still held its lock, or a commit landed meanwhile). Caching
+            // the snapshot under `before` would hand later readers an older
+            // world as current, because releasing a lock doesn't change the
+            // stamp. The slot stays empty: the next reader replays.
+            return Ok(None);
+        }
         let world = Arc::new(world);
         *Self::lock_cached(db) = Some((before, Arc::clone(&world)));
-        Ok(if current { reached(world) } else { None })
+        Ok(reached(world))
     }
 
     pub fn open(directory: &Path, default: Option<String>, system: SystemDb) -> io::Result<Self> {
@@ -708,6 +716,44 @@ mod tests {
         let (_, reloaded) = registry.get(Some("varrow")).unwrap();
         assert_eq!(reloaded.latest_tx().0, first);
         assert_eq!(registry.opens("varrow").0, 2);
+    }
+
+    #[test]
+    fn a_catch_up_that_could_not_read_the_tail_never_labels_the_snapshot_current() {
+        // A commit is in the file but its writer still holds the lock (its
+        // fsync is in flight), so the cached snapshot's catch-up applies
+        // nothing. The snapshot must not then be cached under the file's
+        // stamp: the stamp doesn't change when the lock is released, and
+        // every later reader would be handed the older world as current.
+        let (_dir, registry) = registry();
+        let (_, held) = registry.get(Some("varrow")).unwrap();
+        let loaded = held.latest_tx().0;
+        drop(held);
+        let committed = registry
+            .write("varrow", Duration::from_secs(1), 0, |world| {
+                let greg = world.entity_by_handle("greg").unwrap();
+                let mut tx = world.begin();
+                tx.assert(
+                    greg,
+                    "alias",
+                    kala_core::Value::Str("One".into()),
+                    Some(kala_core::Tick(300)),
+                )
+                .unwrap();
+                Ok(tx.commit().unwrap().tx.0)
+            })
+            .unwrap();
+        assert!(committed > loaded);
+        let writer = std::fs::File::open(&registry.databases["varrow"].path).unwrap();
+        writer.lock().unwrap();
+        assert!(registry.cached_at_least("varrow", 0).unwrap().is_none());
+        writer.unlock().unwrap();
+        let (_, read) = registry.get(Some("varrow")).unwrap();
+        assert_eq!(
+            read.latest_tx().0,
+            committed,
+            "a reader was handed a snapshot older than the file it is labelled with"
+        );
     }
 
     #[test]
