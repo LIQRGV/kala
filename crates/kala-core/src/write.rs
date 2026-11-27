@@ -1,4 +1,6 @@
 //! Language-neutral write results. Formatting and serialization belong to adapters.
+pub mod stage;
+
 use crate::{
     CommitResult, EdgeId, EntityId, EntryId, IdMap, Precision, SchemaChange, Tick, TickMoved, TxId,
     Warnings,
