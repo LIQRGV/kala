@@ -1,6 +1,6 @@
 # kala-cypher
 
-A bounded, hand-written Cypher read parser and compiler to `kala-query`'s shared
+A bounded, hand-written Cypher parser and compiler to `kala-query`'s shared
 IR. It depends only on `kala-core` and `kala-query`. The executor and store are
 shared with Datalog. `prepare(world, text)` returns a `Prepared` plan and parameter
 kinds; `parse` and `prepare_parsed` allow callers to inspect attributes first.
@@ -32,7 +32,7 @@ Keywords ignore case; identifiers and labels match exact case. Backtick names,
 Cypher string escapes (including Unicode), `//` and `/* */` comments, and one
 trailing semicolon are accepted. Queries are at most 64 KiB, expression nesting
 at most 32, and pattern/expression elements at most 256. Errors include a line
-and column. UNION, dynamic property access, writes, arbitrary functions and
+and column. UNION, dynamic property access, arbitrary functions and
 unbounded traversal are not supported yet.
 
 ## Pipelines, aggregates and paths
@@ -189,3 +189,63 @@ sequence ordering, and enrichment at the default tick are documented differences
 from Neo4j. Secret refusal covers every new expression position, including
 aggregates, WITH, UNWIND, optional maps and variable-length relationship maps;
 account nodes inside Paths use the same property redaction as Node results.
+
+## Writing a world
+
+A statement can start with a reading pipeline. Kala evaluates the whole
+pipeline on one snapshot, then applies the write clauses once per row in
+order. A statement starting with a write has one input row. Each statement
+allows 10,000 input rows and 10,000 write primitives. A failure rolls back
+the transaction. For bulk imports, pass a list of scalar handles to
+`UNWIND $handles AS h MERGE (n:CHARACTER {kala_handle:h})`.
+Parameters support scalars, lists and NULL. Map-valued parameters are deferred.
+
+The following pairs show the primitive operations for one input row.
+The SET, REMOVE and DELETE examples assume a preceding MATCH binds the named
+variables. Here `g` is Greg, `a` is Ashford and `r` is their `located_in` edge.
+
+| Cypher | Datalog equivalent |
+| --- | --- |
+| `CREATE (:CHARACTER:Scout {kala_handle:'s', name:'S'}) AT TICK 700` | `[:at 700 [:create :CHARACTER :s] [:assert :s :label "Scout"] [:assert :s :name "S"]]` |
+| `CREATE (g)-[:located_in {since:3}]->(a) AT TICK 700` | `[:at 700 [:assert :greg :located_in :ashford] [:assert [:greg :located_in :ashford] :since 3]]` |
+| `SET g.located_in = a AT TICK 225` | `[:set :greg :located_in :ashford :at 225]` |
+| `SET g += {alias:['Grey','Greg']}` | `[:set :greg :alias ["Grey" "Greg"]]` |
+| `SET g:Scout` / `REMOVE g:Scout` | `[:assert :greg :label "Scout"]` / `[:retract :greg :label "Scout"]` |
+| `REMOVE g.alias` or `SET g.alias = NULL` | `[:set :greg :alias []]` |
+| `DELETE r AT TICK 226` | `[:retract :greg :located_in :ashford :at 226]` |
+| `DELETE n` | One `[:retract …]` per held state. The node must have no active relationships. |
+| `DETACH DELETE n` | The same state retracts plus one `[:retract …]` per active state relationship in either direction. |
+| `MERGE (:CHARACTER {kala_handle:'s'})` | `[:create :CHARACTER :s :if-missing]` |
+| `MERGE (g)-[:located_in]->(a)` | `[:assert :greg :located_in :ashford]` |
+
+The first label gives a new node its permanent type. Additional labels are
+string values of `label`. Lists are sets of property values. A node variable
+on the right of SET supplies a reference. Replacing a property writes the
+difference between its old and new sets, including the explicit retracts.
+Handles are permanent. Use `SET n += {key: value}` to update selected keys.
+Kala refuses whole-map replacement with `SET n = {…}`.
+
+A node MERGE uses exactly one type and its permanent `kala_handle`. A
+relationship MERGE requires two bound endpoints and a type. Use
+`ON CREATE SET` for a new node or newly asserted relationship and
+`ON MATCH SET` for an existing match. CREATE always creates its nodes.
+Relationship writes require an arrow. Bidirectional attributes have one
+stored edge, and inverse names select the stored edge with reversed endpoints.
+
+DELETE preserves node identity, handle, history and events. A detached
+relationship's own properties keep their history too. `kala doctor` can
+warn about a property held on an inactive edge. Summaries count retracted
+relationships and omit a nodes-deleted counter.
+
+One `AT TICK` applies to both reads and writes. Supply it after MATCH and
+again after the writes to choose different ticks. A tick-less write uses
+the transaction's starting latest tick. Corrections use the Datalog
+`[:correct …]` form and the entry ID in the conflict diagnostic.
+
+A write without RETURN produces zero records. RETURN accepts bound variables,
+property access, literals and parameters. Auto-commit renders graph values
+at the write tick with final IDs and committed properties. Within BEGIN,
+write RETURN can read staged properties. Sending a provisional identity
+protects it against renumbering at COMMIT. A later MATCH still reads the
+transaction snapshot. Ordering, aggregation and a new reading pipeline
+after a write are outside this subset.

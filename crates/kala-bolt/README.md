@@ -1,6 +1,6 @@
 # kala-bolt
 
-A Bolt 5.0–5.4 server with Datalog writes and explicit transactions over Kala's Cypher and Datalog front-ends
+A Bolt 5.0–5.4 server with Cypher and Datalog writes and explicit transactions over Kala's Cypher and Datalog front-ends
 and shared query executor. `kala serve DIR` exposes each regular
 `DIR/<name>.kala` file as a database (`[a-z0-9_-]+` names only). Symlinks and
 invalid names are skipped with a startup diagnostic. Files are discovered at
@@ -430,8 +430,33 @@ transports are TCP and Unix sockets.
 
 ## Writing and transactions
 
-Datalog write forms use the same native applier as `kala transact`. Cypher remains
-read-only. Write parameters are not supported: send an empty parameter map.
+Cypher and Datalog both stage native writes. A blind Cypher CREATE needs
+`write`. Reading clauses, SET, REMOVE, DELETE, MERGE, property reads and
+RETURN also need `read`. Admission checks the entire statement before opening
+a writer. Both languages use the same database, mode and privilege checks,
+with reduced diagnostics for a write-only identity. Pass an empty parameter
+map for Datalog writes. Cypher accepts parameters in both pipelines and updates.
+
+```python
+session.execute_write(lambda tx: tx.run(
+    "MATCH (c {kala_handle:$h}) SET c.hp = $hp AT TICK $t",
+    h="greg", hp=30, t=700,
+).consume())
+```
+
+A Cypher write returns rows only for RETURN. Auto-commit renders the committed
+properties and final IDs. Inside BEGIN, write RETURN sees the transaction's
+staged changes. A subsequent query reads the snapshot. The committed
+`kala.ops` list gives operation positions, kinds, ticks, changed counts and
+entry IDs. `ops_omitted` counts operations left out to fit the response.
+`relationships-created` counts newly interned edges in both languages,
+`relationships-deleted` counts retracted reference facts, and `labels-added`
+and `labels-removed` count changes to the label attribute. Nodes keep their
+permanent identity after DELETE. A Cypher summary has type `rw` for a
+reading pipeline or RETURN, otherwise `w`.
+
+Use `SET CONCURRENCY_MODE = 'weak'` or `'optimistic'` as the first statement
+of an explicit transaction, or set the mode in BEGIN metadata.
 For example, with a `read` + `write` account on the varrow fixture:
 
 ```python
@@ -604,7 +629,7 @@ Node/Relationship mapping for identities with read access.
 
 ### Write records and summaries
 
-Each operation produces one record with fields:
+Each Datalog operation produces one record with fields:
 
 ```
 ["form", "op", "kind", "tick", "changed", "entries", "entity", "created"]

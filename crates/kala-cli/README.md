@@ -835,6 +835,15 @@ string or ref. A ref's value is an entity object. Infinite floats are the string
 `"inf"` / `"-inf"`. Ordering is deterministic. JSON snapshots are for external
 tools, not for restoring history; this slice provides no JSON import.
 
+## Cypher writes
+
+`kala transact --lang cypher WORLD FILE` commits each semicolon-delimited
+statement independently. Use `-` for standard input. On an error the CLI
+identifies the failing statement and how many earlier statements committed.
+`--dry-run` applies the script to a discarded copy. `--json`, `--concurrency`
+and `--busy-timeout` use the same reporting and transaction rules as Datalog.
+The default transaction language and the writable REPL use Datalog.
+
 ## Cypher reads
 
 `kala query WORLD --lang cypher QUERY` and `kala explain WORLD --lang cypher QUERY`

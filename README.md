@@ -8,7 +8,7 @@ before last week's retcon?
 The name means "time" in Sanskrit, Javanese and Indonesian.
 
 > **Status: early.** The storage engine, terminal writes, the REPL and Datalog work.
-> Bolt 5 supports Cypher reads, Datalog reads and writes, and explicit transactions through Neo4j drivers.
+> Bolt 5 supports Cypher and Datalog reads, writes and explicit transactions through Neo4j drivers.
 > Gremlin is not built yet. The
 > on-disk format may still change without migration.
 
@@ -99,8 +99,7 @@ to manage per-database grants. Password accounts use Argon2id; non-loopback
 listeners require `--insecure-allow-plaintext` until TLS is available.
 `--auth none` remains a loopback-only development option. Use `--read-only` to refuse writes; `--auth none` grants read access only.
 Changes committed by `kala transact` become visible on the next query.
-Ctrl-C (SIGINT) or SIGTERM stops the server cleanly. Cypher reads, routing, explicit transactions and Datalog writes are supported.
-Cypher write clauses and Neo4j Browser are not supported yet. See the
+Ctrl-C (SIGINT) or SIGTERM stops the server cleanly. Cypher and Datalog share the native transaction path for writes over Bolt. See the
 [Bolt support and limits](crates/kala-bolt/README.md) and the opt-in
 [driver E2E tests](e2e/README.md).
 
@@ -187,7 +186,7 @@ The native Rust API (`kala-core`) can also write directly. See
 | `kala-fixture` | The YAML fixture loader |
 | `kala-query` | A language-neutral query IR and executor, with row, step and memory budgets |
 | `kala-datalog` | The Datalog parser, compiler and planner |
-| `kala-cypher` | Cypher read parser and compiler to the same IR |
+| `kala-cypher` | Cypher parser and compiler to shared query and write primitives |
 | `kala-lang` | One `FrontEnd` interface over the query languages |
 | `kala-system` | The `system` database: accounts, privileges, password hashing, database names |
 | `kala-bolt` | Bolt 5 server, transactions, authentication boundary and driver value mapping |
@@ -210,7 +209,7 @@ The native Rust API (`kala-core`) can also write directly. See
 - [x] Shared Bolt transport seam, multiple listeners and Unix sockets (slice 16)
 - [x] Several writers on one world: writer lock per commit with a busy timeout, log catch-up, chained checksums (log format 6), optimistic conflict detection with an explicit weak mode, `--concurrency` / `--busy-timeout` and a conflict exit code (slice 15b)
 - [x] Datalog writes over Bolt and explicit transactions (slice 15c)
-- [ ] Cypher write clauses (slice 15d)
+- [x] Cypher CREATE, SET, REMOVE, DELETE, DETACH DELETE and handle-based MERGE over Bolt and the CLI (slice 15 complete)
 - [ ] Web clients (WebSocket and remaining Browser stubs), then Gremlin when requested
 - [x] Accounts, host matching, Argon2id passwords and database privileges
 - [ ] TLS for encrypted Bolt connections
