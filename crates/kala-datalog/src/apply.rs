@@ -803,7 +803,12 @@ fn stage_set(tx: &mut Txn<'_>, op: &WriteOp, state: &mut FormState) -> Result<St
             &state.read_meter,
         )
         .map_err(|e| {
-            if matches!(e, kala_core::Error::WorkInterrupted { .. }) {
+            if matches!(
+                e,
+                kala_core::Error::WorkInterrupted {
+                    reason: kala_core::WorkInterruptReason::Limit
+                }
+            ) {
                 Failure::Limit
             } else {
                 Failure::Store(e)
@@ -860,7 +865,9 @@ fn stage_set(tx: &mut Txn<'_>, op: &WriteOp, state: &mut FormState) -> Result<St
                 let found =
                     match tx.entry_at_tick(entity, &attr.name, &value, tick, &state.read_meter) {
                         Ok(found) => found,
-                        Err(kala_core::Error::WorkInterrupted { .. }) => None,
+                        Err(kala_core::Error::WorkInterrupted {
+                            reason: kala_core::WorkInterruptReason::Limit,
+                        }) => None,
                         Err(e) => return Err(Failure::Store(e)),
                     };
                 let occupant = found.map(|found| {
