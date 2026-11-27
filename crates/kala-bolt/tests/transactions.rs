@@ -785,19 +785,46 @@ fn inferred_schema_overlap_and_latest_tick_movement_are_notified() {
     let (_, overlap) = write(&mut a, "[:assert :greg :bolt_inferred 20 :at 301]");
     let text = format!("{:?}", overlap.get("notifications"));
     assert!(text.contains("Kala.Warning.Overlap"), "{text}");
+    // The latest tick is the one at BEGIN: a commit that lands between
+    // BEGIN and the transaction's first write (when its writable handle
+    // opens) doesn't move it, and the commit says that it moved.
     let pinned_tick = world(&server).latest_tick().0;
     begin(&mut a);
-    // The latest tick is taken when the transaction starts writing (its
-    // writable handle opens at the first write form) and kept from then on.
+    write(&mut b, "[:assert :greg :alias \"Later\" :at 999]");
     let (rows, _) = write(&mut a, "[:assert :greg :alias \"Pinned\"]");
     assert_eq!(rows[0][3], Value::Integer(pinned_tick));
-    write(&mut b, "[:assert :greg :alias \"Later\" :at 999]");
+    let moved = commit(&mut a);
+    let text = format!("{moved:?}");
+    assert!(text.contains("latest_tick_moved"), "{text}");
+    assert!(
+        text.contains(&format!("latest tick moved {pinned_tick} → 999")),
+        "{text}"
+    );
+    let greg = world(&server).entity_by_handle("greg").unwrap();
+    let history = world(&server).history(greg, "alias").unwrap();
+    let pinned = history
+        .iter()
+        .find(|change| change.value == kala_core::Value::Str("Pinned".into()))
+        .unwrap();
+    assert_eq!(pinned.tick.0, pinned_tick);
+    // The same when the other commit lands after the first write.
+    let pinned_tick = world(&server).latest_tick().0;
+    assert_eq!(pinned_tick, 999);
+    begin(&mut a);
+    let (rows, _) = write(&mut a, "[:assert :greg :alias \"Pinned again\"]");
+    assert_eq!(rows[0][3], Value::Integer(pinned_tick));
+    write(&mut b, "[:assert :greg :alias \"Later still\" :at 1999]");
     let (rows, _) = write(&mut a, "[:assert :greg :alias \"Pinned too\"]");
     assert_eq!(rows[0][3], Value::Integer(pinned_tick));
     let moved = commit(&mut a);
     let text = format!("{moved:?}");
     assert!(text.contains("latest_tick_moved"), "{text}");
-    assert!(text.contains("latest tick moved"), "{text}");
+    assert!(text.contains("latest tick moved 999 → 1999"), "{text}");
+    // No movement, no notification.
+    begin(&mut a);
+    write(&mut a, "[:assert :greg :alias \"Unmoved\"]");
+    let text = format!("{:?}", commit(&mut a));
+    assert!(!text.contains("latest_tick_moved"), "{text}");
 }
 
 #[test]

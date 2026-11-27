@@ -63,6 +63,14 @@ pub(crate) fn store_error(error: Error, read: bool) -> Failure {
         Error::LogDiverged => (CONFLICT, "the world changed; its handle will be reopened; run the transaction again".into()),
         Error::RecoveryRequired { .. } | Error::RecoveryUnacknowledged => (STORE, "an operator must run a kala write command with --acknowledge-recovery; nothing was written".into()),
         Error::Io { .. } | Error::Corrupt(_) | Error::BadMagic | Error::UnsupportedVersion(_) => (STORE, "the world could not be written".into()),
+        // Policy, not a store rule (see `admit`): it describes the request.
+        Error::SchemaChangeNotPermitted(name) => (
+            FORBIDDEN,
+            format!(
+                "changing {}, which already exists, requires admin privilege on the database (declaring new names needs only write); nothing was written",
+                crate::error::escape(name)
+            ),
+        ),
         Error::WrongValueType { .. } | Error::Value(_) => (TYPE, error.to_string()),
         Error::SameTickConflict { .. } | Error::TxnKeyConflict { .. } | Error::DuplicateHandle(_) | Error::HandleTypeMismatch { .. } => (CONSTRAINT, error.to_string()),
         _ => (SEMANTIC, error.to_string()),
@@ -72,7 +80,7 @@ pub(crate) fn store_error(error: Error, read: bool) -> Failure {
     } else {
         Failure::new(
             code,
-            if read || matches!(code, LOCK | STORE) {
+            if read || matches!(code, LOCK | STORE | FORBIDDEN) {
                 message
             } else {
                 REDUCED.into()
@@ -125,8 +133,15 @@ pub(crate) struct Privileges {
 /// | `[:assert …]`, `[:retract …]`, `[:create …]`, `[:attribute …]`, `[:node-type …]`, names declared by inference | `write` |
 /// | `[:set …]`, `[:create … :if-missing]`, `[:correct …]` (they read first) | `write` + `read` |
 /// | `[:world-setting …]`, `[:rename …]`, `[:deprecate …]`, `[:cardinality …]`, `[:migrate …]` | `admin` on that database |
+/// | `[:attribute …]` or `[:node-type …]` that changes one the committed schema already has | `admin` on that database |
 ///
-/// The last row is policy, not a store rule: those forms change what
+/// The last row can't be decided from the form (it depends on the schema),
+/// so it is the one refusal that comes after staging: the transaction is
+/// limited to schema additions (`Txn::set_schema_additions_only`) and
+/// kala-core refuses the edit, at staging or at a commit over a newer
+/// transaction that declared the name ([`store_error`] maps it).
+///
+/// The admin rows are policy, not a store rule: those forms change what
 /// existing data or the world's rules mean for every other writer, so a
 /// remote identity needs `admin` for them. The owner may relax it; the CLI
 /// is not affected (its boundary is the file's permissions).

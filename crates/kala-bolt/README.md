@@ -212,12 +212,21 @@ Only `kala user` commands may write this world through the CLI; renamed copies
 are protected by the marker too. A user world cannot be named `system`.
 
 Account snapshots reload using the same file-stamp cache as worlds. Password
-changes take effect at the next login. Grants are captured at login and
+changes take effect at the next login: a connection that is already
+authenticated stays so (as in MySQL), and to cut one off the account is
+dropped. Grants are captured at login and
 re-read, if any account changed since, whenever the connection sends BEGIN or
 an auto-commit write: a revoked `write` (or a dropped account, which is then
 refused everything) stops a pooled connection's next transaction or write
 instead of lasting until its next login, and a new grant is picked up the same
-way. Plain auto-commit reads don't check: for them a session keeps the grants
+way. The re-read is of **the account the connection logged in as**, not of
+whatever account has that name now: an account that was dropped and created
+again as the same `user@host` (say, after a compromise, with a new password)
+is another account, and connections authenticated as the old one get none of
+its grants: they are refused everything, like those of any dropped account,
+until they log in again. (An identity carries the account's *generation*,
+the tick in `system` at which it was created; a password or grant change
+keeps it, a drop and re-create doesn't.) Plain auto-commit reads don't check: for them a session keeps the grants
 of its login (or of its last BEGIN or write) until LOGOFF or disconnect. `kala user` takes a writer lock only for its
 command and works while the server is running. The last `admin:*` account cannot
 be dropped or have that grant revoked.
@@ -459,8 +468,13 @@ discard staged writes and release the write slot. After a transaction timed
 out, RESET still answers SUCCESS and GOODBYE still closes; any other request
 gets the `TransactionTimedOut` failure. There is one open result:
 `qid` must be `0` or `-1`. RUN commits an auto-commit write before sending its
-SUCCESS, even if the client never pulls. Several top-level forms commit
-individually, in order. A later failure reports `form N failed; K prior forms
+SUCCESS, even if the client never pulls. The whole text of a write RUN is
+parsed, and every form's privileges are checked, **before anything is staged
+or committed**: a syntax error or a privilege refusal anywhere in the text
+fails the RUN with nothing written (no "prior forms committed"), in
+auto-commit and inside BEGIN alike. Then several top-level forms commit
+individually, in order, and a form that fails for another reason (a store
+rule, a conflict, a timeout) stops them: it reports `form N failed; K prior forms
 committed`. Once K > 0 the message also names the last commit (`the last as
 tx T (bookmark kala:<db>:T)`, so the client can read its own writes), says
 only that *this form* wrote nothing, and is never a transient error that
@@ -482,16 +496,35 @@ also for reads. The private writable handle is opened, and a write slot taken, a
 the transaction's **first write form**, on the world as it is then:
 
 - a transaction that has run no query yet simply takes that world as its
-  snapshot (a tick-less write lands on its latest tick);
-- a transaction that queried first, with nothing committed in between, has its
-  queries' read keys recorded on the handle and checked at COMMIT as usual;
-- a transaction that queried first and then starts writing after **another
-  transaction committed** can no longer be checked (its queries saw an older
-  world than its writes are applied to): its COMMIT fails with the transient
-  conflict code and drivers' `execute_write` retries it. In short, the snapshot
-  a transaction's queries saw must still be current when it starts writing.
-  Its later queries keep reading the snapshot they began on. Weak mode skips
-  this check too.
+  snapshot;
+- a transaction that queried first has its queries' read keys recorded on the
+  handle. If **other transactions committed in between**, those keys are
+  checked at COMMIT against everything committed since BEGIN's snapshot, not
+  only since the handle opened: a commit that wrote something the queries
+  read (an attribute they read, a new entity of a node type they scanned) is
+  a conflict, with the transient code that drivers' `execute_write` retries;
+  a commit that touched nothing they read is not, so a steady background
+  writer doesn't starve read-then-write transactions;
+- such a transaction **keeps reading the BEGIN snapshot** for its whole life,
+  also after its first write: one transaction never shows two worlds. (Its
+  `:set` and `:if-missing` forms read through the writable handle, which is
+  newer; what they read is checked from BEGIN's snapshot as well, so they can
+  conflict but never slip through.)
+
+Two cases are checked more coarsely, as "read everything as of BEGIN" (any
+commit since then conflicts): a transaction whose queries read more than 256
+distinct attribute and node-type names before its first write, and one that
+queried before another transaction **changed the schema** (the read keys are
+names, and a name may mean another attribute afterwards). Weak mode skips
+all of these checks.
+
+**The latest tick is BEGIN's.** A tick-less write in an explicit transaction
+lands on the latest tick of the snapshot BEGIN pinned, whether another
+transaction committed before the transaction's first write or after it, and
+if the world's latest tick is another one at COMMIT the summary carries the
+`latest_tick_moved` notification (`latest tick moved 601 → 610 while this
+transaction ran`). An auto-commit write begins and commits in one step, on
+the latest tick it finds.
 
 Queries read the transaction's committed snapshot. They do **not** see the transaction's
 own writes. Later write forms can resolve handles created by earlier forms and
@@ -513,13 +546,27 @@ fails transiently. Discarding the record does not expose that ID.
 | `[:assert …]`, `[:retract …]`, plain `[:create …]`, declarations (`[:attribute …]`, `[:node-type …]`, names a write declares by inference) | write |
 | `[:set …]`, `[:create … :if-missing]`, `[:correct …]` | read and write |
 | `[:world-setting …]`, `[:rename …]`, `[:deprecate …]`, `[:cardinality …]`, `[:migrate …]` | admin (`admin:<db>` or `admin:*`) |
+| `[:attribute …]` or `[:node-type …]` that **changes** an attribute or node type the committed schema already has | admin (`admin:<db>` or `admin:*`) |
 | ROUTE | read or write |
 | Any write to system, including as admin | Always forbidden |
 
-Admin implies read and write on user databases. The admin row is policy for
+Admin implies read and write on user databases. The admin rows are policy for
 remote writers, not a store rule: those forms change what existing data or the
-world's rules mean for everyone else. It lives in one function (`write::admit`)
-and the CLI is not affected (`kala transact` is bounded by file permissions).
+world's rules mean for everyone else. The CLI is not affected (`kala transact`
+is bounded by file permissions).
+
+Declaring is adding; **re-declaring is changing**. `[:attribute :located_in
+:ref :many]` on an existing `located_in` relabels its cardinality exactly as
+`[:cardinality …]` does (and a re-declaration can also set a reverse
+cardinality or an inverse name, or, while the attribute has no facts, its
+type, kind, direction or index), so without `admin` it is refused with
+`Forbidden`, naming the attribute and `admin`. So is confirming a name that
+was declared by inference (`[:attribute :age :i64]` after a write inferred
+`:age`, or `[:node-type …]` for an inferred type): that edits an existing
+definition too. Declaring again exactly what exists changes nothing and is
+allowed; so is everything about names the same transaction declared itself.
+"Existing" means committed: if another transaction commits a different
+declaration of the same new name first, the COMMIT is refused the same way.
 `[:world-setting …]` accepts only the keys Kala knows (`:schema`,
 `:concurrency`, `:tick_unit`), in the CLI too; another key is an error that
 lists them. `--auth none` grants `read:*`
@@ -527,8 +574,16 @@ only. `--read-only` refuses every write form before world I/O. BEGIN itself is
 never refused for being in write mode: on a read-only server, on `system` (for
 an admin) and for an identity without `write`, a default-mode transaction reads
 normally and the refusal comes when a write form arrives.
-A read-mode transaction cannot write. Form permissions are checked before a
-writable handle is opened or anything is staged.
+A read-mode transaction cannot write. Every form of a RUN is parsed and its
+permissions are checked before a writable handle is opened, a write slot
+taken or anything staged or committed: a refused RUN wrote nothing, also when
+only its last form is refused, and (under `--acknowledge-recovery`) cut
+nothing. The one exception is the re-declaration row above: whether an
+`[:attribute …]` or `[:node-type …]` changes an existing definition depends on
+the schema, so it is refused when the form is staged. Staging is private:
+inside BEGIN the transaction fails and nothing of it commits; in a multi-form
+auto-commit RUN the forms before it were already committed and the failure
+says so (`form N failed; K prior forms committed`).
 
 Write-only reports retain form/op/kind/tick/changed/entries and newly created
 entity identities. Existing entity details and non-true `created` fields are null;

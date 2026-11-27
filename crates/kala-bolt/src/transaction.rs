@@ -138,12 +138,11 @@ pub(crate) struct Transaction {
     /// What the queries run so far depend on, kept until the writable
     /// handle exists to record it on.
     pub pending: Reads,
-    /// Set when the transaction queried the pinned read snapshot and its
-    /// writable handle then opened on a newer world (see
-    /// [`Transaction::writer`]): the snapshot its queries saw, which its
-    /// later queries keep reading so that one transaction never shows two
-    /// worlds.
-    pub stale: Option<Arc<World>>,
+    /// Set when the transaction queried the read snapshot pinned at BEGIN
+    /// and its writable handle then opened on a newer world (see
+    /// [`Transaction::writer`]): the BEGIN snapshot, which its later
+    /// queries keep reading so that one transaction never shows two worlds.
+    pub begun: Option<Arc<World>>,
     /// The end of the transaction's total time (`--tx-timeout`, or the
     /// client's shorter `tx_timeout`). It bounds all server-side work:
     /// queries, staging, the commit and sending responses.
@@ -157,8 +156,8 @@ impl Transaction {
     /// The committed world this transaction's queries read: one snapshot
     /// for its whole life, never showing its own staged writes.
     pub fn world(&self) -> &World {
-        match (&self.stale, &self.snapshot) {
-            (Some(pinned), _) => pinned,
+        match (&self.begun, &self.snapshot) {
+            (Some(begun), _) => begun,
             (None, Snapshot::Read(w)) => w,
             (None, Snapshot::Write(tx, _)) => tx.world(),
         }
@@ -178,27 +177,43 @@ impl Transaction {
     /// transaction in write mode, and most of them only read.
     ///
     /// **The snapshot rule.** The handle opens on the world as it is now,
-    /// which may be newer than the read snapshot pinned at BEGIN. If the
-    /// transaction has run no query yet, nothing depended on the older
-    /// snapshot and the newer one simply becomes the transaction's. If it
-    /// has, and the two are the same tx, the queries' dependencies are
-    /// recorded on the handle and checked precisely at commit. If it has
-    /// and another transaction committed in between, the queries saw a
-    /// world the commit can no longer be checked against: the transaction
-    /// is marked [`stale`](Transaction::stale) (and as having read
-    /// everything), its queries keep reading the snapshot they began on,
-    /// and its COMMIT is refused as a conflict that drivers retry, unless
-    /// it runs in weak mode. In short: the snapshot a transaction's queries
-    /// saw must still be current when it starts writing.
+    /// which may be newer than the read snapshot pinned at BEGIN (tx
+    /// `pinned`).
+    ///
+    /// - If the transaction has run no query yet, nothing depended on the
+    ///   older snapshot and the newer one simply becomes the transaction's.
+    /// - If it has, the read keys its queries recorded (`pending`) are
+    ///   noted on the handle, and when other transactions committed in
+    ///   between, the handle is told that those reads were made at
+    ///   `pinned` (`Txn::set_read_version`): COMMIT then checks them
+    ///   against everything committed after BEGIN's snapshot, so only a
+    ///   commit that wrote something the queries read is a conflict. The
+    ///   transaction's later queries keep reading the BEGIN snapshot
+    ///   ([`Transaction::begun`]), so it never shows two worlds.
+    /// - Two cases fall back to "read everything as of BEGIN" (any commit
+    ///   since then conflicts): the pending set overflowed its bound
+    ///   (`Reads::merge`), or the schema changed in between (the read keys
+    ///   are names, and a name may mean another attribute by now).
+    ///
+    /// Weak mode records and checks none of it.
+    ///
+    /// **The latest tick** is the BEGIN snapshot's, whatever the handle
+    /// opened on (`Txn::set_start_tick`): tick-less writes land on it, and
+    /// the commit warns if the world's latest tick is another one by then.
+    ///
+    /// `admin` is whether the identity administers the database: without
+    /// it the transaction may add to the schema but not change what the
+    /// committed schema has (`Txn::set_schema_additions_only`).
     pub fn writer(
         &mut self,
         registry: &Registry,
         config: &ServerConfig,
         account: &str,
+        admin: bool,
     ) -> Result<&mut OwnedTxn, Failure> {
         if let Snapshot::Read(world) = &self.snapshot {
-            let read_snapshot = Arc::clone(world);
-            let pinned = world.latest_tx();
+            let begun = Arc::clone(world);
+            let pinned = begun.latest_tx();
             let slot = registry.write_slot(config.max_write_transactions, account)?;
             let remaining = self.deadline.saturating_duration_since(Instant::now());
             let mut owned = registry
@@ -212,16 +227,29 @@ impl Transaction {
                 ));
             }
             let moved = owned.snapshot_tx() != pinned;
+            // The pending keys are names: exact only if every name means
+            // on the handle what it meant on the BEGIN snapshot.
+            let same_schema = !moved || {
+                let now = owned.world();
+                begun.attributes().eq(now.attributes()) && begun.node_types().eq(now.node_types())
+            };
             owned.with(|tx| {
                 tx.set_concurrency(self.concurrency);
                 tx.set_deadline(self.deadline);
-                if self.queried && moved {
-                    tx.note_read_all();
-                } else if self.queried {
-                    self.pending.note(tx);
+                tx.set_schema_additions_only(!admin);
+                tx.set_start_tick(begun.latest_tick());
+                if self.queried {
+                    if same_schema {
+                        self.pending.note(tx);
+                    } else {
+                        tx.note_read_all();
+                    }
+                    if moved {
+                        tx.set_read_version(pinned);
+                    }
                 }
             });
-            self.stale = (self.queried && moved).then_some(read_snapshot);
+            self.begun = (self.queried && moved).then_some(begun);
             self.pending = Reads::default();
             self.snapshot = Snapshot::Write(Box::new(owned), slot);
         }

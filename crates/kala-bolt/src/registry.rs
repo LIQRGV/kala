@@ -579,7 +579,9 @@ mod tests {
         assert!(!db.cached.is_poisoned() && !db.loading.is_poisoned());
         // Recovered once: later reads share the reloaded snapshot.
         registry.get(Some("varrow")).unwrap();
-        registry.at_least("varrow", 0, Duration::from_secs(1)).unwrap();
+        registry
+            .at_least("varrow", 0, Duration::from_secs(1))
+            .unwrap();
         assert_eq!(registry.opens("varrow").0, 2);
     }
 

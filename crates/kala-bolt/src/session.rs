@@ -632,7 +632,7 @@ impl Session<'_> {
             queried: false,
             server_statement: false,
             pending: crate::reads::Reads::default(),
-            stale: None,
+            begun: None,
             deadline: now + options.timeout,
             idle_deadline: Instant::now() + self.config.tx_idle_timeout,
         });
@@ -668,15 +668,6 @@ impl Session<'_> {
                     ("type", Value::String("r".into())),
                     ("bookmark", Value::String(format!("kala:{db}:{txid}"))),
                 ]));
-            }
-            if transaction.stale.is_some()
-                && tx.with(|t| t.concurrency()) == kala_core::Concurrency::Optimistic
-            {
-                self.log_refused(&db, "conflict");
-                return Err(Failure::new(
-                    write::CONFLICT,
-                    "conflict: another transaction committed between this transaction's queries and its first write; nothing was written; run it again",
-                ));
             }
             tx.with(|t| t.set_deadline(deadline));
             let (world, result) = tx.commit();
@@ -971,6 +962,15 @@ impl Session<'_> {
             ));
         }
         let forms = kala_lang::write::write_forms(text).map_err(write::parse_error)?;
+        // Every form of the RUN is parsed and admitted (its privileges and
+        // its place in the transaction) before a writable handle is opened
+        // or anything is staged: a syntax error or a privilege refusal
+        // anywhere in the text means this RUN staged and committed nothing.
+        // The text is bounded by the message limit and the forms by the
+        // parser's own limits.
+        let forms = forms
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(write::parse_error)?;
         // Write slots are counted per authenticated account (user and the
         // host selector that matched), as the identity names it.
         let account = self
@@ -996,15 +996,16 @@ impl Session<'_> {
                 .ok_or_else(|| {
                     Failure::new(INVALID, "transaction exceeds the staged-text byte limit")
                 })?;
+            for (index, form) in forms.iter().enumerate() {
+                write::admit(form, tx.forms.len() + index, held)?;
+            }
             let mut data = false;
-            for (index, form) in forms.enumerate() {
-                let form = form.map_err(write::parse_error)?;
-                write::admit(&form, tx.forms.len(), held)?;
+            for (index, form) in forms.iter().enumerate() {
                 let expires = tx.deadline;
-                let owned = tx.writer(self.registry, self.config, &account)?;
+                let owned = tx.writer(self.registry, self.config, &account, held.admin)?;
                 let staged = owned.with(|t| {
                     t.set_deadline(expires);
-                    write::stage(t, &form, read)
+                    write::stage(t, form, read)
                 })?;
                 data |= staged.ops.iter().any(|op| write::writes_data(op.kind));
                 // Label using the transaction so provisional node types resolve.
@@ -1029,6 +1030,10 @@ impl Session<'_> {
                 "s"
             };
         } else {
+            // Each form is its own transaction, the first of it.
+            for form in &forms {
+                write::admit(form, 0, held)?;
+            }
             let deadline = self.started + options.timeout;
             let mut summary = write::Summary::new(self.config.max_message_bytes);
             self.registry.write(
@@ -1039,18 +1044,17 @@ impl Session<'_> {
                 options.bookmark,
                 |world| {
                     let mut committed = 0;
-                    for (index, form) in forms.enumerate() {
+                    for (index, form) in forms.iter().enumerate() {
                         let prior = committed;
                         let result = (|| {
                             if Instant::now() >= deadline {
                                 return Err(write::timeout());
                             }
-                            let form = form.map_err(write::parse_error)?;
-                            write::admit(&form, 0, held)?;
                             let mut tx = world.begin();
                             tx.set_concurrency(options.concurrency);
                             tx.set_deadline(deadline);
-                            let staged = write::stage(&mut tx, &form, read)?;
+                            tx.set_schema_additions_only(!held.admin);
+                            let staged = write::stage(&mut tx, form, read)?;
                             // Check record size before durable append; final IDs have fixed encoding bounds.
                             let mut preview = write::output();
                             let mut preview_ops = staged.ops.clone();
