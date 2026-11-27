@@ -255,7 +255,18 @@ pub(super) fn execute_restore(
     let policy = WritePolicy {
         allow_system: system,
     };
-    let outcome = kala_lang::write::execute_with(w, form, default, policy);
+    // As `kala_lang::write::execute_with`, on a transaction that may write
+    // back a world-setting key the dumped world's log held although a live
+    // write no longer accepts it (replay accepts it too; see
+    // `kala_core::WORLD_SETTING_KEYS`). Only this path does: the world is
+    // a new private file being rebuilt from a dump.
+    let outcome = {
+        let mut tx = w.begin();
+        tx.set_concurrency(form.concurrency.unwrap_or_default());
+        tx.set_unknown_settings_allowed(true);
+        kala_lang::write::stage_with(&mut tx, form, default, policy)
+            .and_then(|staged| kala_lang::write::commit(tx, staged))
+    };
     committed(w, outcome)
 }
 fn write_err(e: WriteError) -> CliError {

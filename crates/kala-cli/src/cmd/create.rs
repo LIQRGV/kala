@@ -157,8 +157,12 @@ fn restore_genesis(
     }
     let reserved_names = reserved(&first.ops);
     let stage = transfer::Staging::new(path)?;
-    let genesis =
-        schema(first.ops).map_err(|_| user("invalid genesis schema (content withheld)"))?;
+    // A dump holds what its world's log held, which may be a setting key
+    // written before the list of keys was enforced: a restore writes it
+    // back, as replay reads it. `kala create` (above) does not.
+    let genesis = schema(first.ops)
+        .map_err(|_| user("invalid genesis schema (content withheld)"))?
+        .accepting_unknown_settings();
     let world = World::create(&stage.path, genesis).map_err(|_| user("cannot create restore world: invalid genesis or unavailable storage (content withheld)"))?;
     let system = kala_system::is_system(&world);
     // Only Kala's own accounts database may carry reserved names.

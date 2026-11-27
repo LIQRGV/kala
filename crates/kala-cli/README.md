@@ -702,6 +702,10 @@ Without a schema file it has no node types or attributes and infers them on writ
 A schema file contains `[:node-type :CHARACTER]`,
 `[:attribute :name :string :state :one :indexed]`, and world-setting forms such as
 `[:world-setting :schema :strict]`. An optional `[:genesis ...]` wraps them.
+A world setting's key must be one Kala knows (`:schema`, `:concurrency`,
+`:tick_unit`), as in a live `[:world-setting …]`; `kala transact --create`
+alone also writes back any other key its dump holds (a world written before
+the keys were checked still dumps and restores identically).
 These declarations become tx#0; node types precede attributes, then settings.
 Existing destinations, including dangling symlinks, are refused (exit 2).
 `[:create :CHARACTER]` allocates an entity without a handle.
