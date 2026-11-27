@@ -885,9 +885,16 @@ impl Txn<'_> {
         Ok(())
     }
 
-    /// Records that the transaction's writes depend on the whole world (a
-    /// read the other keys can't describe): the commit then conflicts with
-    /// any transaction committed since this one began.
+    /// Records a scan of entity definitions or the handle table, including
+    /// future node types. Fact-only commits do not invalidate this read.
+    pub fn note_entity_definitions(&self) {
+        if let Some(mut reads) = self.reads() {
+            reads.any_define.get_or_insert(self.s.ops.len());
+        }
+    }
+
+    /// Records that the transaction's writes depend on the whole world:
+    /// any transaction committed since this one began invalidates this read.
     pub fn note_read_all(&self) {
         if let Some(mut reads) = self.reads() {
             reads.read_all(self.s.ops.len());
