@@ -44,7 +44,9 @@ impl Parser<'_> {
         }
         let mut bindings = read_bindings(&clauses);
         let read_names: Vec<_> = bindings.keys().cloned().collect();
+        self.write_values = true;
         let writes = self.update_clauses(&mut bindings)?;
+        self.write_values = false;
         let explicit_write_tick = if self.kw("AT") {
             self.need_kw("TICK")?;
             Some(self.integer(false)?)
@@ -221,6 +223,10 @@ impl Parser<'_> {
                 for x in xs {
                     self.update_expr(x, bindings)?;
                 }
+            }
+            Expr::ListIndex(list, index) => {
+                self.update_expr(list, bindings)?;
+                self.update_expr(index, bindings)?;
             }
             Expr::Value(_) | Expr::Null | Expr::Param(_) => {}
             _ => return Err(self.err("computed write values are not supported yet")),

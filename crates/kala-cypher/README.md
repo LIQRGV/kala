@@ -198,7 +198,18 @@ order. A statement starting with a write has one input row. Each statement
 allows 10,000 input rows and 10,000 write primitives. A failure rolls back
 the transaction. For bulk imports, pass a list of scalar handles to
 `UNWIND $handles AS h MERGE (n:CHARACTER {kala_handle:h})`.
-Parameters support scalars, lists and NULL. Map-valued parameters are deferred.
+For parallel lists, pass the row positions as `$indices` and index each list
+with the same position.
+
+```cypher
+UNWIND $indices AS i
+MERGE (n:CHARACTER {kala_handle:$handles[i]})
+ON CREATE SET n.name = $names[i]
+```
+
+Positions start at zero. Negative offsets count from the end, and a missing
+element produces NULL. Parameters support scalars, lists and NULL.
+Map-valued parameters are deferred.
 
 The following pairs show the primitive operations for one input row.
 The SET, REMOVE and DELETE examples assume a preceding MATCH binds the named

@@ -134,3 +134,28 @@ fn write_return_in_json_includes_committed_ids_and_dry_run_preview() {
         }
     }
 }
+
+#[test]
+fn cli_imports_parallel_lists_and_repeating_the_script_keeps_identical_bytes() {
+    let fx = common::varrow();
+    let input = fx.dir.path().join("parallel.cypher");
+    fs::write(&input,
+        "WITH ['parallel_a','parallel_b'] AS handles, ['Aster','Briar'] AS names\n\
+         UNWIND [1,0] AS i MERGE (n:CHARACTER {kala_handle:handles[i]}) ON CREATE SET n.name=names[i] AT TICK 813;"
+    ).unwrap();
+    let args = ["--lang", "cypher", input.to_str().unwrap()];
+    let first = fx.json("transact", &args);
+    assert_eq!(first["changed"], 2);
+    let w = kala_core::World::open_read_only(&fx.path).unwrap();
+    for (h, name) in [("parallel_a", "Aster"), ("parallel_b", "Briar")] {
+        assert_eq!(
+            w.as_of(w.entity_by_handle(h).unwrap(), "name", kala_core::Tick(813))
+                .unwrap(),
+            [kala_core::Value::Str(name.into())]
+        );
+    }
+    let bytes = fs::read(&fx.path).unwrap();
+    let again = fx.json("transact", &args);
+    assert_eq!(again["changed"], 0);
+    assert_eq!(fs::read(&fx.path).unwrap(), bytes);
+}

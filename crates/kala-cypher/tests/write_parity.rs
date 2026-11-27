@@ -288,3 +288,103 @@ fn committed_return_rows_follow_the_id_remap() {
         ]
     );
 }
+
+#[test]
+fn parallel_list_merge_is_idempotent_and_uses_signed_offsets() {
+    use kala_query::{Datum, QueryParams};
+    let mut w = kala_fixture::load_fixture(VARROW).unwrap();
+    let sql = "UNWIND $indices AS i MERGE (n:CHARACTER {kala_handle:$handles[i]}) ON CREATE SET n.name=$names[i] AT TICK 811";
+    let parsed = kala_cypher::parse_statement(sql);
+    assert!(
+        parsed.is_ok(),
+        "parallel-list MERGE must parse: {}",
+        parsed.unwrap_err()
+    );
+    let kala_cypher::ast::Statement::Write(stmt) = parsed.unwrap() else {
+        panic!("expected a write");
+    };
+    let strings = |values: &[&str]| {
+        Datum::List(
+            values
+                .iter()
+                .map(|v| kala_core::Value::Str((*v).into()).into())
+                .collect(),
+        )
+    };
+    let mut inputs = QueryParams::new();
+    inputs.insert(
+        "handles".into(),
+        strings(&["parallel_a", "parallel_b", "parallel_c"]),
+    );
+    inputs.insert("names".into(), strings(&["Aster", "Briar", "Calla"]));
+    inputs.insert(
+        "indices".into(),
+        Datum::List([0, 1, -1].map(|i| kala_core::Value::I64(i).into()).to_vec()),
+    );
+    let exec = |world: &mut World| {
+        kala_cypher::write::execute(world, &stmt, &inputs, RunOptions::default()).unwrap()
+    };
+    assert_eq!(exec(&mut w).changed, 3);
+    for (h, name) in [
+        ("parallel_a", "Aster"),
+        ("parallel_b", "Briar"),
+        ("parallel_c", "Calla"),
+    ] {
+        let id = w.entity_by_handle(h).unwrap();
+        assert_eq!(
+            w.as_of(id, "name", kala_core::Tick(811)).unwrap(),
+            [kala_core::Value::Str(name.into())]
+        );
+    }
+    let first = w.latest_tx();
+    assert_eq!(exec(&mut w).changed, 0);
+    assert_eq!(w.latest_tx(), first);
+}
+
+#[test]
+fn parallel_list_index_nulls_and_type_errors_are_atomic() {
+    use kala_query::{Datum, QueryParams};
+    let sql = "CREATE (n:CHARACTER {kala_handle:'indexed',name:$names[$i]}) AT TICK 812";
+    let parsed = kala_cypher::parse_statement(sql);
+    assert!(
+        parsed.is_ok(),
+        "indexed property must parse: {}",
+        parsed.unwrap_err()
+    );
+    let kala_cypher::ast::Statement::Write(stmt) = parsed.unwrap() else {
+        panic!("expected a write");
+    };
+    let one = || Datum::List(vec![kala_core::Value::Str("Aster".into()).into()]);
+    for (list, index, invalid) in [
+        (one(), kala_core::Value::I64(i64::MIN).into(), false),
+        (one(), kala_core::Value::I64(i64::MAX).into(), false),
+        (one(), Datum::Null, false),
+        (Datum::Null, kala_core::Value::I64(0).into(), false),
+        (one(), kala_core::Value::Bool(true).into(), true),
+        (
+            kala_core::Value::I64(3).into(),
+            kala_core::Value::I64(0).into(),
+            true,
+        ),
+    ] {
+        let mut w = kala_fixture::load_fixture(VARROW).unwrap();
+        let before = w.latest_tx();
+        let mut p = QueryParams::new();
+        p.insert("names".into(), list);
+        p.insert("i".into(), index);
+        let done = kala_cypher::write::execute(&mut w, &stmt, &p, RunOptions::default());
+        if invalid {
+            assert!(done.is_err(), "invalid list/index was accepted");
+            assert_eq!(w.latest_tx(), before);
+            assert!(w.entity_by_handle("indexed").is_none());
+        } else {
+            done.unwrap();
+            let id = w.entity_by_handle("indexed").unwrap();
+            assert!(
+                w.as_of(id, "name", kala_core::Tick(812))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+}

@@ -599,6 +599,35 @@ class WriteDriverTests(unittest.TestCase):
                 self.assertEqual(summary.metadata["kala"]["changed"], 0)
             self.assertEqual(names(), handles)
 
+    def test_cypher_parallel_list_merge_with_native_driver_parameters(self):
+        query = ("UNWIND $indices AS i MERGE (n:CHARACTER {kala_handle:$handles[i]}) "
+                 "ON CREATE SET n.name=$names[i] AT TICK 8240")
+        params = {
+            "indices": [2, 0, 1],
+            "handles": ["parallel_ash", "parallel_elm", "parallel_oak"],
+            "names": ["Ash", "Elm", "Oak"],
+        }
+        with self.driver().session(database="annex") as session:
+            session.execute_write(lambda tx: tx.run(query, params).consume())
+            first = session.last_bookmarks().raw_values
+            for handle, expected in zip(params["handles"], params["names"]):
+                actual = session.execute_read(lambda tx: tx.run(
+                    "MATCH (n {kala_handle:$handle}) AT TICK 8240 RETURN n.name", handle=handle
+                ).single()[0])
+                self.assertEqual(actual, expected)
+            again = session.run(query, params).consume()
+            self.assertEqual(again.metadata["kala"]["changed"], 0)
+            self.assertEqual(session.last_bookmarks().raw_values, first)
+            for invalid in [
+                dict(params, indices=[True]),
+                dict(params, names="not a list", handles=["parallel_failed"], indices=[0]),
+            ]:
+                with self.assertRaises(ClientError) as error:
+                    session.execute_write(lambda tx: tx.run(query, invalid).consume())
+                self.assertEqual(error.exception.code, "Neo.ClientError.Statement.TypeError")
+            self.assertEqual(list(session.run(
+                "MATCH (n {kala_handle:'parallel_failed'}) RETURN n")), [])
+
     def test_cypher_execute_write_retries_conflicting_set(self):
         driver = self.driver()
         match = "MATCH (n {kala_handle:'driver_cypher_counter'})"

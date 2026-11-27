@@ -508,9 +508,67 @@ impl Writer<'_, '_> {
             })?;
         Ok(())
     }
+    /// The bulk import lists can be much larger than one updated property.
+    /// Inspect the bindings in place and charge before cloning only the selected cell.
+    fn indexed_value(
+        &mut self,
+        list: &Expr<String>,
+        index: &Expr<String>,
+        row: &Row,
+    ) -> Result<Datum> {
+        self.step()?;
+        let list = match list {
+            Expr::Param(name) => self
+                .params
+                .binding(name)
+                .ok_or_else(|| QueryError::MissingParam(name.clone()))?,
+            Expr::Var(name) => ParameterValue::Datum(
+                row.get(name)
+                    .ok_or_else(|| invalid("unbound list variable"))?,
+            ),
+            _ => {
+                return Err(invalid(
+                    "write indexing expects a list parameter or variable",
+                ));
+            }
+        };
+        let index = match index {
+            Expr::Null => return Ok(Datum::Null),
+            Expr::Value(v) => ParameterValue::Scalar(v),
+            Expr::Param(p) => self
+                .params
+                .binding(p)
+                .ok_or_else(|| QueryError::MissingParam(p.clone()))?,
+            Expr::Var(v) => {
+                ParameterValue::Datum(row.get(v).ok_or_else(|| invalid("unbound list offset"))?)
+            }
+            _ => return Err(invalid("a list offset needs an integer")),
+        };
+        if matches!(list, ParameterValue::Datum(Datum::Null))
+            || matches!(index, ParameterValue::Datum(Datum::Null))
+        {
+            return Ok(Datum::Null);
+        }
+        let ParameterValue::Datum(Datum::List(values)) = list else {
+            return Err(QueryError::TypeMismatch("list indexing requires a list".into()).into());
+        };
+        let (ParameterValue::Scalar(Value::I64(i))
+        | ParameterValue::Datum(Datum::Value(Value::I64(i)))) = index
+        else {
+            return Err(QueryError::TypeMismatch("list offset must be an integer".into()).into());
+        };
+        match kala_query::rows::list_element(values, *i) {
+            Some(value) => {
+                self.charge(datum_bytes(value))?;
+                Ok(value.clone())
+            }
+            None => Ok(Datum::Null),
+        }
+    }
     fn eval(&mut self, e: &Expr<String>, row: &Row, returned: bool) -> Result<Datum> {
         self.step()?;
         let borrowed = match e {
+            Expr::ListIndex(list, index) => return self.indexed_value(list, index, row),
             Expr::Var(n) => Some(
                 row.get(n)
                     .ok_or_else(|| invalid("unbound write variable"))?,

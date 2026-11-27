@@ -131,8 +131,11 @@ impl Reads {
     }
     /// Whether this pipeline ran independently of stored data and names.
     pub fn is_empty(&self) -> bool {
-        !self.all && !self.definitions && self.attributes.is_empty()
-            && self.types.is_empty() && self.entities.is_empty()
+        !self.all
+            && !self.definitions
+            && self.attributes.is_empty()
+            && self.types.is_empty()
+            && self.entities.is_empty()
     }
     /// Adds another query's dependencies to these. A transaction that has
     /// not written yet keeps one merged set for all its queries; past

@@ -13,6 +13,7 @@ pub(crate) fn parse(text: &str) -> Result<Statement, CypherError> {
         at: 0,
         elements: 0,
         copied: 0,
+        write_values: false,
     };
     p.query()
 }
@@ -24,6 +25,8 @@ struct Parser<'a> {
     /// Nodes plus string bytes duplicated by comparison chains (see
     /// [`Parser::comparison`]), bounded by [`MAX_CHAIN_COPY`].
     copied: usize,
+    /// Inside an update, a row binding may be a parallel list indexed by an UNWIND ordinal.
+    write_values: bool,
 }
 /// How much a query's comparison chains may duplicate in total: a middle
 /// operand is copied into two comparisons, and nested chains would otherwise
@@ -703,6 +706,19 @@ impl Parser<'_> {
             }
             _ => return Err(self.unsupported("variable, property, literal or parameter")),
         };
+        if (matches!(e, Expr::Param(_)) || self.write_values && matches!(e, Expr::Var(_)))
+            && self.sym("[")
+        {
+            let index = self.item_depth(depth + 1)?;
+            self.need("]")?;
+            if !matches!(
+                index,
+                Expr::Var(_) | Expr::Param(_) | Expr::Value(_) | Expr::Null
+            ) {
+                return Err(self.err("list offset must be an integer, variable or parameter"));
+            }
+            return Ok(Expr::ListIndex(Box::new(e), Box::new(index)));
+        }
         Ok(e)
     }
     /// Boolean connectives (`OR` < `XOR` < `AND` < `NOT`) by precedence climbing.
@@ -813,7 +829,8 @@ impl Parser<'_> {
                     stack.push(e);
                     0
                 }
-                Expr::Disjoint(a, b)
+                Expr::ListIndex(a, b)
+                | Expr::Disjoint(a, b)
                 | Expr::Compare(_, a, b)
                 | Expr::And(a, b)
                 | Expr::Or(a, b)
@@ -863,7 +880,8 @@ impl Parser<'_> {
                 Expr::Aggregate { argument, .. } => {
                     stack.extend(argument.as_deref().map(|e| (e, d + 1)))
                 }
-                Expr::Disjoint(a, b)
+                Expr::ListIndex(a, b)
+                | Expr::Disjoint(a, b)
                 | Expr::Compare(_, a, b)
                 | Expr::And(a, b)
                 | Expr::Or(a, b)
@@ -883,9 +901,11 @@ pub(crate) fn has_aggregate(e: &Expr<String>) -> bool {
         Expr::Aggregate { .. } => true,
         Expr::List(xs) => xs.iter().any(has_aggregate),
         Expr::Not(x) | Expr::IsNull(x) | Expr::Function(_, x) => has_aggregate(x),
-        Expr::Compare(_, a, b) | Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
-            has_aggregate(a) || has_aggregate(b)
-        }
+        Expr::ListIndex(a, b)
+        | Expr::Compare(_, a, b)
+        | Expr::And(a, b)
+        | Expr::Or(a, b)
+        | Expr::Xor(a, b) => has_aggregate(a) || has_aggregate(b),
         _ => false,
     }
 }
