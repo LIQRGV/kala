@@ -4,11 +4,14 @@ use crate::log::logln;
 use rustls::{ServerConfig, ServerConnection};
 use std::io::{self, Read, Write};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 mod config;
 mod der;
 pub use config::TlsReloader;
+
+/// The longest a rejected peer is waited on to take its fatal alert.
+const ALERT_FLUSH: Duration = Duration::from_secs(1);
 
 pub(super) struct Tls {
     inner: Box<dyn Transport>,
@@ -77,24 +80,31 @@ impl Tls {
         if self.conn.read_tls(&mut reader)? == 0 {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
-        self.conn.process_new_packets().map_err(|e| {
-            // Only static protocol classes may reach logs, never SNI or peer data.
-            use rustls::Error::*;
-            let class = match e {
-                InvalidMessage(_) => "invalid_message",
-                PeerIncompatible(_) => "peer_incompatible",
-                PeerMisbehaved(_) => "peer_misbehaved",
-                AlertReceived(_) => "alert_received",
-                PeerSentOversizedRecord => "oversized_record",
-                DecryptError => "decrypt_error",
-                InappropriateMessage { .. } | InappropriateHandshakeMessage { .. } => {
-                    "unexpected_message"
-                }
-                _ => "tls_protocol_error",
-            };
-            io::Error::new(io::ErrorKind::ConnectionAborted, TlsClass(class))
-        })?;
-        Ok(())
+        let Err(e) = self.conn.process_new_packets() else {
+            return Ok(());
+        };
+        // rustls queued a fatal alert saying why (protocol_version,
+        // handshake_failure, bad_record_mac, ...). Give it one bounded,
+        // best-effort flush so the peer sees more than a bare close.
+        let _ = self.send_records(deadline.min(Instant::now() + ALERT_FLUSH));
+        // Only static protocol classes may reach logs, never SNI or peer data.
+        use rustls::Error::*;
+        let class = match e {
+            InvalidMessage(_) => "invalid_message",
+            PeerIncompatible(_) => "peer_incompatible",
+            PeerMisbehaved(_) => "peer_misbehaved",
+            AlertReceived(_) => "alert_received",
+            PeerSentOversizedRecord => "oversized_record",
+            DecryptError => "decrypt_error",
+            InappropriateMessage { .. } | InappropriateHandshakeMessage { .. } => {
+                "unexpected_message"
+            }
+            _ => "tls_protocol_error",
+        };
+        Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            TlsClass(class),
+        ))
     }
 
     fn handshake(&mut self, deadline: Instant) -> io::Result<()> {

@@ -234,3 +234,50 @@ fn tls_keeps_non_loopback_peers_out_of_trust_accounts() {
         );
     }
 }
+
+/// Reads what the server sends before it closes: at most `limit` bytes.
+fn reply_before_close(stream: TcpStream, limit: u64) -> Vec<u8> {
+    let mut reply = vec![];
+    match stream.take(limit).read_to_end(&mut reply) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!("expected a close, got {e}"),
+    }
+    reply
+}
+
+// PR #23 polish: rustls queues a fatal alert when it rejects a handshake.
+// The wrapper must flush it before closing, so the client learns why
+// (protocol_version, handshake_failure) instead of seeing a bare close.
+#[test]
+fn a_rejected_handshake_sends_its_fatal_alert_before_the_close() {
+    let server = server_at(LISTEN, ServerConfig::default());
+    // Highest version TLS 1.1 (see `tls_1_1_client_hello_is_refused`).
+    let mut tls11 = vec![22, 3, 2, 0, 45, 1, 0, 0, 41, 3, 2];
+    tls11.extend_from_slice(&[0x35; 32]);
+    tls11.extend_from_slice(&[0, 0, 2, 0xc0, 0x09, 1, 0]);
+    // TLS 1.2 offering only TLS_RSA_WITH_RC4_128_MD5: no common cipher suite.
+    let mut no_cipher = vec![22, 3, 3, 0, 45, 1, 0, 0, 41, 3, 3];
+    no_cipher.extend_from_slice(&[0x35; 32]);
+    no_cipher.extend_from_slice(&[0, 0, 2, 0x00, 0x04, 1, 0]);
+    for (hello, name) in [(tls11, "TLS 1.1"), (no_cipher, "no common cipher")] {
+        let start = Instant::now();
+        let mut socket = server.connect();
+        socket.write_all(&hello).unwrap();
+        let reply = reply_before_close(socket, 64);
+        // One plaintext alert record: type 21, version, length 2, level
+        // fatal (2), then the description.
+        assert!(
+            reply.len() == 7 && reply[0] == 21 && reply[3..6] == [0, 2, 2],
+            "{name}: expected one fatal alert record, got {reply:?}"
+        );
+        assert!(
+            matches!(reply[6], 40 | 70 | 71),
+            "{name}: alert description {}",
+            reply[6]
+        );
+        assert!(start.elapsed() < Duration::from_secs(3), "{name}");
+    }
+    // The server keeps serving.
+    logon(tls::stream(server.dir.path(), server.connect())).success();
+}
