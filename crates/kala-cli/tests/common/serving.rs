@@ -1,4 +1,5 @@
 //! A bounded harness for real CLI server and Unix signal tests.
+#![allow(dead_code)]
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -14,6 +15,35 @@ pub struct Serving {
 impl Serving {
     pub fn start(dir: &Path, listeners: &[&str], options: &[&str]) -> Self {
         let stderr = dir.join("stderr.txt");
+        let file = std::fs::File::create(&stderr).unwrap();
+        Self::spawn(dir, listeners, options, file.into(), stderr)
+    }
+
+    /// Like `start`, but stderr is a pipe whose read end the test holds until
+    /// `close_stderr`; `stderr()` then reads nothing.
+    pub fn start_with_piped_stderr(dir: &Path, listeners: &[&str], options: &[&str]) -> Self {
+        let stderr = dir.join("stderr.txt");
+        std::fs::File::create(&stderr).unwrap();
+        Self::spawn(dir, listeners, options, Stdio::piped(), stderr)
+    }
+
+    /// Closes the read end of a piped stderr: the server's next log write
+    /// fails with EPIPE.
+    pub fn close_stderr(&mut self) {
+        drop(self.child.stderr.take().expect("stderr is not piped"));
+    }
+
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn spawn(
+        dir: &Path,
+        listeners: &[&str],
+        options: &[&str],
+        errors: Stdio,
+        stderr: PathBuf,
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_kala"));
         command.arg("serve").arg(dir).args(options);
         for listen in listeners {
@@ -22,7 +52,7 @@ impl Serving {
         let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(std::fs::File::create(&stderr).unwrap())
+            .stderr(errors)
             .spawn()
             .unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -52,6 +82,20 @@ impl Serving {
 
     pub fn stderr(&self) -> String {
         std::fs::read_to_string(&self.stderr).unwrap()
+    }
+
+    /// Waits (bounded) until stderr contains `text`; a test must observe an
+    /// event before asserting what followed it.
+    pub fn await_stderr(&self, text: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let stderr = self.stderr();
+            if stderr.contains(text) {
+                return stderr;
+            }
+            assert!(Instant::now() < deadline, "no {text:?} in {stderr}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     pub fn send_signal(&self, signal: &str) {

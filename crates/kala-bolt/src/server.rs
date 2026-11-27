@@ -1,6 +1,7 @@
 //! Loopback listener, bounded connection threads and cooperative shutdown.
 use crate::{
     auth::{Accounts, Authenticator, NoAuth, Plugin},
+    log::{LogLimit, logln},
     registry::{Registry, SystemDb},
     session,
     transport::{Accepted, ListenAddr, Listener, ShutdownHandle, TlsReloader, Transport},
@@ -174,19 +175,20 @@ impl Server {
             ));
         }
         if config.insecure_allow_plaintext {
-            eprintln!(
+            logln!(
                 "kala serve: WARNING: passwords travel unencrypted; --insecure-allow-plaintext is enabled"
             );
         }
         let directory = directory.as_ref();
         if crate::system::ensure(directory).map_err(io::Error::other)? {
-            eprintln!("kala serve: created system.kala with root@localhost");
+            logln!("kala serve: created system.kala with root@localhost");
         }
         for account in crate::system::list(directory).map_err(io::Error::other)? {
             if account.plugin == Plugin::Trust {
-                eprintln!(
+                logln!(
                     "kala serve: account {}@{} uses trust (no password)",
-                    account.user, account.host
+                    account.user,
+                    account.host
                 );
             }
         }
@@ -286,11 +288,11 @@ impl Server {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no such directory"));
         }
         if config.acknowledge_recovery && config.read_only {
-            eprintln!(
+            logln!(
                 "kala serve: --acknowledge-recovery is ignored: a read-only server never writes, so it never cuts a damaged tail"
             );
         } else if config.acknowledge_recovery {
-            eprintln!(
+            logln!(
                 "kala serve: WARNING: --acknowledge-recovery is on: a world's damaged last transaction is cut to a quarantine file without asking, and its entry IDs are issued again"
             );
         }
@@ -484,7 +486,7 @@ impl Server {
         thread::Builder::new()
             .name(format!("bolt-{id}"))
             .spawn(move || {
-                eprintln!("event=bolt_connected connection_id={id}");
+                logln!("event=bolt_connected connection_id={id}");
                 let shared = session::Shared {
                     registry: &registry,
                     auth: auth.as_ref(),
@@ -501,7 +503,7 @@ impl Server {
                 {
                     let _ = stream.finish(std::time::Instant::now() + config.write_timeout);
                 }
-                eprintln!(
+                logln!(
                     "event=bolt_disconnected connection_id={id} reason={:?}",
                     result.err().map(|e| e.kind())
                 );
@@ -578,41 +580,6 @@ fn accept_error_is_fatal(e: &io::Error) -> bool {
         return BROKEN.contains(&errno);
     }
     e.kind() == io::ErrorKind::InvalidInput
-}
-
-/// Coalesces a repeating log event: the first occurrence in each second is
-/// printed, later ones are counted and reported once with the next print,
-/// so a client looping connect/close can't flood stderr.
-struct LogLimit {
-    last: Option<std::time::Instant>,
-    suppressed: u64,
-}
-
-impl LogLimit {
-    const fn new() -> Self {
-        Self {
-            last: None,
-            suppressed: 0,
-        }
-    }
-
-    fn log(&mut self, line: std::fmt::Arguments<'_>) {
-        let now = std::time::Instant::now();
-        if self
-            .last
-            .is_some_and(|t| now.duration_since(t) < Duration::from_secs(1))
-        {
-            self.suppressed += 1;
-            return;
-        }
-        if self.suppressed > 0 {
-            eprintln!("{line} suppressed_since_last={}", self.suppressed);
-        } else {
-            eprintln!("{line}");
-        }
-        self.last = Some(now);
-        self.suppressed = 0;
-    }
 }
 
 fn valid_advertised_address(address: &str) -> bool {

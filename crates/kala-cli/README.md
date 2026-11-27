@@ -466,9 +466,13 @@ non-loopback plaintext listener. `--auth none` accepts loopback and Unix listene
 No `--listen` still binds `127.0.0.1:7687`. Unsupported URI schemes fail rather
 than selecting another transport. `neo4j://` is a client routing URI and cannot
 be a listener. All listeners share `--max-connections` and stop on Ctrl-C
-(SIGINT) or SIGTERM. Both close connections, cancel queries, remove Unix socket
-files and exit with status 0. SIGHUP reloads the certificate and key for new
-TLS connections and has no effect when all listeners use plaintext.
+(SIGINT), SIGTERM or SIGHUP (a closed terminal or ssh session). Each closes
+connections, cancels queries, removes Unix socket files and exits with status 0.
+SIGUSR1 reloads the certificate and key for new TLS connections. On a server
+without a TLS listener it logs `event=bolt_tls_reload_ignored
+reason=no_tls_listener` and does nothing else. Once the listeners are bound, a
+log line that cannot be written (stderr closed with the terminal, a dead log
+pipe) is dropped and the server keeps running.
 
 ```sh
 kala serve worlds --listen bolt://127.0.0.1:7687 \
@@ -563,8 +567,8 @@ with GraphDatabase.driver("bolt+ssc://localhost:7687", auth=("root", "")) as dri
 ```
 
 The client-side `+ssc` scheme accepts a self-signed certificate without verifying
-the server’s identity. For rotation, replace both PEM files and send SIGHUP to
-the server process. It validates the new pair before swapping it in. Existing
+the server’s identity. For rotation, replace both PEM files and send SIGUSR1 to
+the server process (`kill -USR1 <pid>`). It validates the new pair before swapping it in. Existing
 sessions continue, and a failed reload logs the error and keeps the old pair.
 
 ## Changing and inspecting the schema

@@ -1,4 +1,5 @@
 //! One connection's Bolt state. Authentication failures are terminal.
+use crate::log::logln;
 use crate::transport::Peer;
 use crate::{
     auth::{AuthToken, Authenticator, Credentials, Identity},
@@ -96,7 +97,7 @@ pub(crate) fn serve(
     else {
         return Ok(());
     };
-    eprintln!("event=bolt_negotiated connection_id={id} version=5.{minor}");
+    logln!("event=bolt_negotiated connection_id={id} version=5.{minor}");
     let mut session = Session {
         state: State::Connected,
         minor,
@@ -222,9 +223,10 @@ impl Session<'_> {
             RequestError::Transport(error) => return Err(error),
             RequestError::Client(failure) => failure,
         };
-        eprintln!(
+        logln!(
             "event=bolt_request_failed connection_id={} code={}",
-            self.id, failure.code
+            self.id,
+            failure.code
         );
         self.output = None;
         self.transaction = None;
@@ -295,7 +297,7 @@ impl Session<'_> {
             Peer::Ip(ip) => (ip.to_string(), "tcp"),
             Peer::Local => ("-".to_owned(), "unix"),
         };
-        eprintln!(
+        logln!(
             "event=bolt_authenticated connection_id={} user={:?} client_ip={client_ip} peer={transport}",
             self.id,
             crate::error::escape(&identity.principal),
@@ -470,7 +472,7 @@ impl Session<'_> {
                 )
             })
             .collect();
-        eprintln!("event=bolt_route connection_id={} db={db}", self.id);
+        logln!("event=bolt_route connection_id={} db={db}", self.id);
         Ok(success([(
             "rt",
             Value::Map(
@@ -561,7 +563,7 @@ impl Session<'_> {
         }
     }
     fn log_refused(&self, db: &str, reason: &str) {
-        eprintln!(
+        logln!(
             "event=bolt_write_refused connection_id={} db={:?} user={:?} reason={reason}",
             self.id,
             crate::error::escape(db),
@@ -572,7 +574,7 @@ impl Session<'_> {
     }
     fn log_commit(&self, db: &str, result: &kala_core::CommitResult, forms: usize) {
         if result.committed {
-            eprintln!(
+            logln!(
                 "event=bolt_write_committed connection_id={} db={} user={:?} tx={} forms={forms} changed={}",
                 self.id,
                 crate::error::escape(db),
@@ -854,7 +856,7 @@ impl Session<'_> {
                         "read privilege is required",
                     ));
                 }
-                eprintln!(
+                logln!(
                     "event=bolt_query_started connection_id={} db={name}",
                     self.id
                 );
@@ -886,7 +888,7 @@ impl Session<'_> {
                         self.started + options.timeout,
                     )?
                 };
-                eprintln!(
+                logln!(
                     "event=bolt_query_completed connection_id={} rows={}",
                     self.id,
                     output.rows.len()

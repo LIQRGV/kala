@@ -5,6 +5,7 @@ mod chunk;
 mod error;
 mod handshake;
 mod language;
+mod log;
 mod message;
 pub mod packstream;
 mod query;

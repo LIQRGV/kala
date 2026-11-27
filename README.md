@@ -213,7 +213,7 @@ The native Rust API (`kala-core`) can also write directly. See
 - [x] Cypher CREATE, SET, REMOVE, DELETE, DETACH DELETE and handle-based MERGE over Bolt and the CLI (slice 15 complete)
 - [ ] Web clients (WebSocket and remaining Browser stubs), then Gremlin when requested
 - [x] Accounts, host matching, Argon2id passwords and database privileges
-- [x] TLS for encrypted Bolt connections, with certificate reload on SIGHUP (slice 17)
+- [x] TLS for encrypted Bolt connections, with certificate reload on SIGUSR1 (slice 17)
 - [ ] On-disk indexes with checkpoints
 
 After slices 11–17, Kala is a complete database for its purpose.

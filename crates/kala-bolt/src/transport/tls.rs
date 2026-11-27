@@ -1,5 +1,6 @@
 //! Blocking TLS on a deadline-aware byte transport.
 use super::{ListenAddr, Peer, ShutdownHandle, Transport, remaining};
+use crate::log::logln;
 use rustls::{ServerConfig, ServerConnection};
 use std::io::{self, Read, Write};
 use std::sync::Arc;
@@ -109,7 +110,7 @@ impl Tls {
         if let Err(error) = &result {
             // Underlying I/O errors can contain arbitrary strings. Only our
             // own rustls protocol classes and the I/O kind are safe to log.
-            eprintln!(
+            logln!(
                 "event=bolt_connection_dropped reason=tls_handshake error={:?} class={}",
                 error.kind(),
                 error

@@ -119,7 +119,7 @@ class TlsDriverTests(unittest.TestCase):
             self.assertLess(time.monotonic(), deadline, description)
             time.sleep(0.02)
 
-    def test_sighup_rotates_new_connections_and_retains_last_good_pair(self):
+    def test_sigusr1_rotates_new_connections_and_retains_last_good_pair(self):
         self.start()
         def expected(name):
             der = ssl.PEM_cert_to_DER_cert((self.fixtures / (name + ".pem")).read_text())
@@ -132,13 +132,13 @@ class TlsDriverTests(unittest.TestCase):
                 query = "MATCH (n {kala_handle:'varrow'}) AT TICK -210 RETURN n.name"
                 self.assertEqual(tx.run(query).single()[0], "Varrow")
                 self.install_pair("signed")
-                self.process.send_signal(signal.SIGHUP)
+                self.process.send_signal(signal.SIGUSR1)
                 rotated = expected("signed")
                 self.await_condition(lambda: self.fingerprint() == rotated, "certificate did not rotate")
                 self.assertEqual(tx.run(query).single()[0], "Varrow")
                 marker = "INVALID-TEST-KEY-CONTENTS"
                 (self.directory / "key.pem").write_text(marker)
-                self.process.send_signal(signal.SIGHUP)
+                self.process.send_signal(signal.SIGUSR1)
                 def failures():
                     return [line for line in self.log.read_text().splitlines()
                             if "reload" in line.lower() and ("fail" in line.lower() or "error" in line.lower())]
@@ -148,7 +148,7 @@ class TlsDriverTests(unittest.TestCase):
                 self.assertEqual(len(failures()), 1)
                 self.assertFalse(marker in self.log.read_text(), "failed reload logged private key contents")
 
-    def test_sighup_refuses_oversized_files_and_preserves_identity(self):
+    def test_sigusr1_refuses_oversized_files_and_preserves_identity(self):
         self.start()
         original = self.fingerprint()
         for name in ("cert.pem", "key.pem"):
@@ -158,7 +158,7 @@ class TlsDriverTests(unittest.TestCase):
                 pem = path.read_bytes()
                 path.write_bytes(pem.ljust(1024 * 1024 + 1, b" "))
                 offset = len(self.log.read_text())
-                self.process.send_signal(signal.SIGHUP)
+                self.process.send_signal(signal.SIGUSR1)
                 def reload_log():
                     return [line for line in self.log.read_text()[offset:].splitlines()
                             if "event=bolt_tls_reload" in line]

@@ -560,6 +560,7 @@ dependencies = [
  "proptest",
  "rcgen",
  "rpassword",
+ "rustls",
  "rustyline",
  "serde",
  "serde_json",

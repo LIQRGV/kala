@@ -242,10 +242,13 @@ Outgoing buffering is capped at 64 KiB per connection. An orderly Bolt close
 sends a best-effort TLS close notification within the write timeout.
 
 On startup Kala checks the PEM chain, leaf validity, matching private key and
-Unix key permissions before binding. SIGHUP repeats those checks and installs
+Unix key permissions before binding. SIGUSR1 repeats those checks and installs
 the new pair for future connections. Failed reloads log one error and preserve
-the active identity. Existing connections keep their original session. SIGHUP
-has no effect on a server without TLS listeners.
+the active identity. Existing connections keep their original session. The
+reload runs off the signal thread, and signals that arrive while one is in
+flight coalesce into one more run. On a server without TLS listeners SIGUSR1
+logs `event=bolt_tls_reload_ignored reason=no_tls_listener` and does nothing.
+SIGHUP, like SIGTERM and SIGINT, is the clean shutdown.
 
 Each non-loopback plaintext listener requires `--insecure-allow-plaintext`,
 including on a server that also serves TLS. The accepted TCP peer address

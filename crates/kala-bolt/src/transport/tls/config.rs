@@ -1,6 +1,7 @@
 //! One validated identity shared by all TLS listeners. Replacements are built
 //! off-lock, so reading the files never blocks handshakes on the old identity.
 use super::super::{ListenAddr, invalid};
+use crate::log::logln;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use rustls::{ServerConfig, crypto::ring, server::NoServerSessionStorage};
 use std::fs::{File, OpenOptions};
@@ -168,7 +169,7 @@ fn load(cert: &Path, key: &Path) -> io::Result<ServerConfig> {
     config.session_storage = Arc::new(NoServerSessionStorage {});
     config.send_tls13_tickets = 0;
     if let Some(expiry) = expiry_warning {
-        eprintln!("kala serve: WARNING: leaf certificate in {cert:?} expires on {expiry}");
+        logln!("kala serve: WARNING: leaf certificate in {cert:?} expires on {expiry}");
     }
     Ok(config)
 }
