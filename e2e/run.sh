@@ -61,7 +61,11 @@ generate_test_certificates() (
     openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj /CN=localhost \
         -addext 'subjectAltName=IP:127.0.0.1,DNS:localhost' \
         -keyout self-pkcs8.key -out self.pem &&
-    openssl pkey -in self-pkcs8.key -traditional -out self.key &&
+    # A PKCS#1 key as well as the PKCS#8 one. `pkey -traditional` is OpenSSL 3;
+    # OpenSSL 1.1.1's `rsa` writes the traditional form by default.
+    { openssl pkey -in self-pkcs8.key -traditional -out self.key ||
+        openssl rsa -in self-pkcs8.key -out self.key; } &&
+    grep -q 'BEGIN RSA PRIVATE KEY' self.key &&
     openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj '/CN=Kala test CA' \
         -addext 'basicConstraints=critical,CA:TRUE' -addext 'keyUsage=critical,keyCertSign' \
         -keyout ca.key -out ca.pem &&
@@ -74,10 +78,25 @@ generate_test_certificates() (
 )
 mkdir "$task_tmp/tls"
 unset KALA_TLS_FIXTURES
-if command -v openssl >/dev/null && generate_test_certificates >/dev/null 2>&1; then
-    export KALA_TLS_FIXTURES="$task_tmp/tls"
+# Set KALA_E2E_REQUIRE_TLS=1 (every Bolt review does) to make a skipped TLS
+# suite a failure instead of a quiet pass.
+tls_skipped=
+if ! command -v openssl >/dev/null; then
+    tls_skipped="openssl is not installed"
+elif ! generate_test_certificates > "$task_tmp/openssl.log" 2>&1; then
+    tls_skipped="openssl ($(openssl version 2>/dev/null || echo unknown version)) could not generate the test certificates"
+    echo "--- openssl output ---" >&2
+    cat "$task_tmp/openssl.log" >&2
+    echo "----------------------" >&2
 else
-    echo "Skipping TLS driver tests: OpenSSL could not generate the test certificates." >&2
+    export KALA_TLS_FIXTURES="$task_tmp/tls"
+fi
+if [[ -n "$tls_skipped" ]]; then
+    if [[ "${KALA_E2E_REQUIRE_TLS:-}" == 1 ]]; then
+        echo "KALA_E2E_REQUIRE_TLS=1 but the TLS driver tests cannot run: $tls_skipped." >&2
+        exit 1
+    fi
+    echo "Skipping TLS driver tests: $tls_skipped. (KALA_E2E_REQUIRE_TLS=1 makes this an error.)" >&2
 fi
 export KALA_SERVER_STDOUT="$task_tmp/server.stdout"
 export KALA_SERVER_STDERR="$task_tmp/server.stderr"

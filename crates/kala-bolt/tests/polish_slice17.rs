@@ -99,3 +99,123 @@ fn one_small_response_is_one_write_below_tls_and_on_plain_tcp() {
         }
     }
 }
+
+/// Completes a TLS handshake and returns the leaf the server presented.
+fn presented_leaf(server: &Running) -> Vec<u8> {
+    let mut stream = tls::stream(server.dir.path(), server.connect());
+    while stream.conn.is_handshaking() {
+        stream.conn.complete_io(&mut stream.sock).unwrap();
+    }
+    stream.conn.peer_certificates().unwrap()[0].to_vec()
+}
+
+fn leaf_on_disk(dir: &std::path::Path) -> Vec<u8> {
+    use rustls::pki_types::{CertificateDer, pem::PemObject};
+    CertificateDer::from_pem_file(dir.join("test-cert.pem"))
+        .unwrap()
+        .to_vec()
+}
+
+// `TlsReloader::reload` had no `cargo test` coverage (only the opt-in driver
+// E2E reached it, through a signal). Called directly: a valid new pair is
+// what new connections get, a connection admitted before keeps working, and
+// an invalid pair returns an error and changes nothing.
+#[test]
+fn reload_installs_a_valid_pair_and_keeps_the_old_one_on_any_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = ServerConfig {
+        listen: vec!["bolt+s://127.0.0.1:0".parse().unwrap()],
+        ..ServerConfig::default()
+    };
+    tls::configure(dir.path(), &mut config);
+    let (cert, key) = (
+        config.tls_cert.clone().unwrap(),
+        config.tls_key.clone().unwrap(),
+    );
+    let server = Server::bind_accounts(dir.path(), config).unwrap();
+    let reloader = server
+        .tls_reloader()
+        .expect("a TLS listener has a reloader");
+    let server = Running::from_server(dir, server);
+    let first = leaf_on_disk(server.dir.path());
+    assert_eq!(presented_leaf(&server), first);
+    let mut pinned = logged_on(tls::stream(server.dir.path(), server.connect()));
+
+    // A new valid pair.
+    let install = || {
+        let pair = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        std::fs::write(&cert, pair.cert.pem()).unwrap();
+        std::fs::write(&key, pair.signing_key.serialize_pem()).unwrap();
+        pair.cert.der().to_vec()
+    };
+    let second = install();
+    assert_ne!(first, second);
+    // Nothing changes until reload is called.
+    reloader.reload().unwrap();
+    assert_eq!(presented_leaf(&server), second);
+    pinned.send(0x0f, vec![]);
+    pinned.success();
+
+    // Invalid pairs: each is refused and the second identity stays.
+    let good_cert = std::fs::read(&cert).unwrap();
+    let good_key = std::fs::read(&key).unwrap();
+    let marker = "PRIVATE-TEST-MARKER-DO-NOT-ECHO";
+    let other = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cases: [(&str, &std::path::Path, Vec<u8>, &str); 4] = [
+        ("garbage key", &key, marker.into(), "test-key.pem"),
+        (
+            "key of another certificate",
+            &key,
+            other.signing_key.serialize_pem().into(),
+            "does not match",
+        ),
+        ("empty chain", &cert, vec![], "test-cert.pem"),
+        (
+            "certificate of another key",
+            &cert,
+            other.cert.pem().into(),
+            "does not match",
+        ),
+    ];
+    for (name, path, contents, expected) in cases {
+        std::fs::write(path, contents).unwrap();
+        let error = reloader.reload().expect_err(name).to_string();
+        assert!(error.contains(expected), "{name}: {error}");
+        assert!(!error.contains(marker), "{name}: key contents in the error");
+        std::fs::write(&cert, &good_cert).unwrap();
+        std::fs::write(&key, &good_key).unwrap();
+        // The client trusts the certificate on disk, which is `second` again.
+        assert_eq!(presented_leaf(&server), second, "{name}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let error = reloader.reload().unwrap_err().to_string();
+        assert!(error.contains("mode 0640"), "{error}");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(presented_leaf(&server), second);
+    }
+    // After the failures a good pair is still accepted.
+    let third = install();
+    reloader.reload().unwrap();
+    assert_eq!(presented_leaf(&server), third);
+    pinned.send(0x0f, vec![]);
+    pinned.success();
+}
+
+// A server without a TLS listener has nothing to reload.
+#[test]
+fn a_server_without_a_tls_listener_has_no_reloader() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = ServerConfig {
+        listen: vec!["127.0.0.1:0".parse().unwrap()],
+        ..ServerConfig::default()
+    };
+    assert!(
+        Server::bind(dir.path(), config)
+            .unwrap()
+            .tls_reloader()
+            .is_none()
+    );
+}
