@@ -124,6 +124,11 @@ pub fn replay(args: &TransactArgs) -> Result<String, CliError> {
     let text = transfer::input(source)?;
     let mut forms = kala_datalog::restore_forms(&text);
     let (stage, mut world, system) = restore_genesis(path, forms.next())?;
+    // The staged file is private until it is placed, so nothing else can
+    // hold its lock; the flag is honored all the same.
+    if let Some(wait) = args.busy_timeout {
+        world.set_busy_timeout(wait);
+    }
     restore_transactions(&mut world, forms, system)?;
     let transactions = world.latest_tx().0;
     let entries = world.entries().count();
@@ -152,8 +157,12 @@ fn restore_genesis(
     }
     let reserved_names = reserved(&first.ops);
     let stage = transfer::Staging::new(path)?;
-    let genesis =
-        schema(first.ops).map_err(|_| user("invalid genesis schema (content withheld)"))?;
+    // A dump holds what its world's log held, which may be a setting key
+    // written before the list of keys was enforced: a restore writes it
+    // back, as replay reads it. `kala create` (above) does not.
+    let genesis = schema(first.ops)
+        .map_err(|_| user("invalid genesis schema (content withheld)"))?
+        .accepting_unknown_settings();
     let world = World::create(&stage.path, genesis).map_err(|_| user("cannot create restore world: invalid genesis or unavailable storage (content withheld)"))?;
     let system = kala_system::is_system(&world);
     // Only Kala's own accounts database may carry reserved names.

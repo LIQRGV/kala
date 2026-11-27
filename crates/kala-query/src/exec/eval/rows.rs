@@ -616,6 +616,19 @@ impl Exec<'_, '_> {
                 let v = self.expression(e, row)?;
                 self.row_function(*f, v)?
             }
+            Expr::ListIndex(list, index) => {
+                match (self.expression(list, row)?, self.expression(index, row)?) {
+                    (Val::Null, _) | (_, Val::Null) => Val::Null,
+                    (Val::List(_, values), Val::I64(i)) => crate::rows::list_element(&values, i)
+                        .cloned()
+                        .unwrap_or(Val::Null),
+                    _ => {
+                        return Err(QueryError::TypeMismatch(
+                            "list indexing requires a list and an integer offset".into(),
+                        ));
+                    }
+                }
+            }
             Expr::Disjoint(a, b) => {
                 let a = self.expression(a, row)?;
                 let b = self.expression(b, row)?;

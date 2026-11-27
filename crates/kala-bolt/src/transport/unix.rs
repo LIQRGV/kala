@@ -1,5 +1,6 @@
 //! Filesystem socket ownership stays here, away from the Bolt session.
 use super::{ListenAddr, Peer, ShutdownHandle, Transport, invalid, remaining};
+use crate::log::logln;
 use rustix::fs::{self as fs, AtFlags, FileType, FlockOperation, Mode, OFlags, Stat};
 use rustix::net::{self as net, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 use std::ffi::{OsStr, OsString};
@@ -527,7 +528,7 @@ impl Drop for BoundUnix {
             Ok(())
         };
         if let Err(e) = cleanup() {
-            eprintln!("event=bolt_socket_cleanup_failed error={:?}", e.kind());
+            logln!("event=bolt_socket_cleanup_failed error={:?}", e.kind());
         }
     }
 }

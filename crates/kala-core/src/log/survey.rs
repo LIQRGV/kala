@@ -2,7 +2,10 @@
 //! [`scan`](super::scan::scan), but collecting findings instead of failing
 //! at the first one.
 
-use super::scan::{Begin, BeginStep, BodyFault, BodyStep, begin_step, body_step, check_header};
+use super::format::COMMIT_FRAME_LEN;
+use super::scan::{
+    Begin, BeginStep, BodyFault, BodyStep, begin_step, body_step, check_header, commit_checksum,
+};
 use super::{EntryId, LogEntry};
 use crate::doctor::Finding;
 use crate::error::Error;
@@ -30,7 +33,10 @@ pub(crate) type TaggedFinding = (Option<TxId>, Finding);
 /// a bad transaction whenever its begin record is sound (its `body_len` is
 /// trusted to skip it): a body checksum mismatch with a valid begin record
 /// after it, a `Commit` checksum mismatch, a missing `Commit` or any other
-/// invalid body is reported and that transaction skipped; a tx out of
+/// invalid body is reported and that transaction skipped (a `Commit`
+/// checksum that doesn't chain from the transaction before is a
+/// [`Finding::ChecksumMismatch`] at the transaction whose chain breaks, the
+/// first one *after* a replaced transaction); a tx out of
 /// sequence (a [`Finding::TxGap`]) or entry IDs out of sequence (an
 /// [`Finding::EntryIdGap`]) are reported and the transaction kept, unless it
 /// would rewind (a repeated tx or entry ID), when it is skipped too. After a
@@ -41,6 +47,9 @@ pub(crate) type TaggedFinding = (Option<TxId>, Finding);
 pub(crate) fn survey(bytes: &[u8]) -> Result<(Vec<SurveyedTxn>, Vec<TaggedFinding>), Error> {
     let mut rest = check_header(bytes)?;
     let mut s = Survey::new();
+    // The link the next transaction must chain from; `None` when the
+    // transaction before it gave none (see `stored_commit_checksum`).
+    let mut link = Some(super::header_checksum());
     loop {
         // An in-memory buffer's offsets always fit a u64.
         let at = (bytes.len() - rest.len()) as u64;
@@ -52,7 +61,7 @@ pub(crate) fn survey(bytes: &[u8]) -> Result<(Vec<SurveyedTxn>, Vec<TaggedFindin
         let BodyStep::Body {
             verdict,
             rest: after_body,
-        } = body_step(&begin, after_begin)
+        } = body_step(&begin, after_begin, link)
         else {
             s.found.push((tag, Finding::IncompleteTail { offset: at }));
             break;
@@ -66,16 +75,37 @@ pub(crate) fn survey(bytes: &[u8]) -> Result<(Vec<SurveyedTxn>, Vec<TaggedFindin
                 break;
             }
             Err(fault) => {
+                // The skipped transaction is reported once. The next one
+                // is still checked against the checksum this one stores, so
+                // one replaced transaction gives one finding, not one per
+                // transaction after it.
+                let body = &after_begin[..after_begin.len() - after_body.len()];
+                link = stored_commit_checksum(body);
                 s.skip_body(tag, tx, at, fault);
                 continue;
             }
         };
+        link = commit_checksum(&entries);
         let ascending = s.judge_entry_ids(tag, &entries);
         if in_sequence && ascending {
             s.txns.push(SurveyedTxn { tx, entries });
         }
     }
     Ok((s.txns, s.found))
+}
+
+/// The checksum stored in the `Commit` frame that ends `body`, read without
+/// trusting the rest of the body: `None` unless its last 25 bytes parse as
+/// a `Commit` frame. Then the next transaction's chain can't be checked,
+/// only its own framing.
+fn stored_commit_checksum(body: &[u8]) -> Option<u32> {
+    let (_, frame) = body.split_last_chunk::<COMMIT_FRAME_LEN>()?;
+    let (len, payload) = frame.split_first_chunk::<4>()?;
+    if u32::from_le_bytes(*len) as usize != payload.len() {
+        return None;
+    }
+    let entry = super::decode::parse_payload(payload).ok()?;
+    commit_checksum(std::slice::from_ref(&entry))
 }
 
 /// What [`survey`] has collected so far, and where in the tx and entry-ID

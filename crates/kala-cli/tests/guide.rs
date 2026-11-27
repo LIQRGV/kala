@@ -412,3 +412,162 @@ fn guide_set_move_and_if_missing_script_are_rerunnable() {
         assert!(prose.contains(command), "guide command missing: {command}");
     }
 }
+
+/// "Two terminals, one world": a write session stays open in one process
+/// while `kala transact` commits from another; each sees the other's
+/// commits. (What a conflict prints is pinned in `src/cmd/transact.rs`:
+/// two processes can't be made to collide on cue.)
+#[test]
+fn guide_two_terminals_share_one_world() {
+    use std::io::{BufRead, BufReader};
+    use std::sync::mpsc;
+    use std::time::Duration;
+    const ARRIVAL: &str =
+        "[:at 900 [:create :CHARACTER :ilse] [:assert :ilse :located_in :varrow]]";
+    const WHERE: &str = "[:find ?p :at 900 :where [:ilse :located_in ?p]]";
+    const MOVE: &str = "[:set :ilse :located_in :ashford :at 910]";
+    const WEAK: &str = "[[:concurrency :weak] [:set :ilse :located_in :carnath :at 920]]";
+    let prose = normalized(&guide());
+    assert!(prose.contains("## Two terminals, one world"));
+    for form in [ARRIVAL, WHERE, MOVE, WEAK] {
+        assert!(
+            prose.contains(&normalized(form)),
+            "guide form missing: {form}"
+        );
+    }
+    for text in [
+        "kala repl varrow.kala --write",
+        "kala transact varrow.kala arrival.edn",
+        "kala asof varrow.kala ilse located_in @910",
+        "kala transact varrow.kala script.edn --concurrency weak",
+        "`form 1: committed tx#13: 1 changed`",
+        "`2 changed` at tx#14",
+        "`.concurrency weak`",
+        "--busy-timeout 30s",
+        "exits with code 4",
+        // The message the session prints for a conflict, as transact.rs pins it.
+        "error: conflict: op 1 (:set) read :ilse :located_in, which another transaction \
+         changed; nothing was written; run it again",
+        "warning: latest tick moved 900 → 910 while this transaction ran",
+    ] {
+        assert!(prose.contains(text), "guide text missing: {text}");
+    }
+
+    let f = fixture_through_cli();
+    // Terminal 1: a write session that stays open.
+    let mut session = Command::new(env!("CARGO_BIN_EXE_kala"))
+        .arg("repl")
+        .arg(&f.path)
+        .arg("--write")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = session.stdin.take().unwrap();
+    let output = session.stdout.take().unwrap();
+    let (send, lines) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if send.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut seen = Vec::new();
+    // Types `text` in the session and, given `want`, reads its output up to
+    // that line.
+    let mut say = |text: &str, want: Option<&str>| {
+        writeln!(input, "{text}").unwrap();
+        input.flush().unwrap();
+        while let Some(want) = want {
+            let line = lines
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap_or_else(|_| panic!("`{text}`: no `{want}` in the output: {seen:?}"));
+            let found = line == want;
+            seen.push(line);
+            if found {
+                break;
+            }
+        }
+    };
+
+    // Terminal 2 commits while the session is open and idle.
+    let arrival = f.dir.path().join("arrival.edn");
+    fs::write(&arrival, ARRIVAL).unwrap();
+    let o = f.run("transact", &[arrival.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o).starts_with("form 1: committed tx#13: 1 changed\n"),
+        "{}",
+        stdout(&o)
+    );
+    // The session sees it on its next command, then writes itself.
+    say(WHERE, Some("  varrow"));
+    say(MOVE, Some("form 1: committed tx#14: 2 changed"));
+    // Terminal 2 reads the session's commit at once.
+    let held = f.text("asof", &["ilse", "located_in", "@910"]);
+    assert!(
+        held.contains("ashford") && !held.contains("varrow"),
+        "{held}"
+    );
+
+    // Weak mode: for a session, a script, or one transaction.
+    say(".concurrency weak", None);
+    say(".concurrency", Some("concurrency: weak"));
+    let script = f.dir.path().join("script.edn");
+    fs::write(&script, WEAK).unwrap();
+    let o = f.run(
+        "transact",
+        &[script.to_str().unwrap(), "--concurrency", "weak"],
+    );
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(
+        stdout(&o).starts_with("form 1: committed tx#15: 2 changed\n"),
+        "{}",
+        stdout(&o)
+    );
+    say(
+        "[:find ?p :at 920 :where [:ilse :located_in ?p]]",
+        Some("  carnath"),
+    );
+    say(".quit", None);
+    let o = session.wait_with_output().unwrap();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = f.run("doctor", &[]);
+    assert_eq!(code(&o), 0, "{}", stdout(&o));
+}
+
+#[test]
+fn guide_cypher_move_and_merge_scripts_are_rerunnable() {
+    const MOVE: &str = "MATCH (g {kala_handle:'greg'}), (a {kala_handle:'ashford'}) SET g.located_in = a AT TICK 225;";
+    const IMPORT: &str =
+        "MERGE (n:CHARACTER {kala_handle:'kael2'}) ON CREATE SET n.name = 'Kael' AT TICK 700;";
+    let f = fixture_through_cli();
+    let prose = normalized(&guide());
+    for (filename, statement, changed) in [("move.cypher", MOVE, 2), ("import.cypher", IMPORT, 1)] {
+        let path = f.dir.path().join(filename);
+        fs::write(&path, statement).unwrap();
+        let arguments = ["--lang", "cypher", path.to_str().unwrap()];
+        let first = f.json("transact", &arguments);
+        assert_eq!(first["changed"], changed);
+        assert!(
+            first["warnings"]["introduced"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let before = fs::read(&f.path).unwrap();
+        assert_eq!(f.json("transact", &arguments)["changed"], 0);
+        assert_eq!(fs::read(&f.path).unwrap(), before);
+        assert!(
+            prose.contains(&normalized(statement)),
+            "example missing from GUIDE: {statement}"
+        );
+        let command = format!("kala transact --lang cypher varrow.kala {filename}");
+        assert!(
+            prose.contains(&command),
+            "command missing from GUIDE: {command}"
+        );
+    }
+}

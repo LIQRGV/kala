@@ -166,6 +166,9 @@ impl Compiler<'_> {
             Expr::Value(v) => Expr::Value(v.clone()),
             Expr::Null => Expr::Null,
             Expr::Function(f, e) => Expr::Function(*f, Box::new(self.expr(e)?)),
+            Expr::ListIndex(list, index) => {
+                Expr::ListIndex(Box::new(self.expr(list)?), Box::new(self.expr(index)?))
+            }
             Expr::Disjoint(a, b) => {
                 Expr::Disjoint(Box::new(self.expr(a)?), Box::new(self.expr(b)?))
             }

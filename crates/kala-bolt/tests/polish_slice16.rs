@@ -86,6 +86,7 @@ impl Authenticator for Recording {
             principal: "recorded".into(),
             host: String::new(),
             grants: vec!["read:*".into()],
+            generation: 0,
         })
     }
 }

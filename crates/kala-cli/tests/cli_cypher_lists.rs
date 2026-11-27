@@ -102,3 +102,26 @@ fn cli_world_procedures_work_and_server_procedures_name_bolt() {
         );
     }
 }
+
+#[test]
+fn cli_list_parameter_supports_row_bound_indices_in_read_projections() {
+    let (_dir, path) = world();
+    let output = kala([
+        "query",
+        "--lang",
+        "cypher",
+        &path,
+        "UNWIND [1,0,-1,2] AS i RETURN $names[i] AS name",
+        "--param",
+        r#"names=["Aster","Briar"]"#,
+        "--json",
+    ]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let rows = report["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0][0]["value"], "Briar");
+    assert_eq!(rows[1][0]["value"], "Aster");
+    assert_eq!(rows[2][0]["value"], "Briar");
+    assert!(rows[3][0]["value"].is_null());
+}

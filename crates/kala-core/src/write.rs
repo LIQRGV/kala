@@ -1,6 +1,9 @@
 //! Language-neutral write results. Formatting and serialization belong to adapters.
+pub mod stage;
+
 use crate::{
-    CommitResult, EdgeId, EntityId, EntryId, Precision, SchemaChange, Tick, TxId, Warnings,
+    CommitResult, EdgeId, EntityId, EntryId, IdMap, Precision, SchemaChange, Tick, TickMoved, TxId,
+    Warnings,
 };
 
 /// One source operation and the primitive entries it wrote.
@@ -28,17 +31,86 @@ pub struct WriteReport {
     pub schema: Vec<SchemaChange>,
     pub warnings: Warnings,
     pub ops: Vec<WriteOperation>,
+    /// Provisional IDs the commit renumbered because other transactions
+    /// were committed while this one ran ([`CommitResult::ids`]); `ops`
+    /// already carry the final IDs. Empty when nothing moved.
+    pub ids: IdMap,
+    /// The warning that tick-less writes stayed on the latest tick the
+    /// transaction began with while a newer commit moved it
+    /// ([`CommitResult::latest_tick_moved`]). It displays as the line to
+    /// print.
+    pub latest_tick_moved: Option<TickMoved>,
 }
 /// A staged form. Entry IDs become final only after the caller commits.
 #[derive(Clone, Debug)]
 pub struct StagedWrite {
     pub ops: Vec<WriteOperation>,
     pub entry_offset: usize,
+    /// For each of `ops`, the native operations it made: the range of
+    /// [`Txn::operation_count`](crate::Txn::operation_count) it covers.
+    /// With it, a commit that had to re-apply the transaction over newer
+    /// commits can correct each op's counts ([`StagedWrite::complete`]),
+    /// and a [`Conflict`](crate::Conflict)'s `operation` can be traced to
+    /// the op that read. Empty (no correction) if the stager doesn't track
+    /// it.
+    pub spans: Vec<std::ops::Range<usize>>,
 }
 impl StagedWrite {
+    /// The op a [`Conflict`](crate::Conflict)'s `operation` belongs to:
+    /// the one that made the read a newer commit invalidated. `native` is
+    /// the number of native operations the transaction had made when it
+    /// read, so the reader is the op that began there (an op reads before
+    /// it writes), else the op whose native operations include that index
+    /// (a read made between two of its writes). `None` if the stager kept
+    /// no spans or the read wasn't made by one of this form's ops (an
+    /// earlier form of a caller-owned transaction, or the caller itself).
+    pub fn operation_of(&self, native: usize) -> Option<&WriteOperation> {
+        if self.spans.len() != self.ops.len() {
+            return None;
+        }
+        let at = |found: usize| self.ops.get(found);
+        self.spans
+            .iter()
+            .position(|span| span.start == native)
+            .or_else(|| self.spans.iter().position(|span| span.contains(&native)))
+            .and_then(at)
+    }
+
     /// Attach committed entry IDs to this form's operations. Transaction totals
     /// describe the entire commit, including other forms staged by the caller.
+    ///
+    /// If the commit re-applied the transaction over newer commits
+    /// ([`CommitResult::finalized`]), each operation reports what was
+    /// committed, not what was staged: its counts, a created entity's final
+    /// ID, whether a conditional create still created, and no precision for
+    /// a write that became "0 changed".
     pub fn complete(mut self, result: &CommitResult) -> WriteReport {
+        if let Some(finalized) = &result.finalized
+            && self.spans.len() == self.ops.len()
+        {
+            let made = |span: &std::ops::Range<usize>| {
+                finalized
+                    .ops
+                    .get(span.clone())
+                    .or_else(|| finalized.ops.get(span.start.min(finalized.ops.len())..))
+                    .unwrap_or_default()
+            };
+            if let Some(first) = self.spans.first() {
+                self.entry_offset = made(&(0..first.start)).iter().map(|op| op.changed).sum();
+            }
+            for (op, span) in self.ops.iter_mut().zip(&self.spans) {
+                let made = made(span);
+                op.changed = made.iter().map(|m| m.changed).sum();
+                op.declared = made.iter().map(|m| m.declared).sum();
+                op.entity = op.entity.map(|id| result.ids.resolve(id));
+                if op.created.is_some() {
+                    op.created = made.iter().rev().find_map(|m| m.created).or(op.created);
+                }
+                if matches!(op.kind, "assert" | "retract" | "set") {
+                    op.precision = made.iter().find_map(|m| m.precision);
+                }
+            }
+        }
         let mut ids = result.entries.iter().skip(self.entry_offset);
         for op in &mut self.ops {
             op.entries = ids.by_ref().take(op.changed).copied().collect();
@@ -52,6 +124,8 @@ impl StagedWrite {
             schema: result.schema.clone(),
             warnings: result.warnings.clone(),
             ops: self.ops,
+            ids: result.ids.clone(),
+            latest_tick_moved: result.latest_tick_moved,
         }
     }
 }

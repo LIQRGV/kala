@@ -1,6 +1,6 @@
 mod common;
 
-use common::{VARROW, code, kala, stderr, stdout};
+use common::{VARROW, code, feed, kala, stderr, stdout};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -18,12 +18,7 @@ fn user(dir: &Path, action: &str, args: &[&str], input: Option<&str>) -> Output 
         .spawn()
         .unwrap();
     if let Some(input) = input {
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
+        feed(&mut child, input.as_bytes());
     }
     let result = child.wait_with_output().unwrap();
     assert_no_secrets(&result);

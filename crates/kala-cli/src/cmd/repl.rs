@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use kala_core::{Tick, TxId};
+use kala_core::{Concurrency, Tick, TxId};
 use kala_datalog::{Completeness, CompletenessScanner, MAX_QUERY_BYTES, SessionDefaults};
 use kala_query::Limits;
 use rustyline::error::ReadlineError;
@@ -23,7 +23,7 @@ use crate::cli::{ReplArgs, parse_canon};
 use crate::error::CliError;
 use crate::escape;
 
-const HELP: &str = "Datalog session (read-only snapshot by default; --write holds the writer lock)\n\
+const HELP: &str = "Datalog session (read-only snapshot by default; --write takes the writer lock per commit)\n\
 .at [T]          set/clear default story tick\n\
 .canon [C]       set/clear default canon (N or tx#N)\n\
 .param NAME VALUE / .unparam NAME / .params\n\
@@ -33,6 +33,7 @@ const HELP: &str = "Datalog session (read-only snapshot by default; --write hold
 .schema          show node types and attributes\n\
 .info / .reload  inspect/reopen the snapshot\n\
 .json on|off     select query output format\n\
+.concurrency [optimistic|weak]  show/set how write commits treat other writers (--write)\n\
 .limits          show per-query resource limits\n\
 .cancel          discard incomplete input\n\
 .help / .quit / .exit\n";
@@ -134,6 +135,8 @@ struct Session<'a> {
     defaults: SessionDefaults,
     params: BTreeMap<String, String>,
     json: bool,
+    /// The mode of a write form that doesn't name one (`.concurrency`).
+    concurrency: Concurrency,
     buffer: String,
     scanner: CompletenessScanner,
     pending: Pending,
@@ -161,6 +164,10 @@ impl<'a> Session<'a> {
             },
             params: BTreeMap::new(),
             json: false,
+            concurrency: args
+                .concurrency
+                .as_deref()
+                .map_or_else(Concurrency::default, crate::cli::concurrency),
             buffer: String::new(),
             scanner: CompletenessScanner::new(),
             pending: Pending::Query,
@@ -179,6 +186,7 @@ impl<'a> Session<'a> {
     }
 
     fn query(&mut self, text: &str, explain: bool) -> Result<String, CliError> {
+        self.catch_up()?;
         self.cancel.store(false, Ordering::Relaxed);
         let prepared = kala_datalog::prepare_with(&self.ctx.world, text, &self.defaults)
             .map_err(|e| CliError::User(format!("query: {e}")))?;
@@ -206,6 +214,21 @@ impl<'a> Session<'a> {
         Ok(render_result(&self.ctx.world, &rs, self.json))
     }
 
+    /// In write mode the world's writer lock is free between commands, so
+    /// other processes may have committed: apply what they appended before
+    /// this command reads or writes, and read at the new latest canon. (A
+    /// read-only session stays the snapshot it opened; see `.reload`.)
+    fn catch_up(&mut self) -> Result<(), CliError> {
+        if self.write {
+            self.ctx
+                .world
+                .catch_up()
+                .map_err(|e| CliError::at_path(self.path, &e))?;
+            self.ctx.canon = self.ctx.world.latest_tx();
+        }
+        Ok(())
+    }
+
     fn form(&mut self, text: &str) -> Result<String, CliError> {
         // Only a recognised write form goes to the write path; anything
         // else is parsed as a query, so a malformed query keeps the query
@@ -217,8 +240,13 @@ impl<'a> Session<'a> {
                     return Err(user("write form refused; start with --write"));
                 }
                 let form = kala_datalog::parse_write(text).map_err(|e| user(e.to_string()))?;
-                let report =
-                    super::transact::execute(&mut self.ctx.world, &form, self.defaults.at)?;
+                self.catch_up()?;
+                let report = super::transact::execute(
+                    &mut self.ctx.world,
+                    &form,
+                    self.defaults.at,
+                    self.concurrency,
+                )?;
                 self.ctx.canon = self.ctx.world.latest_tx();
                 Ok(super::transact::render(&report, self.json))
             }
@@ -328,9 +356,11 @@ impl<'a> Session<'a> {
             ".rules" => no_arg(arg).map(|()| Action::Output(self.rules_text())),
             ".unrule" => self.remove_rule(arg),
             ".json" => self.set_json(arg),
+            ".concurrency" => self.set_concurrency(arg),
             ".load" => self.load(arg),
             ".info" => {
                 no_arg(arg)?;
+                self.catch_up()?;
                 Ok(Action::Output(super::info::snapshot(
                     self.path,
                     &self.ctx.world,
@@ -339,7 +369,11 @@ impl<'a> Session<'a> {
             }
             ".reload" => self.reload(arg),
             ".limits" => no_arg(arg).map(|()| Action::Output(limits_text())),
-            ".schema" => no_arg(arg).map(|()| Action::Output(self.schema())),
+            ".schema" => {
+                no_arg(arg)?;
+                self.catch_up()?;
+                Ok(Action::Output(self.schema()))
+            }
             _ => Err(user(format!(
                 "unknown command `{}`; use .help for commands",
                 escape::value(command)
@@ -428,6 +462,29 @@ impl<'a> Session<'a> {
             "on" => true,
             "off" => false,
             _ => return Err(user("usage: .json on|off")),
+        };
+        Ok(Action::Continue)
+    }
+
+    /// `.concurrency [optimistic|weak]`: with no argument, shows the mode
+    /// write forms commit in unless they begin with `[:concurrency …]`.
+    fn set_concurrency(&mut self, arg: &str) -> Result<Action, CliError> {
+        if !self.write {
+            return Err(user(
+                ".concurrency needs a write session; start with --write",
+            ));
+        }
+        self.concurrency = match arg {
+            "" => {
+                let mode = match self.concurrency {
+                    Concurrency::Optimistic => "optimistic",
+                    Concurrency::Weak => "weak",
+                };
+                return Ok(Action::Output(format!("concurrency: {mode}\n")));
+            }
+            "optimistic" => Concurrency::Optimistic,
+            "weak" => Concurrency::Weak,
+            _ => return Err(user("usage: .concurrency [optimistic|weak]")),
         };
         Ok(Action::Continue)
     }
@@ -541,7 +598,8 @@ fn output(stream: &mut impl Write, text: &str) -> Result<(), CliError> {
 pub fn run(args: &ReplArgs) -> Result<Done, CliError> {
     let world = args.world.as_path();
     let ctx = if args.write {
-        let world = super::transact::open_write(world, args.acknowledge_recovery)?;
+        let world =
+            super::transact::open_write(world, args.acknowledge_recovery, args.busy_timeout)?;
         Ctx {
             canon: world.latest_tx(),
             world,
@@ -592,7 +650,7 @@ fn drive(
     if interactive && args.write {
         output(
             &mut io::stdout().lock(),
-            "Write mode: holding the writer lock; other writers are blocked until exit.\n",
+            "Write mode: each commit takes the writer lock; commits by other writers are seen on the next command.\n",
         )?;
     }
     let mut failed = false;

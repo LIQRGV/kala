@@ -50,6 +50,7 @@ at 65,536 bytes. Session parameters and rule definitions are also bounded.
 | `.explain QUERY` | Print a plan with the session defaults, rules and parameters applied. |
 | `.load FILE` | Run one UTF-8 query file (regular files only, at most 65,536 bytes). |
 | `.json on` / `.json off` | Select JSON / text query results, using the same format as `kala query`. |
+| `.concurrency [optimistic\|weak]` | With `--write` only: show (no argument) or set how the session's write forms treat other writers; see "Several writers on one world". |
 | `.schema` | List node types and each attribute's type, kind, cardinality, direction, inverse, reverse cardinality and indexing. |
 | `.info` | Print information about the opened snapshot, as `kala info` does. |
 | `.reload` | Reopen the world and report its latest transaction and tick. |
@@ -127,7 +128,8 @@ A single op is one transaction; a vector of ops commits atomically:
  [:assert :kael :located_in :varrow :precision :year]]
 ```
 
-The first failed form stops the command (exit 1), preserving earlier commits.
+The first failed form stops the command (exit 1; exit 4 for a conflict, exit 3
+if the world can't be written: see "Exit codes"), preserving earlier commits.
 Each successful form prints its number, transaction, changed count, per-op tick,
 precision and entry IDs, new edge IDs, and introduced/resolved overlap warnings.
 A correction that moves a key appends two entries (so reports 2 changed); entity
@@ -192,7 +194,8 @@ exist).
 JSON includes `introduced_omitted` and `resolved_omitted` only when nonzero.
 
 `--json` prints one document per successful form, with fields `form`, `dry_run`,
-`tx`, `changed`, `declared`, `entries`, `edges`, `ops`, `schema` and `warnings`. Each op has `position`,
+`tx`, `changed`, `declared`, `entries`, `edges`, `ops`, `schema` and `warnings`
+(and `latest_tick_moved` when another writer moved the latest tick; see below). Each op has `position`,
 `kind`, `tick`, `precision`, `changed`, `declared`, `entries` and `entity` (null unless created).
 Entry IDs are integers; new edges are `edge#N` strings. Warnings have `introduced`
 and `resolved` arrays of the same messages as `kala load`. Errors stay on stderr.
@@ -211,13 +214,184 @@ rerun with `--acknowledge-recovery`. That cuts the damaged bytes to a
 `<world>.torn-N` quarantine file and continues. A torn tail (a write cut short,
 never acknowledged) is cut without asking.
 
-`kala repl WORLD --write` holds the exclusive writer lock until exit and queries
-see each successful commit immediately. Another writer gets exit 3 with a locked
-world message. Without `--write`, write forms are refused. `.at` supplies the
+The damaged bytes stay in the file until some command is run with
+`--acknowledge-recovery`: no process cuts them on its own, so none can write
+over the lost transaction's entry IDs unasked. (The one process that can be
+told to, in advance, is a server started as `kala serve DIR
+--acknowledge-recovery`; see "Bolt write limits".) A write session that was
+already open when the damage appeared is refused at its next write (`the last
+transaction is damaged … rerun with --acknowledge-recovery`): quit it and
+start it again with the flag. Entry IDs noted from the lost transaction must
+not be used in a `:correct` afterwards. Read commands leave the damaged
+transaction out and keep working.
+
+`kala repl WORLD --write` takes the exclusive writer lock only while a
+transaction commits, and queries see each successful commit immediately. An
+open session **no longer blocks other writers**: a `kala transact` (or another
+write session) on the same world commits while it is open, and the session
+applies what they committed before each of its commands, reads and writes
+alike. Without `--write`, write forms are refused. `.at` supplies the
 write default: an op's `:at` wins over the transaction's `:at`, then session `.at`,
 then the latest tick captured when the transaction began. `.canon` and `.reload`
 are refused in write mode; an explicit query `:canon` still reads an older draft.
 `.json` applies to writes too, and `.load FILE` accepts one write transaction.
+`.concurrency` and `--busy-timeout` are described next.
+
+### Several writers on one world
+
+Any number of `kala` processes may write one world file. They take turns, one
+transaction at a time: the writer lock is held only while a form commits (and
+for the last moment of opening a world for writing: the log itself is read
+without the lock, so starting a command on a large world doesn't keep the
+others out), never by an idle session. Nothing needs to be running in between;
+this is the SQLite model.
+
+A commit is seen by other processes only once it is durable: a session that
+looks at the file while another writer is in the middle of a commit skips it
+for now and picks it up at its next command. It never shows a transaction that
+the other writer then has to take back.
+
+**Waiting for the lock: `--busy-timeout`.** A write that finds another writer
+mid-commit waits for it, by default up to 5 seconds, then gives up with exit 3
+(`world is locked by another writer: … nothing was written; run the command
+again, or wait longer with --busy-timeout`). `--busy-timeout DURATION` sets the
+wait on every command that writes a world file: `kala transact`, `kala repl
+--write`, `kala load` (for `--force`), `kala create` and the `kala user` write
+subcommands (for `system.kala`). A duration is a whole number with a unit:
+`500ms`, `5s`, `2m`; a bare number is seconds; `0` means don't wait at all; the
+most is `60m`. `kala create` and `kala transact --create` build the new world in
+a private file, so they have nothing to wait for and accept the flag only so a
+script can pass it everywhere.
+
+```sh
+kala transact varrow.kala scene.edn --busy-timeout 30s
+kala repl varrow.kala --write --busy-timeout 500ms
+```
+
+**What another writer's commit does to yours.** Each form is one transaction
+that starts from the world as it is at that moment. If another writer commits
+between a form's start and its commit, Kala commits the form over that
+transaction when it safely can:
+
+- The IDs in the report are the committed ones. If both writers created a
+  character, the second is simply given the next number; if both made the same
+  relationship, they share one edge.
+- A write with no tick stays on the latest tick the form started with, even if
+  the other writer moved the world's latest tick meanwhile. The report then
+  ends with a warning, so a write that was meant to be "now" and is no longer
+  the end of history is visible at once:
+
+  ```text
+  form 1: committed tx#14: 1 changed
+    op 1 (:assert): tick 601, 1 changed, entry#52
+  warning: latest tick moved 601 → 610 while this transaction ran
+  ```
+
+  JSON carries the same as `"latest_tick_moved": {"from": 601, "to": 610}`
+  (the field is absent otherwise). Only facts warn: creates and schema forms
+  store no tick, and a fact with its own `:at` (or under a form `:at`) is where
+  you put it.
+
+**Conflicts (exit 4).** What Kala will not do is commit a form that was decided
+from something the other writer has since changed. Forms that *read* before
+they write are `[:set …]` (it reads what the attribute holds, to know what to
+retract), `[:create … :if-missing]` (it reads whether the handle is free) and
+`[:correct …]` (it reads the entry). If a transaction committed meanwhile wrote
+what one of them read, the form is refused, nothing of it is written, and the
+message says which op read what:
+
+```text
+kala: error: form 1 failed; 0 prior forms committed: conflict: op 1 (:set) read :greg :located_in, which another transaction changed; nothing was written; run it again
+```
+
+Running the same form again is always safe: it now reads the other writer's
+result (a `:set` retracts the value that writer set; an `:if-missing` create
+reports that the entity exists). In a file of several forms, the forms before
+the refused one are already committed, so the message adds where to start
+again (`run form 3 and those after it: the 2 before it are already
+committed`); running the whole file again would apply those twice. One more
+thing to expect on a re-run: a `:set` with no tick lands on the latest tick, and
+if the other writer set its value at that same tick, the re-run is the ordinary
+same-tick conflict error (exit 1), because tick order can't decide between the
+two; give the `:set` its own `:at`.
+
+With `--json`, the refused form also gets a document on stdout (the message
+still goes to stderr):
+
+```json
+{"form":1,"error":"conflict","key":"entity-attribute","op":1,"kind":"set","applied":1,"prior_forms_committed":0,"message":"form 1 failed; …"}
+```
+
+`key` is the kind of read that was invalidated (`entity-attribute`, `handle`,
+`entry`; later query layers add `reverse`, `value`, `attribute`, `type-scan`,
+`any-define`, `undeclared`, `all`, `exposed-id`), `op` and `kind` the op that
+read (null if no single op did), `applied` how many transactions the other
+writers committed meanwhile.
+
+Plain asserts, retracts and creates read nothing, so they **never conflict**:
+two writers adding different facts, or even the same fact, both commit (the
+second "same fact" is `0 changed`; opposite ops on one value at one tick are
+the same-tick conflict error, as always).
+
+**Weak mode.** `--concurrency weak` on `kala transact`, `.concurrency weak` in a
+write session (or `kala repl --write --concurrency weak`), or
+`[:concurrency :weak]` as the first op of one transaction turns the read check
+off: the store's own rules still hold (duplicate handles, same-tick conflicts,
+an entry that another writer corrected meanwhile: `log entry#N was already
+corrected by a newer transaction (now rev R); nothing was written`, whether
+that correction replaced or deleted it), but a `:set` decided from a stale read
+goes through,
+which can leave a cardinality-one attribute with two values (reported as the
+usual overlap warning). The default is `optimistic`, and a form's own
+`[:concurrency …]` wins over the flag and the session setting:
+
+```clojure
+[[:concurrency :weak]
+ [:set :greg :located_in :carnath]]
+```
+
+`[:concurrency …]` must be the first op of a transaction vector (after a
+leading `:at T`), appears once, and takes `:weak` or `:optimistic`; anywhere
+else it is a syntax error. It is not an op: the report numbers the ops after
+it from 1. `kala dump` never writes it (a dump holds what was stored, not how
+it was committed), so dumps and restores are unchanged.
+
+```text
+kala> .concurrency
+concurrency: optimistic
+kala> .concurrency weak
+```
+
+In a write session a conflict is an error like any other: the session stays
+open and you run the form again. (A piped session still exits 1 if any command
+failed; use `kala transact` when a script needs to tell a conflict apart.)
+
+**Replacing a world that is open elsewhere.** `kala load --force` replaces a
+world while holding its writer lock, so never in the middle of another
+process's commit: if a commit is in progress it waits the busy timeout and
+then refuses (exit 1, the old world untouched). The same goes for an old file
+that doesn't open as a world (a corrupt log may still be one that a running
+process is committing to): it is replaced only under its lock. The lock is
+checked to be the lock of the file the path names at that moment, so two
+`load --force` racing each other can't replace a world under a third process's
+commit: the second one looks at the file that is there now and waits for that
+file's lock. A process that merely has the world open (an idle
+`kala repl --write`) holds no lock, so the world **is** replaced under it.
+That process's next command finds that its file is gone and writes nothing:
+
+```text
+error: varrow.kala: the world file was cut back, rewritten or replaced by another process (for example `kala load --force`) while this command had it open; nothing was written; run the command again (in a REPL session: quit and start it again)
+```
+
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success. `kala doctor` with warnings or hints only is also 0. |
+| 1 | Your input was wrong: a bad form or fixture, an unknown entity, a store rule (a same-tick conflict, a duplicate handle), a missing file, `kala doctor` error findings, any failed command of a piped REPL session. |
+| 2 | The command line was wrong: an unknown flag or value, an existing destination where a new file is required. |
+| 3 | The world can't be used: a corrupt or foreign log, an older log format, an I/O error, a failed write to stdout/stderr; or it can't be written right now: its writer lock stayed held for the whole busy timeout, its file was replaced under the command, or its damaged last transaction needs `--acknowledge-recovery`. Nothing was written. |
+| 4 | A conflict: another writer changed something a write form had read. Nothing of that form was written; running it again is safe. |
 
 Write input uses the query lexer (strings, escapes, comments, commas). Input is
 capped at 65,536 bytes, nesting at 32 levels, ops per transaction at 256 and forms
@@ -281,21 +455,24 @@ backups because they retain old password hashes too.
 
 See [Bolt accounts and listen rules](../kala-bolt/README.md) for host precedence,
 database authorization and the explicit plaintext opt-in needed for a
-non-loopback listener. `--auth none` remains loopback-only.
+non-loopback plaintext listener. `--auth none` accepts loopback and Unix listeners.
 
 `--listen` is repeatable (at most 16 distinct addresses), with no DNS lookup:
 
 - `IP:PORT`, `[IPv6]:PORT`, or `localhost:PORT` (`localhost` means `127.0.0.1`).
-- `bolt://HOST:PORT`, using those same host forms.
+- `bolt://HOST:PORT` or `bolt+s://HOST:PORT` (TLS), using those same host forms.
 - `unix:///absolute/path` on Unix platforms; the path must fit `sun_path`.
 
 No `--listen` still binds `127.0.0.1:7687`. Unsupported URI schemes fail rather
 than selecting another transport. `neo4j://` is a client routing URI and cannot
 be a listener. All listeners share `--max-connections` and stop on Ctrl-C
-(SIGINT) or SIGTERM; SIGHUP does the same. Each of them runs the same clean
-shutdown: connections are closed, queries cancelled, Unix socket files removed
-and the exit status is 0, so `systemctl stop` and `docker stop` need no special
-handling.
+(SIGINT), SIGTERM or SIGHUP (a closed terminal or ssh session). Each closes
+connections, cancels queries, removes Unix socket files and exits with status 0.
+SIGUSR1 reloads the certificate and key for new TLS connections. On a server
+without a TLS listener it logs `event=bolt_tls_reload_ignored
+reason=no_tls_listener` and does nothing else. Once the listeners are bound, a
+log line that cannot be written (stderr closed with the terminal, a dead log
+pipe) is dropped and the server keeps running.
 
 ```sh
 kala serve worlds --listen bolt://127.0.0.1:7687 \
@@ -331,7 +508,7 @@ shutdown and may remain after a crash, which is harmless.
 See [transport lifecycle and platform rules](../kala-bolt/README.md#transports-and-multiple-listeners).
 
 Unix listeners count as local for auth and plaintext rules; adding a
-non-loopback TCP listener still requires the usual opt-in. Official Neo4j
+non-loopback plaintext TCP listener still requires the usual opt-in. Official Neo4j
 drivers cannot connect to the Unix socket.
 
 Startup prints one line per bound listener in the requested order, only after
@@ -344,7 +521,7 @@ kala serve: listening on unix:///run/kala/bolt.sock
 
 A failed start serves nothing, prints no startup lines, and cleans up sockets
 created by earlier binds. Unix sockets are also removed on clean shutdown
-(SIGINT or SIGTERM), provided the path still names this server's inode.
+(SIGINT, SIGTERM or SIGHUP), provided the path still names this server's inode.
 
 `--advertised-address HOST:PORT` is the address routing drivers (`neo4j://`)
 and `SHOW DATABASES` are given. Without it they get the local address of each
@@ -354,6 +531,67 @@ an internal address); `kala serve` warns on stderr for each such listener when
 it is missing. Over a Unix socket, `SHOW DATABASES` instead reports `unix:///path`
 and `ROUTE` requires `--advertised-address`; an explicit address is used by both.
 
+### Encrypted Bolt connections
+
+Supply `--tls.cert FILE` and `--tls.key FILE` whenever you configure a
+`bolt+s://` listener. All TLS listeners use the same identity. Supply the PEM
+certificate chain with the leaf first, followed by any intermediates. The key
+must be an unencrypted PKCS#8, RSA PKCS#1 or EC SEC1 PEM file. Each file may be
+up to 1 MiB. On Unix the key file must give group and others no access at all
+(read, write or execute): `chmod 600 key.pem` (or `400`). Anything else is
+refused at startup and at reload, naming the mode found. A certificate file
+that group or others can write is accepted with a warning. Kala checks that
+the key matches the leaf and that the leaf is currently valid, and warns on
+stderr when it expires within 14 days.
+
+Validity is checked when the files are read: at startup and at each reload. A
+leaf that expires while the server runs keeps being served until you replace
+the files and send SIGUSR1. The server looks at the date again once an hour and
+logs a warning while the leaf is within 14 days of its end or past it.
+
+With a certificate issued by a CA the driver trusts, connect to
+`bolt+s://HOST:PORT` or use `neo4j+s://HOST:PORT` for routing. Set the
+advertised host and port to an endpoint reachable over TLS, with a host name
+or IP address in the certificate SANs. Remote logins require a password account.
+
+There is one `--advertised-address` per server. With a plaintext listener and a
+TLS listener together, both hand out that same address, and a routing driver
+reuses the scheme it connected with: if the address is the TLS endpoint, a
+`neo4j://` client that arrived over the plaintext listener is sent to a port
+that only speaks TLS, and its routed connections fail (they never fall back to
+plaintext, or the other way round). Use direct `bolt://` / `bolt+s://` URIs on
+the listener the advertised address does not name.
+
+TLS uses rustls with the `ring` crypto provider: TLS 1.3 and 1.2, no
+post-quantum hybrid key exchange (X25519MLKEM768 needs the `aws-lc-rs`
+provider), and a C compiler is needed to build Kala.
+
+For a local self-signed development certificate, run these commands in a
+private directory. The server prints `kala serve: listening on bolt+s://127.0.0.1:7687`.
+
+```sh
+openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 30 \
+  -subj /CN=localhost -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' \
+  -keyout key.pem -out cert.pem
+chmod 600 key.pem
+kala serve worlds --listen bolt+s://127.0.0.1:7687 --tls.cert cert.pem --tls.key key.pem
+```
+
+Connect from a Python driver using the local trust account.
+
+```python
+from neo4j import GraphDatabase
+
+with GraphDatabase.driver("bolt+ssc://localhost:7687", auth=("root", "")) as driver:
+    driver.verify_connectivity()
+```
+
+The client-side `+ssc` scheme accepts a self-signed certificate without verifying
+the server’s identity. For rotation, replace both PEM files and send SIGUSR1 to
+the server process (`kill -USR1 <pid>`). It validates the new pair before
+swapping it in. Existing sessions continue, and a failed reload logs the error
+and keeps the old pair. SIGHUP is not a reload: it stops the server, like
+SIGTERM.
 
 ## Changing and inspecting the schema
 
@@ -473,9 +711,32 @@ count zero; entity creation and edge interning count in neither. Text adds
 `1 changed, 1 declared`, a pure declaration `0 changed, 1 declared`, and a
 fact-only write still prints `1 changed`. The write REPL uses the same reports.
 
-This release writes **log format 5**. Format-4 and older worlds are refused with
-an older-Kala message and must be recreated from their source fixtures/scripts.
-There is no old-file migration before 1.0. `kala info` reports the format version;
+This release writes **log format 6**: every transaction's checksum also covers
+the previous transaction's (the first chains from the file header), so a log in
+which an earlier transaction was replaced, even by a valid one of the same
+length, is refused as corrupt and reported by `kala doctor` as a
+`checksum_mismatch` at the first transaction that no longer continues the log.
+Format-5 and older worlds are refused by every command and by `kala serve` with
+an older-Kala message and are never modified; there is no dual-format reading.
+To carry one across, dump it with the older `kala` binary that wrote it and load
+the dump with this one, which reproduces the same entry IDs and tx numbers:
+
+```sh
+old-kala dump world.kala -o world.dump.edn            # the kala that wrote the file
+kala transact --create new-world.kala world.dump.edn  # this kala
+kala doctor new-world.kala                            # "clean"
+kala info new-world.kala                              # format version: 6
+```
+
+`old-kala` stands for the previous binary under whatever name you kept it (this
+`kala` cannot read the old file, so dump before replacing the binary, or build
+the previous release to dump). The new world is a new file; the old one is left
+as it was. A dump taken from the new world differs from the old dump only in
+its `;; Source format version` comment line.
+
+For a server directory, `old-kala dump --all DIR -o BACKUP` and one
+`kala transact --create` per dump, `system.dump.edn` included (see below).
+`kala info` reports the format version;
 `kala log` includes schema revisions and world settings in operation order.
 In `kala log --json` a schema entry is `{"entry": N, "kind": "schema", "change":
 {...}}`, where `change` uses the write report's field names: `kind` is
@@ -505,6 +766,10 @@ Without a schema file it has no node types or attributes and infers them on writ
 A schema file contains `[:node-type :CHARACTER]`,
 `[:attribute :name :string :state :one :indexed]`, and world-setting forms such as
 `[:world-setting :schema :strict]`. An optional `[:genesis ...]` wraps them.
+A world setting's key must be one Kala knows (`:schema`, `:concurrency`,
+`:tick_unit`), as in a live `[:world-setting …]`; `kala transact --create`
+alone also writes back any other key its dump holds (a world written before
+the keys were checked still dumps and restores identically).
 These declarations become tx#0; node types precede attributes, then settings.
 Existing destinations, including dangling symlinks, are refused (exit 2).
 `[:create :CHARACTER]` allocates an entity without a handle.
@@ -634,6 +899,25 @@ string or ref. A ref's value is an entity object. Infinite floats are the string
 `"inf"` / `"-inf"`. Ordering is deterministic. JSON snapshots are for external
 tools, not for restoring history; this slice provides no JSON import.
 
+## Cypher writes
+
+`kala transact --lang cypher WORLD FILE` commits each semicolon-delimited
+statement independently. Use `-` for standard input. On an error the CLI
+identifies the failing statement and how many earlier statements committed.
+The text report says `statement N` where a Datalog script says `form N` (the
+JSON field is `form` for both), and a created node is shown with its handle
+(`created CHARACTER#34 kael2`) for CREATE as for MERGE. A script may declare
+property types with `CREATE CONSTRAINT … IS :: TYPE;`. Scripts take no
+parameters; a string written to a ref attribute is a handle.
+`--dry-run` applies the script to a discarded copy. `--json`, `--concurrency`
+and `--busy-timeout` use the same reporting and transaction rules as Datalog.
+A `RETURN` clause adds a table to the write report. With `--json`, its
+`columns` and typed `rows` use the same format as `kala query`. Rows show the
+committed IDs and property values at the write tick, or the previewed values
+for `--dry-run`. For example, `CREATE (p:PLACE {name:'Harbor'}) AT TICK 700
+RETURN p AS place, p.name AS name;` returns the new place and its name.
+The default transaction language and the writable REPL use Datalog.
+
 ## Cypher reads
 
 `kala query WORLD --lang cypher QUERY` and `kala explain WORLD --lang cypher QUERY`
@@ -665,3 +949,32 @@ attribute types before execution; nested lists have a depth limit of 32. The
 query/explain commands accept OPTIONAL MATCH, WITH, aggregates and bounded paths.
 `db.labels()`, `db.relationshipTypes()` and `db.propertyKeys()` work locally;
 server components and database listings report "only over Bolt".
+
+### Bolt write limits
+
+`kala serve` accepts Datalog writes through accounts with `write` grants.
+`--read-only` restores read-only server behavior: every write form is refused
+(a transaction begun in write mode, the drivers' default, still reads).
+`--max-write-transactions` defaults to 8 and counts explicit transactions that
+have written; one account may hold at most half of them (at least 1).
+`--tx-timeout` defaults to 60s and bounds a transaction's whole life, including
+the server's own work in it; `--tx-idle-timeout` defaults to 30s and bounds
+only the time the client stays silent between a response and its next request.
+`--busy-timeout` defaults to 5s. Duration flags accept `ms`,
+`s`, `m` and bare seconds. The busy timeout applies to writer locks and causal
+bookmark waits. `--auth none` remains read-only. The system world is written
+only through `kala user`, including when the caller is an administrator.
+Over Bolt, `[:world-setting …]`, `[:rename …]`, `[:deprecate …]`,
+`[:cardinality …]` and `[:migrate …]` need `admin` on the database;
+declarations need only `write`.
+
+`--acknowledge-recovery` (off by default) lets the server cut a world's damaged
+last transaction by itself, to a `<world>.torn-N` quarantine file, and go on
+writing, instead of refusing writes until an operator runs a write command with
+that flag. It prints `event=recovery_acknowledged db=… bytes=… quarantine=…`
+for each cut and a warning at startup. It accepts a risk: the cut transaction's
+entry IDs are issued again, so a client still holding one could `:correct` the
+wrong fact. It never applies to `system`, and a `--read-only` server ignores it
+(and says so).
+See [Bolt transactions, reports and limits](../kala-bolt/README.md#writing-and-transactions)
+for driver examples and error codes.

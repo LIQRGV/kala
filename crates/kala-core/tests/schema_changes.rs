@@ -1338,18 +1338,18 @@ fn world_settings_and_node_origins_are_read_per_canon_and_survive_reopen() {
     let mut tx = world.begin();
     tx.infer_node_type("FACTION").unwrap();
     tx.world_setting("schema", "strict").unwrap();
-    tx.world_setting("concurrency", "weak").unwrap();
+    tx.world_setting("tick_unit", "day").unwrap();
     let first = tx.commit().unwrap().tx;
     let mut tx = world.begin();
     tx.declare_node_type("FACTION").unwrap();
     tx.world_setting("schema", "infer").unwrap();
-    tx.world_setting("concurrency", "optimistic").unwrap();
+    tx.world_setting("tick_unit", "hour").unwrap();
     let second = tx.commit().unwrap().tx;
     let reopened = World::open_read_only(&path).unwrap();
     for world in [&world, &reopened] {
         let genesis = world.at_canon(TxId(0));
         assert_eq!(genesis.settings().get("schema"), Some(&"infer"));
-        assert!(!genesis.settings().contains_key("concurrency"));
+        assert!(!genesis.settings().contains_key("tick_unit"));
         assert!(
             !genesis
                 .node_type_definitions()
@@ -1357,7 +1357,7 @@ fn world_settings_and_node_origins_are_read_per_canon_and_survive_reopen() {
         );
         let inferred = world.at_canon(first);
         assert_eq!(inferred.settings().get("schema"), Some(&"strict"));
-        assert_eq!(inferred.settings().get("concurrency"), Some(&"weak"));
+        assert_eq!(inferred.settings().get("tick_unit"), Some(&"day"));
         assert!(
             inferred
                 .node_type_definitions()
@@ -1365,7 +1365,7 @@ fn world_settings_and_node_origins_are_read_per_canon_and_survive_reopen() {
         );
         let declared = world.at_canon(second);
         assert_eq!(declared.settings().get("schema"), Some(&"infer"));
-        assert_eq!(declared.settings().get("concurrency"), Some(&"optimistic"));
+        assert_eq!(declared.settings().get("tick_unit"), Some(&"hour"));
         assert!(
             declared
                 .node_type_definitions()
@@ -1374,7 +1374,7 @@ fn world_settings_and_node_origins_are_read_per_canon_and_survive_reopen() {
     }
     let mut tx = world.begin();
     tx.world_setting("schema", "infer").unwrap();
-    tx.world_setting("concurrency", "optimistic").unwrap();
+    tx.world_setting("tick_unit", "hour").unwrap();
     let same = tx.commit().unwrap();
     assert_eq!(same.tx, second);
     assert!(same.schema.is_empty());
@@ -1958,4 +1958,42 @@ fn migration_preserves_committed_bidirectional_ref_edge_property_history() {
 #[test]
 fn migration_preserves_staged_bidirectional_ref_edge_property_history() {
     migrate_with_mutual_edge_property(true);
+}
+
+#[test]
+fn a_live_write_sets_only_known_world_settings_and_replay_accepts_any() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.kala");
+    // A genesis schema (and so any older log) may hold a key this build
+    // doesn't know: replay must keep opening it.
+    drop(
+        World::create(
+            &path,
+            Schema::new()
+                .setting("house_rule", "x")
+                .accepting_unknown_settings(),
+        )
+        .unwrap(),
+    );
+    let mut world = World::open(&path).unwrap();
+    assert_eq!(world.world_setting("house_rule"), Some("x"));
+    let mut tx = world.begin();
+    let refused = tx.world_setting("anything_at_all", "x").unwrap_err();
+    let Error::Schema(message) = &refused else {
+        panic!("{refused:?}")
+    };
+    for known in kala_core::WORLD_SETTING_KEYS {
+        assert!(message.contains(&format!(":{known}")), "{message}");
+    }
+    drop(tx);
+    let mut tx = world.begin();
+    tx.world_setting("schema", "strict").unwrap();
+    tx.world_setting("concurrency", "optimistic").unwrap();
+    tx.world_setting("tick_unit", "day").unwrap();
+    tx.commit().unwrap();
+    drop(world);
+    let world = World::open(&path).unwrap();
+    assert_eq!(world.world_setting("tick_unit"), Some("day"));
+    assert_eq!(world.world_setting("house_rule"), Some("x"));
+    assert_eq!(world.world_setting("anything_at_all"), None);
 }

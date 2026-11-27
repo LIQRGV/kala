@@ -124,6 +124,10 @@ pub enum Finding {
     /// A transaction whose body checksum or `Commit` checksum doesn't match
     /// (or, at a begin record whose own checksum fails and isn't a
     /// zero-filled tail, the transaction expected there). It is skipped.
+    /// The `Commit` checksum is chained (see "The checksum chain" in
+    /// [`crate::log`]), so this is also what a transaction *replaced* by
+    /// another valid one looks like: the finding is at the first
+    /// transaction after it, which no longer continues the log.
     ChecksumMismatch {
         /// The transaction's tx.
         tx: TxId,
@@ -347,7 +351,12 @@ pub enum Tamper {
 ///
 /// A file-backed world's log is re-read from disk (without taking its lock),
 /// so damage that happened after the world was opened is found, and the
-/// world keeps working meanwhile. An in-memory world's kept entries are
+/// world keeps working meanwhile. The handle is judged against the log it
+/// has applied (up to [`World::chain_tip`]): transactions other handles
+/// committed since are not replayed, and an incomplete last transaction
+/// past the handle's own (another handle's append in progress, or a torn or
+/// damaged tail still in the file, see [`World::recovery`]) is not a
+/// finding here. [`doctor_log`] judges the whole file and reports it. An in-memory world's kept entries are
 /// replayed instead. Read-only: it writes nothing, cuts nothing and changes
 /// nothing in the world; it works on a world whose log writer failed. Never
 /// panics: anything it can't read is a finding. If the log can't be read at
@@ -357,7 +366,25 @@ pub fn doctor(world: &World, opts: &DoctorOptions) -> Report {
     let mut found = Vec::new();
     let txns = match world.log_path() {
         Some(path) => match log::read_log_file(path).and_then(|bytes| log::survey(&bytes)) {
-            Ok((txns, scanned)) => {
+            Ok((mut txns, mut scanned)) => {
+                // The handle is compared with the log it has applied: other
+                // handles may have committed past it (`World::catch_up`),
+                // and being behind the file is not an index mismatch.
+                let applied = world.latest_tx();
+                txns.retain(|t| t.tx <= applied);
+                // Nor is an incomplete last transaction past the handle's
+                // own last one a finding about this world: it is another
+                // handle's append in progress (torn or failing its checksum
+                // until it is whole), or a dead writer's tail that the next
+                // commit cuts, or a damaged tail this handle reported and
+                // left for its caller to acknowledge (`World::recovery`).
+                // Anything else out there (which no append in progress
+                // looks like) is still reported.
+                if let Some(tip) = world.chain_tip() {
+                    scanned.retain(|(_, f)| {
+                        !matches!(f, Finding::IncompleteTail { offset } if *offset >= tip.end)
+                    });
+                }
                 found.extend(scanned);
                 Some(txns)
             }

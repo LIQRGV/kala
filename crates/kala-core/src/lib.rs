@@ -23,7 +23,9 @@ pub mod write;
 pub use doctor::Tamper;
 pub use doctor::{DoctorOptions, Finding, IndexName, Report, Severity, doctor, doctor_log};
 pub use echo::{Echo, must_escape};
-pub use error::{Error, ErrorEntity, UnconvertibleValue, WorkInterruptReason};
+pub use error::{
+    Conflict, ConflictKey, Error, ErrorEntity, UnconvertibleValue, WorkInterruptReason,
+};
 pub use id::{AttrId, EdgeId, EntityId, IdError, NodeTypeId};
 pub use interval::IntervalSet;
 #[cfg(feature = "test-hooks")]
@@ -36,11 +38,13 @@ pub use overlap::{
 pub use schema::{
     AttrDef, AttributeOptions, BUILTIN_NAME_PREFIX, Cardinality, Kind, MigrationOptions,
     MigrationReport, RESERVED_NAME_PREFIX, RefDirection, SYSTEM_NODE_TYPE, Schema, SchemaChange,
+    WORLD_SETTING_KEYS,
 };
 pub use tick::{Precision, Tick};
 pub use value::{MAX_INDEXED_STRING_BYTES, Value, ValueError, ValueType, fold_for_search};
 pub use world::{
-    AttrStats, Change, CommitResult, Correction, CutCause, Direction, EntryInfo, HeldValues,
-    IndexDump, Mark, MeteredView, Op, RecoveryReport, TickOccupant, TxId, Txn, View, WorkMeter,
-    World, WriteResult,
+    AttrStats, Change, CommitResult, Concurrency, Correction, CutCause, Direction, EntryInfo,
+    Finalized, FinalizedOp, HeldValues, IdMap, IndexDump, MAX_READ_KEYS, Mark, MeteredView, Op,
+    OwnedTxn, RecoveryReport, TickMoved, TickOccupant, TxId, Txn, View, WorkMeter, World,
+    WriteResult,
 };

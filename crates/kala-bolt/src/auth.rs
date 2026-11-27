@@ -22,6 +22,16 @@ pub trait Authenticator: Send + Sync {
             Peer::Local => Err(AuthFailure),
         }
     }
+    /// The current form of an identity this policy issued earlier: its
+    /// grants as they are stored now, or `None` if its account is gone.
+    /// The server asks before a connection begins a transaction or writes,
+    /// when the accounts changed since the connection's grants were read,
+    /// so a revoked privilege doesn't survive on a pooled connection. A
+    /// policy without stored accounts keeps the identity as it is (the
+    /// default).
+    fn refresh(&self, identity: &Identity) -> Result<Option<Identity>, AuthFailure> {
+        Ok(Some(identity.clone()))
+    }
 }
 /// Accept every well-formed token. Server listeners are restricted to loopback.
 /// A development mode, not an administrator: the identity may read every
@@ -37,6 +47,7 @@ impl Authenticator for NoAuth {
             principal: String::new(),
             host: String::new(),
             grants: vec!["read:*".into()],
+            generation: 0,
         })
     }
 }
@@ -68,5 +79,9 @@ impl Authenticator for Accounts {
             let (_, world) = self.registry.get(Some("system")).map_err(|_| AuthFailure)?;
             Ok(world)
         })
+    }
+    fn refresh(&self, identity: &Identity) -> Result<Option<Identity>, AuthFailure> {
+        let (_, world) = self.registry.get(Some("system")).map_err(|_| AuthFailure)?;
+        kala_system::auth::current_identity(&world, identity).map_err(|_| AuthFailure)
     }
 }

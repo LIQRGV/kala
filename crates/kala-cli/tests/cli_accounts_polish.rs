@@ -8,7 +8,7 @@ mod common;
 #[path = "common/damage.rs"]
 mod damage;
 
-use common::{VARROW, code, kala, stderr, stdout};
+use common::{VARROW, code, feed, kala, stderr, stdout};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -733,7 +733,6 @@ fn user_password_flag_before_subcommand_is_diagnosed_without_echoing_the_value()
 
 /// Runs `kala repl --write world [extra]` with `input` on stdin.
 fn repl_write(world: &Path, extra: &[&str], input: &str) -> Output {
-    use std::io::Write;
     let mut child = Command::new(env!("CARGO_BIN_EXE_kala"))
         .args(["repl", "--write"])
         .arg(world)
@@ -743,12 +742,7 @@ fn repl_write(world: &Path, extra: &[&str], input: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
+    feed(&mut child, input.as_bytes());
     child.wait_with_output().unwrap()
 }
 
@@ -787,11 +781,13 @@ fn transact_and_repl_write_on_damaged_system_world_name_the_flag_and_leave_the_f
     assert_eq!(tree(dir.path()), before);
 }
 
-/// Observed (reported to the caller): with the flag the damaged tail IS cut
-/// to a quarantine file before the system world is refused, so the refusal
-/// is not side-effect free. Pinned as observed.
+/// Was `..._refuse_system_world_after_cutting_tail`, which pinned an
+/// observed wart: the open cut the damaged tail before the system world was
+/// refused. An open no longer cuts a damaged tail (PR #20 review, item B):
+/// the flag's cut happens after the refusal, so the refusal is side-effect
+/// free.
 #[test]
-fn transact_and_repl_write_with_acknowledge_recovery_refuse_system_world_after_cutting_tail() {
+fn transact_and_repl_write_with_acknowledge_recovery_refuse_system_world_without_cutting_tail() {
     for which in ["transact", "repl"] {
         let (dir, damaged, start) = damaged_system();
         let scratch = tempfile::tempdir().unwrap();
@@ -814,10 +810,10 @@ fn transact_and_repl_write_with_acknowledge_recovery_refuse_system_world_after_c
             stderr(&o)
         );
         assert_no_hash(&o);
-        // No write applied: the file is exactly the valid prefix.
-        assert_eq!(fs::read(&world).unwrap(), damaged[..start], "{which}");
+        // Nothing written, nothing cut, nothing quarantined.
+        assert!(fs::read(&world).unwrap() == damaged, "{which}");
         let q = dir.path().join(format!("system.kala.torn-{start}"));
-        assert_eq!(fs::read(&q).unwrap(), damaged[start..], "{which}");
+        assert!(!q.exists(), "{which}");
     }
 }
 
@@ -873,7 +869,6 @@ fn recovery_and_write_report_outputs_never_contain_hashes_or_passwords() {
 
 /// `kala user <args>` with `input` piped to stdin.
 fn user_stdin(args: &[&str], input: &str) -> Output {
-    use std::io::Write;
     let mut child = Command::new(env!("CARGO_BIN_EXE_kala"))
         .arg("user")
         .args(args)
@@ -882,12 +877,7 @@ fn user_stdin(args: &[&str], input: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
+    feed(&mut child, input.as_bytes());
     child.wait_with_output().unwrap()
 }
 

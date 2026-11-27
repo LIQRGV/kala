@@ -927,6 +927,8 @@ fn put_body(bytes: &[u8], txn_idx: usize, body: &[u8]) -> Vec<u8> {
     let mut out = bytes[..sp.start].to_vec();
     out.extend_from_slice(&common::txn(sp.tx, body));
     out.extend_from_slice(&bytes[sp.end..]);
+    // Later transactions chain from this one's new checksum (format 6).
+    common::rechain(&mut out, txn_idx + 1);
     out
 }
 
@@ -951,7 +953,7 @@ fn stretch_fact(bytes: &[u8], txn_idx: usize, payload_len: usize) -> Vec<u8> {
     // anything between the first frame and the commit stays as is
     prior.extend_from_slice(&bytes[fe..cs]);
     let commit_id = u64::from_le_bytes(bytes[cs + 5..cs + 13].try_into().unwrap());
-    let commit = common::commit_frame(&prior, commit_id, sp.tx);
+    let commit = common::commit_frame(common::link(&bytes[..sp.start]), &prior, commit_id, sp.tx);
     assert_eq!(ce - cs, commit.len());
     let mut body = prior;
     body.extend_from_slice(&commit);

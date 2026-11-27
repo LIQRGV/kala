@@ -2025,8 +2025,9 @@ fn load_fixture_to_writes_a_file_that_reopens_with_identical_answers() {
     assert_eq!(live.3, mem.index_dump());
     assert_eq!(live.4, mem.latest_tx());
     assert_eq!(live.0, hist(&mem, greg, "located_in"));
-    // the lock is held while the returned world lives
-    assert_eq!(World::open(&path).unwrap_err(), Error::WorldLocked);
+    // Slice 15b: the returned world holds the lock only while it commits,
+    // so another writer can open the file while it lives.
+    assert!(World::open(&path).is_ok());
     drop(w);
     assert!(
         doctor_log(&path, &DoctorOptions::default())
