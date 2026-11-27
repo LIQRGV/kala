@@ -90,3 +90,174 @@ fn the_row_limit_counts_answer_rows_not_the_rows_a_match_scans() {
         "statement exceeds the 10000-row write limit"
     );
 }
+
+// ---- C: DELETE / DETACH DELETE edge cases ----
+
+fn datalog(world: &mut World, form: &str) {
+    let form = kala_datalog::parse_write(form).unwrap();
+    kala_datalog::apply::execute(world, &form, None).unwrap();
+}
+
+#[test]
+fn a_node_with_deprecated_values_can_still_be_deleted() {
+    let mut world = varrow();
+    datalog(
+        &mut world,
+        "[:at 800 [:create :PLACE :lonely] [:assert :lonely :ruled_by :tomas]]",
+    );
+    datalog(&mut world, "[:deprecate :ruled_by]");
+    datalog(&mut world, "[:deprecate :alias]");
+    // A deprecated relationship doesn't block a plain DELETE.
+    let report = ok(
+        &mut world,
+        "MATCH (p {kala_handle:'lonely'}) DELETE p AT TICK 900",
+    );
+    assert_eq!(report.changed, 0);
+    // Osric holds deprecated aliases: they stay, everything else ends.
+    ok(
+        &mut world,
+        "MATCH (o {kala_handle:'osric'}) DETACH DELETE o AT TICK 900",
+    );
+    let osric = world.entity_by_handle("osric").unwrap();
+    assert!(world.as_of(osric, "name", Tick(900)).unwrap().is_empty());
+    assert_eq!(world.as_of(osric, "alias", Tick(900)).unwrap().len(), 2);
+}
+
+#[test]
+fn a_migrated_attribute_does_not_make_its_entities_undeletable() {
+    let mut world = varrow();
+    datalog(&mut world, "[:set :greg :hp 5 :at 700]");
+    datalog(&mut world, "[:migrate :hp :f64]");
+    datalog(&mut world, "[:migrate :located_in :ref :many]");
+    ok(
+        &mut world,
+        "MATCH (g {kala_handle:'greg'}) DETACH DELETE g AT TICK 900",
+    );
+    let greg = world.entity_by_handle("greg").unwrap();
+    assert!(world.as_of(greg, "hp", Tick(900)).unwrap().is_empty());
+    assert!(
+        world
+            .as_of(greg, "located_in", Tick(900))
+            .unwrap()
+            .is_empty()
+    );
+    let report = ok(
+        &mut world,
+        "MATCH (g {kala_handle:'greg'}) DELETE g AT TICK 901",
+    );
+    assert_eq!(report.changed, 0);
+}
+
+#[test]
+fn events_stay_and_never_block_a_plain_delete() {
+    let mut world = varrow();
+    let edwin = world.entity_by_handle("edwin").unwrap();
+    let born = world.as_of(edwin, "born_in", Tick(900)).unwrap();
+    assert!(!born.is_empty());
+    ok(
+        &mut world,
+        "MATCH (e {kala_handle:'edwin'}) DETACH DELETE e AT TICK 900",
+    );
+    let report = ok(
+        &mut world,
+        "MATCH (e {kala_handle:'edwin'}) DELETE e AT TICK 901",
+    );
+    assert_eq!(report.changed, 0);
+    assert_eq!(world.as_of(edwin, "born_in", Tick(901)).unwrap(), born);
+    assert!(world.as_of(edwin, "bought", Tick(901)).unwrap().len() == 1);
+}
+
+/// `count` characters, each with a name, eight earlier hp values (none held
+/// from tick 8), a home and an ally (the previous character).
+fn crowd(count: usize) -> World {
+    use kala_core::{AttrDef, Cardinality, Kind, Schema, ValueType};
+    let attr = AttrDef::new;
+    let schema = Schema::new()
+        .node_type("CHARACTER")
+        .node_type("PLACE")
+        .attribute(attr("name", ValueType::Str, Kind::State, Cardinality::One))
+        .attribute(attr("hp", ValueType::I64, Kind::State, Cardinality::One))
+        .attribute(attr("located_in", ValueType::Ref, Kind::State, Cardinality::One).directed())
+        .attribute(attr("ally_of", ValueType::Ref, Kind::State, Cardinality::Many).bidirectional());
+    let mut world = World::in_memory(schema).unwrap();
+    let mut tx = world.begin();
+    let home = tx.create_entity("PLACE", Some("home")).unwrap();
+    let mut previous = None;
+    for i in 0..count {
+        let id = tx.create_entity("CHARACTER", None).unwrap();
+        tx.assert(id, "name", Value::Str(format!("c{i}")), Some(Tick(0)))
+            .unwrap();
+        for hp in 0..8 {
+            tx.assert(id, "hp", Value::I64(hp), Some(Tick(hp))).unwrap();
+            tx.retract(id, "hp", Value::I64(hp), Some(Tick(hp + 1)))
+                .unwrap();
+        }
+        tx.assert(id, "located_in", Value::Ref(home), Some(Tick(0)))
+            .unwrap();
+        if let Some(previous) = previous {
+            tx.assert(id, "ally_of", Value::Ref(previous), Some(Tick(0)))
+                .unwrap();
+        }
+        previous = Some(id);
+    }
+    tx.commit().unwrap();
+    world
+}
+
+#[test]
+fn detach_delete_of_every_character_stays_within_the_statement_limits() {
+    let mut world = crowd(600);
+    let report = ok(&mut world, "MATCH (c:CHARACTER) DETACH DELETE c AT TICK 50");
+    // name and home for each, and each alliance once.
+    assert_eq!(report.changed, 600 * 2 + 599);
+    let report = ok(&mut world, "MATCH (c:CHARACTER) DELETE c AT TICK 51");
+    assert_eq!(report.changed, 0);
+}
+
+#[test]
+fn deleting_nodes_after_thousands_of_staged_entries_is_not_quadratic() {
+    use kala_cypher::write::{prepare, stage};
+    let mut world = crowd(20);
+    let mut params = QueryParams::new();
+    params.insert(
+        "xs".into(),
+        Datum::List((0..5_000).map(|i| Datum::Value(Value::I64(i))).collect()),
+    );
+    let mut tx = world.begin();
+    let mut changed = 0;
+    for text in [
+        "UNWIND $xs AS i CREATE (:PLACE {size: i}) AT TICK 40",
+        "MATCH (c:CHARACTER) DETACH DELETE c AT TICK 50",
+    ] {
+        let statement = statement(text);
+        let input = prepare(tx.base_world(), &statement, &params, RunOptions::default())
+            .unwrap_or_else(|e| panic!("{text}: {e}"));
+        let staged =
+            stage(&mut tx, &statement, input, &params).unwrap_or_else(|e| panic!("{text}: {e}"));
+        changed = staged.staged.ops.iter().map(|op| op.changed).sum();
+    }
+    assert_eq!(changed, 20 * 2 + 19);
+    assert_eq!(tx.staged_entry_count(), 5_000 + 20 * 2 + 19);
+    tx.commit().unwrap();
+}
+
+// ---- D: the read budget of a statement scales with what it may stage ----
+
+#[test]
+fn set_over_nine_thousand_entities_fits_the_statement_limits() {
+    let mut world = crowd(9_000);
+    let report = ok(&mut world, "MATCH (c:CHARACTER) SET c.hp = 100 AT TICK 50");
+    assert_eq!(report.changed, 9_000);
+    let hp = |world: &World| {
+        let id = world.entities_of_type("CHARACTER").unwrap().last().unwrap();
+        world.as_of(id, "hp", Tick(60)).unwrap()
+    };
+    assert_eq!(hp(&world), [Value::I64(100)]);
+    // Replacing a held value is two primitives a row: 18,000 in all.
+    let error = run(&mut world, "MATCH (c:CHARACTER) SET c.hp = 1 AT TICK 60").unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "op 5001 (:set): statement exceeds the 10000-primitive write limit"
+    );
+    assert_eq!(hp(&world), [Value::I64(100)]);
+}

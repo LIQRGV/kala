@@ -123,10 +123,18 @@ pub(crate) fn write_error(error: write::WriteError, read: bool) -> Failure {
 }
 pub(crate) fn statement_error(error: write::StatementError, read: bool) -> Failure {
     match error {
-        write::StatementError::Stage(e) if matches!(e.cause, write::Failure::SetEvent(_)) => {
-            store_rule(SEMANTIC, format!("{e} in Datalog (// kala:datalog)"), read)
+        write::StatementError::Stage(e)
+            if matches!(
+                e.cause,
+                write::Failure::Store(_)
+                    | write::Failure::SystemWorld
+                    | write::Failure::SameTick(_)
+            ) =>
+        {
+            write_error(e, read)
         }
-        write::StatementError::Stage(e) => write_error(e, read),
+        // The statement's own wording (a Cypher fix, never a Datalog verb).
+        e @ write::StatementError::Stage(_) => store_rule(SEMANTIC, e.to_string(), read),
         write::StatementError::Store(e) => store_error(e, read),
         write::StatementError::Query(e) if read => crate::query::query_error(e),
         e => store_rule(SEMANTIC, e.to_string(), read),

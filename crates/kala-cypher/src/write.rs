@@ -40,6 +40,16 @@ impl fmt::Display for WriteError {
             Self::Stage(e) if matches!(e.cause, native::Failure::SetEvent(_)) => {
                 write!(f, "{e} in Datalog (// kala:datalog)")
             }
+            Self::Stage(native::WriteError {
+                cause: native::Failure::SetTooManyHeld { attr, tick },
+                ..
+            }) => write!(
+                f,
+                "cannot SET {}: it holds more than {} values at tick {} (the limit of one SET); remove members with DELETE or a Datalog [:retract …]",
+                kala_core::Echo(attr),
+                native::MAX_SET_VALUES,
+                tick.0
+            ),
             Self::Stage(e) => e.fmt(f),
             Self::Invalid(s) => f.write_str(s),
         }
@@ -476,66 +486,74 @@ fn apply(
         bytes: input.options.limits.max_bytes.saturating_sub(input.bytes),
         steps: input.options.limits.max_steps.saturating_sub(input.steps),
         limits: input.options.limits,
+        step_bound: false,
     };
     let mut rows = Vec::new();
     let mut properties = Vec::new();
-    for mut data in input.result.rows {
-        writer.snapshot = data.split_off(data.len() - input.property_columns.len());
-        writer.step()?;
-        let mut row: Row = input
-            .result
-            .columns
-            .iter()
-            .map(|v| v.0.clone())
-            .zip(data)
-            .collect();
-        for clause in &stmt.writes {
+    let width = input.property_columns.len();
+    let each = |writer: &mut Writer<'_, '_>| -> Result<()> {
+        for mut data in input.result.rows {
+            writer.snapshot = data.split_off(data.len() - width);
             writer.step()?;
-            match clause {
-                Update::Create(paths) => {
-                    for p in paths {
-                        writer.path(p, false, &mut row)?;
+            let mut row: Row = input
+                .result
+                .columns
+                .iter()
+                .map(|v| v.0.clone())
+                .zip(data)
+                .collect();
+            for clause in &stmt.writes {
+                writer.step()?;
+                match clause {
+                    Update::Create(paths) => {
+                        for p in paths {
+                            writer.path(p, false, &mut row)?;
+                        }
                     }
-                }
-                Update::Merge {
-                    path,
-                    created,
-                    matched,
-                } => {
-                    let new = writer.path(path, true, &mut row)?;
-                    writer.assign(if new { created } else { matched }, &row)?;
-                }
-                Update::Assign(assign) => writer.assign(assign, &row)?,
-                Update::Delete { names, detach } => {
-                    for n in names {
-                        writer.delete(n, *detach, &row)?;
+                    Update::Merge {
+                        path,
+                        created,
+                        matched,
+                    } => {
+                        let new = writer.path(path, true, &mut row)?;
+                        writer.assign(if new { created } else { matched }, &row)?;
+                    }
+                    Update::Assign(assign) => writer.assign(assign, &row)?,
+                    Update::Delete { names, detach } => {
+                        for n in names {
+                            writer.delete(n, *detach, &row)?;
+                        }
                     }
                 }
             }
-        }
-        if !stmt.returns.is_empty() {
-            writer.charge(
-                std::mem::size_of::<Vec<Datum>>()
-                    + stmt
-                        .returns
-                        .len()
-                        .saturating_mul(std::mem::size_of::<Datum>()),
-            )?;
-            let mut cells = Vec::with_capacity(stmt.returns.len());
-            for (col, item) in stmt.returns.iter().enumerate() {
-                if let Expr::Property { entity, key, .. } = &item.expr
-                    && let Some(Datum::Value(Value::Ref(id))) = row.get(entity)
-                {
-                    writer.charge(
-                        key.len() + std::mem::size_of::<(usize, usize, EntityId, String)>(),
-                    )?;
-                    properties.push((rows.len(), col, *id, key.clone()));
+            if !stmt.returns.is_empty() {
+                writer.charge(
+                    std::mem::size_of::<Vec<Datum>>()
+                        + stmt
+                            .returns
+                            .len()
+                            .saturating_mul(std::mem::size_of::<Datum>()),
+                )?;
+                let mut cells = Vec::with_capacity(stmt.returns.len());
+                for (col, item) in stmt.returns.iter().enumerate() {
+                    if let Expr::Property { entity, key, .. } = &item.expr
+                        && let Some(Datum::Value(Value::Ref(id))) = row.get(entity)
+                    {
+                        writer.charge(
+                            key.len() + std::mem::size_of::<(usize, usize, EntityId, String)>(),
+                        )?;
+                        properties.push((rows.len(), col, *id, key.clone()));
+                    }
+                    let d = writer.eval(&item.expr, &row, true)?;
+                    cells.push(d);
                 }
-                let d = writer.eval(&item.expr, &row, true)?;
-                cells.push(d);
+                rows.push(cells);
             }
-            rows.push(cells);
         }
+        Ok(())
+    };
+    if let Err(error) = each(&mut writer) {
+        return Err(writer.limit(error));
     }
     writer.meter.check()?;
     Ok(WriteResult {
@@ -562,17 +580,38 @@ struct Writer<'a, 't> {
     bytes: usize,
     steps: u64,
     limits: kala_query::Limits,
+    /// The stager's read meter is capped by the statement's step budget,
+    /// not by its own read allowance.
+    step_bound: bool,
 }
 impl Writer<'_, '_> {
+    /// Name the limit a stager read really hit.
+    fn limit(&self, error: WriteError) -> WriteError {
+        match error {
+            WriteError::Stage(native::WriteError {
+                cause: native::Failure::ReadWork(_),
+                ..
+            }) if self.step_bound => QueryError::StepBudget {
+                limit: self.limits.max_steps,
+            }
+            .into(),
+            other => other,
+        }
+    }
     fn step(&mut self) -> Result<()> {
         self.meter.check()?;
         self.steps = self.steps.checked_sub(1).ok_or(QueryError::StepBudget {
             limit: self.limits.max_steps,
         })?;
+        // The reads SET, REMOVE and DELETE make through the stager are
+        // bounded by min(256 index keys x the 10,000 primitives a statement
+        // may stage, the statement's remaining step budget), and by its
+        // deadline. (A Datalog form has the same 256 keys for each of its
+        // 256 operations.)
         let native_reads = self.stager.read_meter();
-        native_reads.set_max_keys(
-            native::MAX_SET_READ_KEYS.min(self.steps.saturating_sub(self.meter.keys())),
-        );
+        let remaining = self.steps.saturating_sub(self.meter.keys());
+        self.step_bound = remaining < self.stager.read_limit();
+        native_reads.set_max_keys(self.stager.read_limit().min(remaining));
         self.meter
             .set_max_keys(self.steps.saturating_sub(native_reads.keys()));
         if self.meter.keys().saturating_add(native_reads.keys()) > self.steps {
@@ -921,13 +960,24 @@ impl Writer<'_, '_> {
                 .ok_or_else(|| invalid("unknown relationship"))?;
             self.fact(src, &attr, Value::Ref(tgt), Op::Retract)?;
         } else {
-            let facts = self.tx.delete_facts(
-                id,
-                self.tick,
-                detach,
-                self.stager.remaining_operations(),
-                self.stager.read_meter(),
-            )?;
+            let facts = self
+                .tx
+                .delete_facts(
+                    id,
+                    self.tick,
+                    detach,
+                    self.stager.remaining_operations(),
+                    self.stager.read_meter(),
+                )
+                .map_err(|e| match e {
+                    kala_core::Error::WorkInterrupted {
+                        reason: kala_core::WorkInterruptReason::Limit,
+                    } => WriteError::Stage(native::WriteError {
+                        operation: None,
+                        cause: self.stager.read_limit_failure(),
+                    }),
+                    e => e.into(),
+                })?;
             for (s, k, v) in facts {
                 self.fact(s, &k, v, Op::Retract)?;
             }

@@ -5,8 +5,12 @@ use std::collections::HashMap;
 
 /// Largest value set inspected or supplied to a replacement operation.
 pub const MAX_SET_VALUES: usize = 256;
-/// Key-work allowance shared by replacements in one statement.
+/// Key-work allowance shared by the replacements of one text form.
 pub const MAX_SET_READ_KEYS: u64 = MAX_SET_VALUES as u64 * 256;
+/// Key-work allowance of a bounded statement, per primitive it may stage:
+/// what a text form gets per operation (`MAX_SET_READ_KEYS` over its 256
+/// operations).
+pub const READ_KEYS_PER_PRIMITIVE: u64 = MAX_SET_READ_KEYS / 256;
 /// A failure's position and typed cause. Adapters choose formatting and exit codes.
 #[derive(Debug)]
 pub struct WriteError {
@@ -40,6 +44,12 @@ pub enum Failure {
     OperationLimit(usize),
     /// All rows together exceeded the statement value-byte allowance.
     ValueBudget,
+    /// A bounded statement's replacement and deletion reads examined more
+    /// index keys than its allowance (carried here).
+    ReadWork(u64),
+    /// A bounded statement set more values for one property than a
+    /// replacement takes.
+    SetValueCount,
     /// The attribute holds more values at the tick than one `:set` reads.
     SetTooManyHeld {
         attr: String,
@@ -108,6 +118,14 @@ impl std::fmt::Display for WriteError {
                 crate::Echo(name)
             ),
             Failure::ValueBudget => f.write_str("statement exceeds the 16 MiB value budget"),
+            Failure::ReadWork(limit) => write!(
+                f,
+                "statement exceeds its read work limit ({limit} index keys read by SET, REMOVE and DELETE)"
+            ),
+            Failure::SetValueCount => write!(
+                f,
+                "a property takes at most {MAX_SET_VALUES} values in one SET"
+            ),
             Failure::OperationLimit(limit) => {
                 write!(f, "statement exceeds the {limit}-primitive write limit")
             }
@@ -301,6 +319,11 @@ impl Stager {
             });
         }
         let entry_offset = tx.staged_entry_count();
+        // A bounded statement stages up to `limit` primitives over many
+        // rows, so its reads get the per-operation allowance of a text form
+        // for each of them; its front end lowers the meter further to the
+        // statement's remaining step budget.
+        let read_limit = READ_KEYS_PER_PRIMITIVE.saturating_mul(limit as u64);
         Ok(Self {
             policy,
             state: FormState {
@@ -308,7 +331,8 @@ impl Stager {
                 remaining: limit,
                 limit,
                 remaining_bytes: crate::MAX_ENTRY_BYTES,
-                read_meter: crate::WorkMeter::bounded(MAX_SET_READ_KEYS, None)
+                read_limit,
+                read_meter: crate::WorkMeter::bounded(read_limit, None)
                     .with_deadline(tx.deadline()),
                 form_tick: default,
                 fallback: tx.report_tick(default),
@@ -334,6 +358,8 @@ impl Stager {
     ) -> Result<Self, WriteError> {
         let mut stager = Self::new(tx, default, policy, limit)?;
         stager.state.bounded_statement = false;
+        stager.state.read_limit = MAX_SET_READ_KEYS;
+        stager.state.read_meter.set_max_keys(MAX_SET_READ_KEYS);
         Ok(stager)
     }
 
@@ -485,6 +511,17 @@ impl Stager {
         &self.state.read_meter
     }
 
+    /// The most keys [`Stager::read_meter`] may count for this statement.
+    pub fn read_limit(&self) -> u64 {
+        self.state.read_limit
+    }
+
+    /// Why a read under [`Stager::read_meter`] and the remaining value
+    /// bytes was interrupted by a limit: the key work, else the bytes.
+    pub fn read_limit_failure(&self) -> Failure {
+        self.state.read_failure()
+    }
+
     /// The byte allowance available before resolving a front end's string literals.
     pub fn remaining_bytes(&self) -> usize {
         self.state.remaining_bytes
@@ -517,6 +554,8 @@ struct FormState {
     remaining: usize,
     limit: usize,
     remaining_bytes: usize,
+    /// The statement's key-work allowance (the meter's bound may be lower).
+    read_limit: u64,
     read_meter: crate::WorkMeter<'static>,
     /// The form's `:at`, else the caller's default tick.
     form_tick: Option<Tick>,
@@ -537,6 +576,17 @@ impl FormState {
             .checked_sub(bytes)
             .ok_or_else(|| self.byte_limit())?;
         Ok(())
+    }
+
+    /// A limit interrupted a read: name the one that did.
+    fn read_failure(&self) -> Failure {
+        if !self.bounded_statement {
+            Failure::Limit
+        } else if self.read_meter.check().is_err() {
+            Failure::ReadWork(self.read_limit)
+        } else {
+            Failure::ValueBudget
+        }
     }
 
     fn byte_limit(&self) -> Failure {
@@ -627,7 +677,11 @@ fn stage_set(
     state: &mut FormState,
 ) -> Result<Effect, Failure> {
     if values.len() > MAX_SET_VALUES {
-        return Err(Failure::Limit);
+        return Err(if state.bounded_statement {
+            Failure::SetValueCount
+        } else {
+            Failure::Limit
+        });
     }
     let tick = state.fact_tick(tx, at);
     let mut wanted = std::collections::BTreeMap::new();
@@ -694,7 +748,7 @@ fn stage_set(
                     reason: crate::WorkInterruptReason::Limit
                 }
             ) {
-                Failure::Limit
+                state.read_failure()
             } else {
                 Failure::Store(e)
             }
@@ -716,7 +770,7 @@ fn stage_set(
         state.remaining_bytes = state
             .remaining_bytes
             .checked_sub(key.len())
-            .ok_or(Failure::Limit)?;
+            .ok_or_else(|| state.byte_limit())?;
         if wanted.remove(&key).is_none() {
             removed.push(value);
         }
