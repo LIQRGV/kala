@@ -674,3 +674,34 @@ fn a_first_blind_create_keeps_the_begin_snapshot_for_later_match() {
     assert_eq!(committed.latest_tx(), after_b);
     assert!(committed.entity_by_handle("independent").is_none());
 }
+
+#[test]
+fn a_snapshot_read_after_a_blind_create_conflicts_with_a_renamed_attribute() {
+    let server = writable_server();
+    let mut a = Client::ready(&server);
+    let mut admin = Client::ready(&server);
+    admin.query("MATCH (m {kala_handle:'mara'}) SET m.disguised = true AT TICK 690");
+    begin(&mut a);
+    admin.query("// kala:datalog\n[:rename :disguised :new_disguised]");
+    let renamed = world(&server).latest_tx();
+    assert!(
+        a.query("CREATE (:CHARACTER {kala_handle:'independent'})")
+            .is_empty()
+    );
+    let read = "MATCH (m {kala_handle:'mara'}) AT TICK 700 RETURN m.disguised";
+    assert_eq!(
+        a.query(read),
+        vec![vec![Value::Bool(true)]],
+        "pinned BEGIN schema and value"
+    );
+    assert_eq!(
+        admin.query(read),
+        vec![vec![Value::Null]],
+        "old name has vanished"
+    );
+    a.send(0x12, vec![]);
+    a.failure(CONFLICT);
+    let committed = world(&server);
+    assert_eq!(committed.latest_tx(), renamed);
+    assert!(committed.entity_by_handle("independent").is_none());
+}

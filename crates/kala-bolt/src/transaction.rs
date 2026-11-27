@@ -175,13 +175,21 @@ impl Transaction {
             return;
         }
         match &mut self.snapshot {
-            Snapshot::Write(owned, _) => owned.with(|tx| {
-                if tx.schema_changes().is_empty() {
-                    reads.note(tx);
-                } else {
-                    tx.note_read_all();
-                }
-            }),
+            Snapshot::Write(owned, _) => {
+                // A query may still be reading BEGIN after the writer opened
+                // on a newer catalog. Record an absent/present name only if
+                // both snapshots resolve it the same way.
+                let same_names = self.begun.as_ref().is_none_or(|before| {
+                    reads.defined_names(before) == reads.defined_names(owned.world())
+                });
+                owned.with(|tx| {
+                    if same_names && tx.schema_changes().is_empty() {
+                        reads.note(tx);
+                    } else {
+                        tx.note_read_all();
+                    }
+                });
+            }
             Snapshot::Read(_) if !self.read_only => self.pending.merge(reads),
             _ => {}
         }
