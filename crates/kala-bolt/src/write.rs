@@ -19,6 +19,21 @@ const CONSTRAINT: &str = "Neo.ClientError.Schema.ConstraintValidationFailed";
 pub(crate) const MAX_FORMS: usize = 256;
 pub(crate) const MAX_STAGED_BYTES: usize = 16 * 1024 * 1024;
 
+const REDUCED: &str = "write failed; details require read privilege";
+/// A write refused by a store rule: something about the data it met (a
+/// handle that exists or doesn't, a value that is held, a declared type, a
+/// same-tick conflict). With `read`, the code says which class and the
+/// message says what. Without it every such failure is the same code and
+/// the same sentence, so a write-only identity can't tell them apart and
+/// use writes to probe what the world holds. Syntax errors and privilege
+/// refusals describe the request, not the data, and are not reduced.
+fn store_rule(code: &'static str, message: String, read: bool) -> Failure {
+    if read {
+        Failure::new(code, message)
+    } else {
+        Failure::new(crate::error::EXECUTION, REDUCED)
+    }
+}
 pub(crate) fn timeout() -> Failure {
     Failure::new(TIMEOUT, "transaction timed out; nothing was written")
 }
@@ -52,14 +67,18 @@ pub(crate) fn store_error(error: Error, read: bool) -> Failure {
         Error::SameTickConflict { .. } | Error::TxnKeyConflict { .. } | Error::DuplicateHandle(_) | Error::HandleTypeMismatch { .. } => (CONSTRAINT, error.to_string()),
         _ => (SEMANTIC, error.to_string()),
     };
-    let mut failure = Failure::new(
-        code,
-        if read || matches!(code, LOCK | STORE) {
-            message
-        } else {
-            "write failed; details require read privilege".into()
-        },
-    );
+    let mut failure = if matches!(code, TYPE | CONSTRAINT | SEMANTIC) {
+        store_rule(code, message, read)
+    } else {
+        Failure::new(
+            code,
+            if read || matches!(code, LOCK | STORE) {
+                message
+            } else {
+                REDUCED.into()
+            },
+        )
+    };
     failure.handle_lost = leaves_handle_unusable(&error);
     failure
 }
@@ -82,14 +101,7 @@ pub(crate) fn write_error(error: write::WriteError, read: bool) -> Failure {
             } else {
                 SEMANTIC
             };
-            Failure::new(
-                code,
-                if read {
-                    error.to_string()
-                } else {
-                    "write failed; details require read privilege".into()
-                },
-            )
+            store_rule(code, error.to_string(), read)
         }
     }
 }

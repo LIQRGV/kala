@@ -797,3 +797,65 @@ fn an_unknown_world_setting_key_is_refused_with_the_known_keys() {
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 }
+
+// ---------------------------------------------------------------- G
+
+#[test]
+fn a_write_only_identity_gets_one_code_and_message_for_every_store_rule_failure() {
+    let server = server();
+    let mut root = Client::ready(&server);
+    write(&mut root, "[:assert :greg :alias \"Held\" :at 300]");
+    // Each fails for a different reason that depends on what the world
+    // holds: an existing handle, a held value, a declared type, a missing
+    // handle, a handle of another type.
+    let failing = [
+        "[:create :CHARACTER :greg]",
+        "[:retract :greg :alias \"Held\" :at 300]",
+        "[:assert :greg :alias 7 :at 300]",
+        "[:assert :nobody_here :alias \"x\" :at 300]",
+        "[:assert :greg :located_in :nowhere_at_all :at 300]",
+    ];
+    let outcomes = |client: &mut Client| {
+        let mut seen = Vec::new();
+        for explicit in [false, true] {
+            for form in failing {
+                if explicit {
+                    begin(client);
+                }
+                send_run(client, &datalog(form), map(&[]));
+                let failure = any_failure(client);
+                seen.push((code(&failure).to_owned(), text(&failure).to_owned()));
+                client.reset();
+            }
+        }
+        seen
+    };
+    // With `read`, the codes and messages tell the failures apart.
+    let mut both = login(&server, "both");
+    let detailed = outcomes(&mut both);
+    let codes: std::collections::BTreeSet<_> = detailed.iter().map(|(c, _)| c.clone()).collect();
+    assert!(codes.len() >= 3, "{detailed:?}");
+    // Without it, they are indistinguishable: no membership oracle.
+    let mut writer = login(&server, "writer");
+    let reduced = outcomes(&mut writer);
+    let distinct: std::collections::BTreeSet<_> = reduced.iter().cloned().collect();
+    assert_eq!(distinct.len(), 1, "{reduced:?}");
+    let (code, message) = &reduced[0];
+    assert!(code.starts_with("Neo.ClientError.Statement."), "{code}");
+    assert!(message.contains("read privilege"), "{message}");
+    // Errors that describe the request, not the data, stay distinct.
+    send_run(&mut writer, &datalog("[:assert :greg"), map(&[]));
+    writer.failure("Neo.ClientError.Statement.SyntaxError");
+    writer.reset();
+    send_run(
+        &mut writer,
+        &datalog("[:set :greg :alias \"x\" :at 300]"),
+        map(&[]),
+    );
+    writer.failure(FORBIDDEN);
+    writer.reset();
+    write(
+        &mut writer,
+        "[:assert :greg :alias \"Still writable\" :at 300]",
+    );
+}
