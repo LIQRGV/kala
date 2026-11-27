@@ -905,6 +905,13 @@ impl Session<'_> {
             .as_ref()
             .map(|id| format!("{}@{}", id.principal, id.host))
             .ok_or_else(Failure::invalid)?;
+        let held = write::Privileges {
+            read,
+            admin: self
+                .identity
+                .as_ref()
+                .is_some_and(|id| id.permits_admin(db)),
+        };
         let mut output = write::output();
         let max_message = self.config.max_message_bytes;
         let max_depth = self.config.max_depth;
@@ -918,7 +925,7 @@ impl Session<'_> {
                 })?;
             for (index, form) in forms.enumerate() {
                 let form = form.map_err(write::parse_error)?;
-                write::admit(&form, tx.forms.len(), read)?;
+                write::admit(&form, tx.forms.len(), held)?;
                 let expires = tx.deadline;
                 let owned = tx.writer(self.registry, self.config, &account)?;
                 let staged = owned.with(|t| {
@@ -956,7 +963,7 @@ impl Session<'_> {
                                 return Err(write::timeout());
                             }
                             let form = form.map_err(write::parse_error)?;
-                            write::admit(&form, 0, read)?;
+                            write::admit(&form, 0, held)?;
                             let mut tx = world.begin();
                             tx.set_concurrency(options.concurrency);
                             tx.set_deadline(deadline);

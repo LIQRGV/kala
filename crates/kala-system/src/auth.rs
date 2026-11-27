@@ -101,6 +101,18 @@ impl Identity {
             })
     }
 
+    /// Whether this identity administers the named database: `admin:<db>`
+    /// or `admin:*`. `read` and `write` together are not `admin`. (Nothing
+    /// is writable on `system` whatever this answers: see
+    /// [`Identity::permits_write`].)
+    pub fn permits_admin(&self, db: &str) -> bool {
+        self.grants.iter().any(|grant| {
+            grant.split_once(':').is_some_and(|(privilege, target)| {
+                privilege == "admin" && (target == "*" || target == db)
+            })
+        })
+    }
+
     /// Whether this identity has the stored backup privilege. Local file
     /// backups use filesystem permissions; a future server dump will call this.
     /// Like reads, the accounts database (password hashes) is covered only by

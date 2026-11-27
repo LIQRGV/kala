@@ -1077,6 +1077,17 @@ impl Txn<'_> {
     }
     fn world_setting_op(&mut self, key: &str, value: &str) -> Result<(), Error> {
         self.guard(|txn| {
+            // A live write may set only the settings Kala knows. Replay
+            // (`Catalog::apply_setting`) accepts whatever a log holds, so a
+            // world written before this check still opens.
+            if !crate::WORLD_SETTING_KEYS.contains(&key) {
+                return Err(Error::Schema(format!(
+                    "unknown world setting {key:?}; the settings are: {}",
+                    crate::WORLD_SETTING_KEYS
+                        .map(|k| format!(":{k}"))
+                        .join(", ")
+                )));
+            }
             if txn.world.world_setting(key) == Some(value) {
                 return Ok(());
             }

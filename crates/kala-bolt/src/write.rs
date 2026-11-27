@@ -93,11 +93,39 @@ pub(crate) fn write_error(error: write::WriteError, read: bool) -> Failure {
         }
     }
 }
+/// What the connection's identity holds on the database a write targets.
+#[derive(Clone, Copy)]
+pub(crate) struct Privileges {
+    /// `read`: results and errors may describe existing data.
+    pub read: bool,
+    /// `admin` on this database.
+    pub admin: bool,
+}
 /// What a form needs before anything is staged (or a writable handle
 /// opened) for it: the privileges it requires and its place in the
-/// transaction (`prior` forms already staged).
-pub(crate) fn admit(form: &WriteTxn, prior: usize, read: bool) -> Result<(), Failure> {
-    if write::requires_read(form) && !read {
+/// transaction (`prior` forms already staged). `write` itself was checked
+/// before the text was parsed (`Session::write_allowed`).
+///
+/// **The privilege table for writes over Bolt** (all of it is here):
+///
+/// | Form | Needs |
+/// |---|---|
+/// | `[:assert …]`, `[:retract …]`, `[:create …]`, `[:attribute …]`, `[:node-type …]`, names declared by inference | `write` |
+/// | `[:set …]`, `[:create … :if-missing]`, `[:correct …]` (they read first) | `write` + `read` |
+/// | `[:world-setting …]`, `[:rename …]`, `[:deprecate …]`, `[:cardinality …]`, `[:migrate …]` | `admin` on that database |
+///
+/// The last row is policy, not a store rule: those forms change what
+/// existing data or the world's rules mean for every other writer, so a
+/// remote identity needs `admin` for them. The owner may relax it; the CLI
+/// is not affected (its boundary is the file's permissions).
+pub(crate) fn admit(form: &WriteTxn, prior: usize, held: Privileges) -> Result<(), Failure> {
+    if write::requires_admin(form) && !held.admin {
+        return Err(Failure::new(
+            FORBIDDEN,
+            "this write form requires admin privilege on the database",
+        ));
+    }
+    if write::requires_read(form) && !held.read {
         return Err(Failure::new(
             FORBIDDEN,
             "this write form requires read privilege",

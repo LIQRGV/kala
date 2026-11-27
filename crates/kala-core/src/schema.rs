@@ -267,6 +267,14 @@ pub struct MigrationOptions {
 /// rename) may introduce one, and replay refuses a log where one does.
 pub const RESERVED_NAME_PREFIX: &str = "_KALA_";
 
+/// The world settings a live write may set (`Txn::world_setting`, the
+/// `[:world-setting …]` form): `schema` (`strict` or `infer`), `concurrency`
+/// (`optimistic`) and `tick_unit` (an opaque label for apps, never
+/// interpreted by the store). Any other key is refused with a list of
+/// these, so a settings log can't be filled with arbitrary keys. Opening a
+/// world replays whatever its log holds.
+pub const WORLD_SETTING_KEYS: [&str; 3] = ["schema", "concurrency", "tick_unit"];
+
 /// The node type that marks Kala's own `system` (accounts) world. It is a
 /// reserved name, so only a genesis schema can carry it: a world either has
 /// the marker from its first entry or never gets it. See

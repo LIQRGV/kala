@@ -247,6 +247,35 @@ mod tests {
     use kala_core::{Schema, World};
 
     #[test]
+    fn forms_that_change_existing_schema_or_settings_are_the_admin_ones() {
+        use super::write::{parse_write, requires_admin, requires_read};
+        for (text, admin, read) in [
+            ("[:world-setting :schema :strict]", true, false),
+            ("[:rename :a :b]", true, false),
+            ("[:deprecate :a]", true, false),
+            ("[:cardinality :a :many]", true, false),
+            ("[:migrate :a :i64]", true, true),
+            (
+                "[[:assert :greg :alias \"x\"] [:deprecate :a]]",
+                true,
+                false,
+            ),
+            ("[:attribute :a :string]", false, false),
+            ("[:node-type :FACTION]", false, false),
+            ("[:assert :greg :alias \"x\"]", false, false),
+            ("[:retract :greg :alias \"x\"]", false, false),
+            ("[:create :CHARACTER :x]", false, false),
+            ("[:create :CHARACTER :x :if-missing]", false, true),
+            ("[:set :greg :alias \"x\"]", false, true),
+            ("[:correct 1 :delete]", false, true),
+        ] {
+            let form = parse_write(text).unwrap();
+            assert_eq!(requires_admin(&form), admin, "{text}");
+            assert_eq!(requires_read(&form), read, "{text}");
+        }
+    }
+
+    #[test]
     fn names_match_the_front_ends_in_order() {
         let names: Vec<_> = LANGUAGES.iter().map(|l| l.name()).collect();
         assert_eq!(names, NAMES);
@@ -298,6 +327,28 @@ pub mod write {
                         if_missing: true,
                         ..
                     }
+            )
+        })
+    }
+    /// Whether this form changes what the world's existing data or rules
+    /// mean, rather than adding to them: a world setting, a rename, a
+    /// deprecation, a cardinality change or a migration. Declarations
+    /// (`[:attribute …]`, `[:node-type …]`, and names a write declares by
+    /// inference) are not: they only add.
+    ///
+    /// The helper only classifies. Whether such a form needs a higher
+    /// privilege is the adapter's policy (the Bolt server asks for `admin`;
+    /// the CLI, whose boundary is the file's permissions, asks for nothing).
+    pub fn requires_admin(form: &WriteTxn) -> bool {
+        use kala_datalog::ast::WriteOp;
+        form.ops.iter().any(|op| {
+            matches!(
+                op,
+                WriteOp::WorldSetting { .. }
+                    | WriteOp::Rename { .. }
+                    | WriteOp::Deprecate { .. }
+                    | WriteOp::Cardinality { .. }
+                    | WriteOp::Migrate { .. }
             )
         })
     }

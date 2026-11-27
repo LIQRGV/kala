@@ -757,7 +757,8 @@ class WriteDriverTests(unittest.TestCase):
                     with self.assertRaises(ClientError) as error:
                         session.run(PREFIX + form).consume()
                     self.assertEqual(error.exception.code, "Neo.ClientError.Security.Forbidden")
-                    self.assertIn("read", error.exception.message)
+                    # Migrations (like renames, deprecations and settings) need admin.
+                    self.assertIn("admin" if "migrate" in form else "read", error.exception.message)
         self.assertNotIn("Hidden write", self.aliases(self.driver()))
 
     def test_write_only_reduced_report_and_failure_hide_existing_values(self):

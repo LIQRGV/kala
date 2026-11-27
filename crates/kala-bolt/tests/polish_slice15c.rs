@@ -685,3 +685,115 @@ fn default_mode_begin_is_refused_only_when_a_write_form_arrives() {
         before
     );
 }
+
+// ---------------------------------------------------------------- F
+
+/// The five forms that change what existing data or the world's rules mean,
+/// each on its own attribute so the admin can apply them all.
+const ADMIN_FORMS: [&str; 5] = [
+    "[:world-setting :tick_unit :day]",
+    "[:rename :f_renamed :f_renamed_to]",
+    "[:deprecate :f_deprecated]",
+    "[:cardinality :f_cardinality :many]",
+    "[:migrate :f_migrated :i64]",
+];
+
+#[test]
+fn schema_changes_and_settings_need_admin_and_declarations_need_only_write() {
+    let server = server();
+    let path = server.dir.path().join("varrow.kala");
+    // Declarations (explicit and inferred) need only `write`.
+    let mut writer = login(&server, "writer");
+    for declaration in [
+        "[:attribute :f_renamed :string]",
+        "[:attribute :f_deprecated :string]",
+        "[:attribute :f_cardinality :string]",
+        "[:attribute :f_migrated :string]",
+        "[:node-type :FACTION]",
+        "[:assert :greg :f_inferred 1 :at 300]",
+    ] {
+        let (_, summary) = write(&mut writer, declaration);
+        assert!(summary.contains_key("bookmark"), "{declaration}");
+    }
+    let declared = world(&server);
+    assert!(declared.node_types().any(|t| t == "FACTION"));
+    drop(declared);
+    // Without admin: refused before anything is staged, naming `admin`, in
+    // auto-commit, in an explicit transaction and hidden behind another op.
+    for user in ["writer", "both"] {
+        let mut client = login(&server, user);
+        for form in ADMIN_FORMS {
+            for shape in 0..3 {
+                let before = std::fs::read(&path).unwrap();
+                let body = if shape == 2 {
+                    format!("[[:assert :greg :alias \"Hidden\" :at 300] {form}]")
+                } else {
+                    form.to_owned()
+                };
+                if shape == 1 {
+                    begin(&mut client);
+                }
+                send_run(&mut client, &datalog(&body), map(&[]));
+                let failure = client.failure(FORBIDDEN);
+                assert!(
+                    text(&failure).contains("admin"),
+                    "{user} {form}: {failure:?}"
+                );
+                client.reset();
+                assert_eq!(std::fs::read(&path).unwrap(), before, "{user} {form}");
+            }
+        }
+    }
+    // With admin on the database (or on every database): all five apply.
+    let mut admin = login(&server, "admin");
+    for (n, form) in ADMIN_FORMS.into_iter().enumerate() {
+        if n % 2 == 0 {
+            write(&mut admin, form);
+        } else {
+            begin(&mut admin);
+            write(&mut admin, form);
+            commit(&mut admin);
+        }
+    }
+    let changed = world(&server);
+    assert_eq!(changed.world_setting("tick_unit"), Some("day"));
+    drop(changed);
+    let mut root = Client::ready(&server);
+    write(&mut root, "[:world-setting :schema :strict]");
+    write(&mut root, "[:world-setting :schema :infer]");
+    // `admin` on varrow is not admin elsewhere.
+    send_run(
+        &mut admin,
+        &datalog("[:world-setting :schema :strict]"),
+        map(&[("db", string("other"))]),
+    );
+    admin.failure(FORBIDDEN);
+}
+
+#[test]
+fn an_unknown_world_setting_key_is_refused_with_the_known_keys() {
+    let server = server();
+    let path = server.dir.path().join("varrow.kala");
+    let before = std::fs::read(&path).unwrap();
+    let mut root = Client::ready(&server);
+    for explicit in [false, true] {
+        if explicit {
+            begin(&mut root);
+        }
+        send_run(
+            &mut root,
+            &datalog("[:world-setting :anything_at_all :x]"),
+            map(&[]),
+        );
+        let failure = any_failure(&mut root);
+        assert!(
+            code(&failure).starts_with("Neo.ClientError.Statement."),
+            "{failure:?}"
+        );
+        for known in ["schema", "concurrency", "tick_unit"] {
+            assert!(text(&failure).contains(known), "{failure:?}");
+        }
+        root.reset();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+}

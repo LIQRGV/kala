@@ -618,7 +618,6 @@ fn privilege_checks_cover_auto_explicit_and_hidden_multi_form_writes() {
         "[:set :greg :alias \"Reading\" :at 301]",
         "[:create :CHARACTER :greg :if-missing]",
         "[:correct 1 :delete]",
-        "[:migrate :alias :string]",
         "[[:assert :greg :alias \"Hidden\" :at 301] [:set :greg :alias \"Reading\" :at 302]]",
     ] {
         for explicit in [false, true] {
