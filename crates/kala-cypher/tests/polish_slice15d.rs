@@ -261,3 +261,106 @@ fn set_over_nine_thousand_entities_fits_the_statement_limits() {
     );
     assert_eq!(hp(&world), [Value::I64(100)]);
 }
+
+// ---- E: removing what was never declared, and writes on a NULL variable ----
+
+#[test]
+fn removing_an_undeclared_property_or_label_changes_nothing() {
+    let mut world = crowd(2);
+    let attributes = world.attributes().count();
+    for text in [
+        "MATCH (c:CHARACTER) REMOVE c.nope AT TICK 50",
+        "MATCH (c:CHARACTER) SET c.nope = NULL AT TICK 50",
+        "MATCH (c:CHARACTER) SET c += {nope: NULL, other: NULL} AT TICK 50",
+        "MATCH (c:CHARACTER) REMOVE c:Guide AT TICK 50",
+    ] {
+        let report = ok(&mut world, text);
+        assert_eq!(report.changed, 0, "{text}");
+    }
+    assert_eq!(world.attributes().count(), attributes);
+    // The Datalog form keeps its own rule.
+    let form = kala_datalog::parse_write("[:set :greg :nope []]").unwrap();
+    let error = kala_datalog::apply::execute(&mut varrow(), &form, None).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "op 1 (:set): cannot set unknown attribute :nope to []; declare it first"
+    );
+}
+
+#[test]
+fn a_null_first_value_does_not_stop_a_bulk_merge_from_declaring_the_property() {
+    use kala_core::Schema;
+    let mut world = World::in_memory(Schema::new().node_type("CHARACTER")).unwrap();
+    let list = |values: Vec<Datum>| Datum::List(values);
+    let text = |s: &str| Datum::Value(Value::Str(s.into()));
+    let mut params = QueryParams::new();
+    params.insert(
+        "indices".into(),
+        list(vec![
+            Datum::Value(Value::I64(0)),
+            Datum::Value(Value::I64(1)),
+        ]),
+    );
+    params.insert("handles".into(), list(vec![text("a"), text("b")]));
+    params.insert("names".into(), list(vec![Datum::Null, text("Bee")]));
+    execute(
+        &mut world,
+        &statement(
+            "UNWIND $indices AS i MERGE (n:CHARACTER {kala_handle:$handles[i]}) \
+             ON CREATE SET n.name = $names[i]",
+        ),
+        &params,
+        RunOptions::default(),
+    )
+    .unwrap();
+    let name = |handle| {
+        let id = world.entity_by_handle(handle).unwrap();
+        world.as_of(id, "name", world.latest_tick()).unwrap()
+    };
+    assert!(name("a").is_empty());
+    assert_eq!(name("b"), [Value::Str("Bee".into())]);
+}
+
+#[test]
+fn set_and_remove_on_a_null_variable_skip_the_row() {
+    let mut world = crowd(2);
+    for text in [
+        "OPTIONAL MATCH (x:PLACE {name:'nowhere'}) SET x.hp = 1 AT TICK 50",
+        "OPTIONAL MATCH (x:PLACE {name:'nowhere'}) SET x += {hp: 1} AT TICK 50",
+        "OPTIONAL MATCH (x:PLACE {name:'nowhere'}) REMOVE x.hp AT TICK 50",
+        "OPTIONAL MATCH (x:PLACE {name:'nowhere'}) SET x:Ghost AT TICK 50",
+        "OPTIONAL MATCH (x:PLACE {name:'nowhere'}) REMOVE x:Ghost AT TICK 50",
+    ] {
+        let report = ok(&mut world, text);
+        assert_eq!(report.changed, 0, "{text}");
+    }
+    assert!(world.attribute("label").is_none());
+}
+
+#[test]
+fn removing_an_undeclared_property_reads_the_absence_of_its_name() {
+    use kala_cypher::write::{prepare, stage};
+    for (declared, conflicts) in [("unrelated", false), ("nope", true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.kala");
+        let mut mine = kala_fixture::load_fixture_to(VARROW, &path).unwrap();
+        let mut theirs = World::open(&path).unwrap();
+        let statement = statement(
+            "MATCH (g {kala_handle:'greg'}) REMOVE g.nope SET g.name = 'Gregor' AT TICK 900",
+        );
+        let params = Params::new();
+        let mut tx = mine.begin();
+        let input = prepare(tx.base_world(), &statement, &params, RunOptions::default()).unwrap();
+        stage(&mut tx, &statement, input, &params).unwrap();
+        datalog(
+            &mut theirs,
+            &format!("[:assert :mara :{declared} 1 :at 800]"),
+        );
+        let result = tx.commit();
+        assert_eq!(
+            matches!(result, Err(kala_core::Error::Conflict(_))),
+            conflicts,
+            "{declared}: {result:?}"
+        );
+    }
+}

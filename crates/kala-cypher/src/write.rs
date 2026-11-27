@@ -827,14 +827,34 @@ impl Writer<'_, '_> {
         }
         Ok(())
     }
+    /// Whether `name` is undeclared, recording that its absence was read:
+    /// a newer declaration of the name then conflicts with this
+    /// transaction under optimistic concurrency.
+    fn absent(&self, id: EntityId, name: &str) -> bool {
+        let stored = self.tx.relationship(id, name, id);
+        if self.tx.attribute(stored.1).is_some() {
+            return false;
+        }
+        // The lookup's error is the answer; the read of the name is recorded.
+        let _ = self.tx.note_read_attribute(name);
+        true
+    }
     fn assign(&mut self, items: &[Assignment], row: &Row) -> Result<()> {
         for item in items {
             self.step()?;
             match item {
                 Assignment::Label(var, label, assert) => {
+                    // A NULL variable (OPTIONAL MATCH found nothing) has
+                    // nothing to write to: the row is skipped, as for DELETE.
+                    if row.get(var) == Some(&Datum::Null) {
+                        continue;
+                    }
                     let id = reference(row.get(var))?;
                     if id.is_edge() {
                         return Err(invalid("labels apply only to nodes"));
+                    }
+                    if !*assert && self.absent(id, "label") {
+                        continue;
                     }
                     self.fact(
                         id,
@@ -847,6 +867,9 @@ impl Writer<'_, '_> {
                     if key == "kala_handle" {
                         return Err(invalid("kala_handle is permanent"));
                     }
+                    if row.get(var) == Some(&Datum::Null) {
+                        continue;
+                    }
                     let id = reference(row.get(var))?;
                     let mut wanted = if let Some(e) = expr {
                         values(self.eval(e, row, false)?)?
@@ -854,6 +877,12 @@ impl Writer<'_, '_> {
                         vec![]
                     };
                     self.handles(id, key, &mut wanted)?;
+                    // Removing a property nobody declared changes nothing
+                    // (in Datalog an empty `:set` of an unknown name is an
+                    // error; in Cypher REMOVE and `= NULL` are no-ops).
+                    if wanted.is_empty() && self.absent(id, key) {
+                        continue;
+                    }
                     self.stager
                         .set(self.tx, id, key, &wanted, None, Precision::Exact)?;
                     if !self.cols.is_empty() {
