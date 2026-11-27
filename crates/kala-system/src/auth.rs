@@ -458,6 +458,20 @@ impl AccountVerifier {
         }
     }
 }
+/// The identity of the account `identity` was issued for, as a system-world
+/// snapshot holds it now: the same user and host selector with its current
+/// grants, or `None` if that account no longer exists. No credentials are
+/// involved: this re-reads what an already authenticated connection may do,
+/// it never authenticates one.
+pub fn current_identity(
+    system_world: &World,
+    identity: &Identity,
+) -> Result<Option<Identity>, SystemError> {
+    Ok(system::read_accounts(system_world)?
+        .iter()
+        .find(|a| a.summary.user == identity.principal && a.summary.host == identity.host)
+        .map(system::Account::identity))
+}
 #[cfg(test)]
 thread_local! {
     /// How many passwords this thread has hashed (see `system::tests`).

@@ -62,6 +62,8 @@ struct Session<'a> {
     output_ids: bool,
     /// The open transaction expired while the next request was awaited.
     expired: bool,
+    /// The accounts file as it was when `identity`'s grants were read.
+    grants_seen: Option<crate::registry::Stamp>,
 }
 /// What every connection of one server shares.
 pub(crate) struct Shared<'a> {
@@ -117,6 +119,7 @@ pub(crate) fn serve(
         summary: None,
         output_ids: false,
         expired: false,
+        grants_seen: None,
     };
     loop {
         let Some(message) = session.receive(stream.as_mut())? else {
@@ -275,6 +278,9 @@ impl Session<'_> {
             principal: field(&mut map, "principal")?,
             credentials: Credentials::new(field(&mut map, "credentials")?),
         };
+        // Before the accounts are read: a change that lands in between is
+        // then noticed (a newer stamp), never missed.
+        self.grants_seen = self.registry.accounts_stamp().and_then(Result::ok);
         let identity = self
             .auth
             .authenticate_peer(&token, self.peer)
@@ -387,6 +393,7 @@ impl Session<'_> {
     fn logoff(&mut self) -> Value {
         self.authenticated = false;
         self.identity = None;
+        self.grants_seen = None;
         self.state = State::Authentication;
         success([])
     }
@@ -478,6 +485,43 @@ impl Session<'_> {
             ),
         )]))
     }
+    /// Re-reads this connection's grants if any account changed since they
+    /// were read, so a privilege revoked (or an account dropped) with
+    /// `kala user` stops a pooled connection's next transaction or write
+    /// instead of lasting until its next login. Called at BEGIN and before
+    /// an auto-commit write, not for reads: it costs one look at the
+    /// accounts file, and a reload of the accounts only when it changed.
+    fn refresh_grants(&mut self) -> Result<(), Failure> {
+        let Some(stamp) = self.registry.accounts_stamp() else {
+            return Ok(());
+        };
+        let stamp = stamp?;
+        if self.grants_seen.as_ref() == Some(&stamp) {
+            return Ok(());
+        }
+        let identity = self.identity.as_mut().ok_or_else(Failure::invalid)?;
+        let current = self.auth.refresh(identity).map_err(|_| {
+            Failure::new(
+                crate::error::FORBIDDEN,
+                "this connection's privileges could not be verified",
+            )
+        })?;
+        self.grants_seen = Some(stamp);
+        match current {
+            Some(current) => {
+                *identity = current;
+                Ok(())
+            }
+            None => {
+                // Fail closed for everything that follows on this connection.
+                identity.grants.clear();
+                Err(Failure::new(
+                    crate::error::FORBIDDEN,
+                    "this connection's account no longer exists",
+                ))
+            }
+        }
+    }
     fn write_allowed(&self, db: &str, read_mode: bool) -> Result<(), Failure> {
         let refused = if self.config.read_only {
             Some((
@@ -560,6 +604,7 @@ impl Session<'_> {
     fn begin(&mut self, extra: &Map) -> Result<Value, Failure> {
         let name = self.registry.name(self.requested(extra)?)?.to_owned();
         let options = Options::parse(extra, &name, self.config)?;
+        self.refresh_grants()?;
         let identity = self.identity.as_ref().ok_or_else(Failure::invalid)?;
         if !identity.permits_read(&name) && !identity.permits_write(&name) {
             return Err(Failure::new(
@@ -726,6 +771,14 @@ impl Session<'_> {
         self.output_ids = false;
         let output = match statement {
             kala_lang::Statement::Writes => {
+                // An explicit transaction's grants were refreshed at BEGIN.
+                if self.transaction.is_none() {
+                    self.refresh_grants()?;
+                }
+                let read = self
+                    .identity
+                    .as_ref()
+                    .is_some_and(|id| id.permits_read(&name));
                 let mode = self
                     .transaction
                     .as_ref()

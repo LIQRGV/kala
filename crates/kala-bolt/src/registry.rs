@@ -30,7 +30,7 @@ struct Database {
 /// transaction's commit checksum, so they change with any different last
 /// transaction; the modification time covers the rest.
 #[derive(Clone, PartialEq, Eq)]
-struct Stamp {
+pub(crate) struct Stamp {
     len: u64,
     modified: Option<std::time::SystemTime>,
     /// `(dev, ino)` of the file the tail was read from (Unix).
@@ -248,6 +248,13 @@ impl Registry {
             ));
         }
         Ok(world)
+    }
+    /// What the `system` database's file looks like now, or `None` when
+    /// this server doesn't serve one (`--auth none`). A connection compares
+    /// it with the stamp taken when its grants were read: equal means no
+    /// account changed since.
+    pub fn accounts_stamp(&self) -> Option<Result<Stamp, Failure>> {
+        self.databases.get("system").map(|db| stamp(&db.path))
     }
     /// Takes a slot for an explicit transaction that starts writing, for
     /// `account` (the authenticated `user@host`). Refused, with a code

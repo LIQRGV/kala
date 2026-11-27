@@ -416,7 +416,10 @@ fn a_failed_write_keeps_the_cached_writer_and_a_diverged_log_reopens_it() {
 
 #[test]
 fn sequential_auto_commit_writes_replay_the_log_once_not_once_per_write() {
-    let (server, counts) = counted_server(ServerConfig::default());
+    let (server, counts) = counted_server(ServerConfig {
+        busy_timeout: Duration::from_millis(300),
+        ..ServerConfig::default()
+    });
     let mut client = Client::ready(&server);
     let mut bookmark = None;
     for n in 0..12 {
@@ -452,7 +455,7 @@ fn sequential_auto_commit_writes_replay_the_log_once_not_once_per_write() {
     let failure = any_failure(&mut client);
     assert!(transient(&failure), "{failure:?}");
     assert!(text(&failure).contains("bookmark"), "{failure:?}");
-    assert!(start.elapsed() < Duration::from_secs(8));
+    assert!(start.elapsed() < Duration::from_secs(3));
     client.reset();
     // And a reader given the last write's bookmark sees it: one reload.
     send_run(
@@ -857,5 +860,52 @@ fn a_write_only_identity_gets_one_code_and_message_for_every_store_rule_failure(
     write(
         &mut writer,
         "[:assert :greg :alias \"Still writable\" :at 300]",
+    );
+}
+
+// ---------------------------------------------------------------- I
+
+#[test]
+fn a_revoked_write_grant_or_dropped_account_stops_writes_on_open_connections() {
+    let server = server();
+    let dir = server.dir.path();
+    let path = dir.join("varrow.kala");
+    // Pooled driver connections stay logged in for a long time.
+    let mut auto = login(&server, "both");
+    let mut explicit = login(&server, "both");
+    let mut dropped = login(&server, "both2");
+    let mut promoted = login(&server, "reader");
+    write(
+        &mut auto,
+        "[:assert :greg :alias \"Before revoke\" :at 300]",
+    );
+    kala_system::system::revoke(dir, "both@localhost", "write", "varrow").unwrap();
+    kala_system::system::drop_account(dir, "both2@localhost").unwrap();
+    kala_system::system::grant(dir, "reader@localhost", "write", "varrow").unwrap();
+    let before = std::fs::read(&path).unwrap();
+    // The next auto-commit write sees the revocation.
+    send_run(&mut auto, WRITE, map(&[]));
+    let failure = auto.failure(FORBIDDEN);
+    assert!(text(&failure).contains("write privilege"), "{failure:?}");
+    auto.reset();
+    // So does a transaction begun after it.
+    begin(&mut explicit);
+    send_run(&mut explicit, WRITE, map(&[]));
+    explicit.failure(FORBIDDEN);
+    explicit.reset();
+    // `read` was not revoked.
+    assert_eq!(auto.query(client::ALLIES).len(), 2);
+    // An account that no longer exists can neither begin nor write.
+    dropped.send(0x11, vec![map(&[])]);
+    dropped.failure(FORBIDDEN);
+    dropped.reset();
+    send_run(&mut dropped, WRITE, map(&[]));
+    dropped.failure(FORBIDDEN);
+    dropped.reset();
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    // A grant added meanwhile is picked up the same way.
+    write(
+        &mut promoted,
+        "[:assert :greg :alias \"Granted later\" :at 300]",
     );
 }
