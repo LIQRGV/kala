@@ -155,13 +155,9 @@ impl Server {
     pub fn bind(directory: impl AsRef<Path>, config: ServerConfig) -> io::Result<Self> {
         let tls = Self::validate_listeners(&config)?;
         Self::require_loopback(&config)?;
-        Self::bind_inner(
-            directory.as_ref(),
-            config,
-            tls,
-            Arc::new(NoAuth),
-            SystemDb::Skip,
-        )
+        Self::bind_inner(directory.as_ref(), config, tls, SystemDb::Skip, |_| {
+            Ok(Arc::new(NoAuth))
+        })
     }
     /// Bind with persisted accounts, bootstrapping root@localhost when needed.
     pub fn bind_accounts(directory: impl AsRef<Path>, config: ServerConfig) -> io::Result<Self> {
@@ -198,8 +194,11 @@ impl Server {
                 );
             }
         }
-        let auth = Accounts::open(directory).map_err(io::Error::other)?;
-        Self::bind_inner(directory, config, tls, Arc::new(auth), SystemDb::Serve)
+        Self::bind_inner(directory, config, tls, SystemDb::Serve, |registry| {
+            Ok(Arc::new(
+                Accounts::with_registry(registry).map_err(io::Error::other)?,
+            ))
+        })
     }
     /// Supply an authenticator on a loopback-only listener.
     pub fn bind_with_auth(
@@ -209,7 +208,9 @@ impl Server {
     ) -> io::Result<Self> {
         let tls = Self::validate_listeners(&config)?;
         Self::require_loopback(&config)?;
-        Self::bind_inner(directory.as_ref(), config, tls, auth, SystemDb::Serve)
+        Self::bind_inner(directory.as_ref(), config, tls, SystemDb::Serve, |_| {
+            Ok(auth)
+        })
     }
     fn validate_listeners(config: &ServerConfig) -> io::Result<Option<TlsReloader>> {
         if config.listen.is_empty() || config.listen.len() > 16 {
@@ -254,8 +255,8 @@ impl Server {
         directory: &Path,
         config: ServerConfig,
         tls: Option<TlsReloader>,
-        auth: Arc<dyn Authenticator>,
         system: SystemDb,
+        make_auth: impl FnOnce(Arc<Registry>) -> io::Result<Arc<dyn Authenticator>>,
     ) -> io::Result<Self> {
         if config
             .advertised_address
@@ -306,6 +307,7 @@ impl Server {
             Registry::open(directory, config.default_db.clone(), system)?
                 .acknowledging_recovery(config.acknowledge_recovery && !config.read_only),
         );
+        let auth = make_auth(Arc::clone(&registry))?;
         let mut listeners = Vec::new();
         for addr in &config.listen {
             listeners.push(

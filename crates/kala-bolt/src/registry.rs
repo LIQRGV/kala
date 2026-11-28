@@ -552,7 +552,12 @@ impl Registry {
             }
         }
         if added > 0 {
-            *self.databases.write().unwrap_or_else(|e| e.into_inner()) = names;
+            // Destroying the old map can free every key. Release the write
+            // guard first so known-name lookups don't wait for that work.
+            std::mem::swap(
+                &mut *self.databases.write().unwrap_or_else(|e| e.into_inner()),
+                &mut names,
+            );
             logln!("event=bolt_databases_discovered count={added}");
         }
         Ok(())

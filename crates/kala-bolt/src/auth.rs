@@ -8,7 +8,7 @@ pub use kala_system::auth::{
     AuthFailure, AuthToken, Credentials, Identity, Peer, VerificationStats,
 };
 use kala_system::system::{self, SystemError};
-use std::{net::IpAddr, path::Path};
+use std::{net::IpAddr, path::Path, sync::Arc};
 
 /// Authentication policy for a server. Implementations must never log tokens.
 pub trait Authenticator: Send + Sync {
@@ -53,7 +53,7 @@ impl Authenticator for NoAuth {
 }
 /// Accounts loaded through the registry's committed, stamp-checked snapshots.
 pub struct Accounts {
-    registry: Registry,
+    registry: Arc<Registry>,
     verifier: AccountVerifier,
 }
 impl Accounts {
@@ -62,6 +62,10 @@ impl Accounts {
         system::ensure(directory.as_ref())?;
         let registry = Registry::open(directory.as_ref(), None, SystemDb::Serve)
             .map_err(|_| SystemError::Store)?;
+        Self::with_registry(Arc::new(registry))
+    }
+
+    pub(crate) fn with_registry(registry: Arc<Registry>) -> Result<Self, SystemError> {
         let verifier = AccountVerifier::new()?;
         Ok(Self { registry, verifier })
     }
