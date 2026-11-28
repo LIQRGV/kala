@@ -241,6 +241,15 @@ attribute (`SET c.located_in = $place`, `SET c.located_in = 'varrow'`, a
 CREATE property map) is a handle too, as in a Datalog form; a handle nobody
 holds is the `unknown entity` error.
 
+A row field behaves the same. Where the reading part compares it with a ref
+attribute (`MATCH (c {located_in: row.place})`, `WHERE c.located_in =
+row.place`), its string is a handle or a formatted ID and names that entity;
+a handle nobody holds is the same type error a scalar parameter gives, never
+an empty result. One field cannot be both: a field compared with a ref
+attribute and also used as plain data (compared with a string property,
+written as a `kala_handle` or to a non-ref attribute) is a type error that
+names the field. Pass the handle in two fields.
+
 The following pairs show the primitive operations for one input row.
 The SET, REMOVE and DELETE examples assume a preceding MATCH binds the named
 variables. Here `g` is Greg, `a` is Ashford and `r` is their `located_in` edge.

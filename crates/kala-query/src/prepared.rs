@@ -9,8 +9,12 @@ use kala_core::ValueType;
 pub enum ParamKind {
     /// A scalar of any stored type, inferred from its supplied value.
     Scalar,
-    /// A direct UNWIND source whose elements may be map rows.
-    Unwind,
+    /// A direct UNWIND source whose elements may be map rows. It lists, by
+    /// key, the row fields whose position fixes their kind (today: a field
+    /// compared with a `ref` attribute is an [`ParamKind::Entity`], exactly
+    /// as a scalar parameter there would be); every other field is a scalar
+    /// inferred from its supplied value.
+    Unwind(Vec<(String, ParamKind)>),
     /// An entity (or edge): used in an entity position or as a `ref` value.
     Entity,
     /// A value of this type: used as a non-`ref` value (or compared with one).

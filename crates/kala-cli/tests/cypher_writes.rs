@@ -286,3 +286,96 @@ fn bulk_params_text_value_type_follows_the_parameterized_correction_target() {
         [kala_core::Value::Str("456".into())]
     );
 }
+
+#[test]
+fn a_row_field_compared_with_a_ref_attribute_names_an_entity_like_a_scalar_parameter() {
+    let fx = common::varrow();
+    let count = |query: &str, param: &str| {
+        fx.json("query", &["--lang", "cypher", query, "--param", param])["rows"][0][0]["value"]
+            .clone()
+    };
+    let scalar = count(
+        "MATCH (n:CHARACTER) WHERE n.located_in = $p RETURN count(*)",
+        "p=varrow",
+    );
+    assert_eq!(scalar, 4);
+    for query in [
+        "UNWIND $rows AS row MATCH (n:CHARACTER) WHERE n.located_in = row.place RETURN count(*)",
+        "UNWIND $rows AS row MATCH (n:CHARACTER) WHERE row.place = n.located_in RETURN count(*)",
+        "UNWIND $rows AS row MATCH (n:CHARACTER {located_in: row.place}) RETURN count(*)",
+    ] {
+        assert_eq!(
+            count(query, r#"rows=[{"place":"varrow"}]"#),
+            scalar,
+            "{query}"
+        );
+        // A formatted ID names the same entity, and NULL matches nothing.
+        let id = fx.mem.format_id(fx.mem.entity_by_handle("varrow").unwrap());
+        assert_eq!(
+            count(query, &format!(r#"rows=[{{"place":"{id}"}}]"#)),
+            scalar,
+            "{query}"
+        );
+        assert_eq!(count(query, r#"rows=[{"place":null}]"#), 0, "{query}");
+        // An unknown handle is the scalar parameter's error, never an empty result.
+        let unknown = fx.fails(
+            1,
+            "query",
+            &[
+                "--lang",
+                "cypher",
+                query,
+                "--param",
+                r#"rows=[{"place":"nowhere"}]"#,
+            ],
+        );
+        let scalar_unknown = fx.fails(
+            1,
+            "query",
+            &[
+                "--lang",
+                "cypher",
+                "MATCH (n:CHARACTER) WHERE n.located_in = $p RETURN count(*)",
+                "--param",
+                "p=nowhere",
+            ],
+        );
+        assert_eq!(unknown.replace("$rows", "$p"), scalar_unknown, "{query}");
+    }
+
+    // The write form: SET on the nodes the row's place selects.
+    let input = fx.dir.path().join("by-place.cypher");
+    fs::write(
+        &input,
+        "UNWIND $rows AS row MATCH (n:CHARACTER {located_in: row.place}) SET n.census = row.year AT TICK 700;",
+    )
+    .unwrap();
+    let report = fx.json(
+        "transact",
+        &[
+            "--lang",
+            "cypher",
+            input.to_str().unwrap(),
+            "--param",
+            r#"rows=[{"place":"varrow","year":700}]"#,
+        ],
+    );
+    assert_eq!(report["changed"], 4);
+
+    // One field cannot be both an entity and a plain string.
+    let both = fx.fails(
+        1,
+        "query",
+        &[
+            "--lang",
+            "cypher",
+            "UNWIND $rows AS row MATCH (n:CHARACTER) WHERE n.located_in = row.x AND n.name = row.x RETURN count(*)",
+            "--param",
+            r#"rows=[{"x":"varrow"}]"#,
+        ],
+    );
+    assert!(
+        both.contains("row field") && both.contains("entity") && both.contains("x"),
+        "{both}"
+    );
+}

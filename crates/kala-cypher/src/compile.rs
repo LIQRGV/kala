@@ -20,6 +20,7 @@ pub(crate) fn compile(world: &World, text: &str, q: &Query) -> Result<Prepared, 
         ordinal: None,
         nullable: false,
         unwind_params: BTreeMap::new(),
+        row_fields: BTreeMap::new(),
         list_params: BTreeSet::new(),
         loose: BTreeSet::new(),
         untyped: BTreeSet::new(),
@@ -31,6 +32,9 @@ struct Compiler<'a> {
     ordinal: Option<Var>,
     nullable: bool,
     unwind_params: BTreeMap<String, String>,
+    /// `(parameter, key)` of each row field compared with a typed property
+    /// or literal, with the value type that position gives it.
+    row_fields: BTreeMap<(String, String), ValueType>,
     list_params: BTreeSet<String>,
     text: &'a str,
     root: Op,
@@ -121,6 +125,20 @@ impl Compiler<'_> {
         }
         Ok(())
     }
+    /// Note the type a row field's position gives it. A scalar parameter
+    /// compared with a `ref` attribute names an entity (a handle or an ID),
+    /// and so does a row field; the binding seam can resolve it only one
+    /// way, so a field that is also compared as a plain value is refused.
+    fn field(&mut self, parameter: &str, key: &str, ty: ValueType) -> Result<(), CypherError> {
+        let old = *self
+            .row_fields
+            .entry((parameter.into(), key.into()))
+            .or_insert(ty);
+        if (old == ValueType::Ref) != (ty == ValueType::Ref) {
+            return Err(row_field_conflict(self.text, parameter, key));
+        }
+        Ok(())
+    }
     fn time(&mut self, t: &Term, kind: ParamKind) -> Result<TickSource, CypherError> {
         match t {
             Term::Const(Value::I64(n)) => Ok(TickSource::Const(Tick(*n))),
@@ -164,7 +182,7 @@ impl Compiler<'_> {
                     .clone(),
             ),
             Expr::RowParameter(p) => {
-                self.param(p, ParamKind::Unwind)?;
+                self.param(p, ParamKind::Unwind(Vec::new()))?;
                 Expr::RowParameter(p.clone())
             }
             Expr::RowField {
@@ -233,20 +251,30 @@ impl Compiler<'_> {
             Expr::Var(v) => self.unwind_params.get(v).cloned(),
             _ => None,
         };
-        if let Some(p) = parameter {
-            let ty = match a {
-                Expr::Property { key, .. } => {
-                    if key == "kala_handle" {
-                        Some(ValueType::Str)
-                    } else {
-                        self.world.attribute(key).map(|d| d.value_type)
-                    }
+        let field = match b {
+            Expr::RowField { parameter, key, .. } => Some((parameter, key)),
+            _ => None,
+        };
+        if parameter.is_none() && field.is_none() {
+            return Ok(());
+        }
+        let ty = match a {
+            Expr::Property { key, .. } => {
+                if key == "kala_handle" {
+                    Some(ValueType::Str)
+                } else {
+                    self.world.attribute(key).map(|d| d.value_type)
                 }
-                Expr::Value(v) => Some(v.value_type()),
-                _ => None,
-            };
-            if let Some(ty) = ty {
+            }
+            Expr::Value(v) => Some(v.value_type()),
+            _ => None,
+        };
+        if let Some(ty) = ty {
+            if let Some(p) = parameter {
                 self.param(&p, ParamKind::Value(ty))?;
+            }
+            if let Some((parameter, key)) = field {
+                self.field(parameter, key, ty)?;
             }
         }
         Ok(())
@@ -272,6 +300,21 @@ impl Compiler<'_> {
                         .map_or(ParamKind::Scalar, |d| ParamKind::Value(d.value_type))
                 };
                 self.param(&p, kind)?;
+            }
+            if let Expr::RowField {
+                parameter,
+                key: field,
+                ..
+            } = value
+            {
+                let ty = if key == "kala_handle" {
+                    Some(ValueType::Str)
+                } else {
+                    self.world.attribute(key).map(|d| d.value_type)
+                };
+                if let Some(ty) = ty {
+                    self.field(parameter, field, ty)?;
+                }
             }
             let rhs = self.expr(value)?;
             self.row(RowAction::Select(Expr::Compare(
@@ -377,10 +420,18 @@ impl Compiler<'_> {
             canon: self.canon,
             root: self.root,
         };
-        Ok(Prepared {
-            plan,
-            params: self.params,
-        })
+        let mut params = self.params;
+        for (name, kind) in &mut params {
+            if let ParamKind::Unwind(fields) = kind {
+                *fields = self
+                    .row_fields
+                    .iter()
+                    .filter(|((p, _), ty)| p == name && **ty == ValueType::Ref)
+                    .map(|((_, key), _)| (key.clone(), ParamKind::Entity))
+                    .collect();
+            }
+        }
+        Ok(Prepared { plan, params })
     }
     /// Record a variable an UNWIND, YIELD or WITH expression bound: any
     /// value, known only at run time.
@@ -1034,4 +1085,17 @@ struct Returned {
     aliases: BTreeMap<String, Var>,
     /// Each item's source expression and slot.
     items: Vec<(Expr<String>, Var)>,
+}
+
+/// One row field cannot name an entity in one place and be plain data in
+/// another: the handle would have to be both a string and a reference.
+pub(crate) fn row_field_conflict(text: &str, parameter: &str, key: &str) -> CypherError {
+    CypherError::new(
+        text,
+        0,
+        ErrorKind::Type,
+        format!(
+            "row field `{key}` of ${parameter} is used both as an entity (compared with a ref attribute) and as a plain value; pass it in two fields"
+        ),
+    )
 }

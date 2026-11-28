@@ -74,7 +74,10 @@ impl ParamPolicy {
                 .first()
                 .is_some_and(|x| matches!(x.input(), Input::Map(_)))
         {
-            if !self.map_rows || *kind != ParamKind::Unwind {
+            let ParamKind::Unwind(kinds) = kind else {
+                return Err(BindError::Invalid(MAP_RULE));
+            };
+            if !self.map_rows {
                 return Err(BindError::Invalid(MAP_RULE));
             }
             if xs.len() > kala_query::MAX_MAP_ROWS {
@@ -102,16 +105,19 @@ impl ParamPolicy {
                             .saturating_add(key.len())
                             .saturating_add(size),
                     )?;
-                    row.insert(
-                        key.clone(),
-                        self.datum(world, &ParamKind::Scalar, input, 0)?,
-                    );
+                    // A field takes the kind its position gives it, as a
+                    // scalar parameter there would; any other is a scalar.
+                    let kind = kinds
+                        .iter()
+                        .find(|(field, _)| field == key)
+                        .map_or(&ParamKind::Scalar, |(_, kind)| kind);
+                    row.insert(key.clone(), self.datum(world, kind, input, 0)?);
                 }
                 rows.push(row);
             }
             return Ok(BoundParameter::Rows(rows));
         }
-        let kind = if *kind == ParamKind::Unwind {
+        let kind = if matches!(kind, ParamKind::Unwind(_)) {
             &ParamKind::Scalar
         } else {
             kind
@@ -359,7 +365,7 @@ impl ParamPolicy {
             return self.convert(world, kind, json.input(), remaining);
         }
         let raw: Input<'_, serde_json::Value> = match kind {
-            ParamKind::Scalar | ParamKind::Unwind => s
+            ParamKind::Scalar | ParamKind::Unwind(_) => s
                 .parse()
                 .map(Input::Integer)
                 .ok()

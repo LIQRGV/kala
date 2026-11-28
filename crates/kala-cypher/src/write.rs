@@ -263,6 +263,7 @@ pub fn compile(world: &World, stmt: &WriteStatement) -> Result<CompiledWrite> {
         });
     }
     let prepared = crate::compile::compile(world, "", &read)?;
+    entity_fields_stay_references(world, stmt, &prepared)?;
     let kinds = stmt
         .params
         .iter()
@@ -283,6 +284,56 @@ pub fn compile(world: &World, stmt: &WriteStatement) -> Result<CompiledWrite> {
     })
 }
 
+/// A row field the reading part compares with a `ref` attribute arrives as
+/// an entity. Refuse a statement that also writes it as plain data (a
+/// handle to create, a value of a non-`ref` attribute) instead of guessing
+/// which of the two the author meant.
+fn entity_fields_stay_references(
+    world: &World,
+    stmt: &WriteStatement,
+    prepared: &Prepared,
+) -> Result<()> {
+    let entity = |parameter: &str, key: &str| {
+        prepared.params.iter().any(|(name, kind)| {
+            name == parameter
+                && matches!(kind, kala_query::ParamKind::Unwind(fields)
+                    if fields.iter().any(|(field, _)| field == key))
+        })
+    };
+    let check = |attribute: &str, value: &Expr<String>| match value {
+        Expr::RowField { parameter, key, .. }
+            if entity(parameter, key)
+                && (attribute == "kala_handle"
+                    || world
+                        .attribute(attribute)
+                        .is_some_and(|def| def.value_type != kala_core::ValueType::Ref)) =>
+        {
+            Err(WriteError::Syntax(crate::compile::row_field_conflict(
+                "", parameter, key,
+            )))
+        }
+        _ => Ok(()),
+    };
+    for update in &stmt.writes {
+        for path in update.paths() {
+            for (key, value) in path
+                .nodes
+                .iter()
+                .flat_map(|n| &n.props)
+                .chain(path.edges.iter().flat_map(|e| &e.props))
+            {
+                check(key, value)?;
+            }
+        }
+        for assignment in update.assignments() {
+            if let Assignment::Property(_, key, Some(value)) = assignment {
+                check(key, value)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Run a compiled reading part on the snapshot it was compiled against. It is
 /// refused, before its answer is built, when more rows than a write statement
 /// may take reach the final projection.
@@ -300,7 +351,7 @@ pub fn run<'a>(
     }
     for (name, kind) in compiled.parameter_kinds() {
         if let Some(ParameterValue::Rows(rows)) = params.binding(name) {
-            if *kind != kala_query::ParamKind::Unwind {
+            if !matches!(kind, kala_query::ParamKind::Unwind(_)) {
                 return Err(invalid(
                     "map rows are only allowed as a direct UNWIND source and must be accessed through row.key",
                 ));

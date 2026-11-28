@@ -319,3 +319,47 @@ fn a_row_same_tick_conflict_names_the_entity_tick_entry_and_correction() {
     }
     assert_eq!(w.latest_tx(), before);
 }
+
+#[test]
+fn a_row_field_compared_with_a_ref_attribute_is_typed_as_an_entity() {
+    use kala_query::ParamKind;
+    let w = kala_fixture::load_fixture(include_str!("../../kala-core/tests/fixtures/varrow.yaml"))
+        .unwrap();
+    for text in [
+        "UNWIND $rows AS row MATCH (n:CHARACTER) WHERE n.located_in = row.place AND n.name = row.name RETURN n",
+        "UNWIND $rows AS row MATCH (n:CHARACTER {located_in: row.place, name: row.name}) RETURN n",
+    ] {
+        assert_eq!(
+            kala_cypher::prepare(&w, text).unwrap().params,
+            [(
+                "rows".to_owned(),
+                ParamKind::Unwind(vec![("place".into(), ParamKind::Entity)])
+            )],
+            "{text}"
+        );
+    }
+    let error = kala_cypher::prepare(
+        &w,
+        "UNWIND $rows AS row MATCH (n:CHARACTER {located_in: row.x}) WHERE n.name = row.x RETURN n",
+    )
+    .unwrap_err();
+    assert_eq!(error.kind, kala_cypher::ErrorKind::Type, "{error}");
+    assert!(error.message.contains("row field `x` of $rows"), "{error}");
+
+    // The write clauses cannot use the same field as a handle to create or
+    // as the value of a string attribute.
+    for text in [
+        "UNWIND $rows AS row MATCH (p {located_in: row.x}) MERGE (n:CHARACTER {kala_handle: row.x})",
+        "UNWIND $rows AS row MATCH (p {located_in: row.x}) SET p.name = row.x",
+    ] {
+        let kala_cypher::ast::Statement::Write(stmt) = kala_cypher::parse_statement(text).unwrap()
+        else {
+            panic!("expected write");
+        };
+        let error = kala_cypher::write::compile(&w, &stmt).err().unwrap();
+        assert!(
+            error.to_string().contains("row field `x` of $rows"),
+            "{text}: {error}"
+        );
+    }
+}

@@ -189,14 +189,14 @@ pub(crate) enum Update {
 }
 
 impl Update {
-    fn paths(&self) -> &[Path] {
+    pub(crate) fn paths(&self) -> &[Path] {
         match self {
             Self::Create(paths) => paths,
             Self::Merge { path, .. } => std::slice::from_ref(path),
             _ => &[],
         }
     }
-    fn assignments(&self) -> impl Iterator<Item = &Assignment> {
+    pub(crate) fn assignments(&self) -> impl Iterator<Item = &Assignment> {
         let (a, b): (&[Assignment], &[Assignment]) = match self {
             Self::Assign(items) => (items, &[]),
             Self::Merge {
