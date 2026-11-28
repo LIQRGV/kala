@@ -268,21 +268,11 @@ func TestDiscovery(t *testing.T) {
 	kala(t, ctx, "", "create", world)
 	kala(t, ctx, "[[:node-type :NPC] [:create :NPC :ren] [:assert :ren :name \"Ren\"]]\n", "transact", world, "-")
 	s := session(t, ctx, driver, db)
-	// Another session may have just used the shared directory rescan.
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		rows, err := records(ctx, s, "MATCH (n {kala_handle:'ren'}) RETURN n.name")
-		if err == nil {
-			if len(rows) != 1 || rows[0].Values[0] != "Ren" {
-				t.Fatalf("query selected the wrong world: %v", rows)
-			}
-			break
-		}
-		var failure *neo4j.Neo4jError
-		if !errors.As(err, &failure) || failure.Code != "Neo.ClientError.Database.DatabaseNotFound" || time.Now().After(deadline) {
-			t.Fatalf("querying newly created world: %v", err)
-		}
-		time.Sleep(100 * time.Millisecond)
+	// One attempt: a lookup that misses inside another session's rescan
+	// window waits for the next rescan instead of failing.
+	rows := mustQuery(t, ctx, s, "MATCH (n {kala_handle:'ren'}) RETURN n.name")
+	if len(rows) != 1 || rows[0].Values[0] != "Ren" {
+		t.Fatalf("query selected the wrong world: %v", rows)
 	}
 	names := mustQuery(t, ctx, session(t, ctx, driver, "system"), "SHOW DATABASES YIELD name")
 	for _, record := range names {

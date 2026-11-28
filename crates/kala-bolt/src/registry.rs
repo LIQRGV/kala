@@ -132,9 +132,15 @@ impl Listed for std::fs::DirEntry {
 /// asking it for more (an iterator that failed forever would never end).
 const MAX_BROKEN_ENTRIES: usize = 16;
 
+/// The directory is listed at most once in this long, whoever asks.
+const WINDOW: Duration = Duration::from_secs(1);
+
 #[derive(Default)]
 struct Discovery {
-    last_scan: Option<Instant>,
+    /// When the last listing `(started, finished)`. The window runs from
+    /// its end; its start tells a lookup whether the listing is newer than
+    /// the request (a world created before the request is then in it).
+    last: Option<(Instant, Instant)>,
     /// Names in the directory that are not served, each logged once while
     /// it stays there: only names the last complete listing held.
     skipped: HashSet<OsString>,
@@ -646,18 +652,26 @@ impl Registry {
         }
     }
 
-    /// Lists the directory again unless it was listed within the last
-    /// second. A listing that fails (the directory can't be read just now)
-    /// is logged and changes nothing: the worlds already registered are in
+    /// Lists the directory again, unless that is not due: it was listed
+    /// within the last [`WINDOW`] (then this returns how long is left of
+    /// it), or a listing started at or after `since` (then that listing
+    /// already answers the caller, and this returns `None` at once).
+    ///
+    /// A listing that fails (the directory can't be read just now) is
+    /// logged and changes nothing: the worlds already registered are in
     /// memory and keep being served, and callers answer from them.
-    fn rescan(&self) {
+    fn rescan(&self, since: Option<Instant>) -> Option<Duration> {
         let mut discovery = self.discovery.lock().unwrap_or_else(|e| e.into_inner());
-        if discovery
-            .last_scan
-            .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
-        {
-            return;
+        if let Some((started, finished)) = discovery.last {
+            if since.is_some_and(|since| started >= since) {
+                return None;
+            }
+            let left = WINDOW.saturating_sub(finished.elapsed());
+            if !left.is_zero() {
+                return Some(left);
+            }
         }
+        let started = Instant::now();
         if let Err(error) = self.scan(&mut discovery) {
             logln!(
                 "event=bolt_discovery_failed detail={:?}",
@@ -665,16 +679,40 @@ impl Registry {
             );
         }
         // A directory I/O error consumes the same budget as a successful scan.
-        discovery.last_scan = Some(Instant::now());
+        discovery.last = Some((started, Instant::now()));
+        None
     }
 
+    /// A lookup of a name that isn't registered needs a listing made after
+    /// the request arrived: the world may have been created a moment ago,
+    /// and "not found" from an older listing would be a fatal error for a
+    /// database that exists. Inside the window it therefore waits for the
+    /// window to end (at most [`WINDOW`], holding no lock) and then lists,
+    /// or finds that another session did: any number of concurrent misses
+    /// share that one listing, so the directory is still listed at most
+    /// once per window.
     fn database(&self, name: &str) -> Result<Arc<Database>, Failure> {
         if let Some(db) = self.known(name) {
             return Ok(db);
         }
-        self.rescan();
-        self.known(name)
-            .ok_or_else(|| Failure::new(DATABASE, format!("database {name:?} was not found")))
+        let arrived = Instant::now();
+        // After one wait the window has passed, so the second look lists
+        // (or another session has); the bound is for a clock that says
+        // otherwise.
+        for _ in 0..3 {
+            let wait = self.rescan(Some(arrived));
+            if let Some(db) = self.known(name) {
+                return Ok(db);
+            }
+            match wait {
+                Some(left) => std::thread::sleep(left),
+                None => break,
+            }
+        }
+        Err(Failure::new(
+            DATABASE,
+            format!("database {name:?} was not found"),
+        ))
     }
     /// Resolve the name before loading a world, so authorization precedes I/O.
     pub fn name<'a>(&'a self, requested: Option<&'a str>) -> Result<&'a str, Failure> {
@@ -682,10 +720,11 @@ impl Registry {
             .or(self.default.as_deref())
             .ok_or_else(|| Failure::new(DATABASE, "no default database; specify a database name"))
     }
-    /// Registry names only: does not open any world. If the directory
-    /// can't be listed, these are the worlds registered so far.
+    /// Registry names only: does not open any world. Inside the listing
+    /// window, or if the directory can't be listed, these are the worlds
+    /// registered so far; it never waits.
     pub fn names(&self) -> DatabaseNames {
-        self.rescan();
+        self.rescan(None);
         DatabaseNames(self.snapshot())
     }
     pub fn default_name(&self) -> Option<&str> {
@@ -774,24 +813,48 @@ mod tests {
 
         registry.require("missing").unwrap_err();
         assert_eq!(listings(), 2);
+        let listed = Instant::now();
 
-        // Hold the window open independently of test scheduling.
-        registry.discovery.lock().unwrap().last_scan =
-            Some(Instant::now() + Duration::from_secs(3600));
+        // Inside the window SHOW DATABASES answers from the registered
+        // worlds: no listing and no waiting.
         std::fs::copy(dir.path().join("varrow.kala"), dir.path().join("new.kala")).unwrap();
-        for i in 0..64 {
-            assert_eq!(
-                registry.require(&format!("missing_{i}")).unwrap_err().code,
-                DATABASE
-            );
-            registry.names();
+        for _ in 0..64 {
+            assert_eq!(registry.names().iter().collect::<Vec<_>>(), ["varrow"]);
         }
-        assert_eq!(registry.require("new").unwrap_err().code, DATABASE);
         assert_eq!(listings(), 2);
+        assert!(listed.elapsed() < WINDOW, "the window passed: rerun");
 
-        registry.discovery.lock().unwrap().last_scan = None;
-        registry.require("new").unwrap();
+        // Lookups of unknown names wait for the window to end instead of
+        // answering from a listing older than the request, and all of them
+        // share the one listing that follows.
+        std::thread::scope(|scope| {
+            for i in 0..64 {
+                let registry = &registry;
+                scope.spawn(move || {
+                    assert_eq!(
+                        registry.require(&format!("missing_{i}")).unwrap_err().code,
+                        DATABASE
+                    );
+                });
+            }
+            scope.spawn(|| registry.require("new").unwrap());
+        });
+        assert!(listed.elapsed() >= WINDOW);
         assert_eq!(listings(), 3);
+    }
+
+    #[test]
+    fn a_world_created_right_after_a_listing_is_found_by_a_single_lookup() {
+        let (dir, registry) = registry();
+        // Another session (a tool polling SHOW DATABASES) has just listed.
+        registry.require("missing").unwrap_err();
+        registry.names();
+        let listings = registry.listings.load(Ordering::Relaxed);
+        std::fs::copy(dir.path().join("varrow.kala"), dir.path().join("new.kala")).unwrap();
+        let asked = Instant::now();
+        registry.require("new").unwrap();
+        assert!(asked.elapsed() <= WINDOW + Duration::from_millis(500));
+        assert_eq!(registry.listings.load(Ordering::Relaxed), listings + 1);
     }
 
     /// A listed entry for [`Registry::register`]: `kind` is what reading
@@ -852,7 +915,7 @@ mod tests {
         mode(0o000);
         let listable = std::fs::read_dir(dir.path()).is_ok();
         let names: Vec<_> = registry.names().iter().map(str::to_owned).collect();
-        registry.discovery.lock().unwrap().last_scan = None;
+        registry.discovery.lock().unwrap().last = None;
         let missing = registry.require("missing").map_err(|failure| failure.code);
         mode(0o700);
         if listable {
@@ -863,7 +926,7 @@ mod tests {
         assert_eq!(missing, Err(DATABASE));
         // The next listing works again.
         std::fs::copy(dir.path().join("varrow.kala"), dir.path().join("new.kala")).unwrap();
-        registry.discovery.lock().unwrap().last_scan = None;
+        registry.discovery.lock().unwrap().last = None;
         registry.require("new").unwrap();
     }
 
