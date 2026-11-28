@@ -105,13 +105,18 @@ mod tests {
     fn only_cypher_takes_nullable_parameters() {
         assert!(
             pick("RETURN 1").0 == "cypher"
-                && detect("RETURN 1").unwrap().front_end.nullable_params()
+                && detect("RETURN 1")
+                    .unwrap()
+                    .front_end
+                    .parameter_policy()
+                    .nulls
         );
         assert!(
             !detect("// kala:datalog\n[]")
                 .unwrap()
                 .front_end
-                .nullable_params()
+                .parameter_policy()
+                .nulls
         );
     }
 }

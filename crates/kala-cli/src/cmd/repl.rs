@@ -15,7 +15,7 @@ use rustyline::error::ReadlineError;
 use rustyline::history::MemHistory;
 
 use super::Done;
-use super::query::{parse_params, query_err, read_text_file, render_result};
+use super::query::{query_err, read_text_file, render_result};
 use super::read::Ctx;
 use super::repl_editor::SafeHelper;
 use super::repl_history::{History, MAX_HISTORY_ENTRIES, safe_entry};
@@ -199,7 +199,11 @@ impl<'a> Session<'a> {
                     .map(|value| (name.clone(), value.clone()))
             })
             .collect();
-        let params = parse_params(&self.ctx, &prepared.params, &given)?;
+        let params = super::language::front_end("datalog")?.params(
+            &self.ctx.world,
+            &prepared.params,
+            &given,
+        )?;
         if explain {
             return Ok(prepared.plan.explain(&self.ctx.world));
         }

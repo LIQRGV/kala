@@ -790,8 +790,17 @@ impl Session<'_> {
             }
             kala_lang::Statement::CypherWrite(statement) => {
                 let held = self.allow_write_run(&name, &options)?;
-                self.cypher_run(&name, &statement, params, text.len(), &options, held, stop)
-                    .inspect_err(|failure| self.log_refused(&name, refusal_reason(failure)))?
+                self.cypher_run(
+                    &name,
+                    &statement,
+                    source?.front_end.parameter_policy(),
+                    params,
+                    text.len(),
+                    &options,
+                    held,
+                    stop,
+                )
+                .inspect_err(|failure| self.log_refused(&name, refusal_reason(failure)))?
             }
             kala_lang::Statement::Writes => {
                 let read = self.allow_write_run(&name, &options)?.read;
@@ -964,6 +973,7 @@ impl Session<'_> {
         &mut self,
         db: &str,
         statement: &kala_lang::write::WriteStatement,
+        policy: kala_lang::ParamPolicy,
         given: &Map,
         text_len: usize,
         options: &Options,
@@ -1000,7 +1010,7 @@ impl Session<'_> {
         let prepare = |world: &kala_core::World, limits: kala_query::Limits| {
             let compiled = compile_statement(world, statement)
                 .map_err(|e| write::statement_error(e, held.read))?;
-            let params = query::parameters(world, compiled.parameter_kinds(), given, true)?;
+            let params = query::parameters(world, compiled.parameter_kinds(), given, policy)?;
             let run = kala_query::RunOptions::new(limits)
                 .with_cancel(flag)
                 .with_deadline(deadline);

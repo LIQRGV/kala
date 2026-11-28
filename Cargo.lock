@@ -622,6 +622,7 @@ dependencies = [
  "kala-cypher",
  "kala-datalog",
  "kala-query",
+ "serde_json",
 ]
 
 [[package]]

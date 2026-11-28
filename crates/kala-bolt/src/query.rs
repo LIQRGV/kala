@@ -71,7 +71,7 @@ fn run_inner(
         prepared.plan.find.len(),
         prepared.params.len()
     );
-    let params = parameters(world, &prepared.params, given, front_end.nullable_params())?;
+    let params = parameters(world, &prepared.params, given, front_end.parameter_policy())?;
     execute(
         world,
         &prepared,
@@ -124,7 +124,12 @@ pub(crate) fn run_server(
         return Err(protected());
     }
     let world = World::in_memory(kala_core::Schema::new()).map_err(Failure::store)?;
-    let mut params = parameters(&world, &statement.prepared.params, given, true)?;
+    let mut params = parameters(
+        &world,
+        &statement.prepared.params,
+        given,
+        statement.parameter_policy,
+    )?;
     params.insert(kala_query::SERVER_ROWS_PARAMETER.into(), Datum::List(rows));
     execute(
         &world,
@@ -368,90 +373,39 @@ pub(crate) fn parameters(
     world: &World,
     kinds: &[(String, ParamKind)],
     given: &Map,
-    nullable: bool,
+    policy: kala_lang::ParamPolicy,
 ) -> Result<QueryParams, Failure> {
-    let mut params = QueryParams::new();
-    for (name, kind) in kinds {
-        let raw = given
-            .get(name)
-            .ok_or_else(|| Failure::new(MISSING, format!("missing parameter {name}")))?;
-        params.insert(
-            name.clone(),
-            parameter_value(world, kind, raw, nullable, 0)?,
-        );
-    }
-    Ok(params)
+    policy
+        .bind(kinds, |name, kind| {
+            use kala_lang::params::ParameterTree;
+            given
+                .get(name)
+                .map(|v| policy.convert(world, kind, v.input(), 0))
+                .transpose()
+        })
+        .map_err(|e| {
+            let code = if matches!(e, kala_lang::params::BindError::Missing(_)) {
+                MISSING
+            } else {
+                TYPE
+            };
+            Failure::new(code, e.to_string())
+        })
 }
-/// The largest magnitude an `i64` can have and still convert to `f64`
-/// exactly (2^53).
-const F64_EXACT_INT_MAX: u64 = 1 << 53;
 
-fn parameter_value(
-    world: &World,
-    kind: &ParamKind,
-    raw: &Value,
-    nullable: bool,
-    depth: usize,
-) -> Result<Datum, Failure> {
-    let bad = || Failure::new(TYPE, "wrong type for query parameter");
-    if depth > 32 {
-        return Err(bad());
-    }
-    if nullable && !matches!(kind, ParamKind::Tick | ParamKind::Canon) {
-        match raw {
-            Value::Null => return Ok(Datum::Null),
-            Value::List(values) => {
-                return values
-                    .iter()
-                    .map(|v| parameter_value(world, kind, v, true, depth + 1))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(Datum::List);
-            }
-            _ => {}
+impl kala_lang::params::ParameterTree for Value {
+    fn input(&self) -> kala_lang::params::Input<'_, Self> {
+        use kala_lang::params::Input;
+        match self {
+            Self::Null => Input::Null,
+            Self::Bool(b) => Input::Bool(*b),
+            Self::Integer(n) => Input::Integer(*n),
+            Self::Float(f) => Input::Float(*f),
+            Self::String(s) => Input::String(s),
+            Self::List(xs) => Input::List(xs),
+            _ => Input::Unsupported,
         }
     }
-    let value = match (kind, raw) {
-        (ParamKind::Scalar, Value::Bool(v)) => CoreValue::Bool(*v),
-        (ParamKind::Scalar, Value::Integer(v)) => CoreValue::I64(*v),
-        (ParamKind::Scalar, Value::Float(v)) => CoreValue::f64(*v).map_err(|_| bad())?,
-        (ParamKind::Scalar, Value::String(v)) => CoreValue::Str(v.clone()),
-        (ParamKind::Tick | ParamKind::Value(ValueType::I64), Value::Integer(n)) => {
-            CoreValue::I64(*n)
-        }
-        (ParamKind::Canon, Value::Integer(n)) if *n >= 0 => CoreValue::I64(*n),
-        (ParamKind::Canon, Value::String(s)) => CoreValue::I64(
-            s.strip_prefix("tx#")
-                .unwrap_or(s)
-                .parse::<i64>()
-                .ok()
-                .filter(|n| *n >= 0)
-                .ok_or_else(bad)?,
-        ),
-        (ParamKind::Value(ValueType::F64), Value::Float(n)) => {
-            CoreValue::f64(*n).map_err(|_| bad())?
-        }
-        // Drivers send integral numbers as Integer. Accept one for a float
-        // parameter only when the conversion is exact (|n| <= 2^53), so a
-        // parameter never silently becomes a different number.
-        (ParamKind::Value(ValueType::F64), Value::Integer(n))
-            if n.unsigned_abs() <= F64_EXACT_INT_MAX =>
-        {
-            #[allow(clippy::cast_precision_loss)] // exact: |n| <= 2^53
-            CoreValue::f64(*n as f64).map_err(|_| bad())?
-        }
-        (ParamKind::Value(ValueType::Bool), Value::Bool(v)) => CoreValue::Bool(*v),
-        (ParamKind::Value(ValueType::Str), Value::String(v)) => CoreValue::Str(v.clone()),
-        (ParamKind::Entity | ParamKind::Value(ValueType::Ref), Value::String(s)) => {
-            let id = world
-                .entity_by_handle(s)
-                .or_else(|| world.parse_id(s))
-                .filter(|id| world.is_defined(*id))
-                .ok_or_else(bad)?;
-            CoreValue::Ref(id)
-        }
-        _ => return Err(bad()),
-    };
-    Ok(Datum::Value(value))
 }
 pub(crate) fn query_error(error: QueryError) -> Failure {
     match error {

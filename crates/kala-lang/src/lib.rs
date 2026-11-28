@@ -8,6 +8,8 @@
 //! `FrontEnd` and one more table entry.
 #![forbid(unsafe_code)]
 use std::fmt;
+pub mod params;
+pub use params::ParamPolicy;
 
 use kala_core::World;
 use kala_query::Prepared;
@@ -55,6 +57,8 @@ impl std::error::Error for LangError {}
 /// A prepared metadata statement whose rows must come from the server adapter.
 #[derive(Clone, Debug)]
 pub struct ServerStatement {
+    /// Binding rules of the preparing front-end.
+    pub parameter_policy: ParamPolicy,
     /// Metadata table the adapter must supply.
     pub request: kala_query::ServerRequest,
     /// Shared plan that projects and filters the supplied table.
@@ -111,7 +115,7 @@ pub trait FrontEnd: Sync {
     fn name(&self) -> &'static str;
     /// Whether parameters may be NULL or lists (Cypher), or must be scalars
     /// of their inferred kind (Datalog).
-    fn nullable_params(&self) -> bool;
+    fn parameter_policy(&self) -> ParamPolicy;
     /// Parses and compiles `text`. `refuse` names attributes that must not be
     /// read: it is checked on the AST before compiling, so it also covers
     /// parts of the query the compiler drops (unused rules, empty matches);
@@ -149,8 +153,8 @@ impl FrontEnd for Datalog {
     fn name(&self) -> &'static str {
         "datalog"
     }
-    fn nullable_params(&self) -> bool {
-        false
+    fn parameter_policy(&self) -> ParamPolicy {
+        ParamPolicy::SCALARS
     }
     fn prepare(
         &self,
@@ -205,7 +209,11 @@ impl Cypher {
             message: "could not initialize metadata schema".into(),
         })?;
         let prepared = kala_cypher::prepare_parsed(&empty, text, query).map_err(cypher_error)?;
-        Ok(Some(ServerStatement { request, prepared }))
+        Ok(Some(ServerStatement {
+            request,
+            prepared,
+            parameter_policy: Self.parameter_policy(),
+        }))
     }
 }
 
@@ -239,8 +247,8 @@ impl FrontEnd for Cypher {
     fn name(&self) -> &'static str {
         "cypher"
     }
-    fn nullable_params(&self) -> bool {
-        true
+    fn parameter_policy(&self) -> ParamPolicy {
+        ParamPolicy::COLLECTIONS
     }
     fn prepare(
         &self,

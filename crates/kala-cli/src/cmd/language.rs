@@ -10,8 +10,6 @@ use kala_lang::FrontEnd;
 pub(crate) use kala_lang::NAMES;
 use kala_query::{ParamKind, Prepared, QueryParams};
 
-use super::query::{parse_cypher_params, parse_params};
-use super::read::Ctx;
 use crate::error::CliError;
 
 /// A query language the CLI can prepare: a shared front-end plus the CLI's
@@ -47,15 +45,14 @@ impl Language {
     /// parameters are nullable) also NULL or a list.
     pub(crate) fn params(
         &self,
-        ctx: &Ctx,
+        world: &World,
         kinds: &[(String, ParamKind)],
         given: &[(String, String)],
     ) -> Result<QueryParams, CliError> {
-        if self.0.nullable_params() {
-            parse_cypher_params(ctx, kinds, given)
-        } else {
-            Ok(parse_params(ctx, kinds, given)?.into())
-        }
+        self.0
+            .parameter_policy()
+            .bind_text(world, kinds, given)
+            .map_err(|e| CliError::User(e.to_string()))
     }
 }
 
