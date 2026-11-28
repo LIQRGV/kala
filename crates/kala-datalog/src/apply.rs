@@ -59,10 +59,19 @@ fn kind(op: &WriteOp) -> &'static str {
         WriteOp::Set { .. } => "set",
     }
 }
+/// A parameter in a reference position: a handle, or a formatted ID. One
+/// that names nothing is the literal form's unknown-entity error, shown as
+/// the literal would be written (`:gregg`, `CHARACTER#99`).
 fn bound_reference(tx: &Txn<'_>, name: &str) -> Result<EntityId, Failure> {
     tx.entity_by_handle(name)
         .or_else(|| tx.parse_id(name))
-        .ok_or(Failure::ExpectedReference)
+        .ok_or_else(|| {
+            Failure::UnknownEntity(if name.contains('#') {
+                name.to_owned()
+            } else {
+                format!(":{name}")
+            })
+        })
 }
 
 fn reference(tx: &Txn<'_>, i: &Item) -> Result<EntityId, Failure> {

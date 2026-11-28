@@ -745,6 +745,14 @@ type, a same-tick conflict …) is the same code, `Neo.ClientError.Statement.Exe
 with the same message, `write failed; details require read privilege`, so the
 failures can't be told apart; syntax errors and privilege refusals, which
 describe the request and not the data, keep their own codes.
+That is the only rule: a statement that carries parameters fails with exactly
+the diagnostics of its literal form. An identity that holds `read` gets the
+store rule's own message (the subject, attribute, tick and occupying entry of
+a same-tick conflict, the handle that already exists, the conflict sentence
+naming what the transaction read); a write-only identity gets the reduced
+message above for both. Parameter values are never logged, and a parameter
+refused while it is bound is described by its name and expected kind, never
+by its value.
 Overlap descriptions contain only `overlap details require read privilege`.
 No held values appear in these records, errors or notifications. Changed counts
 remain visible, as do commit IDs and counts. Inferred declaration names and

@@ -215,18 +215,33 @@ fn set_retention_includes_noop_and_member_payloads() {
 }
 
 #[test]
-fn parameterized_commit_conflicts_preserve_the_retry_code_and_hide_the_handle() {
+fn a_commit_conflict_names_the_callers_own_handle_only_for_an_identity_with_read() {
     let world = World::in_memory(kala_core::Schema::new()).unwrap();
-    let conflict = Error::Conflict(kala_core::Conflict {
-        key: kala_core::ConflictKey::Handle {
-            handle: "map_row_handle".into(),
-        },
-        operation: 0,
-        applied: 1,
-    });
-    let failure = commit_error(&world, conflict, &[], true, true);
+    let conflict = || {
+        Error::Conflict(kala_core::Conflict {
+            key: kala_core::ConflictKey::Handle {
+                handle: "map_row_handle".into(),
+            },
+            operation: 0,
+            applied: 1,
+        })
+    };
+    // The handle is the caller's own (a literal or a parameter): with
+    // `read` the sentence is the one every conflict gets.
+    let failure = commit_error(&world, conflict(), &[], true);
     assert_eq!(failure.code, CONFLICT);
-    assert!(!failure.message.contains("map_row_handle"));
+    assert_eq!(
+        failure.message,
+        "conflict: this transaction found the handle :map_row_handle free, and another transaction created it; nothing was written; run it again"
+    );
+    // Without `read`, the retry code and the reduced diagnostic.
+    let reduced = commit_error(&world, conflict(), &[], false);
+    assert_eq!(reduced.code, CONFLICT);
+    assert!(
+        !reduced.message.contains("map_row_handle"),
+        "{}",
+        reduced.message
+    );
 }
 
 #[test]

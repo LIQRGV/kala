@@ -1277,3 +1277,152 @@ fn bulk_params_string_parameter_for_an_undeclared_attribute_is_refused() {
         kala_core::ValueType::I64
     );
 }
+
+/// Each pair: a literal form and the same form with parameters, which must
+/// fail with the same code and message.
+fn store_rule_pairs() -> Vec<(&'static str, &'static str, Value)> {
+    vec![
+        (
+            "// kala:datalog\n[:retract :wren :alias \"Twin\" :at 900]",
+            "// kala:datalog\n[:retract ?w :alias ?a :at ?t]",
+            map(&[
+                ("w", string("wren")),
+                ("a", string("Twin")),
+                ("t", Value::Integer(900)),
+            ]),
+        ),
+        (
+            "// kala:datalog\n[:create :CHARACTER :greg]",
+            "// kala:datalog\n[:create :CHARACTER ?h]",
+            map(&[("h", string("greg"))]),
+        ),
+        (
+            "// kala:datalog\n[:assert :gregg :alias \"Twin\" :at 901]",
+            "// kala:datalog\n[:assert ?w :alias ?a :at ?t]",
+            map(&[
+                ("w", string("gregg")),
+                ("a", string("Twin")),
+                ("t", Value::Integer(901)),
+            ]),
+        ),
+        (
+            "CREATE (:CHARACTER {kala_handle: 'greg'}) AT TICK 902",
+            "CREATE (:CHARACTER {kala_handle: $h}) AT TICK $t",
+            map(&[("h", string("greg")), ("t", Value::Integer(902))]),
+        ),
+    ]
+}
+
+#[test]
+fn bulk_params_store_rule_diagnostics_are_the_literal_forms_for_a_reader() {
+    let server = socket_server(true, false);
+    let mut root = Client::ready(&server);
+    root.query("// kala:datalog\n[:assert :wren :alias \"Twin\" :at 900]");
+    let before = world(&server).latest_tx();
+    for explicit in [false, true] {
+        for (literal, parameterized, params) in store_rule_pairs() {
+            if explicit {
+                begin(&mut root);
+            }
+            let plain = failure(&mut root, literal, map(&[]), map(&[]));
+            if explicit {
+                begin(&mut root);
+            }
+            let bound = failure(&mut root, parameterized, params, map(&[]));
+            assert_eq!(bound, plain, "{parameterized}");
+            assert!(
+                !bound.1.contains("parameterized") && !bound.1.contains("require read privilege"),
+                "{parameterized}: {}",
+                bound.1
+            );
+        }
+    }
+    // The diagnosis itself, not only its equality with the literal form.
+    let (code, message) = failure(
+        &mut root,
+        "// kala:datalog\n[:retract ?w :alias ?a :at ?t]",
+        map(&[
+            ("w", string("wren")),
+            ("a", string("Twin")),
+            ("t", Value::Integer(900)),
+        ]),
+        map(&[]),
+    );
+    assert_eq!(code, "Neo.ClientError.Schema.ConstraintValidationFailed");
+    assert!(
+        message.contains("same-tick conflict") && message.contains("at tick 900"),
+        "{message}"
+    );
+    let (_, message) = failure(
+        &mut root,
+        "// kala:datalog\n[:create :CHARACTER ?h]",
+        map(&[("h", string("greg"))]),
+        map(&[]),
+    );
+    assert!(message.contains("greg"), "{message}");
+    assert_eq!(world(&server).latest_tx(), before);
+
+    // A write-only identity: the reduced diagnostic, the same for both
+    // forms, and never a supplied or stored value.
+    let mut writer = login(&server, "writer");
+    for explicit in [false, true] {
+        for (literal, parameterized, params) in store_rule_pairs() {
+            if explicit {
+                begin(&mut writer);
+            }
+            let plain = failure(&mut writer, literal, map(&[]), map(&[]));
+            if explicit {
+                begin(&mut writer);
+            }
+            let bound = failure(&mut writer, parameterized, params, map(&[]));
+            assert_eq!(bound, plain, "{parameterized}");
+            assert_eq!(
+                bound.1, "write failed; details require read privilege",
+                "{parameterized}"
+            );
+        }
+    }
+    assert_eq!(world(&server).latest_tx(), before);
+}
+
+#[test]
+fn bulk_params_commit_conflict_keeps_its_sentence_with_scalar_parameters() {
+    let mut messages = Vec::new();
+    for parameterized in [false, true] {
+        let server = writable_server();
+        let mut first = Client::ready(&server);
+        let mut second = Client::ready(&server);
+        first.query("// kala:datalog\n[:assert :greg :points 0 :at 800]");
+        begin(&mut first);
+        begin(&mut second);
+        first.query("MATCH (n {kala_handle:'greg'}) SET n.points = 1 AT TICK 801");
+        if parameterized {
+            second.run(
+                "MATCH (n {kala_handle:$h}) SET n.points = $p AT TICK $t",
+                map(&[
+                    ("h", string("greg")),
+                    ("p", Value::Integer(2)),
+                    ("t", Value::Integer(802)),
+                ]),
+                map(&[]),
+            );
+            second.pull(-1);
+        } else {
+            second.query("MATCH (n {kala_handle:'greg'}) SET n.points = 2 AT TICK 802");
+        }
+        commit(&mut first);
+        second.send(0x12, vec![]);
+        let refused = second.failure(CONFLICT);
+        let Value::String(message) = &refused["message"] else {
+            panic!("{refused:?}")
+        };
+        assert!(
+            message.starts_with("conflict: op ")
+                && message.contains(":points")
+                && message.ends_with("nothing was written; run it again"),
+            "{message}"
+        );
+        messages.push(message.clone());
+    }
+    assert_eq!(messages[0], messages[1]);
+}

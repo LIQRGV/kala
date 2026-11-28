@@ -133,7 +133,6 @@ pub(crate) struct Transaction {
     pub concurrency: Concurrency,
     pub forms: Vec<StagedWrite>,
     pub bytes: usize,
-    pub parameterized: bool,
     pub queried: bool,
     /// The summary type includes reads for a query, a read pipeline or RETURN.
     pub summary_reads: bool,

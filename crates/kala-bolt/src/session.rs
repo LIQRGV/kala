@@ -640,7 +640,6 @@ impl Session<'_> {
             concurrency: options.concurrency,
             forms: Vec::new(),
             bytes: 0,
-            parameterized: false,
             queried: false,
             summary_reads: false,
             mode_set: false,
@@ -688,7 +687,7 @@ impl Session<'_> {
             let (world, result) = tx.commit();
             let result = result.map_err(|e| {
                 self.log_refused(&db, "conflict");
-                write::commit_error(&world, e, &forms, read, transaction.parameterized)
+                write::commit_error(&world, e, &forms, read)
             })?;
             self.log_commit(&db, &result, forms.len());
             let mut summary = write::Summary::new(self.config.max_message_bytes);
@@ -1037,7 +1036,6 @@ impl Session<'_> {
                 .as_ref()
                 .map(|id| format!("{}@{}", id.principal, id.host))
                 .ok_or_else(Failure::invalid)?;
-            tx.parameterized |= !given.is_empty();
             write::charge(&mut tx.bytes, input_bytes)?;
             let (params, input) = prepare(tx.world(), full)?;
             // Pin BEGIN even for the one empty input row of a blind CREATE.
@@ -1169,7 +1167,7 @@ impl Session<'_> {
                             world,
                             e,
                             std::slice::from_ref(&staged.staged),
-                            held.read, !given.is_empty(),
+                            held.read,
                         )
                     })?;
                     self.log_commit(db, &result, 1);
@@ -1291,7 +1289,6 @@ impl Session<'_> {
                 )?;
             }
             let mut remaining = write::MAX_STAGED_BYTES - tx.bytes;
-            tx.parameterized |= !given.is_empty();
             let mut data = false;
             for (index, template) in templates.iter().enumerate() {
                 let expires = tx.deadline;
@@ -1300,7 +1297,6 @@ impl Session<'_> {
                     t.set_deadline(expires);
                     let form = bind(t.base_world(), template, &mut remaining)?;
                     write::stage(t, &form, read)
-                        .map_err(|e| write::parameter_error(e, !given.is_empty()))
                 })?;
                 data |= staged.ops.iter().any(|op| write::writes_data(op.kind));
                 // Label using the transaction so provisional node types resolve.
@@ -1352,8 +1348,7 @@ impl Session<'_> {
                             tx.set_deadline(deadline);
                             tx.set_schema_additions_only(!held.admin);
                             let form = bind(tx.base_world(), template, &mut remaining)?;
-                            let staged = write::stage(&mut tx, &form, read)
-                                .map_err(|e| write::parameter_error(e, !given.is_empty()))?;
+                            let staged = write::stage(&mut tx, &form, read)?;
                             // Check record size before durable append; final IDs have fixed encoding bounds.
                             let mut preview = write::output();
                             let mut preview_ops = staged.ops.clone();
@@ -1381,13 +1376,7 @@ impl Session<'_> {
                                 return Err(write::timeout());
                             }
                             let result = tx.commit().map_err(|e| {
-                                write::commit_error(
-                                    world,
-                                    e,
-                                    std::slice::from_ref(&staged),
-                                    read,
-                                    !given.is_empty(),
-                                )
+                                write::commit_error(world, e, std::slice::from_ref(&staged), read)
                             })?;
                             committed += usize::from(result.committed);
                             self.log_commit(db, &result, 1);

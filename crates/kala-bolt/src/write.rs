@@ -155,23 +155,17 @@ pub(crate) fn statement_error(error: write::StatementError, read: bool) -> Failu
         e => store_rule(SEMANTIC, e.to_string(), read),
     }
 }
-/// Keep parameter data out of diagnostics from store rules. Preserve the
-/// failure class, including reduced diagnostics for write-only identities.
+/// A parameter refused while a write form is bound to the schema. One rule
+/// covers every write diagnostic, with or without parameters ([`store_rule`]):
+/// an identity that holds `read` gets the message a literal form gets, and a
+/// write-only identity gets the reduced one, because a type refusal says
+/// what the world declares.
 pub(crate) fn parameter_binding_error(failure: Failure, read: bool) -> Failure {
     if failure.code == TYPE && !read {
         Failure::new(crate::error::EXECUTION, REDUCED)
     } else {
         failure
     }
-}
-
-pub(crate) fn parameter_error(mut failure: Failure, bound: bool) -> Failure {
-    if bound && failure.code == CONFLICT && failure.message != REDUCED {
-        failure.message = "another transaction changed data read by this write; nothing was written; run it again".into();
-    } else if bound && matches!(failure.code, TYPE | SEMANTIC | CONSTRAINT) {
-        failure.message = "parameterized write failed a store rule".into();
-    }
-    failure
 }
 
 /// What the connection's identity holds on the database a write targets.
@@ -745,18 +739,12 @@ impl Summary {
     }
 }
 
-/// The CLI conflict sentence, using only the caller's read keys, never held values.
-pub(crate) fn commit_error(
-    w: &World,
-    error: Error,
-    forms: &[StagedWrite],
-    read: bool,
-    parameterized: bool,
-) -> Failure {
-    if parameterized {
-        // Optimistic conflict keys can contain the exact handle read by the write.
-        return parameter_error(store_error(error, read), true);
-    }
+/// The CLI conflict sentence, using only the caller's read keys, never held
+/// values. A key names what this transaction itself read (a handle it
+/// looked up, an attribute it set), whether the statement spelled it as a
+/// literal or supplied it as a parameter; an identity without `read` gets
+/// the reduced diagnostic either way.
+pub(crate) fn commit_error(w: &World, error: Error, forms: &[StagedWrite], read: bool) -> Failure {
     let Error::Conflict(conflict) = &error else {
         return store_error(error, read);
     };
