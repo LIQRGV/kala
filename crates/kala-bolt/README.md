@@ -3,8 +3,12 @@
 A Bolt 5.0–5.4 server with Cypher and Datalog writes and explicit transactions over Kala's Cypher and Datalog front-ends
 and shared query executor. `kala serve DIR` exposes each regular
 `DIR/<name>.kala` file as a database (`[a-z0-9_-]+` names only). Symlinks and
-invalid names are skipped with a startup diagnostic. Files are discovered at
-startup; readers open immutable snapshots on first RUN. File stamps (length, modification time, file identity and commit tail) trigger a reload of
+invalid names are skipped with one diagnostic per name. After startup, an
+authorized lookup of an unknown database or a `SHOW DATABASES` request rescans
+the directory. Sessions share one rescan per second. A new world is available
+by name on the next eligible scan. Readers open immutable snapshots on first
+RUN and retry a failed open on the next request. Removing a file leaves its
+name registered until restart. File stamps (length, modification time, file identity and commit tail) trigger a reload of
 committed transactions; each result pins one snapshot. A damaged tail is never acknowledged or cut by this server unless it was started with `--acknowledge-recovery` (see "Damaged tails"); otherwise an operator must acknowledge recovery through the CLI. The served directory and its files
 are trusted local input: concurrent replacement of directory entries is outside
 the network security boundary.
@@ -25,8 +29,11 @@ client socket, cancels queries and joins connection threads; `kala serve` sets
 it on SIGINT or SIGTERM, so `systemctl stop` and `docker stop`
 shut down cleanly and remove Unix socket files.
 
-A single discovered user database is the implicit default (`system` is excluded). With multiple databases,
-set `--default-db` or supply the driver's session database. The library exports
+A single user database at startup is the implicit default (`system` is excluded).
+The default stays fixed until restart. With several user databases, set
+`--default-db` or supply the driver's session database. With zero user
+databases, start the server without a default and name each new world in the
+driver session. The library exports
 `Server`, `ServerConfig`, PackStream values/codecs and `auth::Authenticator`.
 `Server::bind_accounts` implements the default CLI policy.
 `Server::bind` retains its loopback-only `NoAuth` library behavior; it never

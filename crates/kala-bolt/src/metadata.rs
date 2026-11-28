@@ -68,7 +68,7 @@ pub(crate) fn rows(
     }
     let mut rows = Vec::new();
     let mut bytes = grant_bytes;
-    for name in registry.names() {
+    for name in registry.names()?.iter() {
         check()?;
         let visible = if name == "system" {
             system_admin

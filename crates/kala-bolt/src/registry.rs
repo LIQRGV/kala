@@ -1,12 +1,13 @@
-//! Immutable database names and lazily cached, committed read-only snapshots.
+//! On-demand database discovery and lazily cached, committed read-only snapshots.
 use crate::error::{DATABASE, Failure, escape};
 use crate::log::logln;
 use kala_core::World;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, RwLock,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -95,8 +96,30 @@ pub(crate) enum SystemDb {
     /// skipped by name, whatever it contains or whoever may read it.
     Skip,
 }
+type DatabaseMap = BTreeMap<String, Arc<Database>>;
+
+/// A metadata query can walk one consistent set of names without holding a lock.
+pub(crate) struct DatabaseNames(Arc<DatabaseMap>);
+
+impl DatabaseNames {
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.0.keys().map(String::as_str)
+    }
+}
+
+#[derive(Default)]
+struct Discovery {
+    last_scan: Option<Instant>,
+    skipped: HashSet<OsString>,
+}
+
 pub(crate) struct Registry {
-    databases: BTreeMap<String, Database>,
+    directory: PathBuf,
+    system: SystemDb,
+    databases: RwLock<Arc<DatabaseMap>>,
+    discovery: Mutex<Discovery>,
+    #[cfg(test)]
+    listings: AtomicUsize,
     default: Option<String>,
     write_transactions: Arc<Mutex<WriteSlots>>,
     /// `kala serve --acknowledge-recovery`: see [`Registry::recover`].
@@ -140,7 +163,7 @@ impl Registry {
     /// replayed from its file.
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn opens(&self, name: &str) -> (usize, usize) {
-        let db = &self.databases[name];
+        let db = self.known(name).expect("registered test database");
         (
             db.reader_opens.load(Ordering::Relaxed),
             db.writer_opens.load(Ordering::Relaxed),
@@ -165,7 +188,7 @@ impl Registry {
     /// costs one `stat`, and only then is the lock taken to look). A torn
     /// tail needs none of this: a commit cuts it by itself. `system` never
     /// gets here: no writable handle of it is ever opened.
-    fn recover(&self, name: &str, world: &mut World) -> Result<(), Failure> {
+    fn recover(&self, name: &str, db: &Database, world: &mut World) -> Result<(), Failure> {
         use kala_core::{CutCause, Error};
         if !self.acknowledge_recovery {
             return Ok(());
@@ -174,9 +197,9 @@ impl Registry {
             let report = world.recovery();
             report.cause == Some(CutCause::Damaged) && report.quarantine.is_none()
         };
-        let unapplied = world.chain_tip().is_some_and(|tip| {
-            std::fs::metadata(&self.databases[name].path).map_or(true, |m| m.len() > tip.end)
-        });
+        let unapplied = world
+            .chain_tip()
+            .is_some_and(|tip| std::fs::metadata(&db.path).map_or(true, |m| m.len() > tip.end));
         if !reported && !unapplied {
             return Ok(());
         }
@@ -226,13 +249,12 @@ impl Registry {
         at_least: u64,
         f: impl FnOnce(&mut World) -> Result<R, Failure>,
     ) -> Result<R, Failure> {
-        self.require(name)?;
-        let db = &self.databases[name];
+        let db = self.database(name)?;
         let until = Instant::now() + busy;
         let mut cached = loop {
-            let mut cached = Self::lock_writer(db, until)?;
+            let mut cached = Self::lock_writer(&db, until)?;
             if cached.is_none() {
-                *cached = Some(self.open_writer(name, busy)?);
+                *cached = Some(self.open_writer_for(name, &db, busy)?);
             }
             let world = cached.as_mut().ok_or_else(Failure::invalid)?;
             world.set_busy_timeout(busy);
@@ -240,7 +262,7 @@ impl Registry {
                 *cached = None;
                 return Err(crate::write::store_error(error, true));
             }
-            if let Err(failure) = self.recover(name, world) {
+            if let Err(failure) = self.recover(name, &db, world) {
                 *cached = None;
                 return Err(failure);
             }
@@ -293,18 +315,20 @@ impl Registry {
         }
     }
     pub fn open_writer(&self, name: &str, busy: Duration) -> Result<World, Failure> {
-        self.require(name)?;
+        let db = self.database(name)?;
+        self.open_writer_for(name, &db, busy)
+    }
+
+    fn open_writer_for(&self, name: &str, db: &Database, busy: Duration) -> Result<World, Failure> {
         if name == "system" {
             return Err(Failure::new(
                 crate::error::FORBIDDEN,
                 "the system database is written only with kala user",
             ));
         }
-        let path = &self.databases[name].path;
+        let path = &db.path;
         stamp(path)?;
-        self.databases[name]
-            .writer_opens
-            .fetch_add(1, Ordering::Relaxed);
+        db.writer_opens.fetch_add(1, Ordering::Relaxed);
         let mut world =
             World::open_waiting(path, busy).map_err(|e| crate::write::store_error(e, true))?;
         if crate::system::is_system(&world) {
@@ -313,7 +337,7 @@ impl Registry {
                 "the system database is written only with kala user",
             ));
         }
-        self.recover(name, &mut world)?;
+        self.recover(name, db, &mut world)?;
         Ok(world)
     }
     /// What the `system` database's file looks like now, or `None` when
@@ -321,7 +345,7 @@ impl Registry {
     /// it with the stamp taken when its grants were read: equal means no
     /// account changed since.
     pub fn accounts_stamp(&self) -> Option<Result<Stamp, Failure>> {
-        self.databases.get("system").map(|db| stamp(&db.path))
+        self.known("system").map(|db| stamp(&db.path))
     }
     /// Takes a slot for an explicit transaction that starts writing, for
     /// `account` (the authenticated `user@host`). Refused, with a code
@@ -388,11 +412,10 @@ impl Registry {
         name: &str,
         at_least: u64,
     ) -> Result<Option<Arc<World>>, Failure> {
-        self.require(name)?;
-        let db = &self.databases[name];
+        let db = self.database(name)?;
         let reached = |world: Arc<World>| (world.latest_tx().0 >= at_least).then_some(world);
         let now = stamp(&db.path)?;
-        match Self::lock_cached(db).as_ref() {
+        match Self::lock_cached(&db).as_ref() {
             None => return Ok(None),
             Some((s, world)) if *s == now => return Ok(reached(Arc::clone(world))),
             Some(_) => {}
@@ -402,18 +425,18 @@ impl Registry {
             return Ok(None);
         };
         let before = stamp(&db.path)?;
-        let Some((labelled, shared)) = Self::lock_cached(db).take() else {
+        let Some((labelled, shared)) = Self::lock_cached(&db).take() else {
             return Ok(None);
         };
         if labelled == before {
-            *Self::lock_cached(db) = Some((labelled, Arc::clone(&shared)));
+            *Self::lock_cached(&db) = Some((labelled, Arc::clone(&shared)));
             return Ok(reached(shared));
         }
         let mut world = match Arc::try_unwrap(shared) {
             Ok(world) => world,
             Err(shared) => {
                 // A query is still reading it; it stays what it was.
-                *Self::lock_cached(db) = Some((labelled, shared));
+                *Self::lock_cached(&db) = Some((labelled, shared));
                 return Ok(None);
             }
         };
@@ -436,55 +459,126 @@ impl Registry {
             return Ok(None);
         }
         let world = Arc::new(world);
-        *Self::lock_cached(db) = Some((before, Arc::clone(&world)));
+        *Self::lock_cached(&db) = Some((before, Arc::clone(&world)));
         Ok(reached(world))
     }
 
     pub fn open(directory: &Path, default: Option<String>, system: SystemDb) -> io::Result<Self> {
-        let mut databases = BTreeMap::new();
-        for entry in std::fs::read_dir(directory)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let text = name.to_string_lossy();
-            let db = text.strip_suffix(".kala");
-            if system == SystemDb::Skip && db == Some("system") {
-                // Decided by name only, before any metadata or content is read.
-                logln!(
-                    "kala serve: skipping system.kala: the system database is never served without account authentication"
-                );
-            } else if entry.file_type()?.is_file()
-                && db.is_some_and(kala_system::valid_database_name)
-            {
-                databases.insert(
-                    db.unwrap_or_default().to_string(),
-                    Database {
-                        path: entry.path(),
-                        cached: Mutex::new(None),
-                        loading: Mutex::new(()),
-                        writer: Mutex::new(None),
-                        reader_opens: AtomicUsize::new(0),
-                        writer_opens: AtomicUsize::new(0),
-                    },
-                );
-            } else {
-                logln!("event=bolt_database_skipped name={:?}", escape(&text));
-            }
-        }
-        if default.as_ref().is_some_and(|d| !databases.contains_key(d)) {
+        let mut registry = Self {
+            directory: directory.to_owned(),
+            system,
+            databases: RwLock::default(),
+            discovery: Mutex::default(),
+            #[cfg(test)]
+            listings: AtomicUsize::new(0),
+            default: None,
+            write_transactions: Arc::default(),
+            acknowledge_recovery: false,
+        };
+        // Startup doesn't consume the first client-triggered rescan.
+        registry.scan(&mut registry.discovery.lock().unwrap_or_else(|e| e.into_inner()))?;
+        let names = registry.snapshot();
+        if default.as_ref().is_some_and(|d| !names.contains_key(d)) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "default database is not a registered world",
             ));
         }
-        // The reserved system world is never an implicit user database.
-        let user_names: Vec<_> = databases.keys().filter(|name| *name != "system").collect();
-        let default = default.or_else(|| (user_names.len() == 1).then(|| user_names[0].clone()));
-        Ok(Self {
-            databases,
-            default,
-            write_transactions: Arc::default(),
-            acknowledge_recovery: false,
-        })
+        let mut users = names.keys().filter(|name| name.as_str() != "system");
+        registry.default = default.or_else(|| {
+            let first = users.next()?;
+            users.next().is_none().then(|| first.clone())
+        });
+        Ok(registry)
+    }
+
+    fn snapshot(&self) -> Arc<DatabaseMap> {
+        Arc::clone(&self.databases.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn known(&self, name: &str) -> Option<Arc<Database>> {
+        self.databases
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned()
+    }
+
+    /// Only the scanner takes the discovery mutex. Directory I/O and building
+    /// the updated map both happen outside the lock used by ordinary lookups.
+    fn scan(&self, discovery: &mut Discovery) -> io::Result<()> {
+        let mut names = self.snapshot();
+        let mut added = 0;
+        #[cfg(test)]
+        self.listings.fetch_add(1, Ordering::Relaxed);
+        for entry in std::fs::read_dir(&self.directory)? {
+            let entry = entry?;
+            let file = entry.file_name();
+            let name = file.to_str().and_then(|file| file.strip_suffix(".kala"));
+            if self.system == SystemDb::Skip && name == Some("system") {
+                // Skip by name, even before reading the file type.
+                if discovery.skipped.insert(file) {
+                    logln!(
+                        "kala serve: skipping system.kala: the system database is never served without account authentication"
+                    );
+                }
+                continue;
+            }
+            if let Some(name) = name.filter(|n| kala_system::valid_database_name(n)) {
+                if names.contains_key(name) {
+                    continue;
+                }
+                if entry.file_type()?.is_file() {
+                    Arc::make_mut(&mut names).insert(
+                        name.to_owned(),
+                        Arc::new(Database {
+                            path: entry.path(),
+                            cached: Mutex::new(None),
+                            loading: Mutex::new(()),
+                            writer: Mutex::new(None),
+                            reader_opens: AtomicUsize::new(0),
+                            writer_opens: AtomicUsize::new(0),
+                        }),
+                    );
+                    added += 1;
+                    continue;
+                }
+            }
+            if discovery.skipped.insert(file.clone()) {
+                logln!(
+                    "event=bolt_database_skipped name={:?}",
+                    escape(&file.to_string_lossy())
+                );
+            }
+        }
+        if added > 0 {
+            *self.databases.write().unwrap_or_else(|e| e.into_inner()) = names;
+            logln!("event=bolt_databases_discovered count={added}");
+        }
+        Ok(())
+    }
+
+    fn rescan(&self) -> Result<(), Failure> {
+        let mut discovery = self.discovery.lock().unwrap_or_else(|e| e.into_inner());
+        if discovery
+            .last_scan
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
+        {
+            return Ok(());
+        }
+        let result = self.scan(&mut discovery);
+        // A directory I/O error consumes the same budget as a successful scan.
+        discovery.last_scan = Some(Instant::now());
+        result.map_err(Failure::store)
+    }
+
+    fn database(&self, name: &str) -> Result<Arc<Database>, Failure> {
+        if let Some(db) = self.known(name) {
+            return Ok(db);
+        }
+        self.rescan()?;
+        self.known(name)
+            .ok_or_else(|| Failure::new(DATABASE, format!("database {name:?} was not found")))
     }
     /// Resolve the name before loading a world, so authorization precedes I/O.
     pub fn name<'a>(&'a self, requested: Option<&'a str>) -> Result<&'a str, Failure> {
@@ -493,21 +587,15 @@ impl Registry {
             .ok_or_else(|| Failure::new(DATABASE, "no default database; specify a database name"))
     }
     /// Registry names only: does not open any world.
-    pub fn names(&self) -> impl Iterator<Item = &str> {
-        self.databases.keys().map(String::as_str)
+    pub fn names(&self) -> Result<DatabaseNames, Failure> {
+        self.rescan()?;
+        Ok(DatabaseNames(self.snapshot()))
     }
     pub fn default_name(&self) -> Option<&str> {
         self.default.as_deref()
     }
     pub fn require(&self, name: &str) -> Result<(), Failure> {
-        if self.databases.contains_key(name) {
-            Ok(())
-        } else {
-            Err(Failure::new(
-                DATABASE,
-                format!("database {name:?} was not found"),
-            ))
-        }
+        self.database(name).map(drop)
     }
     /// The database's reader snapshot slot. A poisoned mutex (a session
     /// thread panicked while it held the slot or a reload) is recovered as
@@ -524,11 +612,8 @@ impl Registry {
     }
     pub fn get(&self, requested: Option<&str>) -> Result<(String, Arc<World>), Failure> {
         let name = self.name(requested)?;
-        let db = self
-            .databases
-            .get(name)
-            .ok_or_else(|| Failure::new(DATABASE, format!("database {name:?} was not found")))?;
-        let lock = || Self::lock_cached(db);
+        let db = self.database(name)?;
+        let lock = || Self::lock_cached(&db);
         // Take the stamp BEFORE loading: a commit after this observation
         // changes the stamp again and forces another refresh, so a snapshot
         // is never labelled with a newer stamp than its own.
@@ -544,7 +629,7 @@ impl Registry {
         let _loading = db.loading.lock().unwrap_or_else(|poisoned| {
             // A reload panicked: whatever it left is not trusted either.
             let lock = poisoned.into_inner();
-            *Self::lock_cached(db) = None;
+            *Self::lock_cached(&db) = None;
             db.loading.clear_poison();
             lock
         });
@@ -583,6 +668,45 @@ mod tests {
     }
 
     #[test]
+    fn discovery_shares_a_listing_window_between_misses_and_database_lists() {
+        let (dir, registry) = registry();
+        let listings = || registry.listings.load(Ordering::Relaxed);
+        assert_eq!(listings(), 1);
+        registry.require("varrow").unwrap();
+        assert_eq!(listings(), 1);
+
+        registry.require("missing").unwrap_err();
+        assert_eq!(listings(), 2);
+
+        // Hold the window open independently of test scheduling.
+        registry.discovery.lock().unwrap().last_scan =
+            Some(Instant::now() + Duration::from_secs(3600));
+        std::fs::copy(dir.path().join("varrow.kala"), dir.path().join("new.kala")).unwrap();
+        for i in 0..64 {
+            assert_eq!(
+                registry.require(&format!("missing_{i}")).unwrap_err().code,
+                DATABASE
+            );
+            registry.names().unwrap();
+        }
+        assert_eq!(registry.require("new").unwrap_err().code, DATABASE);
+        assert_eq!(listings(), 2);
+
+        registry.discovery.lock().unwrap().last_scan = None;
+        registry.require("new").unwrap();
+        assert_eq!(listings(), 3);
+    }
+
+    #[test]
+    fn discovery_never_registers_the_reserved_name_without_accounts() {
+        let (dir, registry) = registry();
+        std::fs::write(dir.path().join("system.kala"), []).unwrap();
+        std::fs::copy(dir.path().join("varrow.kala"), dir.path().join("new.kala")).unwrap();
+        registry.require("new").unwrap();
+        assert_eq!(registry.require("system").unwrap_err().code, DATABASE);
+    }
+
+    #[test]
     fn a_poisoned_writer_mutex_is_recovered_by_reopening_the_writer() {
         let (_dir, registry) = registry();
         let busy = Duration::from_secs(1);
@@ -597,7 +721,7 @@ mod tests {
                 .join()
         });
         assert!(panicked.is_err());
-        assert!(registry.databases["varrow"].writer.is_poisoned());
+        assert!(registry.known("varrow").unwrap().writer.is_poisoned());
         // The handle the panic interrupted is discarded, not trusted; the
         // next write rebuilds one from the log and the database stays
         // writable without a restart.
@@ -616,7 +740,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(registry.opens("varrow").1, 2);
-        assert!(!registry.databases["varrow"].writer.is_poisoned());
+        assert!(!registry.known("varrow").unwrap().writer.is_poisoned());
         registry.write("varrow", busy, tx.0, |_| Ok(())).unwrap();
         assert_eq!(registry.opens("varrow").1, 2);
     }
@@ -626,7 +750,7 @@ mod tests {
         let (_dir, registry) = registry();
         registry.get(Some("varrow")).unwrap();
         assert_eq!(registry.opens("varrow").0, 1);
-        let db = &registry.databases["varrow"];
+        let db = &registry.known("varrow").unwrap();
         // A session thread panics while it holds each of the reader's
         // mutexes (a reload, and the snapshot slot).
         for poison_cached in [false, true] {
@@ -698,7 +822,7 @@ mod tests {
         assert!(registry.cached_at_least("varrow", 0).unwrap().is_none());
         assert_eq!(held.latest_tx().0, loaded);
         drop(held);
-        let original = std::fs::read(&registry.databases["varrow"].path).unwrap();
+        let original = std::fs::read(&registry.known("varrow").unwrap().path).unwrap();
         // Behind the file and unused: the log's tail is applied to it.
         let second = commit("Two");
         assert!(second > first);
@@ -711,7 +835,7 @@ mod tests {
         // A log that is no longer the one the snapshot applied drops it:
         // the write path loads nothing, the next reader replays.
         drop((read, caught_up));
-        std::fs::write(&registry.databases["varrow"].path, &original[..]).unwrap();
+        std::fs::write(&registry.known("varrow").unwrap().path, &original[..]).unwrap();
         assert!(registry.cached_at_least("varrow", 0).unwrap().is_none());
         assert_eq!(registry.opens("varrow").0, 1);
         let (_, reloaded) = registry.get(Some("varrow")).unwrap();
@@ -745,7 +869,7 @@ mod tests {
             })
             .unwrap();
         assert!(committed > loaded);
-        let writer = std::fs::File::open(&registry.databases["varrow"].path).unwrap();
+        let writer = std::fs::File::open(&registry.known("varrow").unwrap().path).unwrap();
         writer.lock().unwrap();
         assert!(registry.cached_at_least("varrow", 0).unwrap().is_none());
         writer.unlock().unwrap();

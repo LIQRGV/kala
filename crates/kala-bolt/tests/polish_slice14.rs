@@ -225,6 +225,41 @@ fn route_keeps_run_failures_for_unknown_and_forbidden_databases() {
     }
 }
 
+#[test]
+fn discovery_keeps_ungranted_worlds_indistinguishable_from_a_missing_world() {
+    let server = account_server();
+    let mut user = alice(&server);
+    let db = "new";
+    let denied = |c: &mut Client| {
+        send_route(c, &[("db", string(db))]);
+        let route = c.failure(FORBIDDEN);
+        c.reset();
+        send_run(c, client::ALLIES, &[("db", string(db))]);
+        let run = c.failure(FORBIDDEN);
+        c.reset();
+        c.send(0x11, vec![map(&[("db", string(db))])]);
+        let begin = c.failure(FORBIDDEN);
+        c.reset();
+        (route, run, begin)
+    };
+    let before = denied(&mut user);
+    let dir = server.dir.path();
+    std::fs::copy(dir.join("varrow.kala"), dir.join("new.kala")).unwrap();
+    assert_eq!(denied(&mut user), before);
+    // An authorized ROUTE alone discovers the file.
+    let mut root = Client::ready(&server);
+    send_route(&mut root, &[("db", string(db))]);
+    c_db(&root.success(), db);
+    assert_eq!(denied(&mut user), before);
+    send_run(
+        &mut user,
+        "SHOW DATABASES YIELD name",
+        &[("db", string("system"))],
+    );
+    user.success();
+    assert_eq!(user.pull(-1).0, vec![vec![string("varrow")]]);
+}
+
 fn c_db(meta: &BTreeMap<String, Value>, db: &str) {
     let Value::Map(rt) = &meta["rt"] else {
         panic!("routing table")
