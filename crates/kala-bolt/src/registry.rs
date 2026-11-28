@@ -135,6 +135,8 @@ const MAX_BROKEN_ENTRIES: usize = 16;
 #[derive(Default)]
 struct Discovery {
     last_scan: Option<Instant>,
+    /// Names in the directory that are not served, each logged once while
+    /// it stays there: only names the last complete listing held.
     skipped: HashSet<OsString>,
 }
 
@@ -558,6 +560,8 @@ impl Registry {
             first_error.get_or_insert(error);
         };
         let mut broken = 0;
+        // The skipped names this listing still holds.
+        let mut present = HashSet::new();
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -575,6 +579,7 @@ impl Registry {
             let name = file.to_str().and_then(|file| file.strip_suffix(".kala"));
             if self.system == SystemDb::Skip && name == Some("system") {
                 // Skip by name, even before reading the file type.
+                present.insert(file.clone());
                 if discovery.skipped.insert(file) {
                     logln!(
                         "kala serve: skipping system.kala: the system database is never served without account authentication"
@@ -615,6 +620,14 @@ impl Registry {
                     escape(&file.to_string_lossy())
                 );
             }
+            present.insert(file);
+        }
+        if first_error.is_none() {
+            // A complete listing: forget the names that are gone, so the
+            // set is never larger than the directory. (One that comes back
+            // is logged again.) An incomplete listing can't tell which
+            // names are gone, and forgets none.
+            discovery.skipped = present;
         }
         if added > 0 {
             // Destroying the old map can free every key. Release the write
@@ -852,6 +865,42 @@ mod tests {
         std::fs::copy(dir.path().join("varrow.kala"), dir.path().join("new.kala")).unwrap();
         registry.discovery.lock().unwrap().last_scan = None;
         registry.require("new").unwrap();
+    }
+
+    #[test]
+    fn skipped_names_are_remembered_only_while_they_stay_in_the_directory() {
+        let (dir, registry) = registry();
+        let scan = || {
+            let mut discovery = registry.discovery.lock().unwrap();
+            registry.scan(&mut discovery).unwrap();
+            let mut skipped: Vec<_> = discovery.skipped.iter().cloned().collect();
+            skipped.sort();
+            skipped
+        };
+        std::fs::write(dir.path().join("stays.txt"), []).unwrap();
+        for i in 0..100 {
+            // A tool's temporary files come and go under ever new names.
+            let temporary = dir.path().join(format!("upload-{i}.tmp"));
+            std::fs::write(&temporary, []).unwrap();
+            assert_eq!(
+                scan(),
+                [
+                    OsString::from("stays.txt"),
+                    temporary.file_name().unwrap().into()
+                ]
+            );
+            std::fs::remove_file(temporary).unwrap();
+        }
+        assert_eq!(scan(), ["stays.txt"]);
+        // A listing that left entries out says nothing about what is gone.
+        let mut discovery = registry.discovery.lock().unwrap();
+        let failed: io::Result<Entry> = Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        registry.register(&mut discovery, [failed].into_iter());
+        assert!(
+            discovery
+                .skipped
+                .contains(std::ffi::OsStr::new("stays.txt"))
+        );
     }
 
     #[test]

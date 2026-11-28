@@ -3,7 +3,7 @@
 A Bolt 5.0–5.4 server with Cypher and Datalog writes and explicit transactions over Kala's Cypher and Datalog front-ends
 and shared query executor. `kala serve DIR` exposes each regular
 `DIR/<name>.kala` file as a database (`[a-z0-9_-]+` names only). Symlinks and
-invalid names are skipped with one diagnostic per name. After startup, an
+invalid names are skipped with one diagnostic per name while the name stays in the directory. After startup, an
 authorized lookup of an unknown database or a `SHOW DATABASES` request rescans
 the directory. Sessions share one rescan per second. A new world is available
 by name on the next eligible scan. A directory entry that can't be read is left for the next scan, and a scan that can't list the directory at all is logged (`event=bolt_discovery_failed`) and answered from the worlds already registered: `SHOW DATABASES` lists them and an unknown name is `DatabaseNotFound`. Readers open immutable snapshots on first
