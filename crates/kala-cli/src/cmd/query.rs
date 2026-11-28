@@ -70,14 +70,15 @@ pub(crate) fn table_at_ticks(
     rs: &ResultSet,
     ticks: &[kala_core::Tick],
 ) -> (Vec<String>, Vec<Vec<JValue>>) {
+    let mut labeler = Labeler::new(world, rs.canon, rs.tick);
     let columns = rs.columns.iter().map(|v| column_name(&v.0)).collect();
     let rows = rs
         .rows
         .iter()
         .enumerate()
         .map(|(i, r)| {
-            let l = Labeler::new(world, rs.canon, ticks.get(i).copied().unwrap_or(rs.tick));
-            r.iter().map(|d| l.datum(d)).collect()
+            labeler.tick = ticks.get(i).copied().unwrap_or(rs.tick);
+            r.iter().map(|d| labeler.datum(d)).collect()
         })
         .collect();
     (columns, rows)

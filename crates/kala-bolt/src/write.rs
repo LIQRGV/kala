@@ -166,7 +166,7 @@ pub(crate) fn parameter_binding_error(failure: Failure, read: bool) -> Failure {
 }
 
 pub(crate) fn parameter_error(mut failure: Failure, bound: bool) -> Failure {
-    if bound && failure.code == CONFLICT {
+    if bound && failure.code == CONFLICT && failure.message != REDUCED {
         failure.message = "another transaction changed data read by this write; nothing was written; run it again".into();
     } else if bound && matches!(failure.code, TYPE | SEMANTIC | CONSTRAINT) {
         failure.message = "parameterized write failed a store rule".into();
