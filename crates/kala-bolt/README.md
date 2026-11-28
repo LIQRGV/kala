@@ -858,8 +858,14 @@ expanded parameter occurrences. Cypher charges estimated memory for expanded
 primitives and their reports.
 Materialized write records are capped at 16 MiB per RUN. Socket messages remain
 bounded by `max_message_bytes` and `max_depth`. RUN decoding checks the
-10,000-row limit and accounts for map containers, field entries and payloads
-before allocating them. The idle clock starts when a
+10,000-row limit and charges what the parameters expand to, before
+allocating it, against a 16 MiB parameter memory budget: every list (plain,
+nested, or a table of map rows) at one decoded value per element, every
+string by its bytes, and map containers and field entries. A list of
+one-byte integers that fits the message limit can exceed it; that RUN is a
+TypeError (`RUN parameters exceed the parameter memory budget`) and the
+connection stays usable. Binding charges list parameters the same way
+against the 16 MiB transaction budget. The idle clock starts when a
 response has been sent and stops when the next request has arrived: a statement
 or COMMIT that takes longer than `--tx-idle-timeout` is not idle and is bounded
 by `--tx-timeout` (or the client's shorter `tx_timeout`) only. A request's

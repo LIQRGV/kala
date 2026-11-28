@@ -117,7 +117,12 @@ impl ParamPolicy {
                         .iter()
                         .find(|(field, _)| field == key)
                         .map_or(&ParamKind::Scalar, |(_, kind)| kind);
-                    row.insert(key.clone(), self.datum(world, kind, input, 0)?);
+                    // `field_bytes` has charged this field's list already.
+                    let mut charged = usize::MAX;
+                    row.insert(
+                        key.clone(),
+                        self.datum(world, kind, input, 0, &mut charged)?,
+                    );
                 }
                 rows.push(row);
             }
@@ -128,7 +133,8 @@ impl ParamPolicy {
         } else {
             kind
         };
-        self.datum(world, kind, value, 0).map(BoundParameter::Value)
+        self.datum(world, kind, value, 0, remaining)
+            .map(BoundParameter::Value)
     }
 
     fn datum<T: ParameterTree>(
@@ -137,6 +143,7 @@ impl ParamPolicy {
         kind: &ParamKind,
         value: Input<'_, T>,
         depth: usize,
+        remaining: &mut usize,
     ) -> Result<Datum, BindError> {
         if depth > 32 {
             return Err(wrong(kind));
@@ -145,9 +152,16 @@ impl ParamPolicy {
         let v = match value {
             Input::Null if collections && self.nulls => return Ok(Datum::Null),
             Input::List(xs) if collections && self.lists => {
+                // Charged before the list is built: each element becomes a
+                // whole `Datum`, however small it was on the wire.
+                *remaining = remaining
+                    .checked_sub(xs.len().saturating_mul(std::mem::size_of::<Datum>()))
+                    .ok_or(BindError::Invalid(
+                        "list parameters exceed the 16 MiB parameter budget",
+                    ))?;
                 return xs
                     .iter()
-                    .map(|x| self.datum(world, kind, x.input(), depth + 1))
+                    .map(|x| self.datum(world, kind, x.input(), depth + 1, remaining))
                     .collect::<Result<_, _>>()
                     .map(Datum::List);
             }
@@ -500,4 +514,47 @@ fn numeric_float(s: &str) -> Option<f64> {
         return None;
     }
     s.parse::<f64>().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kala_core::Schema;
+
+    #[test]
+    fn a_list_parameter_is_charged_per_element_at_every_level() {
+        let world = World::in_memory(Schema::new()).unwrap();
+        let cell = std::mem::size_of::<Datum>();
+        let convert = |json: serde_json::Value, mut remaining: usize| {
+            ParamPolicy::COLLECTIONS
+                .convert(&world, &ParamKind::Scalar, json.input(), &mut remaining)
+                .map(|_| remaining)
+        };
+        let flat = serde_json::json!([1, 2, 3, 4]);
+        assert!(matches!(convert(flat.clone(), 4 * cell), Ok(0)));
+        assert!(matches!(
+            convert(flat, 4 * cell - 1),
+            Err(BindError::Invalid(message)) if message.contains("parameter budget")
+        ));
+        // Two inner lists of two: 2 + 2 * 2 cells.
+        let nested = serde_json::json!([[1, 2], [3, 4]]);
+        assert!(matches!(convert(nested.clone(), 6 * cell), Ok(0)));
+        assert!(convert(nested, 6 * cell - 1).is_err());
+        // A map row's list field is charged once, with its row.
+        let rows = serde_json::json!([{"xs": [1, 2, 3]}]);
+        let mut remaining = MAX_STAGED_BYTES;
+        ParamPolicy::COLLECTIONS
+            .convert(
+                &world,
+                &ParamKind::Unwind(Vec::new()),
+                rows.input(),
+                &mut remaining,
+            )
+            .ok()
+            .unwrap();
+        assert_eq!(
+            MAX_STAGED_BYTES - remaining,
+            std::mem::size_of::<ParameterRow>() + MAP_FIELD_BYTES + "xs".len() + 3 * cell
+        );
+    }
 }

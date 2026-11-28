@@ -1426,3 +1426,32 @@ fn bulk_params_commit_conflict_keeps_its_sentence_with_scalar_parameters() {
     }
     assert_eq!(messages[0], messages[1]);
 }
+
+#[test]
+fn bulk_params_plain_list_parameters_count_against_the_run_parameter_budget() {
+    let server = writable_server();
+    let mut c = Client::ready(&server);
+    let size = "WITH $xs AS xs RETURN size(xs)";
+    let list = |n: usize| map(&[("xs", Value::List(vec![Value::Integer(1); n]))]);
+    // 600,000 one-byte integers fit in a 1 MiB message and decode to well
+    // over the 16 MiB parameter budget.
+    let (code, message) = failure(&mut c, size, list(600_000), map(&[]));
+    assert_eq!(code, "Neo.ClientError.Statement.TypeError", "{message}");
+    assert!(message.contains("parameter memory budget"), "{message}");
+    // Nested lists are charged at every level.
+    let nested = map(&[(
+        "xs",
+        Value::List(vec![Value::List(vec![Value::Integer(1); 60_000]); 10]),
+    )]);
+    let (code, message) = failure(&mut c, size, nested, map(&[]));
+    assert_eq!(code, "Neo.ClientError.Statement.TypeError", "{message}");
+    // The connection survives, and an ordinary bulk list is unaffected.
+    c.run(size, list(100_000), map(&[]));
+    assert_eq!(c.pull(-1).0, vec![vec![Value::Integer(100_000)]]);
+    c.run(
+        "MATCH (n:CHARACTER) WHERE n.name = $s RETURN count(*)",
+        map(&[("s", string(&"x".repeat(900_000)))]),
+        map(&[]),
+    );
+    assert_eq!(c.pull(-1).0, vec![vec![Value::Integer(0)]]);
+}

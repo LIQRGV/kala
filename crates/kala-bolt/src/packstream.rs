@@ -27,7 +27,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 impl Error {
     const ROW_COUNT: Self = Self("map rows exceed the 10000 row limit");
-    const ROW_BYTES: Self = Self("map rows exceed the parameter memory budget");
+    const ROW_BYTES: Self = Self("RUN parameters exceed the parameter memory budget");
     pub(crate) fn parameter_limit(&self) -> bool {
         matches!(*self, Self::ROW_COUNT | Self::ROW_BYTES)
     }
@@ -146,6 +146,15 @@ impl<'a> Decoder<'a> {
         }
         Ok(())
     }
+    /// Charge what a parameter value expands to before it is allocated: a
+    /// one-byte element of a list becomes a whole [`Value`], so a message
+    /// within the size limit can decode to many times its length.
+    fn charge_parameter(&mut self, area: Area, bytes: usize) -> Result<(), Error> {
+        if matches!(area, Area::Parameter | Area::Row) {
+            self.charge_row(bytes)?;
+        }
+        Ok(())
+    }
     fn value(&mut self, depth: usize, area: Area) -> Result<Value, Error> {
         if depth > self.depth {
             return Err(Error("PackStream depth limit exceeded"));
@@ -163,9 +172,7 @@ impl<'a> Decoder<'a> {
             0xcb => Value::Integer(i64::from_be_bytes(self.number()?)),
             0x80..=0x8f | 0xd0..=0xd2 => {
                 let n = self.len(marker)?;
-                if area == Area::Row {
-                    self.charge_row(n)?;
-                }
+                self.charge_parameter(area, n)?;
                 Value::String(
                     std::str::from_utf8(self.take(n)?)
                         .map_err(|_| Error("invalid UTF-8"))?
@@ -176,9 +183,7 @@ impl<'a> Decoder<'a> {
                 // `take` checks `n` against the bytes actually remaining
                 // before anything is copied.
                 let n = self.len(marker)?;
-                if area == Area::Row {
-                    self.charge_row(n)?;
-                }
+                self.charge_parameter(area, n)?;
                 Value::Bytes(self.take(n)?.to_vec())
             }
             0x90..=0x9f | 0xd4..=0xd6 => {
@@ -244,9 +249,9 @@ impl<'a> Decoder<'a> {
         if n > self.bytes.len() {
             return Err(Error("list length exceeds remaining bytes"));
         }
-        if area == Area::Row {
-            self.charge_row(n.saturating_mul(std::mem::size_of::<Value>()))?;
-        }
+        // Every list of a parameter, plain or a table of map rows, at
+        // every nesting level.
+        self.charge_parameter(area, n.saturating_mul(std::mem::size_of::<Value>()))?;
         let mut table = false;
         let mut values = Vec::new();
         for _ in 0..n {
@@ -257,7 +262,6 @@ impl<'a> Decoder<'a> {
                 if n > kala_query::MAX_MAP_ROWS {
                     return Err(Error::ROW_COUNT);
                 }
-                self.charge_row(n.saturating_mul(std::mem::size_of::<Value>()))?;
                 table = true;
             }
             values.push(self.value(depth + 1, area)?);

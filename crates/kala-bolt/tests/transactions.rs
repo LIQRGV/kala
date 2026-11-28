@@ -1842,7 +1842,9 @@ fn server_statements_and_writes_cannot_share_an_explicit_transaction_in_either_o
 fn client_timeout_also_covers_metadata_pipeline_execution() {
     let server = writable_server();
     let mut client = Client::ready(&server);
-    let payload = Value::List(vec![Value::Integer(1); 300_000]);
+    // Heavy, and inside the 16 MiB budget a list parameter is charged
+    // against when it is bound (one `Datum` per element).
+    let payload = Value::List(vec![Value::Integer(1); 200_000]);
     client.send(
         0x10,
         vec![
