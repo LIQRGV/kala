@@ -65,11 +65,6 @@ impl WriteTemplate {
         &self.prototype
     }
 
-    /// Whether the form contains any parameter references.
-    pub fn is_parameterized(&self) -> bool {
-        self.source.is_some()
-    }
-
     /// Names accepted in the RUN parameter map.
     pub fn parameter_names(&self) -> impl Iterator<Item = &str> {
         self.uses.iter().map(|u| u.name.as_str())

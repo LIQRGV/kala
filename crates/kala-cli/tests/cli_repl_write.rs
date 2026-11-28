@@ -429,3 +429,78 @@ fn bulk_params_string_for_an_undeclared_attribute_is_refused_by_transact_and_the
         [kala_core::Value::Ref(edwin)]
     );
 }
+
+#[test]
+fn bulk_params_local_errors_are_the_literal_forms() {
+    let fx = common::varrow();
+    let input = fx.dir.path().join("form");
+    let fails = |text: &str, params: &[&str]| {
+        std::fs::write(&input, text).unwrap();
+        let mut args = vec![input.to_str().unwrap()];
+        for p in params {
+            args.extend(["--param", p]);
+        }
+        fx.fails(1, "transact", &args)
+    };
+    let unknown = fails(
+        "[:retract ?who :alias ?a :at 700]",
+        &["who=gregg", "a=Twin"],
+    );
+    assert!(
+        unknown
+            .trim_end()
+            .ends_with("op 1 (:retract): unknown entity `:gregg`"),
+        "{unknown}"
+    );
+    let setup = fx.dir.path().join("setup");
+    std::fs::write(&setup, "[:assert :wren :alias \"Twin\" :at 900]").unwrap();
+    fx.text("transact", &[setup.to_str().unwrap()]);
+    for (literal, bound, params) in [
+        (
+            "[:retract :gregg :alias \"Twin\" :at 700]",
+            "[:retract ?who :alias ?a :at 700]",
+            &["who=gregg", "a=Twin"][..],
+        ),
+        (
+            "[:retract :wren :alias \"Twin\" :at 900]",
+            "[:retract ?who :alias ?a :at ?t]",
+            &["who=wren", "a=Twin", "t=900"],
+        ),
+        (
+            "[:create :CHARACTER :greg]",
+            "[:create :CHARACTER ?h]",
+            &["h=greg"],
+        ),
+    ] {
+        let plain = fails(literal, &[]);
+        assert_eq!(fails(bound, params), plain, "{bound}");
+        assert!(!plain.contains("parameterized"), "{plain}");
+    }
+    // The same in a write REPL.
+    let session = repl(
+        &fx,
+        ".param who gregg\n.param a Twin\n[:retract ?who :alias ?a :at 700]\n.quit\n",
+        &["--write"],
+    );
+    let shown = format!("{}{}", stdout(&session), stderr(&session));
+    assert!(shown.contains("unknown entity `:gregg`"), "{shown}");
+
+    // The system world's refusal keeps its own sentence.
+    let dir = tempfile::tempdir().unwrap();
+    kala_system::system::ensure(dir.path()).unwrap();
+    let system = dir.path().join("system.kala");
+    std::fs::write(&input, "[:create :USER ?h :if-missing]").unwrap();
+    let o = kala([
+        "transact",
+        system.to_str().unwrap(),
+        input.to_str().unwrap(),
+        "--param",
+        "h=attacker",
+    ]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("managed only by `kala user`"),
+        "{}",
+        stderr(&o)
+    );
+}

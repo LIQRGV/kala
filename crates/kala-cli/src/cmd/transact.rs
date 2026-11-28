@@ -574,13 +574,9 @@ pub(super) fn execute_template(
         kala_lang::write::stage_with(&mut tx, &form, default, WritePolicy::default())
             .and_then(|staged| kala_lang::write::commit(tx, staged))
     };
-    committed(world, outcome).map_err(|e| {
-        if template.is_parameterized() {
-            e.map_message(|_| "parameterized write failed a store rule".into())
-        } else {
-            e
-        }
-    })
+    // Whatever failed is reported as for a literal form: the author typed
+    // the parameter values on this command line.
+    committed(world, outcome)
 }
 
 /// Use the transaction's starting snapshot for input, then project final IDs
@@ -592,6 +588,20 @@ fn execute_cypher(
     lang: super::language::Language,
     given: &[(String, String)],
 ) -> Result<Report, CliError> {
+    execute_cypher_then(world, stmt, mode, lang, given, || ())
+}
+
+/// [`execute_cypher`], running `staged` after the statement is staged and
+/// before it commits (where another process's commit can land: the tests
+/// put one there).
+fn execute_cypher_then(
+    world: &mut World,
+    stmt: &kala_lang::write::WriteStatement,
+    mode: Concurrency,
+    lang: super::language::Language,
+    given: &[(String, String)],
+    staged_hook: impl FnOnce(),
+) -> Result<Report, CliError> {
     use kala_lang::write::{
         Failure, StatementError, compile_statement, run_statement, stage_statement,
     };
@@ -602,6 +612,7 @@ fn execute_cypher(
         tx.set_concurrency(mode);
         let input = run_statement(tx.base_world(), stmt, compiled, &params, Default::default())?;
         let staged = stage_statement(&mut tx, stmt, input, &params)?;
+        staged_hook();
         let result = tx.commit().map_err(|error| {
             let operation = match &error {
                 kala_core::Error::Conflict(c) => staged
@@ -625,14 +636,6 @@ fn execute_cypher(
                 ..
             }),
         ) => return Err(user(e.to_string())),
-        Err(StatementError::Stage(e))
-            if matches!(e.cause, Failure::Store(kala_core::Error::Conflict(_)))
-                && !given.is_empty() =>
-        {
-            return committed(world, Err(e)).map_err(|e| {
-                e.map_message(|_| format!("parameterized write conflict; {CONFLICT_ADVICE}"))
-            });
-        }
         Err(StatementError::Stage(e)) => return committed(world, Err(e)),
         Err(StatementError::Store(e)) => return Err(core_err(e)),
         Err(e) => return Err(user(e.to_string())),
@@ -1081,6 +1084,60 @@ mod tests {
             let report = again.unwrap_or_else(|e| panic!("{mine}: {e:?}"));
             assert!(report.latest_tick_moved.is_none(), "{mine}");
         }
+    }
+
+    /// A Cypher statement with `--param` values conflicts like its literal
+    /// twin: the same sentence (which op read what) and the retry advice.
+    #[test]
+    fn a_cypher_conflict_with_parameters_says_which_op_read_what() {
+        let lang = super::super::language::front_end("cypher").unwrap();
+        let mut messages = Vec::new();
+        for (text, given) in [
+            (
+                "MATCH (n {kala_handle:'greg'}) SET n.located_in = 'carnath' AT TICK 700",
+                vec![],
+            ),
+            (
+                "MATCH (n {kala_handle:$h}) SET n.located_in = $p AT TICK $t",
+                vec![
+                    ("h".to_owned(), "greg".to_owned()),
+                    ("p".to_owned(), "carnath".to_owned()),
+                    ("t".to_owned(), "700".to_owned()),
+                ],
+            ),
+        ] {
+            let (_dir, _path, mut a, mut b) = pair();
+            let kala_lang::Statement::CypherWrite(stmt) =
+                kala_lang::classify(&kala_lang::Cypher, text, &kala_lang::refuse_nothing).unwrap()
+            else {
+                panic!("expected a write statement");
+            };
+            // The other writer commits between this statement's read and
+            // its commit.
+            let other = || {
+                execute(
+                    &mut a,
+                    &parse_write(TO_ASHFORD).unwrap(),
+                    None,
+                    Concurrency::Optimistic,
+                )
+                .ok()
+                .unwrap();
+            };
+            let e =
+                execute_cypher_then(&mut b, &stmt, Concurrency::Optimistic, lang, &given, other)
+                    .err()
+                    .unwrap_or_else(|| panic!("{text}: committed without a conflict"));
+            assert_eq!(exit(&e), code(4), "{text}");
+            messages.push(e.message().to_owned());
+        }
+        assert!(
+            messages[0].starts_with("conflict: op 1 (:set) read :greg :located_in")
+                && messages[0].ends_with("nothing was written; run it again"),
+            "{}",
+            messages[0]
+        );
+        assert_eq!(messages[1], messages[0]);
     }
 
     /// Every kind of invalidated read has its own sentence, in the names
