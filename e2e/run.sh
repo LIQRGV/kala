@@ -3,6 +3,14 @@ set -euo pipefail
 
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo"
+run_go=1
+if ! command -v go >/dev/null; then
+    echo 'SKIPPED: Go driver tests (go not found)' >&2
+    if [[ "${KALA_E2E_REQUIRE_GO:-}" == 1 ]]; then
+        exit 1
+    fi
+    run_go=
+fi
 if [[ ! -x e2e/.venv/bin/python ]]; then
     python3 -m venv e2e/.venv
 fi
@@ -100,8 +108,13 @@ if [[ -n "$tls_skipped" ]]; then
 fi
 export KALA_SERVER_STDOUT="$task_tmp/server.stdout"
 export KALA_SERVER_STDERR="$task_tmp/server.stderr"
+tls_listener=()
+unset KALA_GO_TLS_URI
+if [[ -n "$run_go" && -n "${KALA_TLS_FIXTURES:-}" ]]; then
+    tls_listener=(--listen bolt+s://127.0.0.1:0 --tls.cert "$KALA_TLS_FIXTURES/signed.pem" --tls.key "$KALA_TLS_FIXTURES/signed.key")
+fi
 mkfifo "$task_tmp/ready"
-"$KALA_BINARY" serve "$task_tmp" --listen 127.0.0.1:0 --default-db varrow > "$task_tmp/ready" 2> "$task_tmp/server.stderr" &
+"$KALA_BINARY" serve "$task_tmp" --listen 127.0.0.1:0 "${tls_listener[@]}" --default-db varrow > "$task_tmp/ready" 2> "$task_tmp/server.stderr" &
 server_pid=$!
 exec {ready_fd}<"$task_tmp/ready"
 if ! IFS= read -r -t 20 ready <&"$ready_fd"; then
@@ -114,7 +127,18 @@ if [[ "$ready" != "kala serve: listening on 127.0.0.1:"* ]]; then
 fi
 printf '%s\n' "$ready"
 printf '%s\n' "$ready" > "$KALA_SERVER_STDOUT"
+if (( ${#tls_listener[@]} )); then
+    if ! IFS= read -r -t 20 tls_ready <&"$ready_fd" || [[ "$tls_ready" != "kala serve: listening on bolt+s://127.0.0.1:"* ]]; then
+        echo "missing TLS listener announcement" >&2
+        exit 1
+    fi
+    printf '%s\n' "$tls_ready" >> "$KALA_SERVER_STDOUT"
+    export KALA_GO_TLS_URI="${tls_ready#kala serve: listening on }"
+fi
 cat <&"$ready_fd" >> "$KALA_SERVER_STDOUT" &
 stdout_pid=$!
 export KALA_BOLT_URI="bolt://${ready#kala serve: listening on }"
 e2e/.venv/bin/python e2e/test_python_driver.py "$@"
+if [[ -n "$run_go" ]]; then
+    (cd e2e/go && go test -mod=readonly -count=1 -v ./...)
+fi
