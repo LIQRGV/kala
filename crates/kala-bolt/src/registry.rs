@@ -567,8 +567,7 @@ impl Registry {
     fn scan(&self, discovery: &mut Discovery, startup: bool) -> io::Result<()> {
         #[cfg(test)]
         self.listings.fetch_add(1, Ordering::Relaxed);
-        self.register(discovery, std::fs::read_dir(&self.directory)?, startup);
-        Ok(())
+        self.register(discovery, std::fs::read_dir(&self.directory)?, startup)
     }
 
     /// Registers the worlds among one listing's `entries`.
@@ -577,12 +576,14 @@ impl Registry {
     /// type can't be told) is left out of this pass and looked at again by
     /// the next one; the worlds listed before and after it are registered
     /// all the same. One log line per pass says how many were left out.
+    /// The `startup` listing is the exception: it fails with the first such
+    /// error instead, as it always has.
     fn register<E: Listed>(
         &self,
         discovery: &mut Discovery,
         entries: impl Iterator<Item = io::Result<E>>,
         startup: bool,
-    ) {
+    ) -> io::Result<()> {
         let mut names = self.snapshot();
         let mut added = 0;
         let mut unreadable = 0;
@@ -673,11 +674,19 @@ impl Registry {
             logln!("event=bolt_databases_discovered count={added}");
         }
         if let Some(error) = first_error {
+            if startup {
+                // The server never starts on a list it knows is incomplete:
+                // a world left out would be found later as one "added while
+                // the server ran", and an implicit default could be chosen
+                // from the worlds that happened to be readable.
+                return Err(error);
+            }
             logln!(
                 "event=bolt_discovery_entries_unreadable count={unreadable} first={:?}",
                 escape(&error.to_string())
             );
         }
+        Ok(())
     }
 
     /// Lists the directory again, unless that is not due: it was listed
@@ -722,6 +731,15 @@ impl Registry {
     fn database(&self, name: &str) -> Result<Arc<Database>, Failure> {
         if let Some(db) = self.known(name) {
             return Ok(db);
+        }
+        // No listing can register these, so none is waited for.
+        if !kala_system::valid_database_name(name)
+            || (self.system == SystemDb::Skip && name == "system")
+        {
+            return Err(Failure::new(
+                DATABASE,
+                format!("database {name:?} was not found"),
+            ));
         }
         let arrived = Instant::now();
         // After one wait the window has passed, so the second look lists
@@ -964,7 +982,9 @@ mod tests {
             Ok(Entry(world("after"), Ok(true))),
         ];
         let mut discovery = Discovery::default();
-        registry.register(&mut discovery, entries.into_iter(), false);
+        registry
+            .register(&mut discovery, entries.into_iter(), false)
+            .unwrap();
         let names = DatabaseNames(registry.snapshot());
         assert_eq!(
             names.iter().collect::<Vec<_>>(),
@@ -974,6 +994,44 @@ mod tests {
         // neither registered nor remembered as "not a world", so the next
         // listing looks at it again.
         assert!(discovery.skipped.is_empty());
+    }
+
+    #[test]
+    fn a_startup_listing_fails_on_an_entry_it_cannot_read() {
+        let (dir, registry) = registry();
+        let failed = || io::Error::from(io::ErrorKind::PermissionDenied);
+        let unreadable = || {
+            let entry = Entry(dir.path().join("other.kala"), Err(failed()));
+            [Ok(entry)].into_iter()
+        };
+        // A server must not start with a world missing from its list: the
+        // world would be found later as one "added while the server ran",
+        // and an implicit default could be chosen from an incomplete list.
+        let mut discovery = Discovery::default();
+        let error = registry
+            .register(&mut discovery, unreadable(), true)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let broken = [Err::<Entry, _>(failed())].into_iter();
+        registry.register(&mut discovery, broken, true).unwrap_err();
+        // A listing made for a client still tolerates it.
+        registry
+            .register(&mut discovery, unreadable(), false)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_name_no_world_file_can_have_is_not_found_without_waiting_or_listing() {
+        let (_dir, registry) = registry();
+        // Opens the window: a miss inside it would wait for it to end.
+        registry.require("missing").unwrap_err();
+        let listings = registry.listings.load(Ordering::Relaxed);
+        let asked = Instant::now();
+        for name in ["Not A Name", "", "a.b", "system"] {
+            assert_eq!(registry.require(name).unwrap_err().code, DATABASE);
+        }
+        assert!(asked.elapsed() < WINDOW / 2, "{:?}", asked.elapsed());
+        assert_eq!(registry.listings.load(Ordering::Relaxed), listings);
     }
 
     #[cfg(unix)]
@@ -1148,7 +1206,9 @@ mod tests {
         // A listing that left entries out says nothing about what is gone.
         let mut discovery = registry.discovery.lock().unwrap();
         let failed: io::Result<Entry> = Err(io::Error::from(io::ErrorKind::PermissionDenied));
-        registry.register(&mut discovery, [failed].into_iter(), false);
+        registry
+            .register(&mut discovery, [failed].into_iter(), false)
+            .unwrap();
         assert!(
             discovery
                 .skipped
