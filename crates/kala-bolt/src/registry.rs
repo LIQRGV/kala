@@ -107,6 +107,31 @@ impl DatabaseNames {
     }
 }
 
+/// One directory entry as a scan sees it. A seam: tests list entries whose
+/// reads fail, which a real directory does only under I/O errors.
+trait Listed {
+    fn file_name(&self) -> OsString;
+    fn path(&self) -> PathBuf;
+    /// Whether it is a regular file (a symlink is not: it is never followed).
+    fn is_file(&self) -> io::Result<bool>;
+}
+
+impl Listed for std::fs::DirEntry {
+    fn file_name(&self) -> OsString {
+        self.file_name()
+    }
+    fn path(&self) -> PathBuf {
+        self.path()
+    }
+    fn is_file(&self) -> io::Result<bool> {
+        Ok(self.file_type()?.is_file())
+    }
+}
+
+/// After this many entries the listing itself failed at, a pass stops
+/// asking it for more (an iterator that failed forever would never end).
+const MAX_BROKEN_ENTRIES: usize = 16;
+
 #[derive(Default)]
 struct Discovery {
     last_scan: Option<Instant>,
@@ -507,12 +532,45 @@ impl Registry {
     /// Only the scanner takes the discovery mutex. Directory I/O and building
     /// the updated map both happen outside the lock used by ordinary lookups.
     fn scan(&self, discovery: &mut Discovery) -> io::Result<()> {
-        let mut names = self.snapshot();
-        let mut added = 0;
         #[cfg(test)]
         self.listings.fetch_add(1, Ordering::Relaxed);
-        for entry in std::fs::read_dir(&self.directory)? {
-            let entry = entry?;
+        self.register(discovery, std::fs::read_dir(&self.directory)?);
+        Ok(())
+    }
+
+    /// Registers the worlds among one listing's `entries`.
+    ///
+    /// An entry that can't be read (the listing fails at it, or its file
+    /// type can't be told) is left out of this pass and looked at again by
+    /// the next one; the worlds listed before and after it are registered
+    /// all the same. One log line per pass says how many were left out.
+    fn register<E: Listed>(
+        &self,
+        discovery: &mut Discovery,
+        entries: impl Iterator<Item = io::Result<E>>,
+    ) {
+        let mut names = self.snapshot();
+        let mut added = 0;
+        let mut unreadable = 0;
+        let mut first_error = None;
+        let mut failed = |error: io::Error| {
+            unreadable += 1;
+            first_error.get_or_insert(error);
+        };
+        let mut broken = 0;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    failed(error);
+                    // A listing that keeps failing has nothing more to give.
+                    broken += 1;
+                    if broken == MAX_BROKEN_ENTRIES {
+                        break;
+                    }
+                    continue;
+                }
+            };
             let file = entry.file_name();
             let name = file.to_str().and_then(|file| file.strip_suffix(".kala"));
             if self.system == SystemDb::Skip && name == Some("system") {
@@ -528,7 +586,14 @@ impl Registry {
                 if names.contains_key(name) {
                     continue;
                 }
-                if entry.file_type()?.is_file() {
+                let is_file = match entry.is_file() {
+                    Ok(is_file) => is_file,
+                    Err(error) => {
+                        failed(error);
+                        continue;
+                    }
+                };
+                if is_file {
                     Arc::make_mut(&mut names).insert(
                         name.to_owned(),
                         Arc::new(Database {
@@ -560,28 +625,41 @@ impl Registry {
             );
             logln!("event=bolt_databases_discovered count={added}");
         }
-        Ok(())
+        if let Some(error) = first_error {
+            logln!(
+                "event=bolt_discovery_entries_unreadable count={unreadable} first={:?}",
+                escape(&error.to_string())
+            );
+        }
     }
 
-    fn rescan(&self) -> Result<(), Failure> {
+    /// Lists the directory again unless it was listed within the last
+    /// second. A listing that fails (the directory can't be read just now)
+    /// is logged and changes nothing: the worlds already registered are in
+    /// memory and keep being served, and callers answer from them.
+    fn rescan(&self) {
         let mut discovery = self.discovery.lock().unwrap_or_else(|e| e.into_inner());
         if discovery
             .last_scan
             .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
         {
-            return Ok(());
+            return;
         }
-        let result = self.scan(&mut discovery);
+        if let Err(error) = self.scan(&mut discovery) {
+            logln!(
+                "event=bolt_discovery_failed detail={:?}",
+                escape(&error.to_string())
+            );
+        }
         // A directory I/O error consumes the same budget as a successful scan.
         discovery.last_scan = Some(Instant::now());
-        result.map_err(Failure::store)
     }
 
     fn database(&self, name: &str) -> Result<Arc<Database>, Failure> {
         if let Some(db) = self.known(name) {
             return Ok(db);
         }
-        self.rescan()?;
+        self.rescan();
         self.known(name)
             .ok_or_else(|| Failure::new(DATABASE, format!("database {name:?} was not found")))
     }
@@ -591,10 +669,11 @@ impl Registry {
             .or(self.default.as_deref())
             .ok_or_else(|| Failure::new(DATABASE, "no default database; specify a database name"))
     }
-    /// Registry names only: does not open any world.
-    pub fn names(&self) -> Result<DatabaseNames, Failure> {
-        self.rescan()?;
-        Ok(DatabaseNames(self.snapshot()))
+    /// Registry names only: does not open any world. If the directory
+    /// can't be listed, these are the worlds registered so far.
+    pub fn names(&self) -> DatabaseNames {
+        self.rescan();
+        DatabaseNames(self.snapshot())
     }
     pub fn default_name(&self) -> Option<&str> {
         self.default.as_deref()
@@ -692,7 +771,7 @@ mod tests {
                 registry.require(&format!("missing_{i}")).unwrap_err().code,
                 DATABASE
             );
-            registry.names().unwrap();
+            registry.names();
         }
         assert_eq!(registry.require("new").unwrap_err().code, DATABASE);
         assert_eq!(listings(), 2);
@@ -700,6 +779,79 @@ mod tests {
         registry.discovery.lock().unwrap().last_scan = None;
         registry.require("new").unwrap();
         assert_eq!(listings(), 3);
+    }
+
+    /// A listed entry for [`Registry::register`]: `kind` is what reading
+    /// its file type gives.
+    struct Entry(PathBuf, io::Result<bool>);
+
+    impl Listed for Entry {
+        fn file_name(&self) -> OsString {
+            self.0.file_name().unwrap().to_owned()
+        }
+        fn path(&self) -> PathBuf {
+            self.0.clone()
+        }
+        fn is_file(&self) -> io::Result<bool> {
+            match &self.1 {
+                Ok(is_file) => Ok(*is_file),
+                Err(error) => Err(io::Error::from(error.kind())),
+            }
+        }
+    }
+
+    #[test]
+    fn a_listing_registers_every_world_around_entries_that_cannot_be_read() {
+        let (dir, registry) = registry();
+        let world = |name: &str| {
+            let path = dir.path().join(format!("{name}.kala"));
+            std::fs::copy(dir.path().join("varrow.kala"), &path).unwrap();
+            path
+        };
+        let failed = || io::Error::from(io::ErrorKind::PermissionDenied);
+        let entries = vec![
+            Ok(Entry(world("before"), Ok(true))),
+            Err(failed()),
+            Ok(Entry(world("unreadable"), Err(failed()))),
+            Ok(Entry(world("after"), Ok(true))),
+        ];
+        let mut discovery = Discovery::default();
+        registry.register(&mut discovery, entries.into_iter());
+        let names = DatabaseNames(registry.snapshot());
+        assert_eq!(
+            names.iter().collect::<Vec<_>>(),
+            ["after", "before", "varrow"]
+        );
+        // The entry whose type could not be read was not judged: it is
+        // neither registered nor remembered as "not a world", so the next
+        // listing looks at it again.
+        assert!(discovery.skipped.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_cannot_be_listed_is_answered_from_the_known_worlds() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, registry) = registry();
+        let mode = |mode| {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        mode(0o000);
+        let listable = std::fs::read_dir(dir.path()).is_ok();
+        let names: Vec<_> = registry.names().iter().map(str::to_owned).collect();
+        registry.discovery.lock().unwrap().last_scan = None;
+        let missing = registry.require("missing").map_err(|failure| failure.code);
+        mode(0o700);
+        if listable {
+            // Running as root: nothing can be made unreadable this way.
+            return;
+        }
+        assert_eq!(names, ["varrow"]);
+        assert_eq!(missing, Err(DATABASE));
+        // The next listing works again.
+        std::fs::copy(dir.path().join("varrow.kala"), dir.path().join("new.kala")).unwrap();
+        registry.discovery.lock().unwrap().last_scan = None;
+        registry.require("new").unwrap();
     }
 
     #[test]

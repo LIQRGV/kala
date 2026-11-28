@@ -6,7 +6,7 @@ and shared query executor. `kala serve DIR` exposes each regular
 invalid names are skipped with one diagnostic per name. After startup, an
 authorized lookup of an unknown database or a `SHOW DATABASES` request rescans
 the directory. Sessions share one rescan per second. A new world is available
-by name on the next eligible scan. Readers open immutable snapshots on first
+by name on the next eligible scan. A directory entry that can't be read is left for the next scan, and a scan that can't list the directory at all is logged (`event=bolt_discovery_failed`) and answered from the worlds already registered: `SHOW DATABASES` lists them and an unknown name is `DatabaseNotFound`. Readers open immutable snapshots on first
 RUN and retry a failed open on the next request. Removing a file leaves its
 name registered until restart. File stamps (length, modification time, file identity and commit tail) trigger a reload of
 committed transactions; each result pins one snapshot. A damaged tail is never acknowledged or cut by this server unless it was started with `--acknowledge-recovery` (see "Damaged tails"); otherwise an operator must acknowledge recovery through the CLI. The served directory and its files
