@@ -93,3 +93,35 @@ fn simultaneous_sessions_can_read_the_same_new_world() {
         }
     });
 }
+
+#[test]
+fn a_world_still_being_copied_in_is_refused_with_a_retryable_error_and_not_touched() {
+    let server = Running::start();
+    let mut c = Client::ready(&server);
+    let dir = server.dir.path();
+    let complete = std::fs::read(dir.join("varrow.kala")).unwrap();
+    let file = dir.join("copying.kala");
+    // `cp` got as far as the middle of the last transaction.
+    std::fs::write(&file, &complete[..complete.len() - 7]).unwrap();
+    for _ in 0..2 {
+        c.send(0x10, vec![string(ALLIES), map(&[]), on("copying")]);
+        let failure = c.failure("Neo.TransientError.Transaction.LockAcquisitionTimeout");
+        assert_eq!(
+            failure["message"],
+            string(
+                "world copying was added while the server ran and its last transaction is incomplete; if it is still being copied, retry when the copy is done; otherwise restart the server or repair it with the CLI"
+            )
+        );
+        c.reset();
+    }
+    assert_eq!(std::fs::read(&file).unwrap().len(), complete.len() - 7);
+    assert_eq!(std::fs::read_dir(dir).unwrap().count(), 2);
+    // It is listed all the while: the file is there.
+    assert_eq!(
+        c.query("SHOW DATABASE copying YIELD name"),
+        vec![vec![string("copying")]]
+    );
+    std::fs::write(&file, &complete).unwrap();
+    c.run(ALLIES, map(&[]), on("copying"));
+    assert_eq!(c.pull(-1).0.len(), 2);
+}

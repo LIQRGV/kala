@@ -8,7 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, RwLock,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 struct Database {
@@ -24,6 +24,17 @@ struct Database {
     /// tests pin how many a sequence of requests may cost.
     reader_opens: AtomicUsize,
     writer_opens: AtomicUsize,
+    /// Whether this file is known to be a whole world: it was there when
+    /// the server started, or one open of it since found no torn or damaged
+    /// tail. A world that appears while the server runs may still be being
+    /// copied into the directory, and a copy in progress looks exactly like
+    /// a torn tail: until it is verified, such a tail refuses the world
+    /// (see [`Registry::incomplete`]) and nothing ever cuts it.
+    verified: AtomicBool,
+    /// The file as it was when an unverified world's tail was last found
+    /// incomplete: while the file stays like that, requests are refused
+    /// without replaying it again.
+    incomplete: Mutex<Option<Stamp>>,
 }
 
 /// What a cached snapshot was loaded from. The length alone is not enough:
@@ -361,6 +372,13 @@ impl Registry {
         }
         let path = &db.path;
         stamp(path)?;
+        if !db.verified.load(Ordering::Acquire) {
+            // A writable open cuts a torn tail, and the "torn tail" of a
+            // world added while the server ran may be a copy in progress.
+            // Look first, without writing: the one extra replay such a
+            // world costs, and it leaves the reader snapshot behind.
+            self.load(name, db)?;
+        }
         db.writer_opens.fetch_add(1, Ordering::Relaxed);
         let mut world =
             World::open_waiting(path, busy).map_err(|e| crate::write::store_error(e, true))?;
@@ -509,7 +527,10 @@ impl Registry {
             acknowledge_recovery: false,
         };
         // Startup doesn't consume the first client-triggered rescan.
-        registry.scan(&mut registry.discovery.lock().unwrap_or_else(|e| e.into_inner()))?;
+        registry.scan(
+            &mut registry.discovery.lock().unwrap_or_else(|e| e.into_inner()),
+            true,
+        )?;
         let names = registry.snapshot();
         if default.as_ref().is_some_and(|d| !names.contains_key(d)) {
             return Err(io::Error::new(
@@ -539,10 +560,14 @@ impl Registry {
 
     /// Only the scanner takes the discovery mutex. Directory I/O and building
     /// the updated map both happen outside the lock used by ordinary lookups.
-    fn scan(&self, discovery: &mut Discovery) -> io::Result<()> {
+    ///
+    /// `startup`: the worlds found are the ones the server starts with,
+    /// trusted to be whole files. Any found later are unverified at first
+    /// (see [`Database::verified`]).
+    fn scan(&self, discovery: &mut Discovery, startup: bool) -> io::Result<()> {
         #[cfg(test)]
         self.listings.fetch_add(1, Ordering::Relaxed);
-        self.register(discovery, std::fs::read_dir(&self.directory)?);
+        self.register(discovery, std::fs::read_dir(&self.directory)?, startup);
         Ok(())
     }
 
@@ -556,6 +581,7 @@ impl Registry {
         &self,
         discovery: &mut Discovery,
         entries: impl Iterator<Item = io::Result<E>>,
+        startup: bool,
     ) {
         let mut names = self.snapshot();
         let mut added = 0;
@@ -614,6 +640,8 @@ impl Registry {
                             writer: Mutex::new(None),
                             reader_opens: AtomicUsize::new(0),
                             writer_opens: AtomicUsize::new(0),
+                            verified: AtomicBool::new(startup),
+                            incomplete: Mutex::new(None),
                         }),
                     );
                     added += 1;
@@ -672,7 +700,7 @@ impl Registry {
             }
         }
         let started = Instant::now();
-        if let Err(error) = self.scan(&mut discovery) {
+        if let Err(error) = self.scan(&mut discovery, false) {
             logln!(
                 "event=bolt_discovery_failed detail={:?}",
                 escape(&error.to_string())
@@ -749,7 +777,32 @@ impl Registry {
     pub fn get(&self, requested: Option<&str>) -> Result<(String, Arc<World>), Failure> {
         let name = self.name(requested)?;
         let db = self.database(name)?;
-        let lock = || Self::lock_cached(&db);
+        Ok((name.into(), self.load(name, &db)?))
+    }
+
+    /// The refusal of a world added while the server ran whose tail is
+    /// incomplete (see [`Database::verified`]). The code is one drivers
+    /// retry: if the file is still being copied, a managed transaction
+    /// succeeds once the copy is done.
+    fn incomplete(name: &str) -> Failure {
+        Failure::new(
+            crate::write::LOCK,
+            format!(
+                "world {name} was added while the server ran and its last transaction is incomplete; if it is still being copied, retry when the copy is done; otherwise restart the server or repair it with the CLI"
+            ),
+        )
+    }
+
+    /// The current reader snapshot of `db`, replayed from the file if the
+    /// cached one is not of the file as it is now.
+    ///
+    /// This is also where a world added while the server ran is verified:
+    /// the read-only open cuts nothing and reports what a writer would
+    /// cut. If that is anything, the world is refused; if nothing, it is
+    /// verified for good and the snapshot serves readers as usual, so
+    /// verification by itself never costs a reader a replay.
+    fn load(&self, name: &str, db: &Database) -> Result<Arc<World>, Failure> {
+        let lock = || Self::lock_cached(db);
         // Take the stamp BEFORE loading: a commit after this observation
         // changes the stamp again and forces another refresh, so a snapshot
         // is never labelled with a newer stamp than its own.
@@ -757,7 +810,7 @@ impl Registry {
         if let Some((s, world)) = lock().as_ref()
             && *s == stamp
         {
-            return Ok((name.into(), Arc::clone(world)));
+            return Ok(Arc::clone(world));
         }
         // Single-flight: one thread replays, the others wait for it and then
         // find the fresh snapshot. Queries whose stamp matches (above) never
@@ -765,7 +818,7 @@ impl Registry {
         let _loading = db.loading.lock().unwrap_or_else(|poisoned| {
             // A reload panicked: whatever it left is not trusted either.
             let lock = poisoned.into_inner();
-            *Self::lock_cached(&db) = None;
+            *Self::lock_cached(db) = None;
             db.loading.clear_poison();
             lock
         });
@@ -773,7 +826,13 @@ impl Registry {
         if let Some((s, world)) = lock().as_ref()
             && *s == stamp
         {
-            return Ok((name.into(), Arc::clone(world)));
+            return Ok(Arc::clone(world));
+        }
+        let verified = db.verified.load(Ordering::Acquire);
+        let seen_incomplete = || db.incomplete.lock().unwrap_or_else(|e| e.into_inner());
+        if !verified && seen_incomplete().as_ref() == Some(&stamp) {
+            // Nothing was written to the file since the last look.
+            return Err(Self::incomplete(name));
         }
         db.reader_opens.fetch_add(1, Ordering::Relaxed);
         let world = Arc::new(World::open_read_only(&db.path).map_err(Failure::store)?);
@@ -782,12 +841,25 @@ impl Registry {
         if crate::system::is_system(&world) != (name == "system") {
             return Err(Failure::store("reserved system database marker mismatch"));
         }
+        if !verified {
+            let recovery = world.recovery();
+            if let Some(cause) = recovery.cause {
+                logln!(
+                    "event=bolt_database_incomplete db={name} cause={cause:?} bytes={}",
+                    recovery.bytes_cut
+                );
+                *seen_incomplete() = Some(stamp);
+                return Err(Self::incomplete(name));
+            }
+            *seen_incomplete() = None;
+            db.verified.store(true, Ordering::Release);
+        }
         logln!(
             "event=bolt_database_loaded db={name} canon={}",
             world.latest_tx().0
         );
         *lock() = Some((stamp, Arc::clone(&world)));
-        Ok((name.into(), world))
+        Ok(world)
     }
 }
 
@@ -892,7 +964,7 @@ mod tests {
             Ok(Entry(world("after"), Ok(true))),
         ];
         let mut discovery = Discovery::default();
-        registry.register(&mut discovery, entries.into_iter());
+        registry.register(&mut discovery, entries.into_iter(), false);
         let names = DatabaseNames(registry.snapshot());
         assert_eq!(
             names.iter().collect::<Vec<_>>(),
@@ -930,12 +1002,130 @@ mod tests {
         registry.require("new").unwrap();
     }
 
+    /// The directory's file names and the bytes of `world`: what a refused
+    /// request must leave exactly as it was (no cut, no quarantine file).
+    fn on_disk(dir: &Path, world: &str) -> (Vec<OsString>, Vec<u8>) {
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        files.sort();
+        (files, std::fs::read(dir.join(world)).unwrap())
+    }
+
+    fn commit_alias(registry: &Registry, db: &str, alias: &str) -> Result<u64, Failure> {
+        registry.write(db, Duration::from_secs(1), 0, |world| {
+            let greg = world.entity_by_handle("greg").unwrap();
+            let mut tx = world.begin();
+            tx.assert(
+                greg,
+                "alias",
+                kala_core::Value::Str(alias.into()),
+                Some(kala_core::Tick(300)),
+            )
+            .unwrap();
+            Ok(tx.commit().unwrap().tx.0)
+        })
+    }
+
+    #[test]
+    fn a_world_still_being_copied_in_is_refused_and_left_untouched() {
+        let (dir, registry) = registry();
+        let complete = std::fs::read(dir.path().join("varrow.kala")).unwrap();
+        let committed = registry.get(Some("varrow")).unwrap().1.latest_tx().0;
+        let path = dir.path().join("new.kala");
+        let busy = Duration::from_secs(1);
+        let refused = |result: Result<(), Failure>| {
+            let failure = result.unwrap_err();
+            assert_eq!(failure.code, crate::write::LOCK);
+            assert_eq!(
+                failure.message,
+                "world new was added while the server ran and its last transaction is incomplete; if it is still being copied, retry when the copy is done; otherwise restart the server or repair it with the CLI"
+            );
+            assert!(!failure.handle_lost);
+        };
+        // `cp` has written all but the end of the last transaction (a torn
+        // tail), then all of it with one byte still wrong (a damaged one).
+        let mut damaged = complete.clone();
+        *damaged.iter_mut().nth_back(40).unwrap() ^= 0xff;
+        for (copied, replays) in [(&complete[..complete.len() - 7], 1), (&damaged[..], 2)] {
+            std::fs::write(&path, copied).unwrap();
+            let before = on_disk(dir.path(), "new.kala");
+            refused(registry.get(Some("new")).map(drop));
+            refused(commit_alias(&registry, "new", "Cut").map(drop));
+            refused(registry.open_writer("new", busy).map(drop));
+            refused(registry.at_least("new", 0, busy).map(drop));
+            assert_eq!(on_disk(dir.path(), "new.kala"), before);
+            // One look per state of the file, not one replay per request.
+            assert_eq!(registry.opens("new"), (replays, 0));
+        }
+        // The copy is done: the world is served, and stays served.
+        std::fs::write(&path, &complete).unwrap();
+        assert_eq!(
+            registry.get(Some("new")).unwrap().1.latest_tx().0,
+            committed
+        );
+        assert_eq!(
+            commit_alias(&registry, "new", "Kept").unwrap(),
+            committed + 1
+        );
+        assert_eq!(registry.opens("new"), (3, 1));
+        // From here on it is an ordinary world: a tail torn later (a writer
+        // that crashed) is cut by the next commit, as for any other.
+        let mut torn = std::fs::read(&path).unwrap();
+        torn.extend_from_slice(&complete[complete.len() - 30..complete.len() - 7]);
+        std::fs::write(&path, &torn).unwrap();
+        registry.get(Some("new")).unwrap();
+        assert_eq!(
+            commit_alias(&registry, "new", "After").unwrap(),
+            committed + 2
+        );
+    }
+
+    #[test]
+    fn a_complete_world_added_at_runtime_costs_a_write_one_extra_replay() {
+        let (dir, registry) = registry();
+        std::fs::copy(dir.path().join("varrow.kala"), dir.path().join("new.kala")).unwrap();
+        commit_alias(&registry, "new", "One").unwrap();
+        // The look that found its tail complete, and the writable handle.
+        assert_eq!(registry.opens("new"), (1, 1));
+        commit_alias(&registry, "new", "Two").unwrap();
+        registry.open_writer("new", Duration::from_secs(1)).unwrap();
+        assert_eq!(registry.opens("new"), (1, 2));
+    }
+
+    #[test]
+    fn a_world_found_at_startup_with_a_torn_tail_is_served_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("varrow.kala");
+        let fixture = include_str!("../../kala-core/tests/fixtures/varrow.yaml");
+        drop(kala_fixture::load_fixture_to(fixture, &path).unwrap());
+        let complete = std::fs::read(&path).unwrap();
+        let mut torn = complete.clone();
+        torn.extend_from_slice(&complete[complete.len() - 30..complete.len() - 7]);
+        std::fs::write(&path, &torn).unwrap();
+        let registry = Registry::open(dir.path(), None, SystemDb::Skip).unwrap();
+        let committed = registry.get(Some("varrow")).unwrap().1.latest_tx().0;
+        // A write never costs a startup world a look first.
+        assert_eq!(
+            commit_alias(&registry, "varrow", "One").unwrap(),
+            committed + 1
+        );
+        assert_eq!(registry.opens("varrow"), (1, 1));
+        assert!(std::fs::read(&path).unwrap().starts_with(&complete));
+        assert_eq!(
+            on_disk(dir.path(), "varrow.kala").0.len(),
+            2,
+            "a quarantine file"
+        );
+    }
+
     #[test]
     fn skipped_names_are_remembered_only_while_they_stay_in_the_directory() {
         let (dir, registry) = registry();
         let scan = || {
             let mut discovery = registry.discovery.lock().unwrap();
-            registry.scan(&mut discovery).unwrap();
+            registry.scan(&mut discovery, false).unwrap();
             let mut skipped: Vec<_> = discovery.skipped.iter().cloned().collect();
             skipped.sort();
             skipped
@@ -958,7 +1148,7 @@ mod tests {
         // A listing that left entries out says nothing about what is gone.
         let mut discovery = registry.discovery.lock().unwrap();
         let failed: io::Result<Entry> = Err(io::Error::from(io::ErrorKind::PermissionDenied));
-        registry.register(&mut discovery, [failed].into_iter());
+        registry.register(&mut discovery, [failed].into_iter(), false);
         assert!(
             discovery
                 .skipped

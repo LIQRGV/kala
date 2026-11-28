@@ -608,3 +608,9 @@ executable write, retry, bookmark and rollback examples, and the
 [Bolt README](crates/kala-bolt/README.md#writing-and-transactions) for permissions
 and result fields. This Python example is covered by the driver suite rather
 than the Rust `guide.rs` CLI tests.
+
+A running server finds new worlds in its directory by itself. Create them
+there with `kala create` or `kala load`, or move (`mv`) a finished file in;
+never `cp` a world into a served directory. A half-copied file looks like a
+world with an incomplete last transaction, and the server refuses it until the
+copy is done.
