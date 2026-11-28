@@ -1156,3 +1156,124 @@ fn bulk_params_binding_error_names_the_parameter_and_kind_never_the_value() {
         assert!(!message.contains("client_only_marker"), "{text}: {message}");
     }
 }
+
+#[test]
+fn bulk_params_datalog_parameter_types_follow_declarations_staged_or_committed_just_before() {
+    let server = writable_server();
+    let mut c = Client::ready(&server);
+    let params = || {
+        map(&[
+            ("e", string("greg")),
+            ("w", Value::Integer(80)),
+            ("to", string("edwin")),
+        ])
+    };
+    // An explicit transaction: the declaration is only staged when the
+    // parameterized form is bound.
+    begin(&mut c);
+    c.run(
+        "// kala:datalog\n[:attribute :weight :f64]",
+        map(&[]),
+        map(&[]),
+    );
+    c.pull(-1);
+    c.run(
+        "// kala:datalog\n[:attribute :mentor_of :ref]",
+        map(&[]),
+        map(&[]),
+    );
+    c.pull(-1);
+    c.run(
+        "// kala:datalog\n[[:assert ?e :weight ?w :at 5] [:assert ?e :mentor_of ?to :at 5]]",
+        params(),
+        map(&[]),
+    );
+    c.pull(-1);
+    commit(&mut c);
+    // One auto-commit RUN: each form is its own transaction, bound after
+    // the forms before it committed.
+    c.run(
+        "// kala:datalog\n[:attribute :weight3 :f64] [:attribute :pupil_of :ref] [[:assert ?e :weight3 ?w :at 5] [:assert ?to :pupil_of ?e :at 5]]",
+        params(),
+        map(&[]),
+    );
+    c.pull(-1);
+    let w = world(&server);
+    let greg = w.entity_by_handle("greg").unwrap();
+    let edwin = w.entity_by_handle("edwin").unwrap();
+    for attr in ["weight", "weight3"] {
+        assert_eq!(
+            w.as_of(greg, attr, Tick(5)).unwrap(),
+            [kala_core::Value::f64(80.0).unwrap()],
+            "{attr}"
+        );
+    }
+    assert_eq!(
+        w.as_of(greg, "mentor_of", Tick(5)).unwrap(),
+        [kala_core::Value::Ref(edwin)]
+    );
+    assert_eq!(
+        w.as_of(edwin, "pupil_of", Tick(5)).unwrap(),
+        [kala_core::Value::Ref(greg)]
+    );
+}
+
+#[test]
+fn bulk_params_string_parameter_for_an_undeclared_attribute_is_refused() {
+    let server = writable_server();
+    let mut c = Client::ready(&server);
+    let before = world(&server).latest_tx();
+    let pair = || map(&[("a", string("greg")), ("b", string("edwin"))]);
+    for explicit in [false, true] {
+        if explicit {
+            begin(&mut c);
+        }
+        let (code, message) = failure(
+            &mut c,
+            "// kala:datalog\n[:assert ?a :friend_of ?b :at 700]",
+            pair(),
+            map(&[]),
+        );
+        assert_eq!(code, "Neo.ClientError.Statement.TypeError", "{message}");
+        for part in [
+            ":friend_of",
+            "[:attribute :friend_of :ref]",
+            ":string",
+            "?b",
+        ] {
+            assert!(message.contains(part), "missing {part}: {message}");
+        }
+        assert!(!message.contains("edwin"), "{message}");
+        let w = world(&server);
+        assert_eq!(w.latest_tx(), before);
+        assert!(w.attribute("friend_of").is_none());
+    }
+    // Declared first, the same form interns an edge, as the literal form does.
+    c.query("// kala:datalog\n[:attribute :friend_of :ref]");
+    c.run(
+        "// kala:datalog\n[:assert ?a :friend_of ?b :at 700]",
+        pair(),
+        map(&[]),
+    );
+    c.pull(-1);
+    let w = world(&server);
+    let (greg, edwin) = (
+        w.entity_by_handle("greg").unwrap(),
+        w.entity_by_handle("edwin").unwrap(),
+    );
+    assert_eq!(
+        w.as_of(greg, "friend_of", Tick(700)).unwrap(),
+        [kala_core::Value::Ref(edwin)]
+    );
+    // A number still declares the attribute by inference, as a literal would.
+    c.run(
+        "// kala:datalog\n[:assert ?a :shoe_size ?n :at 700]",
+        map(&[("a", string("greg")), ("n", Value::Integer(43))]),
+        map(&[]),
+    );
+    c.pull(-1);
+    assert_eq!(
+        world(&server).attribute("shoe_size").unwrap().value_type,
+        kala_core::ValueType::I64
+    );
+}

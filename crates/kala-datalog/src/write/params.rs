@@ -169,17 +169,29 @@ impl WriteTemplate {
                     kinds: &self.parameter_kinds(world, params)?,
                     params,
                     remaining,
+                    world,
+                    defined: BTreeSet::new(),
                 },
             ),
         }
     }
 }
 
+/// The value type of attribute (or inverse) `name` as `world` defines it.
+/// Given a transaction's own view (`Txn::base_world`), that includes what
+/// the transaction has staged so far.
+fn attribute_type(world: &World, name: &str) -> Option<ValueType> {
+    world.attribute(name).map(|def| def.value_type).or_else(|| {
+        world
+            .at_canon(world.latest_tx())
+            .resolve_attribute(name)
+            .ok()
+            .map(|(def, _)| def.value_type)
+    })
+}
+
 fn attribute_kind(world: &World, name: &str) -> ParamKind {
-    world
-        .at_canon(world.latest_tx())
-        .resolve_attribute(name)
-        .map_or(ParamKind::Scalar, |(attr, _)| value_kind(attr.value_type))
+    attribute_type(world, name).map_or(ParamKind::Scalar, value_kind)
 }
 
 fn correction_kind(world: &World, entry: EntryId) -> ParamKind {
@@ -228,6 +240,11 @@ pub(super) enum Bindings<'a> {
         kinds: &'a BTreeMap<String, ParamKind>,
         params: &'a dyn ParameterInput,
         remaining: &'a mut usize,
+        /// The schema the form will be staged on.
+        world: &'a World,
+        /// Attributes an earlier operation of this form declares, renames
+        /// to, or writes: defined by the time a later operation is staged.
+        defined: BTreeSet<String>,
     },
 }
 
@@ -236,6 +253,21 @@ fn wrong_type(span: Span) -> DatalogError {
         ErrorKind::TypeMismatch,
         Some(span),
         "wrong type for write parameter",
+    )
+}
+
+/// A string says nothing about what it is: on an attribute nobody has
+/// defined, a literal `:edwin` declares a relationship and `"edwin"` a
+/// string property, and a parameter holding `edwin` could be either.
+/// Guessing "string" would turn a loader's relationships into text.
+fn undeclared_string(parameter: &str, attribute: &str, span: Span) -> DatalogError {
+    let attribute = crate::error::show(attribute);
+    DatalogError::new(
+        ErrorKind::TypeMismatch,
+        Some(span),
+        format!(
+            "string parameter ?{parameter} is written to :{attribute}, which is not declared: a string cannot say whether it is a handle or text; declare the attribute first ([:attribute :{attribute} :ref] or [:attribute :{attribute} :string])"
+        ),
     )
 }
 
@@ -250,12 +282,27 @@ fn missing(name: &str, span: Span) -> DatalogError {
 impl Bindings<'_> {
     /// Later operations bind against an explicit declaration in this form.
     pub(super) fn note_declaration(&mut self, op: &crate::ast::WriteOp) {
-        if let Self::Discover { declarations, .. } = self
-            && let crate::ast::WriteOp::Attribute {
-                name, value_type, ..
-            } = op
-        {
-            declarations.insert(name.clone(), *value_type);
+        use crate::ast::WriteOp;
+        match self {
+            Self::Discover { declarations, .. } => {
+                if let WriteOp::Attribute {
+                    name, value_type, ..
+                } = op
+                {
+                    declarations.insert(name.clone(), *value_type);
+                }
+            }
+            Self::Values { defined, .. } => {
+                let name = match op {
+                    WriteOp::Attribute { name, .. } | WriteOp::Migrate { name, .. } => name,
+                    WriteOp::Rename { new, .. } => new,
+                    // Staged by now: declared by inference if it was new.
+                    WriteOp::Fact { attr, .. } | WriteOp::Set { attr, .. } => &attr.name,
+                    _ => return,
+                };
+                defined.insert(name.clone());
+            }
+            Self::Literal => {}
         }
     }
 
@@ -302,6 +349,8 @@ impl Bindings<'_> {
                 kinds,
                 params,
                 remaining,
+                world,
+                defined,
             } => {
                 let v = params.get(name).ok_or_else(|| {
                     if params.contains_key(name) {
@@ -310,6 +359,13 @@ impl Bindings<'_> {
                         missing(name, *span)
                     }
                 })?;
+                if let Position::Attribute(attribute) = position
+                    && matches!(v, Value::Str(_))
+                    && !defined.contains(attribute)
+                    && attribute_type(world, attribute).is_none()
+                {
+                    return Err(undeclared_string(name, attribute, *span));
+                }
                 let correct = match kinds.get(name).ok_or_else(|| missing(name, *span))? {
                     ParamKind::Tick => matches!(v, Value::I64(_)),
                     ParamKind::Value(ty) => v.value_type() == *ty,

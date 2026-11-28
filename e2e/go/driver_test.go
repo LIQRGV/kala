@@ -347,6 +347,12 @@ func TestBulkRowParameters(t *testing.T) {
 
 	const value = "projector \"note\"]\nsecond line"
 	if _, err := s.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		// A string parameter needs a declared attribute (a string cannot say
+		// whether it is a handle or text). The declaration is only staged
+		// when the parameterized form is bound in the same transaction.
+		if err := write(ctx, tx, datalog+"[:attribute :projector_note :string]", nil); err != nil {
+			return nil, err
+		}
 		return nil, write(ctx, tx, datalog+"[:assert ?e :projector_note ?v :at ?t]", map[string]any{
 			"e": rows[0]["handle"], "v": value, "t": int64(200),
 		})

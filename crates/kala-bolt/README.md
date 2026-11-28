@@ -497,7 +497,13 @@ with reduced diagnostics for a write-only identity. Bind Datalog write values in
 map with bare names. For `[:assert ?e :name ?v :at ?t]`, supply a handle
 string as `e`, the name as `v` and an integer as `t`. Datalog accepts
 scalars. Attribute names, node types, verbs and schema declarations stay
-in the query text. Cypher accepts parameters in both pipelines and updates,
+in the query text. Each form is bound just before it is staged, so a
+parameter's type follows an attribute declared earlier in the same
+transaction or by an earlier form of the same RUN. A string parameter
+written to an attribute that is not defined is a TypeError naming the
+parameter and the attribute (a string cannot say whether it is a handle or
+text): declare the attribute first. A parameter the forms use and the map
+lacks refuses the whole RUN before any form is staged. Cypher accepts parameters in both pipelines and updates,
 converted with the kinds the statement gives them as for a read query (a handle
 string for a ref position names the entity; a wrong type is a TypeError before
 anything runs). `UNWIND … CREATE` has a reading part, so it needs `read` as well

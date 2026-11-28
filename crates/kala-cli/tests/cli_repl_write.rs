@@ -378,3 +378,54 @@ fn bulk_params_repl_uses_dot_params_for_datalog_writes() {
         [kala_core::Value::I64(37)]
     );
 }
+
+#[test]
+fn bulk_params_string_for_an_undeclared_attribute_is_refused_by_transact_and_the_repl() {
+    let fx = common::varrow();
+    let before = std::fs::read(&fx.path).unwrap();
+    let input = fx.dir.path().join("friends");
+    std::fs::write(&input, "[:assert ?a :friend_of ?b :at 700]").unwrap();
+    let args = [
+        input.to_str().unwrap(),
+        "--param",
+        "a=greg",
+        "--param",
+        "b=edwin",
+    ];
+    let refused = fx.fails(1, "transact", &args);
+    for part in [
+        "?b",
+        ":friend_of",
+        "[:attribute :friend_of :ref]",
+        ":string",
+    ] {
+        assert!(refused.contains(part), "missing {part}: {refused}");
+    }
+    assert_eq!(std::fs::read(&fx.path).unwrap(), before);
+    let session = repl(
+        &fx,
+        ".param a greg\n.param b edwin\n[:assert ?a :friend_of ?b :at 700]\n.quit\n",
+        &["--write"],
+    );
+    let shown = format!("{}{}", stdout(&session), stderr(&session));
+    assert!(shown.contains("[:attribute :friend_of :ref]"), "{shown}");
+    assert_eq!(std::fs::read(&fx.path).unwrap(), before);
+
+    // Declared in an earlier form of the same file, the string is a handle.
+    std::fs::write(
+        &input,
+        "[:attribute :friend_of :ref :many]\n[:assert ?a :friend_of ?b :at 700]",
+    )
+    .unwrap();
+    let o = fx.run("transact", &args);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let w = kala_core::World::open_read_only(&fx.path).unwrap();
+    let (greg, edwin) = (
+        w.entity_by_handle("greg").unwrap(),
+        w.entity_by_handle("edwin").unwrap(),
+    );
+    assert_eq!(
+        w.as_of(greg, "friend_of", kala_core::Tick(700)).unwrap(),
+        [kala_core::Value::Ref(edwin)]
+    );
+}

@@ -592,7 +592,10 @@ use `auth=None`; other accounts need a `write` grant (and `read` for `:set`).
 For a Datalog file containing `[:assert ?who :alias ?alias :at ?tick]`, run
 `kala transact varrow.kala alias.edn --param who=greg --param alias=Ned --param tick=300`.
 In a write REPL, set the same names with `.param who greg`, `.param alias Ned`
-and `.param tick 300`. Over Bolt, pass the values in the driver's parameter map:
+and `.param tick 300`. A string parameter needs an attribute that is already
+declared (`alias` is, in this world): for a new one, write
+`[:attribute :motto :string]` or `[:attribute :friend_of :ref]` first, because
+a string alone cannot say whether it is text or a handle. Over Bolt, pass the values in the driver's parameter map:
 
 ```python
 from neo4j import GraphDatabase

@@ -154,18 +154,9 @@ fn is_zero(n: &u128) -> bool {
 fn user(s: impl Into<String>) -> CliError {
     CliError::User(s.into())
 }
-/// Apply one form after enforcing the CLI's system-world policy. The shared
-/// applier refuses a system world too (its default policy); the CLI's own
-/// check comes first so its message names `kala user`.
-///
-/// `mode` is the concurrency mode of a form that doesn't begin with
-/// `[:concurrency …]`. Another process may commit to the world between
-/// this form's start and its commit. kala-core then commits the form over
-/// those transactions (final IDs, the form's own latest tick: see
-/// [`committed`]) unless, in optimistic mode, one of them wrote something
-/// the form read (a `:set`, a conditional create): that is a conflict
-/// ([`CliError::Conflict`], exit 4), nothing is written, and the message
-/// says which op read what and to run the form again.
+/// [`execute_template`] for a form already parsed from literals (the unit
+/// tests' entry point).
+#[cfg(test)]
 pub fn execute(
     w: &mut World,
     form: &WriteTxn,
@@ -544,6 +535,18 @@ impl Input<'_> {
     }
 }
 
+/// Apply one form after enforcing the CLI's system-world policy. The shared
+/// applier refuses a system world too (its default policy); the CLI's own
+/// check comes first so its message names `kala user`.
+///
+/// `mode` is the concurrency mode of a form that doesn't begin with
+/// `[:concurrency …]`. Another process may commit to the world between
+/// this form's start and its commit. kala-core then commits the form over
+/// those transactions (final IDs, the form's own latest tick: see
+/// [`committed`]) unless, in optimistic mode, one of them wrote something
+/// the form read (a `:set`, a conditional create): that is a conflict
+/// ([`CliError::Conflict`], exit 4), nothing is written, and the message
+/// says which op read what and to run the form again.
 pub(super) fn execute_template(
     world: &mut World,
     template: &kala_lang::write::WriteTemplate,
@@ -552,15 +555,26 @@ pub(super) fn execute_template(
     lang: super::language::Language,
     given: &[(String, String)],
 ) -> Result<Report, CliError> {
-    let params = template.bind_parameters(
-        world,
-        |kinds| lang.write_params(world, kinds, given),
-        |error| user(error.to_string()),
-    )?;
-    let form = template
-        .bind(world, &params)
-        .map_err(|e| user(e.to_string()))?;
-    execute(world, &form, default, mode).map_err(|e| {
+    refuse_system(world)?;
+    // As `kala_lang::write::execute_in`, with the form bound inside its own
+    // transaction: a parameter's type follows the schema that transaction
+    // sees (`Txn::base_world`), the same seam the Bolt server binds through.
+    let outcome = {
+        let mut tx = world.begin();
+        tx.set_concurrency(template.prototype().concurrency.unwrap_or(mode));
+        let view = tx.base_world();
+        let params = template.bind_parameters(
+            view,
+            |kinds| lang.write_params(view, kinds, given),
+            |error| user(error.to_string()),
+        )?;
+        let form = template
+            .bind(view, &params)
+            .map_err(|e| user(e.to_string()))?;
+        kala_lang::write::stage_with(&mut tx, &form, default, WritePolicy::default())
+            .and_then(|staged| kala_lang::write::commit(tx, staged))
+    };
+    committed(world, outcome).map_err(|e| {
         if template.is_parameterized() {
             e.map_message(|_| "parameterized write failed a store rule".into())
         } else {

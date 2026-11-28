@@ -1235,19 +1235,33 @@ impl Session<'_> {
         if given.keys().any(|k| !used.contains(k.as_str())) {
             return Err(Failure::new(INVALID, "unknown parameter for write forms"));
         }
-        let bind = |world: &kala_core::World, remaining: &mut usize| {
-            templates
-                .iter()
-                .map(|f| {
-                    let params = f.bind_parameters(
-                        world,
-                        |kinds| query::parameters(world, kinds, given, policy),
-                        form_binding_error,
-                    )?;
-                    f.bind_with_budget(world, &params, remaining)
+        // A missing parameter needs no schema to detect: refuse the whole
+        // RUN for it before any form is staged or committed.
+        if let Some(name) = used.iter().find(|name| !given.contains_key(**name)) {
+            return Err(Failure::new(
+                crate::error::MISSING,
+                format!("missing parameter `?{}`", crate::error::escape(name)),
+            ));
+        }
+        // A parameter's type follows the attribute it is written to, so a
+        // form is bound just before it is staged, against the schema its
+        // transaction sees (`Txn::base_world`): declarations staged by
+        // earlier forms of an explicit transaction, or committed by earlier
+        // forms of the same auto-commit RUN, included.
+        let bind = |world: &kala_core::World,
+                    template: &kala_lang::write::WriteTemplate,
+                    remaining: &mut usize| {
+            template
+                .bind_parameters(
+                    world,
+                    |kinds| query::parameters(world, kinds, given, policy),
+                    form_binding_error,
+                )
+                .and_then(|params| {
+                    template
+                        .bind_with_budget(world, &params, remaining)
                         .map_err(form_binding_error)
                 })
-                .collect::<Result<Vec<_>, Failure>>()
                 .map_err(|e| write::parameter_binding_error(e, read))
         };
         // Write slots are counted per authenticated account (user and the
@@ -1277,16 +1291,15 @@ impl Session<'_> {
                 )?;
             }
             let mut remaining = write::MAX_STAGED_BYTES - tx.bytes;
-            let forms = bind(tx.world(), &mut remaining)?;
-            tx.bytes = write::MAX_STAGED_BYTES - remaining;
             tx.parameterized |= !given.is_empty();
             let mut data = false;
-            for (index, form) in forms.iter().enumerate() {
+            for (index, template) in templates.iter().enumerate() {
                 let expires = tx.deadline;
                 let owned = tx.writer(self.registry, self.config, &account, held.admin)?;
                 let staged = owned.with(|t| {
                     t.set_deadline(expires);
-                    write::stage(t, form, read)
+                    let form = bind(t.base_world(), template, &mut remaining)?;
+                    write::stage(t, &form, read)
                         .map_err(|e| write::parameter_error(e, !given.is_empty()))
                 })?;
                 data |= staged.ops.iter().any(|op| write::writes_data(op.kind));
@@ -1304,6 +1317,7 @@ impl Session<'_> {
                 })?;
                 tx.forms.push(staged);
             }
+            tx.bytes = write::MAX_STAGED_BYTES - remaining;
             self.run_type = if tx.summary_reads {
                 "rw"
             } else if data {
@@ -1325,9 +1339,9 @@ impl Session<'_> {
                     .min(deadline.saturating_duration_since(Instant::now())),
                 options.bookmark,
                 |world| {
-                    let forms = bind(world, &mut (write::MAX_STAGED_BYTES - input_bytes))?;
+                    let mut remaining = write::MAX_STAGED_BYTES - input_bytes;
                     let mut committed = 0;
-                    for (index, form) in forms.iter().enumerate() {
+                    for (index, template) in templates.iter().enumerate() {
                         let prior = committed;
                         let result = (|| {
                             if Instant::now() >= deadline {
@@ -1337,7 +1351,8 @@ impl Session<'_> {
                             tx.set_concurrency(options.concurrency);
                             tx.set_deadline(deadline);
                             tx.set_schema_additions_only(!held.admin);
-                            let staged = write::stage(&mut tx, form, read)
+                            let form = bind(tx.base_world(), template, &mut remaining)?;
+                            let staged = write::stage(&mut tx, &form, read)
                                 .map_err(|e| write::parameter_error(e, !given.is_empty()))?;
                             // Check record size before durable append; final IDs have fixed encoding bounds.
                             let mut preview = write::output();
