@@ -198,13 +198,20 @@ impl Session<'_> {
             Err(e) => return Err(e),
         };
         self.expired = expired;
-        let value =
-            packstream::decode_with_limits(&bytes, config.max_message_bytes, config.max_depth);
+        let value = packstream::decode_request(
+            &bytes,
+            config.max_message_bytes,
+            config.max_depth,
+            write::MAX_STAGED_BYTES,
+        );
         // Input may carry credentials. Drop the original bytes before dispatch,
         // never format them or the decoded request, even on malformed input.
         drop(bytes);
         let value = match value {
             Ok(v) => v,
+            Err(e) if e.parameter_limit() => {
+                return Ok(Some(Err(Failure::new(crate::error::TYPE, e.0))));
+            }
             Err(_) => {
                 let _ = self.send(
                     stream,
@@ -681,10 +688,7 @@ impl Session<'_> {
             let (world, result) = tx.commit();
             let result = result.map_err(|e| {
                 self.log_refused(&db, "conflict");
-                write::parameter_error(
-                    write::commit_error(&world, e, &forms, read),
-                    transaction.parameterized,
-                )
+                write::commit_error(&world, e, &forms, read, transaction.parameterized)
             })?;
             self.log_commit(&db, &result, forms.len());
             let mut summary = write::Summary::new(self.config.max_message_bytes);
@@ -1165,7 +1169,7 @@ impl Session<'_> {
                             world,
                             e,
                             std::slice::from_ref(&staged.staged),
-                            held.read,
+                            held.read, !given.is_empty(),
                         )
                     })?;
                     self.log_commit(db, &result, 1);
@@ -1359,13 +1363,11 @@ impl Session<'_> {
                                 return Err(write::timeout());
                             }
                             let result = tx.commit().map_err(|e| {
-                                write::parameter_error(
-                                    write::commit_error(
-                                        world,
-                                        e,
-                                        std::slice::from_ref(&staged),
-                                        read,
-                                    ),
+                                write::commit_error(
+                                    world,
+                                    e,
+                                    std::slice::from_ref(&staged),
+                                    read,
                                     !given.is_empty(),
                                 )
                             })?;

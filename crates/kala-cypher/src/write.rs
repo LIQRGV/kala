@@ -447,6 +447,11 @@ impl WriteResult {
                 _ => {}
             }
         }
+        if self.row_ticks.len() != self.rows.len() {
+            return Err(invalid(
+                "RETURN rows or ticks were modified before rendering",
+            ));
+        }
         let mut rows = std::mem::take(&mut self.rows);
         // Staging already charged the source rows and property metadata. Keep that
         // charge while replacements are allocated, including an old cell's payload.

@@ -213,3 +213,39 @@ fn set_retention_includes_noop_and_member_payloads() {
     assert_eq!(costs[2].0, 2);
     assert!(costs[2].1 >= costs[0].1 + "longer member".len() + "another member".len());
 }
+
+#[test]
+fn parameterized_commit_conflicts_preserve_the_retry_code_and_hide_the_handle() {
+    let world = World::in_memory(kala_core::Schema::new()).unwrap();
+    let conflict = Error::Conflict(kala_core::Conflict {
+        key: kala_core::ConflictKey::Handle {
+            handle: "map_row_handle".into(),
+        },
+        operation: 0,
+        applied: 1,
+    });
+    let failure = commit_error(&world, conflict, &[], true, true);
+    assert_eq!(failure.code, CONFLICT);
+    assert!(!failure.message.contains("map_row_handle"));
+}
+
+#[test]
+fn decoding_run_map_rows_checks_the_allocation_budget() {
+    let field = Value::Map([("name".into(), Value::String("Wren".into()))].into());
+    let rows = Value::List(vec![field]);
+    let params = Value::Map([("rows".into(), rows)].into());
+    let request = Value::Structure(
+        0x10,
+        vec![
+            Value::String("UNWIND $rows AS row RETURN row.name".into()),
+            params,
+            Value::Map(Map::new()),
+        ],
+    );
+    let bytes = packstream::encode(&request).unwrap();
+    let error = packstream::decode_request(&bytes, bytes.len(), 32, 1).unwrap_err();
+    assert!(error.parameter_limit());
+    let decoded = packstream::decode_request(&bytes, bytes.len(), 32, 1 << 20).unwrap();
+    assert_eq!(decoded, request);
+    assert_eq!(packstream::decode(&bytes).unwrap(), request);
+}

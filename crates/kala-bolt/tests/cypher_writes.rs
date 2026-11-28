@@ -784,7 +784,11 @@ fn bulk_params_map_positions_and_inconsistent_columns_fail_before_commit() {
     let row = map(&[("name", string("marker-never-echo"))]);
     let write = "UNWIND $rows AS row CREATE (:NPC {name:row.name})";
     for (query, params, expected) in [
-        ("RETURN $rows", supplied_rows(vec![row.clone()]), "unwind"),
+        (
+            "WITH $rows AS x RETURN x",
+            supplied_rows(vec![row.clone()]),
+            "unwind",
+        ),
         (
             "UNWIND $rows AS row WITH * RETURN row",
             supplied_rows(vec![row.clone()]),
@@ -1088,4 +1092,28 @@ fn bulk_params_blind_write_reports_schema_type_failures_like_literal_writes() {
         );
         assert_eq!(parameterized, literal);
     }
+}
+
+#[test]
+fn bulk_params_wire_map_rows_over_the_limit_allow_reset_and_reuse() {
+    let server = writable_server();
+    let mut c = Client::ready(&server);
+    let before = world(&server).latest_tx();
+    let row = map(&[("tick", Value::Integer(0))]);
+    let (code, message) = failure(
+        &mut c,
+        "UNWIND $rows AS row CREATE (:NPC) AT TICK row.tick",
+        supplied_rows(vec![row; 10_001]),
+        map(&[]),
+    );
+    assert_eq!(code, "Neo.ClientError.Statement.TypeError", "{message}");
+    assert!(
+        message.replace(',', "").contains("10000") && message.contains("row"),
+        "{message}"
+    );
+    assert_eq!(world(&server).latest_tx(), before);
+    assert_eq!(
+        c.query("WITH 1 AS x RETURN x"),
+        vec![vec![Value::Integer(1)]]
+    );
 }

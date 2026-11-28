@@ -610,6 +610,14 @@ fn execute_cypher(
                 ..
             }),
         ) => return Err(user(e.to_string())),
+        Err(StatementError::Stage(e))
+            if matches!(e.cause, Failure::Store(kala_core::Error::Conflict(_)))
+                && !given.is_empty() =>
+        {
+            return committed(world, Err(e)).map_err(|e| {
+                e.map_message(|_| format!("parameterized write conflict; {CONFLICT_ADVICE}"))
+            });
+        }
         Err(StatementError::Stage(e)) => return committed(world, Err(e)),
         Err(StatementError::Store(e)) => return Err(core_err(e)),
         Err(e) => return Err(user(e.to_string())),

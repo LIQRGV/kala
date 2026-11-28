@@ -5,6 +5,9 @@ use kala_query::{Datum, ParamKind, ParameterRow, QueryParams};
 /// Maximum retained input for a write transaction.
 pub const MAX_STAGED_BYTES: usize = 16 * 1024 * 1024;
 
+/// Conservative cost of a row map entry, including the temporary type index.
+pub const MAP_FIELD_BYTES: usize = 192;
+
 /// An ordinary expression value or a table restricted to UNWIND.
 pub enum BoundParameter {
     Value(Datum),
@@ -96,7 +99,9 @@ impl ParamPolicy {
                     // B-tree cell and validation index, plus owned key and value buffers.
                     charge_map(
                         remaining,
-                        192usize.saturating_add(key.len()).saturating_add(size),
+                        MAP_FIELD_BYTES
+                            .saturating_add(key.len())
+                            .saturating_add(size),
                     )?;
                     row.insert(
                         key.clone(),

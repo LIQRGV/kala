@@ -843,7 +843,9 @@ Every parameter supplied to a Datalog write RUN must appear in its forms. Datalo
 expanded parameter occurrences. Cypher charges estimated memory for expanded
 primitives and their reports.
 Materialized write records are capped at 16 MiB per RUN. Socket messages remain
-bounded by `max_message_bytes` and `max_depth`. The idle clock starts when a
+bounded by `max_message_bytes` and `max_depth`. RUN decoding checks the
+10,000-row limit and accounts for map containers, field entries and payloads
+before allocating them. The idle clock starts when a
 response has been sent and stops when the next request has arrived: a statement
 or COMMIT that takes longer than `--tx-idle-timeout` is not idle and is bounded
 by `--tx-timeout` (or the client's shorter `tx_timeout`) only. A request's

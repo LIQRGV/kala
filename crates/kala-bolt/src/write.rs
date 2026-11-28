@@ -166,7 +166,9 @@ pub(crate) fn parameter_binding_error(failure: Failure, read: bool) -> Failure {
 }
 
 pub(crate) fn parameter_error(mut failure: Failure, bound: bool) -> Failure {
-    if bound && matches!(failure.code, TYPE | SEMANTIC | CONSTRAINT | CONFLICT) {
+    if bound && failure.code == CONFLICT {
+        failure.message = "another transaction changed data read by this write; nothing was written; run it again".into();
+    } else if bound && matches!(failure.code, TYPE | SEMANTIC | CONSTRAINT) {
         failure.message = "parameterized write failed a store rule".into();
     }
     failure
@@ -744,7 +746,17 @@ impl Summary {
 }
 
 /// The CLI conflict sentence, using only the caller's read keys, never held values.
-pub(crate) fn commit_error(w: &World, error: Error, forms: &[StagedWrite], read: bool) -> Failure {
+pub(crate) fn commit_error(
+    w: &World,
+    error: Error,
+    forms: &[StagedWrite],
+    read: bool,
+    parameterized: bool,
+) -> Failure {
+    if parameterized {
+        // Optimistic conflict keys can contain the exact handle read by the write.
+        return parameter_error(store_error(error, read), true);
+    }
     let Error::Conflict(conflict) = &error else {
         return store_error(error, read);
     };
