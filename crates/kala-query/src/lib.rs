@@ -32,7 +32,9 @@ pub use rows::{
 };
 
 mod params;
-pub use params::{MAX_MAP_ROWS, ParameterInput, ParameterRow, ParameterValue, QueryParams};
+pub use params::{
+    MAX_MAP_ROWS, MAX_STAGED_BYTES, ParameterInput, ParameterRow, ParameterValue, QueryParams,
+};
 
 mod sources;
 pub use sources::{DatabaseSelection, RowSource, SERVER_ROWS_PARAMETER, ServerRequest};

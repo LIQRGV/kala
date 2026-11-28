@@ -2,8 +2,7 @@
 use kala_core::{Value, ValueType, World};
 use kala_query::{Datum, ParamKind, ParameterRow, QueryParams};
 
-/// Maximum retained input for a write transaction.
-pub const MAX_STAGED_BYTES: usize = 16 * 1024 * 1024;
+pub use kala_query::MAX_STAGED_BYTES;
 
 /// Conservative cost of a row map entry, including the temporary type index.
 pub const MAP_FIELD_BYTES: usize = 192;

@@ -1239,8 +1239,11 @@ impl Session<'_> {
             templates
                 .iter()
                 .map(|f| {
-                    let kinds = f.parameter_kinds(world).map_err(form_binding_error)?;
-                    let params = query::parameters(world, &kinds, given, policy)?;
+                    let params = f.bind_parameters(
+                        world,
+                        |kinds| query::parameters(world, kinds, given, policy),
+                        form_binding_error,
+                    )?;
                     f.bind_with_budget(world, &params, remaining)
                         .map_err(form_binding_error)
                 })

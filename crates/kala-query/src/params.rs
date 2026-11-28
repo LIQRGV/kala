@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 
 /// Maximum number of map rows a parameter can supply.
 pub const MAX_MAP_ROWS: usize = 10_000;
+/// Byte budget shared by write parameter expansion and transaction staging.
+pub const MAX_STAGED_BYTES: usize = 16 * 1024 * 1024;
 /// One client-supplied row. Keys belong to the parameter, not the schema.
 pub type ParameterRow = BTreeMap<String, Datum>;
 
@@ -95,13 +97,15 @@ impl QueryParams {
                     }
                     _ => {
                         return Err(QueryError::TypeMismatch(format!(
-                            "row {index} key {key:?} must contain a scalar, NULL, or a list of scalars"
+                            "row {index} key {} must contain a scalar, NULL, or a list of scalars",
+                            kala_core::Echo(key)
                         )));
                     }
                 };
                 if fields.entry(key).or_insert(kind) != &kind {
                     return Err(QueryError::TypeMismatch(format!(
-                        "mixed types at row {index} key {key:?}"
+                        "mixed types at row {index} key {}",
+                        kala_core::Echo(key)
                     )));
                 }
             }

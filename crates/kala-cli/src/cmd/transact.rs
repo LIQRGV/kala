@@ -552,10 +552,11 @@ pub(super) fn execute_template(
     lang: super::language::Language,
     given: &[(String, String)],
 ) -> Result<Report, CliError> {
-    let kinds = template
-        .parameter_kinds(world)
-        .map_err(|e| user(e.to_string()))?;
-    let params = lang.write_params(world, &kinds, given)?;
+    let params = template.bind_parameters(
+        world,
+        |kinds| lang.write_params(world, kinds, given),
+        |error| user(error.to_string()),
+    )?;
     let form = template
         .bind(world, &params)
         .map_err(|e| user(e.to_string()))?;

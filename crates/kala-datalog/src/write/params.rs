@@ -2,8 +2,8 @@
 use super::{Form, Tok, WriteTxn, transaction};
 use crate::{DatalogError, ErrorKind, ParamKind, Span};
 use kala_core::{EntryId, Value, ValueType, World};
-use kala_query::ParameterInput;
-use std::collections::BTreeMap;
+use kala_query::{ParameterInput, QueryParams};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A syntax-checked write form whose parameters have yet to be supplied.
 #[derive(Debug)]
@@ -23,6 +23,7 @@ pub(super) struct ParameterUse {
 #[derive(Debug)]
 enum Requirement {
     Correction(EntryId),
+    CorrectionParameter(String),
     Attribute(String),
     Known(ParamKind),
 }
@@ -38,7 +39,14 @@ impl WriteTemplate {
 
         let mut uses = Vec::new();
         let (prototype, source) = if has_variable(&form) {
-            let prototype = transaction(form.clone(), false, &mut Bindings::Discover(&mut uses))?;
+            let prototype = transaction(
+                form.clone(),
+                false,
+                &mut Bindings::Discover {
+                    uses: &mut uses,
+                    declarations: BTreeMap::new(),
+                },
+            )?;
             (prototype, Some(form))
         } else {
             (transaction(form, false, &mut Bindings::Literal)?, None)
@@ -67,13 +75,52 @@ impl WriteTemplate {
         self.uses.iter().map(|u| u.name.as_str())
     }
 
-    /// Kinds for the shared parameter binder. References travel as handle or ID
-    /// strings so a write may refer to an entity the transaction will create.
-    pub fn parameter_kinds(&self, world: &World) -> Result<Vec<(String, ParamKind)>, DatalogError> {
+    /// Decode only correction-entry parameters first: a replacement value
+    /// takes its type from the fact that its supplied entry number names.
+    /// Both passes use the caller's usual transport conversion.
+    pub fn bind_parameters<E>(
+        &self,
+        world: &World,
+        mut convert: impl FnMut(&[(String, ParamKind)]) -> Result<QueryParams, E>,
+        error: impl Fn(DatalogError) -> E,
+    ) -> Result<QueryParams, E> {
+        let entries: BTreeSet<_> = self
+            .uses
+            .iter()
+            .filter_map(|u| match &u.kind {
+                Requirement::CorrectionParameter(name) => Some(name),
+                _ => None,
+            })
+            .collect();
+        let targets = if entries.is_empty() {
+            QueryParams::new()
+        } else {
+            let kinds: Vec<_> = entries
+                .into_iter()
+                .map(|name| (name.clone(), ParamKind::Value(ValueType::I64)))
+                .collect();
+            convert(&kinds)?
+        };
+        let kinds = self.parameter_kinds(world, &targets).map_err(error)?;
+        convert(&kinds.into_iter().collect::<Vec<_>>())
+    }
+
+    fn parameter_kinds(
+        &self,
+        world: &World,
+        targets: &dyn ParameterInput,
+    ) -> Result<BTreeMap<String, ParamKind>, DatalogError> {
         let mut kinds = BTreeMap::new();
         for usage in &self.uses {
             let kind = match &usage.kind {
-                Requirement::Correction(entry) => Position::Correction(*entry).kind(Some(world)),
+                Requirement::Correction(entry) => correction_kind(world, *entry),
+                Requirement::CorrectionParameter(name) => match targets.get(name) {
+                    Some(Value::I64(n)) if *n >= 0 => {
+                        correction_kind(world, EntryId(n.unsigned_abs()))
+                    }
+                    None if !targets.contains_key(name) => return Err(missing(name, usage.span)),
+                    _ => return Err(wrong_type(usage.span)),
+                },
                 Requirement::Known(kind) => kind.clone(),
                 Requirement::Attribute(attr) => attribute_kind(world, attr),
             };
@@ -92,7 +139,7 @@ impl WriteTemplate {
                 }
             }
         }
-        Ok(kinds.into_iter().collect())
+        Ok(kinds)
     }
 
     /// Bind typed values into a parsed write. A value never becomes source text.
@@ -101,7 +148,7 @@ impl WriteTemplate {
         world: &World,
         params: &dyn ParameterInput,
     ) -> Result<WriteTxn, DatalogError> {
-        let mut remaining = kala_core::MAX_ENTRY_BYTES;
+        let mut remaining = kala_query::MAX_STAGED_BYTES;
         self.bind_with_budget(world, params, &mut remaining)
     }
 
@@ -119,7 +166,7 @@ impl WriteTemplate {
                 f.clone(),
                 false,
                 &mut Bindings::Values {
-                    world,
+                    kinds: &self.parameter_kinds(world, params)?,
                     params,
                     remaining,
                 },
@@ -133,6 +180,12 @@ fn attribute_kind(world: &World, name: &str) -> ParamKind {
         .at_canon(world.latest_tx())
         .resolve_attribute(name)
         .map_or(ParamKind::Scalar, |(attr, _)| value_kind(attr.value_type))
+}
+
+fn correction_kind(world: &World, entry: EntryId) -> ParamKind {
+    world
+        .fact_value_type(entry)
+        .map_or(ParamKind::Scalar, value_kind)
 }
 
 fn value_kind(ty: ValueType) -> ParamKind {
@@ -151,28 +204,28 @@ pub(super) enum Position<'a> {
     Tick,
     Entry,
     Attribute(&'a str),
-    Correction(EntryId),
+    Correction(EntryId, Option<&'a str>),
 }
 
 impl Position<'_> {
-    fn kind(self, world: Option<&World>) -> ParamKind {
+    fn kind(self) -> ParamKind {
         match self {
             Self::Reference | Self::Handle => ParamKind::Value(ValueType::Str),
             Self::Tick => ParamKind::Tick,
             Self::Entry => ParamKind::Value(ValueType::I64),
-            Self::Attribute(name) => world.map_or(ParamKind::Scalar, |w| attribute_kind(w, name)),
-            Self::Correction(entry) => world
-                .and_then(|w| w.fact_value_type(entry))
-                .map_or(ParamKind::Scalar, value_kind),
+            Self::Attribute(_) | Self::Correction(..) => ParamKind::Scalar,
         }
     }
 }
 
 pub(super) enum Bindings<'a> {
     Literal,
-    Discover(&'a mut Vec<ParameterUse>),
+    Discover {
+        uses: &'a mut Vec<ParameterUse>,
+        declarations: BTreeMap<String, ValueType>,
+    },
     Values {
-        world: &'a World,
+        kinds: &'a BTreeMap<String, ParamKind>,
         params: &'a dyn ParameterInput,
         remaining: &'a mut usize,
     },
@@ -186,7 +239,26 @@ fn wrong_type(span: Span) -> DatalogError {
     )
 }
 
+fn missing(name: &str, span: Span) -> DatalogError {
+    DatalogError::new(
+        ErrorKind::UnboundVariable,
+        Some(span),
+        format!("missing write parameter ?{name}"),
+    )
+}
+
 impl Bindings<'_> {
+    /// Later operations bind against an explicit declaration in this form.
+    pub(super) fn note_declaration(&mut self, op: &crate::ast::WriteOp) {
+        if let Self::Discover { declarations, .. } = self
+            && let crate::ast::WriteOp::Attribute {
+                name, value_type, ..
+            } = op
+        {
+            declarations.insert(name.clone(), *value_type);
+        }
+    }
+
     /// During discovery substitute inert typed data; running the ordinary grammar
     /// still checks every structural position before any binding or staging.
     pub(super) fn take(
@@ -203,8 +275,8 @@ impl Bindings<'_> {
         };
         let value = match self {
             Self::Literal => return Ok(None),
-            Self::Discover(uses) => {
-                let kind = position.kind(None);
+            Self::Discover { uses, declarations } => {
+                let kind = position.kind();
                 let sample = match kind {
                     ParamKind::Tick | ParamKind::Value(ValueType::I64) => Value::I64(0),
                     _ => Value::Str(String::new()),
@@ -213,15 +285,21 @@ impl Bindings<'_> {
                     name: name.clone(),
                     span: *span,
                     kind: match position {
-                        Position::Correction(entry) => Requirement::Correction(entry),
-                        Position::Attribute(name) => Requirement::Attribute(name.to_owned()),
+                        Position::Correction(_, Some(name)) => {
+                            Requirement::CorrectionParameter(name.to_owned())
+                        }
+                        Position::Correction(entry, None) => Requirement::Correction(entry),
+                        Position::Attribute(name) => declarations.get(name).map_or_else(
+                            || Requirement::Attribute(name.to_owned()),
+                            |ty| Requirement::Known(value_kind(*ty)),
+                        ),
                         _ => Requirement::Known(kind),
                     },
                 });
                 sample
             }
             Self::Values {
-                world,
+                kinds,
                 params,
                 remaining,
             } => {
@@ -229,16 +307,12 @@ impl Bindings<'_> {
                     if params.contains_key(name) {
                         wrong_type(*span)
                     } else {
-                        DatalogError::new(
-                            ErrorKind::UnboundVariable,
-                            Some(*span),
-                            format!("missing write parameter ?{name}"),
-                        )
+                        missing(name, *span)
                     }
                 })?;
-                let correct = match position.kind(Some(world)) {
+                let correct = match kinds.get(name).ok_or_else(|| missing(name, *span))? {
                     ParamKind::Tick => matches!(v, Value::I64(_)),
-                    ParamKind::Value(ty) => v.value_type() == ty,
+                    ParamKind::Value(ty) => v.value_type() == *ty,
                     ParamKind::Scalar => true,
                     _ => false,
                 };

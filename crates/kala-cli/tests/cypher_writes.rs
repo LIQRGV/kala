@@ -223,3 +223,66 @@ fn bulk_params_transact_map_rows_parallel_lists_and_datalog_write_identical_logs
         );
     }
 }
+
+#[test]
+fn bulk_params_text_value_type_follows_an_attribute_declared_in_the_same_form() {
+    let fx = common::varrow();
+    let input = fx.dir.path().join("parameter-types");
+    fs::write(
+        &input,
+        "[[:attribute :projector_code :string] [:assert :greg :projector_code ?v :at 603]]",
+    )
+    .unwrap();
+    let output = fx.run("transact", &[input.to_str().unwrap(), "--param", "v=123"]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let world = kala_core::World::open_read_only(&fx.path).unwrap();
+    let greg = world.entity_by_handle("greg").unwrap();
+    assert_eq!(
+        world
+            .as_of(greg, "projector_code", kala_core::Tick(603))
+            .unwrap(),
+        [kala_core::Value::Str("123".into())]
+    );
+}
+
+#[test]
+fn bulk_params_text_value_type_follows_the_parameterized_correction_target() {
+    let fx = common::varrow();
+    let input = fx.dir.path().join("correction");
+    fs::write(&input, r#"[:assert :greg :projector_code "123" :at 603]"#).unwrap();
+    let setup = fx.run("transact", &[input.to_str().unwrap()]);
+    assert_eq!(code(&setup), 0, "{}", stderr(&setup));
+    let target = {
+        let world = kala_core::World::open_read_only(&fx.path).unwrap();
+        let greg = world.entity_by_handle("greg").unwrap();
+        assert_eq!(
+            world
+                .as_of(greg, "projector_code", kala_core::Tick(603))
+                .unwrap(),
+            [kala_core::Value::Str("123".into())]
+        );
+        world.entries().find(|entry| matches!(&entry.body,
+            kala_core::log::EntryBody::Fact {entity, tick: kala_core::Tick(603), value: kala_core::Value::Str(s), ..}
+            if *entity == greg && s == "123")).unwrap().id
+    };
+    fs::write(&input, "[:correct ?entry :replace :value ?v]").unwrap();
+    let output = fx.run(
+        "transact",
+        &[
+            input.to_str().unwrap(),
+            "--param",
+            &format!("entry={}", target.0),
+            "--param",
+            "v=456",
+        ],
+    );
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let world = kala_core::World::open_read_only(&fx.path).unwrap();
+    let greg = world.entity_by_handle("greg").unwrap();
+    assert_eq!(
+        world
+            .as_of(greg, "projector_code", kala_core::Tick(603))
+            .unwrap(),
+        [kala_core::Value::Str("456".into())]
+    );
+}

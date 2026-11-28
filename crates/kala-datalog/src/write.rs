@@ -417,7 +417,9 @@ fn transaction_ops(
             concurrency = Some(concurrency_mode(items, s)?);
             continue;
         }
-        ops.push(operation(items, s, restore, vars)?);
+        let op = operation(items, s, restore, vars)?;
+        vars.note_declaration(&op);
+        ops.push(op);
     }
     Ok(Parts {
         at,
@@ -747,6 +749,13 @@ fn correct_op(mut args: Args, vars: &mut Bindings<'_>) -> Result<WriteOp, Datalo
     let span = args.span;
     let f = args.required()?;
     let es = f.span();
+    let target_parameter = match &f {
+        Form::Atom {
+            tok: Tok::Var(name),
+            ..
+        } => Some(name.clone()),
+        _ => None,
+    };
     let n = if let Some(kala_core::Value::I64(n)) = vars.take(&f, Position::Entry)? {
         u64::try_from(n).ok()
     } else {
@@ -769,7 +778,12 @@ fn correct_op(mut args: Args, vars: &mut Bindings<'_>) -> Result<WriteOp, Datalo
             }
             None
         }
-        "replace" => Some(options(args.it, Some(EntryId(n)), span, vars)?),
+        "replace" => Some(options(
+            args.it,
+            Some((EntryId(n), target_parameter.as_deref())),
+            span,
+            vars,
+        )?),
         _ => {
             return Err(DatalogError::syntax(
                 ms,
@@ -785,7 +799,7 @@ fn correct_op(mut args: Args, vars: &mut Bindings<'_>) -> Result<WriteOp, Datalo
 }
 fn options(
     mut it: impl Iterator<Item = Form>,
-    entry: Option<EntryId>,
+    entry: Option<(EntryId, Option<&str>)>,
     span: Span,
     vars: &mut Bindings<'_>,
 ) -> Result<Replacement, DatalogError> {
@@ -805,8 +819,8 @@ fn options(
         match (k.as_str(), entry) {
             ("at", _) => out.at = Some(tick(v, vars)?),
             ("precision", _) => out.precision = Some(precision(v)?),
-            ("value", Some(entry)) => {
-                out.value = Some(value(v, Position::Correction(entry), vars)?);
+            ("value", Some((entry, parameter))) => {
+                out.value = Some(value(v, Position::Correction(entry, parameter), vars)?);
             }
             ("op", Some(_)) => {
                 let (o, s) = keyword(v)?;
