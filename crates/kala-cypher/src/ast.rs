@@ -217,11 +217,17 @@ impl WriteStatement {
                 .writes
                 .iter()
                 .any(|w| !matches!(w, Update::Create(_) | Update::Constraint { .. }))
-            || self.write_expressions().iter().any(|expr| {
-                let mut props = vec![];
-                expr.attributes(&mut props);
-                !props.is_empty()
-            })
+            // The parser admits no graph read in a write tick; scanning it
+            // here keeps the privilege check independent of that rule.
+            || self
+                .write_expressions()
+                .into_iter()
+                .chain(self.tick.as_ref())
+                .any(|expr| {
+                    let mut props = vec![];
+                    expr.attributes(&mut props);
+                    !props.is_empty()
+                })
     }
     /// Whether the statement only declares schema (a type constraint): its
     /// summary type is `s`, and it stores no facts.

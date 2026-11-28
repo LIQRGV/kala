@@ -205,3 +205,76 @@ fn scalar_trailing_tick_controls_match_and_null_uses_transaction_default() {
     let wren = w.entity_by_handle("wren").unwrap();
     assert_eq!(w.history(wren, "mark").unwrap()[0].tick, Tick(-33));
 }
+
+#[test]
+fn write_tick_accepts_only_row_scoped_integers_and_names_the_rule() {
+    for tick in [
+        "count(*)",
+        "size($xs)",
+        "n.age",
+        "n",
+        "1.5",
+        "'soon'",
+        "true",
+        "[1]",
+        "$ticks[n.age]",
+        "row.ticks[0]",
+        "(1)",
+    ] {
+        let text = format!("UNWIND $rows AS row MATCH (n:NPC) SET n.flag = true AT TICK {tick}");
+        let error = kala_cypher::parse_statement(&text)
+            .expect_err(&format!("AT TICK {tick} must be refused at parse time"));
+        assert_eq!(error.kind, kala_cypher::ErrorKind::Syntax, "{tick}");
+        assert!(
+            error.message.contains("AT TICK on a write takes"),
+            "{tick}: {error}"
+        );
+        assert!(error.column > 50, "{tick}: positioned at the tick: {error}");
+    }
+    for tick in [
+        "-17",
+        "+3",
+        "0",
+        "$t",
+        "i",
+        "t",
+        "row.tick",
+        "$ticks[i]",
+        "$ticks[0]",
+        "$ticks[$k]",
+        "NULL",
+    ] {
+        let text = format!(
+            "UNWIND $rows AS row UNWIND $indices AS i WITH *, i AS t MATCH (n:NPC) SET n.flag = true AT TICK {tick}"
+        );
+        let parsed = kala_cypher::parse_statement(&text);
+        assert!(parsed.is_ok(), "AT TICK {tick}: {:?}", parsed.err());
+    }
+}
+
+#[test]
+fn a_set_member_cannot_be_picked_by_position() {
+    for text in [
+        r#"MATCH (n {kala_handle:"greg"}) RETURN n.alias[0]"#,
+        r#"MATCH (n {kala_handle:"greg"}) WHERE n.alias[0] = "x" RETURN n"#,
+        "UNWIND $rows AS row MATCH (n:NPC) RETURN row.names[n.rank]",
+        "UNWIND $rows AS row MATCH (n:NPC) SET n.name = n.alias[row.i]",
+        "MATCH (n:NPC) SET n.name = $names[n.rank]",
+    ] {
+        let error = kala_cypher::parse_statement(text).expect_err(text);
+        assert!(
+            error.message.starts_with("[ is not supported yet"),
+            "{text}: {error}"
+        );
+        let bracket = text.find('[').unwrap();
+        assert_eq!(error.offset, bracket, "{text}: {error}");
+    }
+    for text in [
+        "UNWIND $rows AS row RETURN row.names[0]",
+        "UNWIND $rows AS row UNWIND $is AS i RETURN row.names[i], $xs[row.i]",
+        "UNWIND $rows AS row MATCH (n:NPC) SET n.name = row.names[row.i]",
+    ] {
+        let parsed = kala_cypher::parse_statement(text);
+        assert!(parsed.is_ok(), "{text}: {:?}", parsed.err());
+    }
+}

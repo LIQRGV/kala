@@ -213,7 +213,10 @@ ON CREATE SET n.name = $names[i]
 ```
 
 Positions start at zero. Negative offsets count from the end, and a missing
-element produces NULL. Drivers can also supply a list of maps directly:
+element produces NULL. `[…]` indexes a list parameter, a list variable or a
+row field. A graph property is never indexed (`n.alias[0]` is a syntax
+error at the `[`): an attribute's values are an unordered set. Drivers can
+also supply a list of maps directly:
 
 ```cypher
 UNWIND $rows AS row
@@ -290,8 +293,11 @@ warn about a property held on an inactive edge. Summaries count retracted
 relationships and omit a nodes-deleted counter.
 
 A read-side `AT TICK` takes one integer literal or parameter. After the
-write clauses, `AT TICK` accepts an expression over the input row, such as
-`row.tick` or `$ticks[i]`. Each integer selects that row's write tick.
+write clauses, `AT TICK` takes one of: an integer literal, a parameter, a
+variable bound by `UNWIND` or `WITH`, a row field (`row.tick`), an indexed
+list parameter (`$ticks[i]`), or NULL. Anything else (an aggregate, a
+function call, a graph property such as `n.age`) is a syntax error at the
+tick. Each integer selects that row's write tick.
 NULL uses the read-side tick if supplied, then the transaction default,
 then the transaction's starting latest tick. A trailing integer literal or
 scalar tick parameter also supplies the MATCH tick when MATCH has none.

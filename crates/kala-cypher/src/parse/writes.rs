@@ -2,6 +2,7 @@
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
+const WRITE_TICK_RULE: &str = "AT TICK on a write takes an integer literal, a parameter, a variable bound by UNWIND or WITH, a row field (row.tick), an indexed list parameter ($ticks[i]) or NULL";
 const NARROW_MERGE: &str = "MERGE matches nodes by kala_handle only; put other properties in ON CREATE SET / ON MATCH SET or use MATCH … SET";
 
 impl Parser<'_> {
@@ -57,7 +58,19 @@ impl Parser<'_> {
         self.write_values = false;
         let explicit_write_tick = if self.kw("AT") {
             self.need_kw("TICK")?;
-            Some(self.expression(0, 0)?)
+            let start = self.token().start;
+            // Whatever else stands here, the author needs the rule.
+            match self.item().ok() {
+                Some(tick) if write_tick_shape(&tick, &row_bindings(&clauses)) => Some(tick),
+                _ => {
+                    return Err(CypherError::new(
+                        self.text,
+                        start,
+                        ErrorKind::Syntax,
+                        WRITE_TICK_RULE,
+                    ));
+                }
+            }
         } else {
             None
         };
@@ -470,6 +483,58 @@ impl Parser<'_> {
             }
         }
         Ok(())
+    }
+}
+
+/// Variables of the reading part that hold values, not graph elements, as
+/// far as the text can tell: `values` are bound by UNWIND or WITH, `rows`
+/// directly by UNWIND (the only variables a `row.key` field can belong to).
+struct RowBindings {
+    values: BTreeSet<String>,
+    rows: BTreeSet<String>,
+}
+
+fn row_bindings(clauses: &[Clause]) -> RowBindings {
+    let mut b = RowBindings {
+        values: BTreeSet::new(),
+        rows: BTreeSet::new(),
+    };
+    for c in clauses {
+        match c {
+            Clause::Unwind(_, n) => {
+                b.values.insert(n.clone());
+                b.rows.insert(n.clone());
+            }
+            Clause::With(q, _) => {
+                if !q.include_all {
+                    b.values.clear();
+                    b.rows.clear();
+                }
+                for i in &q.items {
+                    b.rows.remove(&i.name);
+                    b.values.insert(i.name.clone());
+                }
+            }
+            Clause::Match(_) | Clause::Source(_) => {}
+        }
+    }
+    b
+}
+
+/// Whether a write's `AT TICK` is a per-row integer the reading part already
+/// determines (see [`WRITE_TICK_RULE`]). Anything computed from the graph or
+/// across rows would let the statement choose its own place in story time.
+fn write_tick_shape(e: &Expr<String>, bound: &RowBindings) -> bool {
+    let scalar = |e: &Expr<String>| match e {
+        Expr::Value(Value::I64(_)) | Expr::Param(_) => true,
+        Expr::Var(n) => bound.values.contains(n),
+        Expr::Property { entity, .. } => bound.rows.contains(entity),
+        _ => false,
+    };
+    match e {
+        Expr::Null => true,
+        Expr::ListIndex(list, index) => matches!(**list, Expr::Param(_)) && scalar(index),
+        e => scalar(e),
     }
 }
 

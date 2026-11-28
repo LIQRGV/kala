@@ -10,15 +10,23 @@ struct Usage {
     rows: BTreeMap<String, String>,
     /// A second use of the parameter or a use of the whole row.
     ordinary: BTreeSet<String>,
+    /// `(variable, key)` of a graph property left as the list or the offset
+    /// of a `[…]` after lowering.
+    indexed: Option<(String, String)>,
 }
 
-pub(crate) fn resolve(statement: &mut Statement) {
+/// Lower row fields. `Err` names the first graph property (`variable`,
+/// `key`) that is still an operand of `[…]`: an attribute's values are a
+/// set, so a position in it means nothing; only a parameter, a list variable
+/// or a row field has an order.
+pub(crate) fn resolve(statement: &mut Statement) -> Result<(), (String, String)> {
     // A parameter used earlier in a statement can be disqualified by its
     // last use. Analyze every use before lowering any field or source.
     let mut usage = Usage::default();
     usage.statement(statement, false);
     usage.rows.clear();
     usage.statement(statement, true);
+    usage.indexed.map_or(Ok(()), Err)
 }
 
 impl Usage {
@@ -189,8 +197,17 @@ impl Usage {
                 }
             }
             Expr::Function(_, e) | Expr::Not(e) | Expr::IsNull(e) => self.expr(e, lower),
-            Expr::ListIndex(a, b)
-            | Expr::Disjoint(a, b)
+            Expr::ListIndex(a, b) => {
+                self.expr(a, lower);
+                self.expr(b, lower);
+                if lower && self.indexed.is_none() {
+                    self.indexed = [&**a, &**b].into_iter().find_map(|e| match e {
+                        Expr::Property { entity, key, .. } => Some((entity.clone(), key.clone())),
+                        _ => None,
+                    });
+                }
+            }
+            Expr::Disjoint(a, b)
             | Expr::Compare(_, a, b)
             | Expr::And(a, b)
             | Expr::Or(a, b)
