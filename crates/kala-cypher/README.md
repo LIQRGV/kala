@@ -213,10 +213,25 @@ ON CREATE SET n.name = $names[i]
 ```
 
 Positions start at zero. Negative offsets count from the end, and a missing
-element produces NULL. Parameters support scalars, lists and NULL.
-Map-valued parameters (`UNWIND $rows AS row … row.name`) are not supported
-yet; use parallel lists. `UNWIND … CREATE` has a reading part, so it is a
-reading statement: over Bolt it needs `read` as well as `write`.
+element produces NULL. `[…]` indexes a list parameter, a list variable or a
+row field. A graph property is never indexed (`n.alias[0]` is a syntax
+error at the `[`): an attribute's values are an unordered set. Drivers can
+also supply a list of maps directly:
+
+```cypher
+UNWIND $rows AS row
+MERGE (n:NPC {kala_handle: row.handle})
+SET n.name = row.name AT TICK row.tick
+```
+
+For example, pass `rows=[{"handle":"kael","name":"Kael","tick":-20}]`.
+Read a field with `row.key` in a read or write expression. A missing field
+yields NULL. A field holds a scalar, NULL or a list of scalars. Its type must
+agree across rows that supply a non-NULL value. Keys are data, including
+keys that happen to share a graph property's name. Maps must arrive through
+a direct parameter UNWIND. Returning, comparing or storing the row itself,
+nesting maps and `SET n += row` are errors. `UNWIND … CREATE` requires both
+`read` and `write` over Bolt.
 
 Parameters take the kind their position gives them, as in a read query: a
 handle string given where the reading part compares a ref attribute
@@ -225,6 +240,15 @@ wrong type is a type error before anything runs. A string written to a ref
 attribute (`SET c.located_in = $place`, `SET c.located_in = 'varrow'`, a
 CREATE property map) is a handle too, as in a Datalog form; a handle nobody
 holds is the `unknown entity` error.
+
+A row field behaves the same. Where the reading part compares it with a ref
+attribute (`MATCH (c {located_in: row.place})`, `WHERE c.located_in =
+row.place`), its string is a handle or a formatted ID and names that entity;
+a handle nobody holds is the same type error a scalar parameter gives, never
+an empty result. One field cannot be both: a field compared with a ref
+attribute and also used as plain data (compared with a string property,
+written as a `kala_handle` or to a non-ref attribute) is a type error that
+names the field. Pass the handle in two fields.
 
 The following pairs show the primitive operations for one input row.
 The SET, REMOVE and DELETE examples assume a preceding MATCH binds the named
@@ -277,13 +301,24 @@ relationship's own properties keep their history too. `kala doctor` can
 warn about a property held on an inactive edge. Summaries count retracted
 relationships and omit a nodes-deleted counter.
 
-One `AT TICK` applies to both reads and writes. Supply it after MATCH and
-again after the writes to choose different ticks. A tick-less write uses
-the transaction's starting latest tick. Corrections use the Datalog
-`[:correct …]` form: a same-tick conflict from any clause (SET, CREATE,
-MERGE, labels, DELETE) names the entry that holds the tick and the
-`[:correct N …]` to use, or, when the same statement or transaction staged
-it, the operation to change.
+A read-side `AT TICK` takes one integer literal or parameter. After the
+write clauses, `AT TICK` takes one of: an integer literal, a parameter, a
+variable bound by `UNWIND` or `WITH`, a row field (`row.tick`), an indexed
+list parameter (`$ticks[i]`), or NULL. Anything else (an aggregate, a
+function call, a graph property such as `n.age`) is a syntax error at the
+tick. Each integer selects that row's write tick.
+NULL uses the read-side tick if supplied, then the transaction default,
+then the transaction's starting latest tick. A trailing integer literal or
+scalar tick parameter also supplies the MATCH tick when MATCH has none.
+
+Bolt's write summary reports `kala.tick_min`, `kala.tick_max` and
+`kala.tick_count` for the reported operations. Each operation counts once,
+including a no-op. A same-tick conflict names the subject, the attribute,
+the tick and what holds it: the occupying entry with its `[:correct …]`
+form, or the earlier staged operation. In a map-row write or a write with a
+per-row tick the same message starts with the zero-based input row
+(`row 3: …`).
+Corrections use the Datalog `[:correct …]` form.
 
 ### Declaring a property type
 
@@ -313,7 +348,7 @@ and ignored. Uniqueness, existence, key and relationship constraints,
 
 A write without RETURN produces zero records. RETURN accepts bound variables,
 property access, literals and parameters. Auto-commit renders graph values
-at the write tick with final IDs and committed properties. Within BEGIN,
+at each row's write tick with final IDs and committed properties. Within BEGIN,
 write RETURN can read staged properties. Sending a provisional identity
 protects it against renumbering at COMMIT. A later MATCH still reads the
 transaction snapshot. Ordering, aggregation and a new reading pipeline

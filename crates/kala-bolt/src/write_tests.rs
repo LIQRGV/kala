@@ -213,3 +213,54 @@ fn set_retention_includes_noop_and_member_payloads() {
     assert_eq!(costs[2].0, 2);
     assert!(costs[2].1 >= costs[0].1 + "longer member".len() + "another member".len());
 }
+
+#[test]
+fn a_commit_conflict_names_the_callers_own_handle_only_for_an_identity_with_read() {
+    let world = World::in_memory(kala_core::Schema::new()).unwrap();
+    let conflict = || {
+        Error::Conflict(kala_core::Conflict {
+            key: kala_core::ConflictKey::Handle {
+                handle: "map_row_handle".into(),
+            },
+            operation: 0,
+            applied: 1,
+        })
+    };
+    // The handle is the caller's own (a literal or a parameter): with
+    // `read` the sentence is the one every conflict gets.
+    let failure = commit_error(&world, conflict(), &[], true);
+    assert_eq!(failure.code, CONFLICT);
+    assert_eq!(
+        failure.message,
+        "conflict: this transaction found the handle :map_row_handle free, and another transaction created it; nothing was written; run it again"
+    );
+    // Without `read`, the retry code and the reduced diagnostic.
+    let reduced = commit_error(&world, conflict(), &[], false);
+    assert_eq!(reduced.code, CONFLICT);
+    assert!(
+        !reduced.message.contains("map_row_handle"),
+        "{}",
+        reduced.message
+    );
+}
+
+#[test]
+fn decoding_run_map_rows_checks_the_allocation_budget() {
+    let field = Value::Map([("name".into(), Value::String("Wren".into()))].into());
+    let rows = Value::List(vec![field]);
+    let params = Value::Map([("rows".into(), rows)].into());
+    let request = Value::Structure(
+        0x10,
+        vec![
+            Value::String("UNWIND $rows AS row RETURN row.name".into()),
+            params,
+            Value::Map(Map::new()),
+        ],
+    );
+    let bytes = packstream::encode(&request).unwrap();
+    let error = packstream::decode_request(&bytes, bytes.len(), 32, 1).unwrap_err();
+    assert!(error.parameter_limit());
+    let decoded = packstream::decode_request(&bytes, bytes.len(), 32, 1 << 20).unwrap();
+    assert_eq!(decoded, request);
+    assert_eq!(packstream::decode(&bytes).unwrap(), request);
+}

@@ -1,7 +1,7 @@
 //! Terminal writes are adapters over the native transaction API.
 use super::{
     Done,
-    query::{read_text_file, row_text, table},
+    query::{read_text_file, row_text, table_at_ticks},
     read::core_err as read_core_err,
 };
 use crate::error::{CONFLICT_ADVICE, CliError, Conflicted};
@@ -32,6 +32,12 @@ struct Operation {
     created: Option<bool>,
     #[serde(skip)]
     handle: Option<String>,
+}
+#[derive(Serialize)]
+struct TickSummary {
+    tick_min: i64,
+    tick_max: i64,
+    tick_count: usize,
 }
 #[derive(Serialize)]
 struct Warnings {
@@ -75,6 +81,8 @@ pub struct Report {
     entries: Vec<u64>,
     edges: Vec<String>,
     ops: Vec<Operation>,
+    #[serde(flatten)]
+    ticks: Option<TickSummary>,
     warnings: Warnings,
     /// Present only when another writer's commit moved the world's latest
     /// tick while this transaction ran (its tick-less writes stayed on the
@@ -146,18 +154,9 @@ fn is_zero(n: &u128) -> bool {
 fn user(s: impl Into<String>) -> CliError {
     CliError::User(s.into())
 }
-/// Apply one form after enforcing the CLI's system-world policy. The shared
-/// applier refuses a system world too (its default policy); the CLI's own
-/// check comes first so its message names `kala user`.
-///
-/// `mode` is the concurrency mode of a form that doesn't begin with
-/// `[:concurrency …]`. Another process may commit to the world between
-/// this form's start and its commit. kala-core then commits the form over
-/// those transactions (final IDs, the form's own latest tick: see
-/// [`committed`]) unless, in optimistic mode, one of them wrote something
-/// the form read (a `:set`, a conditional create): that is a conflict
-/// ([`CliError::Conflict`], exit 4), nothing is written, and the message
-/// says which op read what and to run the form again.
+/// [`execute_template`] for a form already parsed from literals (the unit
+/// tests' entry point).
+#[cfg(test)]
 pub fn execute(
     w: &mut World,
     form: &WriteTxn,
@@ -367,6 +366,7 @@ fn committed_report(w: &World, result: WriteReport) -> Report {
             .map(|e| w.format_id((*e).into()))
             .collect(),
         ops,
+        ticks: None,
         warnings: Warnings {
             introduced: overlap_lines(&result.warnings.introduced),
             resolved: overlap_lines(&result.warnings.resolved),
@@ -416,6 +416,15 @@ pub fn render(report: &Report, json: bool) -> String {
             }
         ),
     };
+    if let Some(ticks) = &report.ticks
+        && ticks.tick_min != ticks.tick_max
+    {
+        let _ = writeln!(
+            s,
+            "  {} operations at ticks {} through {}",
+            ticks.tick_count, ticks.tick_min, ticks.tick_max
+        );
+    }
     for change in &report.schema_text {
         let _ = writeln!(s, "  {change}");
     }
@@ -487,13 +496,19 @@ pub fn render(report: &Report, json: bool) -> String {
 }
 
 enum Input<'a> {
-    Form(WriteTxn),
+    Form(kala_lang::write::WriteTemplate),
     Statement(&'a str),
 }
 impl Input<'_> {
-    fn execute(self, world: &mut World, mode: Concurrency) -> Result<Report, CliError> {
+    fn execute(
+        self,
+        world: &mut World,
+        mode: Concurrency,
+        lang: super::language::Language,
+        given: &[(String, String)],
+    ) -> Result<Report, CliError> {
         match self {
-            Self::Form(form) => execute(world, &form, None, mode),
+            Self::Form(form) => execute_template(world, &form, None, mode, lang, given),
             Self::Statement(text) => {
                 let statement = match kala_lang::classify(
                     &kala_lang::Cypher,
@@ -514,10 +529,54 @@ impl Input<'_> {
                         ));
                     }
                 };
-                execute_cypher(world, &statement, mode)
+                execute_cypher(world, &statement, mode, lang, given)
             }
         }
     }
+}
+
+/// Apply one form after enforcing the CLI's system-world policy. The shared
+/// applier refuses a system world too (its default policy); the CLI's own
+/// check comes first so its message names `kala user`.
+///
+/// `mode` is the concurrency mode of a form that doesn't begin with
+/// `[:concurrency …]`. Another process may commit to the world between
+/// this form's start and its commit. kala-core then commits the form over
+/// those transactions (final IDs, the form's own latest tick: see
+/// [`committed`]) unless, in optimistic mode, one of them wrote something
+/// the form read (a `:set`, a conditional create): that is a conflict
+/// ([`CliError::Conflict`], exit 4), nothing is written, and the message
+/// says which op read what and to run the form again.
+pub(super) fn execute_template(
+    world: &mut World,
+    template: &kala_lang::write::WriteTemplate,
+    default: Option<Tick>,
+    mode: Concurrency,
+    lang: super::language::Language,
+    given: &[(String, String)],
+) -> Result<Report, CliError> {
+    refuse_system(world)?;
+    // As `kala_lang::write::execute_in`, with the form bound inside its own
+    // transaction: a parameter's type follows the schema that transaction
+    // sees (`Txn::base_world`), the same seam the Bolt server binds through.
+    let outcome = {
+        let mut tx = world.begin();
+        tx.set_concurrency(template.prototype().concurrency.unwrap_or(mode));
+        let view = tx.base_world();
+        let params = template.bind_parameters(
+            view,
+            |kinds| lang.write_params(view, kinds, given),
+            |error| user(error.to_string()),
+        )?;
+        let form = template
+            .bind(view, &params)
+            .map_err(|e| user(e.to_string()))?;
+        kala_lang::write::stage_with(&mut tx, &form, default, WritePolicy::default())
+            .and_then(|staged| kala_lang::write::commit(tx, staged))
+    };
+    // Whatever failed is reported as for a literal form: the author typed
+    // the parameter values on this command line.
+    committed(world, outcome)
 }
 
 /// Use the transaction's starting snapshot for input, then project final IDs
@@ -526,14 +585,34 @@ fn execute_cypher(
     world: &mut World,
     stmt: &kala_lang::write::WriteStatement,
     mode: Concurrency,
+    lang: super::language::Language,
+    given: &[(String, String)],
 ) -> Result<Report, CliError> {
-    use kala_lang::write::{Failure, StatementError, prepare_statement, stage_statement};
-    let params = kala_query::QueryParams::new();
+    execute_cypher_then(world, stmt, mode, lang, given, || ())
+}
+
+/// [`execute_cypher`], running `staged` after the statement is staged and
+/// before it commits (where another process's commit can land: the tests
+/// put one there).
+fn execute_cypher_then(
+    world: &mut World,
+    stmt: &kala_lang::write::WriteStatement,
+    mode: Concurrency,
+    lang: super::language::Language,
+    given: &[(String, String)],
+    staged_hook: impl FnOnce(),
+) -> Result<Report, CliError> {
+    use kala_lang::write::{
+        Failure, StatementError, compile_statement, run_statement, stage_statement,
+    };
+    let compiled = compile_statement(world, stmt).map_err(|e| user(e.to_string()))?;
+    let params = lang.write_params(world, compiled.parameter_kinds(), given)?;
     let staged = (|| {
         let mut tx = world.begin();
         tx.set_concurrency(mode);
-        let input = prepare_statement(tx.base_world(), stmt, &params, Default::default())?;
+        let input = run_statement(tx.base_world(), stmt, compiled, &params, Default::default())?;
         let staged = stage_statement(&mut tx, stmt, input, &params)?;
+        staged_hook();
         let result = tx.commit().map_err(|error| {
             let operation = match &error {
                 kala_core::Error::Conflict(c) => staged
@@ -567,7 +646,7 @@ fn execute_cypher(
         Ok(None)
     } else {
         staged.committed_rows(world, &result.ids).map(|rows| {
-            let (columns, rows) = table(
+            let (columns, rows) = table_at_ticks(
                 world,
                 &kala_query::ResultSet {
                     columns: fields.into_iter().map(kala_query::Var).collect(),
@@ -575,6 +654,7 @@ fn execute_cypher(
                     tick: staged.tick,
                     canon: world.latest_tx(),
                 },
+                &staged.row_ticks,
             );
             Some(Returned { columns, rows })
         })
@@ -592,6 +672,16 @@ fn execute_cypher(
         .collect();
     let mut report = committed_report(world, written);
     report.item = "statement";
+    if let (Some(lo), Some(hi)) = (
+        report.ops.iter().map(|op| op.tick).min(),
+        report.ops.iter().map(|op| op.tick).max(),
+    ) {
+        report.ticks = Some(TickSummary {
+            tick_min: lo,
+            tick_max: hi,
+            tick_count: report.ops.len(),
+        });
+    }
     for (op, handle) in report.ops.iter_mut().zip(handles) {
         op.handle = handle;
     }
@@ -609,6 +699,7 @@ pub fn run(args: &TransactArgs) -> Result<Done, CliError> {
     let mode = crate::cli::concurrency(&args.concurrency);
     let mut w = open_target(args)?;
     let cypher = args.lang == "cypher";
+    let lang = super::language::front_end(&args.lang)?;
     let forms: Box<dyn Iterator<Item = Result<Input<'_>, CliError>> + '_> = if cypher {
         Box::new(
             kala_lang::write::statements(&text)
@@ -616,7 +707,7 @@ pub fn run(args: &TransactArgs) -> Result<Done, CliError> {
         )
     } else {
         Box::new(
-            kala_datalog::write_forms(&text)
+            kala_lang::write::prepare_write_forms(&text)
                 .map_err(|e| user(e.to_string()))?
                 .map(|f| f.map(Input::Form).map_err(|e| user(e.to_string()))),
         )
@@ -630,23 +721,24 @@ pub fn run(args: &TransactArgs) -> Result<Done, CliError> {
     };
     let mut count = 0;
     for (i, form) in forms.enumerate() {
-        let mut report =
-            match form.and_then(|input| input.execute(preview.as_mut().unwrap_or(&mut w), mode)) {
-                Ok(report) => report,
-                Err(e) => {
-                    let e = item_failed(
-                        if cypher { "statement" } else { "form" },
-                        i + 1,
-                        count,
-                        dry_run,
-                        e,
-                    );
-                    if let (true, CliError::Conflict(conflict)) = (json, &e) {
-                        print(&conflict_json(i + 1, count, conflict))?;
-                    }
-                    return Err(e);
+        let mut report = match form.and_then(|input| {
+            input.execute(preview.as_mut().unwrap_or(&mut w), mode, lang, &args.params)
+        }) {
+            Ok(report) => report,
+            Err(e) => {
+                let e = item_failed(
+                    if cypher { "statement" } else { "form" },
+                    i + 1,
+                    count,
+                    dry_run,
+                    e,
+                );
+                if let (true, CliError::Conflict(conflict)) = (json, &e) {
+                    print(&conflict_json(i + 1, count, conflict))?;
                 }
-            };
+                return Err(e);
+            }
+        };
         report.form = i + 1;
         report.dry_run = dry_run;
         print(&render(&report, json))?;
@@ -992,6 +1084,60 @@ mod tests {
             let report = again.unwrap_or_else(|e| panic!("{mine}: {e:?}"));
             assert!(report.latest_tick_moved.is_none(), "{mine}");
         }
+    }
+
+    /// A Cypher statement with `--param` values conflicts like its literal
+    /// twin: the same sentence (which op read what) and the retry advice.
+    #[test]
+    fn a_cypher_conflict_with_parameters_says_which_op_read_what() {
+        let lang = super::super::language::front_end("cypher").unwrap();
+        let mut messages = Vec::new();
+        for (text, given) in [
+            (
+                "MATCH (n {kala_handle:'greg'}) SET n.located_in = 'carnath' AT TICK 700",
+                vec![],
+            ),
+            (
+                "MATCH (n {kala_handle:$h}) SET n.located_in = $p AT TICK $t",
+                vec![
+                    ("h".to_owned(), "greg".to_owned()),
+                    ("p".to_owned(), "carnath".to_owned()),
+                    ("t".to_owned(), "700".to_owned()),
+                ],
+            ),
+        ] {
+            let (_dir, _path, mut a, mut b) = pair();
+            let kala_lang::Statement::CypherWrite(stmt) =
+                kala_lang::classify(&kala_lang::Cypher, text, &kala_lang::refuse_nothing).unwrap()
+            else {
+                panic!("expected a write statement");
+            };
+            // The other writer commits between this statement's read and
+            // its commit.
+            let other = || {
+                execute(
+                    &mut a,
+                    &parse_write(TO_ASHFORD).unwrap(),
+                    None,
+                    Concurrency::Optimistic,
+                )
+                .ok()
+                .unwrap();
+            };
+            let e =
+                execute_cypher_then(&mut b, &stmt, Concurrency::Optimistic, lang, &given, other)
+                    .err()
+                    .unwrap_or_else(|| panic!("{text}: committed without a conflict"));
+            assert_eq!(exit(&e), code(4), "{text}");
+            messages.push(e.message().to_owned());
+        }
+        assert!(
+            messages[0].starts_with("conflict: op 1 (:set) read :greg :located_in")
+                && messages[0].ends_with("nothing was written; run it again"),
+            "{}",
+            messages[0]
+        );
+        assert_eq!(messages[1], messages[0]);
     }
 
     /// Every kind of invalidated read has its own sentence, in the names

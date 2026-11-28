@@ -11,3 +11,4 @@ kala-core = { path = "../kala-core" }
 kala-query = { path = "../kala-query" }
 kala-datalog = { path = "../kala-datalog" }
 kala-cypher = { path = "../kala-cypher" }
+serde_json = "1.0.154"

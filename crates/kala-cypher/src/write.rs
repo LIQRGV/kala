@@ -10,7 +10,7 @@ use kala_core::{
     },
 };
 use kala_query::{
-    Datum, Expr, ParameterInput, ParameterValue, Prepared, QueryError, ResultSet, RunOptions, Term,
+    Datum, Expr, ParameterInput, ParameterValue, Prepared, QueryError, ResultSet, RunOptions,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -18,7 +18,7 @@ use std::{
 };
 
 /// Maximum number of input rows that can drive an update.
-pub const MAX_WRITE_ROWS: usize = 10_000;
+pub use kala_query::MAX_MAP_ROWS as MAX_WRITE_ROWS;
 /// Maximum number of primitives (including no-ops) in one statement.
 pub const MAX_WRITE_PRIMITIVES: usize = 10_000;
 
@@ -30,6 +30,23 @@ pub enum WriteError {
     Store(kala_core::Error),
     Stage(native::WriteError),
     Invalid(String),
+    /// Zero-based input row that supplied a non-integer tick.
+    RowTick {
+        row: usize,
+    },
+    /// A same-tick conflict in a statement driven by rows, with the
+    /// zero-based input row that met it. The cause keeps what an author
+    /// needs to resolve it: the subject, attribute, tick, and the entry
+    /// holding the tick with its `[:correct …]` form.
+    RowConflict {
+        row: usize,
+        cause: Box<native::WriteError>,
+    },
+    /// A store diagnostic whose original text would include a row value.
+    RowData {
+        row: usize,
+        cause: Box<WriteError>,
+    },
 }
 impl fmt::Display for WriteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -52,7 +69,39 @@ impl fmt::Display for WriteError {
             ),
             Self::Stage(e) => e.fmt(f),
             Self::Invalid(s) => f.write_str(s),
+            Self::RowData { row, cause } => write!(
+                f,
+                "row {row}: {}",
+                cause.data_rule().unwrap_or("write refused")
+            ),
+            Self::RowTick { row } => write!(f, "row {row}: write tick requires an integer or NULL"),
+            Self::RowConflict { row, cause } => write!(f, "row {row}: {cause}"),
         }
+    }
+}
+impl WriteError {
+    /// Descriptions of rules that normally quote the offending stored data.
+    fn data_rule(&self) -> Option<&'static str> {
+        use kala_core::Error;
+        let store = match self {
+            Self::Stage(native::WriteError {
+                cause: native::Failure::UnknownEntity(_),
+                ..
+            }) => return Some("unknown entity in a reference field"),
+            Self::Stage(native::WriteError {
+                cause: native::Failure::Store(e),
+                ..
+            })
+            | Self::Store(e) => e,
+            _ => return None,
+        };
+        Some(match store {
+            Error::DuplicateHandle(_) => "the supplied handle is already in use",
+            Error::HandleTypeMismatch { .. } => "the supplied handle belongs to another node type",
+            Error::InvalidHandle(_) | Error::DottedName(_) => "invalid handle",
+            Error::ConnectedEntity { .. } => "the node still has an asserted relationship",
+            _ => return None,
+        })
     }
 }
 impl std::error::Error for WriteError {}
@@ -92,7 +141,7 @@ pub struct WriteInput<'a> {
     depends_on_snapshot: bool,
     result: ResultSet,
     property_columns: BTreeMap<(String, String), usize>,
-    tick: Option<Tick>,
+    row_ticks: Vec<Option<Tick>>,
     options: RunOptions<'a>,
     bytes: usize,
     steps: u64,
@@ -201,7 +250,20 @@ pub fn compile(world: &World, stmt: &WriteStatement) -> Result<CompiledWrite> {
             expr: Expr::Value(Value::Bool(true)),
         });
     }
+    if let Some(expr) = &stmt.tick {
+        // The tick belongs to the input row. Project it on the snapshot so
+        // no staged write can influence another row's tick expression.
+        let mut name = String::from("\0write-tick");
+        while read.items.iter().any(|item| item.name == name) {
+            name.push('_');
+        }
+        read.items.push(Item {
+            name,
+            expr: expr.clone(),
+        });
+    }
     let prepared = crate::compile::compile(world, "", &read)?;
+    entity_fields_stay_references(world, stmt, &prepared)?;
     let kinds = stmt
         .params
         .iter()
@@ -211,13 +273,7 @@ pub fn compile(world: &World, stmt: &WriteStatement) -> Result<CompiledWrite> {
                 .iter()
                 .find(|(n, _)| n == name)
                 .map(|(_, kind)| kind.clone())
-                .unwrap_or_else(|| {
-                    if matches!(&stmt.tick, Some(Term::Param(p)) if p == name) {
-                        kala_query::ParamKind::Tick
-                    } else {
-                        kala_query::ParamKind::Scalar
-                    }
-                });
+                .unwrap_or(kala_query::ParamKind::Scalar);
             (name.clone(), kind)
         })
         .collect();
@@ -226,6 +282,56 @@ pub fn compile(world: &World, stmt: &WriteStatement) -> Result<CompiledWrite> {
         property_columns: props,
         kinds,
     })
+}
+
+/// A row field the reading part compares with a `ref` attribute arrives as
+/// an entity. Refuse a statement that also writes it as plain data (a
+/// handle to create, a value of a non-`ref` attribute) instead of guessing
+/// which of the two the author meant.
+fn entity_fields_stay_references(
+    world: &World,
+    stmt: &WriteStatement,
+    prepared: &Prepared,
+) -> Result<()> {
+    let entity = |parameter: &str, key: &str| {
+        prepared.params.iter().any(|(name, kind)| {
+            name == parameter
+                && matches!(kind, kala_query::ParamKind::Unwind(fields)
+                    if fields.iter().any(|(field, _)| field == key))
+        })
+    };
+    let check = |attribute: &str, value: &Expr<String>| match value {
+        Expr::RowField { parameter, key, .. }
+            if entity(parameter, key)
+                && (attribute == "kala_handle"
+                    || world
+                        .attribute(attribute)
+                        .is_some_and(|def| def.value_type != kala_core::ValueType::Ref)) =>
+        {
+            Err(WriteError::Syntax(crate::compile::row_field_conflict(
+                "", parameter, key,
+            )))
+        }
+        _ => Ok(()),
+    };
+    for update in &stmt.writes {
+        for path in update.paths() {
+            for (key, value) in path
+                .nodes
+                .iter()
+                .flat_map(|n| &n.props)
+                .chain(path.edges.iter().flat_map(|e| &e.props))
+            {
+                check(key, value)?;
+            }
+        }
+        for assignment in update.assignments() {
+            if let Assignment::Property(_, key, Some(value)) = assignment {
+                check(key, value)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Run a compiled reading part on the snapshot it was compiled against. It is
@@ -243,26 +349,40 @@ pub fn run<'a>(
             return Err(QueryError::MissingParam(name.clone()).into());
         }
     }
-    let tick = match &stmt.tick {
-        None => None,
-        Some(Term::Const(Value::I64(t))) => Some(Tick(*t)),
-        Some(Term::Param(p)) => match params.get(p) {
-            Some(Value::I64(t)) => Some(Tick(*t)),
-            _ => {
-                return Err(QueryError::ParamType {
-                    name: p.clone(),
-                    expected: "an integer tick".into(),
-                }
-                .into());
+    for (name, kind) in compiled.parameter_kinds() {
+        if let Some(ParameterValue::Rows(rows)) = params.binding(name) {
+            if !matches!(kind, kala_query::ParamKind::Unwind(_)) {
+                return Err(invalid(
+                    "map rows are only allowed as a direct UNWIND source and must be accessed through row.key",
+                ));
             }
-        },
-        _ => return Err(invalid("integer tick required")),
-    };
+            if rows.len() > MAX_WRITE_ROWS {
+                return Err(row_limit());
+            }
+        }
+    }
     let CompiledWrite {
-        prepared,
+        mut prepared,
         property_columns,
         ..
     } = compiled;
+    // A trailing scalar tick historically supplied the read snapshot too.
+    // NULL leaves that snapshot at its default. A row expression can only
+    // affect writes because its inputs do not exist until after the read.
+    if !stmt.has_read_tick
+        && let Some(Expr::Param(name)) = &stmt.tick
+    {
+        match params.binding(name) {
+            Some(
+                ParameterValue::Scalar(Value::I64(t))
+                | ParameterValue::Datum(Datum::Value(Value::I64(t))),
+            ) => {
+                prepared.plan.default_tick = kala_query::TickSource::Const(Tick(*t));
+            }
+            Some(ParameterValue::Datum(Datum::Null)) => {}
+            _ => return Err(WriteError::RowTick { row: 0 }),
+        }
+    }
     // The 10,000-row limit is on the rows that reach the write clauses: the
     // run is refused before it builds a larger answer. Intermediate
     // operators keep the caller's own row limit, so a selective MATCH over
@@ -272,7 +392,7 @@ pub fn run<'a>(
             .result_rows
             .map_or(MAX_WRITE_ROWS, |rows| rows.min(MAX_WRITE_ROWS)),
     );
-    let (result, usage) = match kala_query::run_with(world, &prepared.plan, params, bounded) {
+    let (mut result, usage) = match kala_query::run_with(world, &prepared.plan, params, bounded) {
         Err(QueryError::RowLimit { limit }) if limit == MAX_WRITE_ROWS => {
             return Err(row_limit());
         }
@@ -280,6 +400,31 @@ pub fn run<'a>(
     };
     if result.rows.len() > MAX_WRITE_ROWS {
         return Err(row_limit());
+    }
+    let mut row_ticks = Vec::new();
+    let mut bytes = usage.peak_bytes;
+    if stmt.tick.is_some() {
+        bytes = bytes.saturating_add(
+            result
+                .rows
+                .len()
+                .saturating_mul(std::mem::size_of::<Option<Tick>>()),
+        );
+        if bytes > options.limits.max_bytes {
+            return Err(QueryError::MemoryBudget {
+                limit: options.limits.max_bytes,
+            }
+            .into());
+        }
+        row_ticks.reserve_exact(result.rows.len());
+        result.columns.pop();
+        for (i, row) in result.rows.iter_mut().enumerate() {
+            row_ticks.push(match row.pop() {
+                Some(Datum::Value(Value::I64(t))) => Some(Tick(t)),
+                Some(Datum::Null) => stmt.has_read_tick.then_some(result.tick),
+                _ => return Err(WriteError::RowTick { row: i }),
+            });
+        }
     }
     let reads = kala_query::reads::Reads::plan(&prepared.plan, world);
     let defined_names = reads.defined_names(world);
@@ -290,9 +435,9 @@ pub fn run<'a>(
         depends_on_snapshot: stmt.requires_read(),
         result,
         property_columns,
-        tick,
+        row_ticks,
         options,
-        bytes: usage.peak_bytes,
+        bytes,
         steps: usage.steps,
     })
 }
@@ -320,6 +465,8 @@ pub struct WriteResult {
     pub staged: StagedWrite,
     pub rows: Vec<Vec<Datum>>,
     pub tick: Tick,
+    /// Effective tick of each RETURN row, including the transaction default.
+    pub row_ticks: Vec<Tick>,
     properties: Vec<(usize, usize, EntityId, String)>,
     limits: kala_query::Limits,
     render_bytes: usize,
@@ -351,6 +498,11 @@ impl WriteResult {
                 }
                 _ => {}
             }
+        }
+        if self.row_ticks.len() != self.rows.len() {
+            return Err(invalid(
+                "RETURN rows or ticks were modified before rendering",
+            ));
         }
         let mut rows = std::mem::take(&mut self.rows);
         // Staging already charged the source rows and property metadata. Keep that
@@ -410,7 +562,7 @@ impl WriteResult {
                             .min(meter.keys().saturating_add(cap as u64)),
                     );
                     let neighbors =
-                        view.neighbors(entity, &key, kala_core::Direction::Out, self.tick)?;
+                        view.neighbors(entity, &key, kala_core::Direction::Out, self.row_ticks[r])?;
                     reserve(neighbors.len().saturating_mul(per_value))?;
                     meter.set_max_keys(self.limits.max_steps);
                     neighbors
@@ -422,7 +574,7 @@ impl WriteResult {
                     view.visit_non_ref_values_charged(
                         entity,
                         &key,
-                        self.tick,
+                        self.row_ticks[r],
                         |encoded| {
                             reserve(encoded.saturating_add(
                                 std::mem::size_of::<Value>() + std::mem::size_of::<Datum>(),
@@ -477,8 +629,8 @@ fn apply(
         .chain(tx.deadline())
         .min();
     input.note_reads(tx)?;
-    let tick = tx.report_tick(input.tick);
-    let stager = Stager::new(tx, input.tick, Default::default(), MAX_WRITE_PRIMITIVES)?;
+    let tick = tx.report_tick(input.row_ticks.first().copied().flatten());
+    let stager = Stager::new(tx, None, Default::default(), MAX_WRITE_PRIMITIVES)?;
     let mut writer = Writer {
         tx,
         stager,
@@ -499,9 +651,15 @@ fn apply(
     };
     let mut rows = Vec::new();
     let mut properties = Vec::new();
+    let mut row_ticks = Vec::new();
+    let mut current_row = 0;
     let width = input.property_columns.len();
     let each = |writer: &mut Writer<'_, '_>| -> Result<()> {
-        for mut data in input.result.rows {
+        for (i, mut data) in input.result.rows.into_iter().enumerate() {
+            current_row = i;
+            let at = input.row_ticks.get(i).copied().flatten();
+            writer.tick = writer.tx.report_tick(at);
+            writer.stager.set_row_tick(writer.tx, at);
             writer.snapshot = data.split_off(data.len() - width);
             writer.step()?;
             let mut row: Row = input
@@ -581,6 +739,7 @@ fn apply(
             if !stmt.returns.is_empty() {
                 writer.charge(
                     std::mem::size_of::<Vec<Datum>>()
+                        + std::mem::size_of::<Tick>()
                         + stmt
                             .returns
                             .len()
@@ -600,11 +759,38 @@ fn apply(
                     cells.push(d);
                 }
                 rows.push(cells);
+                row_ticks.push(writer.tick);
             }
         }
         Ok(())
     };
     if let Err(error) = each(&mut writer) {
+        let has_rows = stmt
+            .params
+            .iter()
+            .any(|p| matches!(params.binding(p), Some(ParameterValue::Rows(_))));
+        let per_row_tick = stmt
+            .tick
+            .as_ref()
+            .is_some_and(|e| !matches!(e, Expr::Value(_) | Expr::Param(_) | Expr::Null));
+        let error = match error {
+            WriteError::Stage(cause)
+                if (has_rows || per_row_tick)
+                    && matches!(cause.cause, native::Failure::SameTick(_)) =>
+            {
+                return Err(WriteError::RowConflict {
+                    row: current_row,
+                    cause: Box::new(cause),
+                });
+            }
+            other => other,
+        };
+        if has_rows && error.data_rule().is_some() {
+            return Err(WriteError::RowData {
+                row: current_row,
+                cause: Box::new(error),
+            });
+        }
         return Err(writer.limit(error));
     }
     writer.meter.check()?;
@@ -612,6 +798,7 @@ fn apply(
         retained_bytes: writer.stager.retained_bytes(),
         staged: writer.stager.finish(),
         rows,
+        row_ticks,
         tick,
         properties,
         limits: input.options.limits,
@@ -683,6 +870,27 @@ impl Writer<'_, '_> {
             })?;
         Ok(())
     }
+    /// Borrow a single row field, preserving NULL for an absent key.
+    fn row_field<'p>(
+        params: &'p dyn ParameterInput,
+        parameter: &str,
+        index: Option<&Datum>,
+        key: &str,
+    ) -> Result<&'p Datum> {
+        match (params.binding(parameter), index) {
+            (Some(ParameterValue::Rows(rows)), Some(Datum::Value(Value::I64(i)))) => {
+                Ok(usize::try_from(*i)
+                    .ok()
+                    .and_then(|i| rows.get(i))
+                    .and_then(|r| r.get(key))
+                    .unwrap_or(&Datum::Null))
+            }
+            (_, Some(Datum::Null)) => Ok(&Datum::Null),
+            _ => Err(invalid(
+                "row.key requires an UNWIND parameter containing map rows",
+            )),
+        }
+    }
     /// The bulk import lists can be much larger than one updated property.
     /// Inspect the bindings in place and charge before cloning only the selected cell.
     fn indexed_value(
@@ -692,32 +900,33 @@ impl Writer<'_, '_> {
         row: &Row,
     ) -> Result<Datum> {
         self.step()?;
-        let list = match list {
-            Expr::Param(name) => self
-                .params
-                .binding(name)
-                .ok_or_else(|| QueryError::MissingParam(name.clone()))?,
-            Expr::Var(name) => ParameterValue::Datum(
-                row.get(name)
-                    .ok_or_else(|| invalid("unbound list variable"))?,
-            ),
-            _ => {
-                return Err(invalid(
-                    "write indexing expects a list parameter or variable",
-                ));
+        let operand = |e: &'_ Expr<String>| -> Result<ParameterValue<'_>> {
+            match e {
+                Expr::Null => Ok(ParameterValue::Datum(&Datum::Null)),
+                Expr::Var(name) => row
+                    .get(name)
+                    .map(ParameterValue::Datum)
+                    .ok_or_else(|| invalid("unbound list operand")),
+                Expr::Param(name) => self
+                    .params
+                    .binding(name)
+                    .ok_or_else(|| QueryError::MissingParam(name.clone()).into()),
+                Expr::RowField {
+                    parameter,
+                    row: var,
+                    key,
+                } => Self::row_field(self.params, parameter, row.get(var), key)
+                    .map(ParameterValue::Datum),
+                _ => Err(invalid(
+                    "list indexing requires a list and an integer offset",
+                )),
             }
         };
-        let index = match index {
-            Expr::Null => return Ok(Datum::Null),
-            Expr::Value(v) => ParameterValue::Scalar(v),
-            Expr::Param(p) => self
-                .params
-                .binding(p)
-                .ok_or_else(|| QueryError::MissingParam(p.clone()))?,
-            Expr::Var(v) => {
-                ParameterValue::Datum(row.get(v).ok_or_else(|| invalid("unbound list offset"))?)
-            }
-            _ => return Err(invalid("a list offset needs an integer")),
+        let list = operand(list)?;
+        let index = if let Expr::Value(v) = index {
+            ParameterValue::Scalar(v)
+        } else {
+            operand(index)?
         };
         if matches!(list, ParameterValue::Datum(Datum::Null))
             || matches!(index, ParameterValue::Datum(Datum::Null))
@@ -768,6 +977,11 @@ impl Writer<'_, '_> {
                     return self.property(id, key);
                 }
             }
+            Expr::RowField {
+                parameter,
+                row: var,
+                key,
+            } => Some(Self::row_field(self.params, parameter, row.get(var), key)?),
             Expr::Null => return Ok(Datum::Null),
             Expr::Value(v) => {
                 self.charge(value_bytes(v))?;
@@ -783,6 +997,9 @@ impl Writer<'_, '_> {
                     return Ok(Datum::Value(v.clone()));
                 }
                 ParameterValue::Datum(d) => Some(d),
+                ParameterValue::Rows(_) => {
+                    return Err(invalid("map rows must be accessed through row.key"));
+                }
             },
             Expr::List(xs) => {
                 return xs

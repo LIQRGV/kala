@@ -655,7 +655,9 @@ impl Exec<'_, '_> {
                 value
             }
             Expr::Aggregate { .. } => unreachable!("aggregate lowered before execution"),
-            Expr::Param(_) => unreachable!("parameters resolved by compile"),
+            Expr::Param(_) | Expr::RowParameter(_) | Expr::RowField { .. } => {
+                unreachable!("parameters resolved by compile")
+            }
             Expr::Property {
                 entity,
                 key,

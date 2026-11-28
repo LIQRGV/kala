@@ -572,12 +572,14 @@ Save the following import in `import.cypher`. The permanent handle makes
 it safe to run the file again.
 
 ```cypher
-MERGE (n:CHARACTER {kala_handle:'kael2'})
-ON CREATE SET n.name = 'Kael' AT TICK 700;
+UNWIND $rows AS row
+MERGE (n:CHARACTER {kala_handle:row.handle})
+ON CREATE SET n.name = row.name AT TICK row.tick;
 ```
 
 ```sh
-kala transact --lang cypher varrow.kala import.cypher
+kala transact --lang cypher varrow.kala import.cypher \
+  --param 'rows=[{"handle":"kael2","name":"Kael","tick":700}]'
 ```
 
 The first run creates the character and asserts the name. The second finds
@@ -587,14 +589,23 @@ the character and appends nothing.
 
 With `kala serve worlds --default-db varrow`, a local bootstrap root account can
 use `auth=None`; other accounts need a `write` grant (and `read` for `:set`).
-Send Datalog write text with the first-line prefix and no parameters:
+For a Datalog file containing `[:assert ?who :alias ?alias :at ?tick]`, run
+`kala transact varrow.kala alias.edn --param who=greg --param alias=Ned --param tick=300`.
+In a write REPL, set the same names with `.param who greg`, `.param alias Ned`
+and `.param tick 300`. A string parameter needs an attribute that is already
+declared (`alias` is, in this world): for a new one, write
+`[:attribute :motto :string]` or `[:attribute :friend_of :ref]` first, because
+a string alone cannot say whether it is text or a handle. Over Bolt, pass the values in the driver's parameter map:
 
 ```python
 from neo4j import GraphDatabase
 
 with GraphDatabase.driver("bolt://localhost:7687", auth=None) as driver:
     with driver.session(database="varrow") as session:
-        result = session.run('// kala:datalog\n[:assert :greg :alias "Ned" :at 300]')
+        result = session.run(
+            "// kala:datalog\n[:assert ?who :alias ?alias :at ?tick]",
+            who="greg", alias="Ned", tick=300,
+        )
         print(result.data())
         print(result.consume().metadata["kala"])
 ```

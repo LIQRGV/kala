@@ -14,8 +14,25 @@ pub(crate) fn parse(text: &str) -> Result<Statement, CypherError> {
         elements: 0,
         copied: 0,
         write_values: false,
+        property_indexes: Vec::new(),
     };
-    p.query()
+    let mut statement = p.query()?;
+    // Which `variable.key` is a row field is known only after the whole
+    // statement is read (a later use can disqualify the parameter).
+    row_params::resolve(&mut statement).map_err(|property| {
+        let offset = p
+            .property_indexes
+            .iter()
+            .find(|(_, operand)| *operand == property)
+            .map_or(0, |(offset, _)| *offset);
+        CypherError::new(
+            text,
+            offset,
+            ErrorKind::Syntax,
+            "[ is not supported yet on a graph property (its values are an unordered set); index a list parameter, a list variable or a row field",
+        )
+    })?;
+    Ok(statement)
 }
 struct Parser<'a> {
     text: &'a str,
@@ -27,6 +44,8 @@ struct Parser<'a> {
     copied: usize,
     /// Inside an update, a row binding may be a parallel list indexed by an UNWIND ordinal.
     write_values: bool,
+    /// Where each `[` follows or holds a `variable.key`, with that operand.
+    property_indexes: Vec<(usize, (String, String))>,
 }
 /// How much a query's comparison chains may duplicate in total: a middle
 /// operand is copied into two comparisons, and nested chains would otherwise
@@ -706,14 +725,22 @@ impl Parser<'_> {
             }
             _ => return Err(self.unsupported("variable, property, literal or parameter")),
         };
-        if (matches!(e, Expr::Param(_)) || self.write_values && matches!(e, Expr::Var(_)))
+        let bracket = self.token().start;
+        if (matches!(e, Expr::Param(_) | Expr::Property { .. })
+            || self.write_values && matches!(e, Expr::Var(_)))
             && self.sym("[")
         {
             let index = self.item_depth(depth + 1)?;
             self.need("]")?;
+            for operand in [&e, &index] {
+                if let Expr::Property { entity, key, .. } = operand {
+                    self.property_indexes
+                        .push((bracket, (entity.clone(), key.clone())));
+                }
+            }
             if !matches!(
                 index,
-                Expr::Var(_) | Expr::Param(_) | Expr::Value(_) | Expr::Null
+                Expr::Var(_) | Expr::Param(_) | Expr::Value(_) | Expr::Null | Expr::Property { .. }
             ) {
                 return Err(self.err("list offset must be an integer, variable or parameter"));
             }
@@ -811,7 +838,12 @@ impl Parser<'_> {
             let bytes = match e {
                 Expr::Var(v) => v.len(),
                 Expr::Value(Value::Str(s)) => s.len(),
-                Expr::Param(p) => p.len(),
+                Expr::Param(p) | Expr::RowParameter(p) => p.len(),
+                Expr::RowField {
+                    row,
+                    parameter,
+                    key,
+                } => row.len() + parameter.len() + key.len(),
                 Expr::Property { entity, key, .. } => entity.len() + key.len(),
                 Expr::Value(_) | Expr::Null => 0,
                 Expr::Path { start, segments } => {

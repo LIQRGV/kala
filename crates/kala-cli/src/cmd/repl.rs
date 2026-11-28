@@ -15,7 +15,7 @@ use rustyline::error::ReadlineError;
 use rustyline::history::MemHistory;
 
 use super::Done;
-use super::query::{parse_params, query_err, read_text_file, render_result};
+use super::query::{query_err, read_text_file, render_result};
 use super::read::Ctx;
 use super::repl_editor::SafeHelper;
 use super::repl_history::{History, MAX_HISTORY_ENTRIES, safe_entry};
@@ -199,7 +199,11 @@ impl<'a> Session<'a> {
                     .map(|value| (name.clone(), value.clone()))
             })
             .collect();
-        let params = parse_params(&self.ctx, &prepared.params, &given)?;
+        let params = super::language::front_end("datalog")?.params(
+            &self.ctx.world,
+            &prepared.params,
+            &given,
+        )?;
         if explain {
             return Ok(prepared.plan.explain(&self.ctx.world));
         }
@@ -239,13 +243,28 @@ impl<'a> Session<'a> {
                 if !self.write {
                     return Err(user("write form refused; start with --write"));
                 }
-                let form = kala_datalog::parse_write(text).map_err(|e| user(e.to_string()))?;
+                let mut forms =
+                    kala_lang::write::prepare_write_forms(text).map_err(|e| user(e.to_string()))?;
+                let form = forms
+                    .next()
+                    .ok_or_else(|| user("expected a write form"))?
+                    .map_err(|e| user(e.to_string()))?;
+                if forms.next().is_some() {
+                    return Err(user("expected one write transaction"));
+                }
                 self.catch_up()?;
-                let report = super::transact::execute(
+                let given = self
+                    .params
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<Vec<_>>();
+                let report = super::transact::execute_template(
                     &mut self.ctx.world,
                     &form,
                     self.defaults.at,
                     self.concurrency,
+                    super::language::front_end("datalog")?,
+                    &given,
                 )?;
                 self.ctx.canon = self.ctx.world.latest_tx();
                 Ok(super::transact::render(&report, self.json))

@@ -331,6 +331,9 @@ pub struct WriteTxn {
 /// A literal value or an edge triple used as a reference.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WriteValue {
+    /// Typed parameter data. String references resolve when the operation stages,
+    /// so handles created by an earlier operation are already visible.
+    Bound(kala_core::Value),
     Scalar(Item),
     Edge {
         source: Item,

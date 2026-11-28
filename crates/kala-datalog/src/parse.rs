@@ -46,7 +46,7 @@ const PLANNED_FORMS: [&str; 2] = ["not-join", "or-join"];
 const SLICE7: &str = "planned for slice 7";
 
 /// A read EDN form.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum Form {
     Seq {
         bracket: Bracket,

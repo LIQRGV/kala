@@ -25,6 +25,14 @@ impl fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+impl Error {
+    const ROW_COUNT: Self = Self("map rows exceed the 10000 row limit");
+    const ROW_BYTES: Self = Self("RUN parameters exceed the parameter memory budget");
+    pub(crate) fn parameter_limit(&self) -> bool {
+        matches!(*self, Self::ROW_COUNT | Self::ROW_BYTES)
+    }
+}
+
 /// Encode one value with the standard limits.
 pub fn encode(value: &Value) -> Result<Vec<u8>, Error> {
     encode_with_limits(value, 1 << 20, 32)
@@ -39,13 +47,15 @@ pub fn encode_with_limits(
     max_bytes: usize,
     max_depth: usize,
 ) -> Result<Vec<u8>, Error> {
+    let mut bytes = Vec::new();
     let mut encoder = Encoder {
-        bytes: Vec::new(),
+        bytes: Some(&mut bytes),
+        size: 0,
         max: max_bytes,
         depth: max_depth.min(32),
     };
     encoder.value(value, 0)?;
-    Ok(encoder.bytes)
+    Ok(bytes)
 }
 /// Decode exactly one value within explicit byte and nesting limits.
 /// Depth is capped at 32 even if the caller asks for more (native stack bound).
@@ -54,20 +64,52 @@ pub fn decode_with_limits(
     max_bytes: usize,
     max_depth: usize,
 ) -> Result<Value, Error> {
+    decode_frame(bytes, max_bytes, max_depth, None)
+}
+
+/// Decode a request, bounding the expanded representation of its RUN parameters
+/// before allocating the vectors, maps or strings for a row table.
+pub(crate) fn decode_request(
+    bytes: &[u8],
+    max_bytes: usize,
+    max_depth: usize,
+    map_budget: usize,
+) -> Result<Value, Error> {
+    decode_frame(bytes, max_bytes, max_depth, Some(map_budget))
+}
+
+fn decode_frame(
+    bytes: &[u8],
+    max_bytes: usize,
+    max_depth: usize,
+    map_budget: Option<usize>,
+) -> Result<Value, Error> {
     if bytes.len() > max_bytes {
         return Err(Error("message size limit exceeded"));
     }
     let mut decoder = Decoder {
         bytes,
+        map_budget,
         depth: max_depth.min(32),
     };
-    let value = decoder.value(0)?;
+    let value = decoder.value(0, Area::Other)?;
     if !decoder.bytes.is_empty() {
         return Err(Error("trailing PackStream data"));
     }
     Ok(value)
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Area {
+    Other,
+    /// The second field of RUN contains parameter names and their values.
+    Parameters,
+    Parameter,
+    /// A map in a parameter and all values nested inside that map.
+    Row,
+}
+
 struct Decoder<'a> {
+    map_budget: Option<usize>,
     bytes: &'a [u8],
     depth: usize,
 }
@@ -98,7 +140,22 @@ impl<'a> Decoder<'a> {
             _ => Err(Error("invalid length marker")),
         }
     }
-    fn value(&mut self, depth: usize) -> Result<Value, Error> {
+    fn charge_row(&mut self, bytes: usize) -> Result<(), Error> {
+        if let Some(left) = &mut self.map_budget {
+            *left = left.checked_sub(bytes).ok_or(Error::ROW_BYTES)?;
+        }
+        Ok(())
+    }
+    /// Charge what a parameter value expands to before it is allocated: a
+    /// one-byte element of a list becomes a whole [`Value`], so a message
+    /// within the size limit can decode to many times its length.
+    fn charge_parameter(&mut self, area: Area, bytes: usize) -> Result<(), Error> {
+        if matches!(area, Area::Parameter | Area::Row) {
+            self.charge_row(bytes)?;
+        }
+        Ok(())
+    }
+    fn value(&mut self, depth: usize, area: Area) -> Result<Value, Error> {
         if depth > self.depth {
             return Err(Error("PackStream depth limit exceeded"));
         }
@@ -115,6 +172,7 @@ impl<'a> Decoder<'a> {
             0xcb => Value::Integer(i64::from_be_bytes(self.number()?)),
             0x80..=0x8f | 0xd0..=0xd2 => {
                 let n = self.len(marker)?;
+                self.charge_parameter(area, n)?;
                 Value::String(
                     std::str::from_utf8(self.take(n)?)
                         .map_err(|_| Error("invalid UTF-8"))?
@@ -125,23 +183,43 @@ impl<'a> Decoder<'a> {
                 // `take` checks `n` against the bytes actually remaining
                 // before anything is copied.
                 let n = self.len(marker)?;
+                self.charge_parameter(area, n)?;
                 Value::Bytes(self.take(n)?.to_vec())
             }
             0x90..=0x9f | 0xd4..=0xd6 => {
                 let n = self.len(marker)?;
-                Value::List(self.sequence(n, depth)?)
+                Value::List(self.sequence(n, depth, area)?)
             }
             0xa0..=0xaf | 0xd8..=0xda => {
                 let n = self.len(marker)?;
                 if n > self.bytes.len() / 2 {
                     return Err(Error("map length exceeds remaining bytes"));
                 }
+                let field_area = match area {
+                    Area::Parameters => Area::Parameter,
+                    Area::Parameter | Area::Row => {
+                        self.charge_row(n.saturating_mul(kala_lang::params::MAP_FIELD_BYTES))?;
+                        Area::Row
+                    }
+                    Area::Other => Area::Other,
+                };
                 let mut map = BTreeMap::new();
                 for _ in 0..n {
-                    let Value::String(key) = self.value(depth + 1)? else {
+                    if !matches!(self.bytes.first(), Some(0x80..=0x8f | 0xd0..=0xd2)) {
+                        return Err(Error("map key must be a string"));
+                    }
+                    let Value::String(key) = self.value(
+                        depth + 1,
+                        if field_area == Area::Row {
+                            Area::Row
+                        } else {
+                            Area::Other
+                        },
+                    )?
+                    else {
                         return Err(Error("map key must be a string"));
                     };
-                    let value = self.value(depth + 1)?;
+                    let value = self.value(depth + 1, field_area)?;
                     if map.insert(key, value).is_some() {
                         return Err(Error("duplicate map key"));
                     }
@@ -151,33 +229,72 @@ impl<'a> Decoder<'a> {
             0xb0..=0xbf => {
                 let n = self.len(marker)?;
                 let tag = self.byte()?;
-                Value::Structure(tag, self.sequence(n, depth)?)
+                if depth == 0 && tag == 0x10 && n == 3 && self.map_budget.is_some() {
+                    Value::Structure(
+                        tag,
+                        vec![
+                            self.value(1, Area::Other)?,
+                            self.value(1, Area::Parameters)?,
+                            self.value(1, Area::Other)?,
+                        ],
+                    )
+                } else {
+                    Value::Structure(tag, self.sequence(n, depth, area)?)
+                }
             }
             _ => return Err(Error("unsupported PackStream marker")),
         })
     }
-    fn sequence(&mut self, n: usize, depth: usize) -> Result<Vec<Value>, Error> {
+    fn sequence(&mut self, n: usize, depth: usize, area: Area) -> Result<Vec<Value>, Error> {
         if n > self.bytes.len() {
             return Err(Error("list length exceeds remaining bytes"));
         }
+        // Every list of a parameter, plain or a table of map rows, at
+        // every nesting level.
+        self.charge_parameter(area, n.saturating_mul(std::mem::size_of::<Value>()))?;
+        let mut table = false;
         let mut values = Vec::new();
         for _ in 0..n {
-            values.push(self.value(depth + 1)?);
+            if area == Area::Parameter
+                && !table
+                && matches!(self.bytes.first(), Some(0xa0..=0xaf | 0xd8..=0xda))
+            {
+                if n > kala_query::MAX_MAP_ROWS {
+                    return Err(Error::ROW_COUNT);
+                }
+                table = true;
+            }
+            values.push(self.value(depth + 1, area)?);
         }
         Ok(values)
     }
 }
-struct Encoder {
-    bytes: Vec<u8>,
+/// Count the encoded parameter map with the same markers as the encoder.
+pub(crate) fn map_size(map: &BTreeMap<String, Value>, max: usize) -> Result<usize, Error> {
+    let mut counter = Encoder {
+        bytes: None,
+        size: 0,
+        max,
+        depth: 32,
+    };
+    counter.map(map, 0)?;
+    Ok(counter.size)
+}
+struct Encoder<'a> {
+    bytes: Option<&'a mut Vec<u8>>,
+    size: usize,
     max: usize,
     depth: usize,
 }
-impl Encoder {
+impl Encoder<'_> {
     fn put(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        if bytes.len() > self.max.saturating_sub(self.bytes.len()) {
+        if bytes.len() > self.max.saturating_sub(self.size) {
             return Err(Error("message size limit exceeded"));
         }
-        self.bytes.extend_from_slice(bytes);
+        self.size += bytes.len();
+        if let Some(buf) = &mut self.bytes {
+            buf.extend_from_slice(bytes);
+        }
         Ok(())
     }
     fn len(&mut self, n: usize, tiny: u8, wide: u8) -> Result<(), Error> {
@@ -193,6 +310,15 @@ impl Encoder {
             self.put(&[wide + 2])?;
             self.put(&n.to_be_bytes())
         }
+    }
+    fn map(&mut self, map: &BTreeMap<String, Value>, depth: usize) -> Result<(), Error> {
+        self.len(map.len(), 0xa0, 0xd8)?;
+        for (key, value) in map {
+            self.len(key.len(), 0x80, 0xd0)?;
+            self.put(key.as_bytes())?;
+            self.value(value, depth + 1)?;
+        }
+        Ok(())
     }
     fn value(&mut self, value: &Value, depth: usize) -> Result<(), Error> {
         if depth > self.depth {
@@ -245,15 +371,7 @@ impl Encoder {
                 }
                 Ok(())
             }
-            Value::Map(v) => {
-                self.len(v.len(), 0xa0, 0xd8)?;
-                for (key, value) in v {
-                    self.len(key.len(), 0x80, 0xd0)?;
-                    self.put(key.as_bytes())?;
-                    self.value(value, depth + 1)?;
-                }
-                Ok(())
-            }
+            Value::Map(v) => self.map(v, depth),
             Value::Structure(tag, fields) => {
                 if fields.len() > 15 {
                     return Err(Error("too many structure fields"));

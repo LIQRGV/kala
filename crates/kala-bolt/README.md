@@ -357,7 +357,7 @@ RUN parameters use the front-end's inferred kinds: integers for ticks/i64,
 floats for f64, booleans, strings for strings, handles or readable IDs for
 entities, and a nonnegative integer or `tx#N`/`N` string for canon. No numeric
 coercion; NaN, byte arrays and other mismatched types are TypeError. Cypher
-value parameters also accept NULL and lists, while ticks/canon remain integers. Undeclared params are
+value parameters also accept NULL and lists. A direct UNWIND source accepts a list of row maps. Read ticks and canon retain their scalar kinds. Undeclared params are
 ignored. Fields omit the variable's `?`; aggregate names retain their text.
 
 ## Errors and limits
@@ -415,7 +415,7 @@ sorted sets (no order or duplicates); labels consist of one node type plus
 `label` values. Cardinality-one overlaps also return lists. Ref properties
 return graph references or lists of them. Node/Relationship/Path enrichment always
 uses the plan's default tick; explicit `v.key` uses its binding clause's tick.
-Cypher parameters support NULL and lists (with input order preserved). Native
+Cypher parameters support NULL, ordered lists and lists of maps for direct UNWIND sources. Native
 ref-to-edge targets remain edge references in unlabelled relationship endpoints;
 standalone node scans exclude edges.
 Every explicit system-world `password_hash` reference is refused before
@@ -493,8 +493,17 @@ Cypher and Datalog both stage native writes. A blind Cypher CREATE needs
 `write`. Reading clauses, SET, REMOVE, DELETE, MERGE, property reads and
 RETURN also need `read`. Admission checks the entire statement before opening
 a writer. Both languages use the same database, mode and privilege checks,
-with reduced diagnostics for a write-only identity. Pass an empty parameter
-map for Datalog writes. Cypher accepts parameters in both pipelines and updates,
+with reduced diagnostics for a write-only identity. Bind Datalog write values in the RUN parameter
+map with bare names. For `[:assert ?e :name ?v :at ?t]`, supply a handle
+string as `e`, the name as `v` and an integer as `t`. Datalog accepts
+scalars. Attribute names, node types, verbs and schema declarations stay
+in the query text. Each form is bound just before it is staged, so a
+parameter's type follows an attribute declared earlier in the same
+transaction or by an earlier form of the same RUN. A string parameter
+written to an attribute that is not defined is a TypeError naming the
+parameter and the attribute (a string cannot say whether it is a handle or
+text): declare the attribute first. A parameter the forms use and the map
+lacks refuses the whole RUN before any form is staged. Cypher accepts parameters in both pipelines and updates,
 converted with the kinds the statement gives them as for a read query (a handle
 string for a ref position names the entity; a wrong type is a TypeError before
 anything runs). `UNWIND … CREATE` has a reading part, so it needs `read` as well
@@ -563,7 +572,9 @@ A Cypher write returns rows only for RETURN. Auto-commit renders the committed
 properties and final IDs. Inside BEGIN, write RETURN sees the transaction's
 staged changes. A subsequent query reads the snapshot. The committed
 `kala.ops` list gives operation positions, kinds, ticks, changed counts and
-entry IDs. `ops_omitted` counts operations left out to fit the response.
+entry IDs. `kala.tick_min` and `kala.tick_max` report the range across
+Cypher primitives, and `kala.tick_count` counts those primitives, including
+ones that changed nothing. `ops_omitted` counts operations left out to fit the response.
 `relationships-created` counts newly interned edges in both languages,
 `relationships-deleted` counts retracted reference facts, and `labels-added`
 and `labels-removed` count changes to the label attribute. Nodes keep their
@@ -734,6 +745,14 @@ type, a same-tick conflict …) is the same code, `Neo.ClientError.Statement.Exe
 with the same message, `write failed; details require read privilege`, so the
 failures can't be told apart; syntax errors and privilege refusals, which
 describe the request and not the data, keep their own codes.
+That is the only rule: a statement that carries parameters fails with exactly
+the diagnostics of its literal form. An identity that holds `read` gets the
+store rule's own message (the subject, attribute, tick and occupying entry of
+a same-tick conflict, the handle that already exists, the conflict sentence
+naming what the transaction read); a write-only identity gets the reduced
+message above for both. Parameter values are never logged, and a parameter
+refused while it is bound is described by its name and expected kind, never
+by its value.
 Overlap descriptions contain only `overlap details require read privilege`.
 No held values appear in these records, errors or notifications. Changed counts
 remain visible, as do commit IDs and counts. Inferred declaration names and
@@ -833,11 +852,20 @@ request can't make every writer replay the log.
 
 Durations accept `ms`, `s`, `m` or bare seconds. Native defaults live in
 `ServerConfig`. Each transaction accepts at most 256 forms. The 16 MiB transaction budget
-includes write text and, for Cypher, parameters and the estimated memory for
-expanded primitive operations and their reports. Datalog also observes its
-per-form limits.
+includes write text and encoded RUN parameters for both languages.
+Every parameter supplied to a Datalog write RUN must appear in its forms. Datalog also charges
+expanded parameter occurrences. Cypher charges estimated memory for expanded
+primitives and their reports.
 Materialized write records are capped at 16 MiB per RUN. Socket messages remain
-bounded by `max_message_bytes` and `max_depth`. The idle clock starts when a
+bounded by `max_message_bytes` and `max_depth`. RUN decoding checks the
+10,000-row limit and charges what the parameters expand to, before
+allocating it, against a 16 MiB parameter memory budget: every list (plain,
+nested, or a table of map rows) at one decoded value per element, every
+string by its bytes, and map containers and field entries. A list of
+one-byte integers that fits the message limit can exceed it; that RUN is a
+TypeError (`RUN parameters exceed the parameter memory budget`) and the
+connection stays usable. Binding charges list parameters the same way
+against the 16 MiB transaction budget. The idle clock starts when a
 response has been sent and stops when the next request has arrived: a statement
 or COMMIT that takes longer than `--tx-idle-timeout` is not idle and is bounded
 by `--tx-timeout` (or the client's shorter `tx_timeout`) only. A request's

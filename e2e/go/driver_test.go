@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -303,5 +304,63 @@ func TestVerifiedTLS(t *testing.T) {
 	rows := mustQuery(t, ctx, session(t, ctx, driver, "varrow"), "MATCH (n {kala_handle:'varrow'}) RETURN n.name")
 	if len(rows) != 1 || rows[0].Values[0] != "Varrow" {
 		t.Fatalf("unexpected TLS query result: %v", rows)
+	}
+}
+
+func TestBulkRowParameters(t *testing.T) {
+	ctx := testContext(t)
+	driver := openDriver(t, ctx, os.Getenv("KALA_BOLT_URI"), neo4j.NoAuth())
+	s := session(t, ctx, driver, "varrow")
+	const count = 250
+	rows := make([]map[string]any, count)
+	for i := range rows {
+		rows[i] = map[string]any{
+			"handle": fmt.Sprintf("go_projector_%03d", i),
+			"name":   fmt.Sprintf("Scout %03d", i),
+			"tick":   int64(i - 100),
+		}
+	}
+	const merge = "UNWIND $rows AS row MERGE (n:GO_NPC {kala_handle:row.handle}) SET n.name=row.name AT TICK row.tick"
+	if _, err := s.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		return nil, write(ctx, tx, merge, map[string]any{"rows": rows})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tick := range []int{0, count - 101} {
+		result, err := s.Run(ctx, "MATCH (n:GO_NPC) AT TICK $t WHERE n.name IS NOT NULL RETURN n.kala_handle, n.name ORDER BY n.kala_handle", map[string]any{"t": tick})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := result.Collect(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != tick+101 {
+			t.Fatalf("tick %d: got %d rows, want %d", tick, len(got), tick+101)
+		}
+		for i, record := range got {
+			if record.Values[0] != rows[i]["handle"] || record.Values[1] != rows[i]["name"] {
+				t.Fatalf("tick %d row %d: %v", tick, i, record.Values)
+			}
+		}
+	}
+
+	const value = "projector \"note\"]\nsecond line"
+	if _, err := s.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		// A string parameter needs a declared attribute (a string cannot say
+		// whether it is a handle or text). The declaration is only staged
+		// when the parameterized form is bound in the same transaction.
+		if err := write(ctx, tx, datalog+"[:attribute :projector_note :string]", nil); err != nil {
+			return nil, err
+		}
+		return nil, write(ctx, tx, datalog+"[:assert ?e :projector_note ?v :at ?t]", map[string]any{
+			"e": rows[0]["handle"], "v": value, "t": int64(200),
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got := mustQuery(t, ctx, s, "MATCH (n {kala_handle:'go_projector_000'}) AT TICK 200 RETURN n.projector_note")
+	if len(got) != 1 || got[0].Values[0] != value {
+		t.Fatalf("Datalog string did not round trip: %v", got)
 	}
 }

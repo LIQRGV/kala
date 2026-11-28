@@ -59,8 +59,25 @@ fn kind(op: &WriteOp) -> &'static str {
         WriteOp::Set { .. } => "set",
     }
 }
+/// A parameter in a reference position: a handle, or a formatted ID. One
+/// that names nothing is the literal form's unknown-entity error, shown as
+/// the literal would be written (`:gregg`, `CHARACTER#99`).
+fn bound_reference(tx: &Txn<'_>, name: &str) -> Result<EntityId, Failure> {
+    tx.entity_by_handle(name)
+        .or_else(|| tx.parse_id(name))
+        .ok_or_else(|| {
+            Failure::UnknownEntity(if name.contains('#') {
+                name.to_owned()
+            } else {
+                format!(":{name}")
+            })
+        })
+}
+
 fn reference(tx: &Txn<'_>, i: &Item) -> Result<EntityId, Failure> {
     match i {
+        // The edge grammar reserves a string endpoint for an already-bound parameter.
+        Item::Str(name, _) => bound_reference(tx, name),
         Item::Keyword(s, _) => tx
             .entity_by_handle(s)
             .ok_or_else(|| Failure::UnknownEntity(format!(":{s}"))),
@@ -72,6 +89,9 @@ fn reference(tx: &Txn<'_>, i: &Item) -> Result<EntityId, Failure> {
 }
 fn subject(tx: &Txn<'_>, v: &WriteValue) -> Result<EntityId, Failure> {
     match v {
+        WriteValue::Bound(Value::Str(s)) => bound_reference(tx, s),
+        WriteValue::Bound(Value::Ref(id)) => Ok(*id),
+        WriteValue::Bound(_) => Err(Failure::ExpectedReference),
         WriteValue::Scalar(Item::Id(s, _)) => tx
             .parse_id(s)
             .ok_or_else(|| Failure::UnknownEntity(s.clone())),
@@ -86,8 +106,16 @@ fn subject(tx: &Txn<'_>, v: &WriteValue) -> Result<EntityId, Failure> {
             .ok_or(Failure::UnknownEdge),
     }
 }
-fn value(tx: &Txn<'_>, v: &WriteValue) -> Result<Value, Failure> {
+fn value(
+    tx: &Txn<'_>,
+    v: &WriteValue,
+    expected: Option<kala_core::ValueType>,
+) -> Result<Value, Failure> {
     Ok(match v {
+        WriteValue::Bound(_) if expected == Some(kala_core::ValueType::Ref) => {
+            Value::Ref(subject(tx, v)?)
+        }
+        WriteValue::Bound(v) => v.clone(),
         WriteValue::Scalar(Item::Str(s, _)) => Value::Str(s.clone()),
         WriteValue::Scalar(Item::Int(n, _)) => Value::I64(*n),
         WriteValue::Scalar(Item::Float(n, _)) => {
@@ -96,6 +124,22 @@ fn value(tx: &Txn<'_>, v: &WriteValue) -> Result<Value, Failure> {
         WriteValue::Scalar(Item::Bool(b, _)) => Value::Bool(*b),
         _ => Value::Ref(subject(tx, v)?),
     })
+}
+
+fn attribute_value(tx: &Txn<'_>, v: &WriteValue, name: &str) -> Result<Value, Failure> {
+    let expected = if matches!(v, WriteValue::Bound(_)) {
+        let world = tx.base_world();
+        world.attribute(name).map(|d| d.value_type).or_else(|| {
+            world
+                .at_canon(world.latest_tx())
+                .resolve_attribute(name)
+                .ok()
+                .map(|(d, _)| d.value_type)
+        })
+    } else {
+        None
+    };
+    value(tx, v, expected)
 }
 
 /// Stage and commit one form under the default [`WritePolicy`] (a system
@@ -210,7 +254,7 @@ pub fn stage_with(
                     ..
                 } => {
                     let e = subject(tx, s).map_err(error)?;
-                    let v = value(tx, v).map_err(error)?;
+                    let v = attribute_value(tx, v, &attr.name).map_err(error)?;
                     stager.fact(tx, e, &attr.name, v, *op, *at, *precision)?;
                 }
                 WriteOp::Set {
@@ -230,12 +274,14 @@ pub fn stage_with(
                     let mut remaining = stager.remaining_bytes();
                     let mut resolved = Vec::with_capacity(values.len());
                     for v in values {
-                        if let WriteValue::Scalar(Item::Str(s, _)) = v {
+                        if let WriteValue::Scalar(Item::Str(s, _))
+                        | WriteValue::Bound(Value::Str(s)) = v
+                        {
                             remaining = remaining
                                 .checked_sub(s.len())
                                 .ok_or_else(|| error(Failure::Limit))?;
                         }
-                        resolved.push(value(tx, v).map_err(error)?);
+                        resolved.push(attribute_value(tx, v, &attr.name).map_err(error)?);
                     }
                     stager.set(tx, e, &attr.name, &resolved, *at, *precision)?;
                 }
@@ -317,21 +363,28 @@ fn stage_correct(tx: &mut Txn<'_>, op: &WriteOp) -> Result<Effect, Failure> {
     else {
         return Err(Failure::ExpectedCorrection);
     };
-    let c = match replacement {
-        None => Correction::Delete,
-        Some(r) => Correction::Replace {
-            value: r.value.as_ref().map(|v| value(tx, v)).transpose()?,
-            tick: r.at,
-            op: r.op,
-            precision: r.precision,
-        },
-    };
     // The chain's stored precision before the correction, so a no-op or a
     // delete still reports the truth. Read here, as part of this op: the
     // read of the chain is what an optimistic commit conflicts on, and it
     // must be reported at the `:correct` that made it, not at the form's
     // first op.
-    let stored = tx.current_change(*entry).ok().map(|c| c.precision);
+    let stored = tx
+        .current_change(*entry)
+        .ok()
+        .map(|c| (c.precision, c.value.value_type()));
+    let c = match replacement {
+        None => Correction::Delete,
+        Some(r) => Correction::Replace {
+            value: r
+                .value
+                .as_ref()
+                .map(|v| value(tx, v, stored.map(|(_, ty)| ty)))
+                .transpose()?,
+            tick: r.at,
+            op: r.op,
+            precision: r.precision,
+        },
+    };
     let r = tx.correct(*entry, c).map_err(Failure::Store)?;
     Ok(Effect {
         changed: r.changed,
@@ -340,7 +393,7 @@ fn stage_correct(tx: &mut Txn<'_>, op: &WriteOp) -> Result<Effect, Failure> {
             replacement
                 .as_ref()
                 .and_then(|r| r.precision)
-                .or(stored)
+                .or_else(|| stored.map(|(precision, _)| precision))
                 .unwrap_or(Precision::Exact),
         ),
         entity: None,

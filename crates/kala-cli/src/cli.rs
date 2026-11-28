@@ -449,6 +449,9 @@ pub struct QueryArgs {
 // `kala transact`.
 #[derive(Debug, Args)]
 pub struct TransactArgs {
+    /// A write parameter shared by the statements in this file.
+    #[arg(long = "param", value_name = "NAME=VALUE", value_parser = parse_param, conflicts_with = "create")]
+    pub params: Vec<(String, String)>,
     /// Language of the transaction file. A Cypher file has one transaction per statement.
     #[arg(long, default_value = "datalog", value_parser = crate::cmd::language::NAMES, conflicts_with = "create")]
     pub lang: String,

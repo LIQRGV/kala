@@ -198,13 +198,20 @@ impl Session<'_> {
             Err(e) => return Err(e),
         };
         self.expired = expired;
-        let value =
-            packstream::decode_with_limits(&bytes, config.max_message_bytes, config.max_depth);
+        let value = packstream::decode_request(
+            &bytes,
+            config.max_message_bytes,
+            config.max_depth,
+            write::MAX_STAGED_BYTES,
+        );
         // Input may carry credentials. Drop the original bytes before dispatch,
         // never format them or the decoded request, even on malformed input.
         drop(bytes);
         let value = match value {
             Ok(v) => v,
+            Err(e) if e.parameter_limit() => {
+                return Ok(Some(Err(Failure::new(crate::error::TYPE, e.0))));
+            }
             Err(_) => {
                 let _ = self.send(
                     stream,
@@ -790,20 +797,30 @@ impl Session<'_> {
             }
             kala_lang::Statement::CypherWrite(statement) => {
                 let held = self.allow_write_run(&name, &options)?;
-                self.cypher_run(&name, &statement, params, text.len(), &options, held, stop)
-                    .inspect_err(|failure| self.log_refused(&name, refusal_reason(failure)))?
+                self.cypher_run(
+                    &name,
+                    &statement,
+                    source?.front_end.parameter_policy(),
+                    params,
+                    text.len(),
+                    &options,
+                    held,
+                    stop,
+                )
+                .inspect_err(|failure| self.log_refused(&name, refusal_reason(failure)))?
             }
             kala_lang::Statement::Writes => {
                 let read = self.allow_write_run(&name, &options)?.read;
-                if !params.is_empty() {
-                    return Err(Failure::new(
-                        INVALID,
-                        "Datalog write forms do not accept parameters",
-                    ));
-                }
                 let source = source?;
-                self.write_run(&name, &source.text, &options, read)
-                    .inspect_err(|failure| self.log_refused(&name, refusal_reason(failure)))?
+                self.write_run(
+                    &name,
+                    &source.text,
+                    params,
+                    source.front_end.parameter_policy(),
+                    &options,
+                    read,
+                )
+                .inspect_err(|failure| self.log_refused(&name, refusal_reason(failure)))?
             }
             kala_lang::Statement::Server(statement) => {
                 if self
@@ -964,6 +981,7 @@ impl Session<'_> {
         &mut self,
         db: &str,
         statement: &kala_lang::write::WriteStatement,
+        policy: kala_lang::ParamPolicy,
         given: &Map,
         text_len: usize,
         options: &Options,
@@ -1000,7 +1018,7 @@ impl Session<'_> {
         let prepare = |world: &kala_core::World, limits: kala_query::Limits| {
             let compiled = compile_statement(world, statement)
                 .map_err(|e| write::statement_error(e, held.read))?;
-            let params = query::parameters(world, compiled.parameter_kinds(), given, true)?;
+            let params = query::parameters(world, compiled.parameter_kinds(), given, policy)?;
             let run = kala_query::RunOptions::new(limits)
                 .with_cancel(flag)
                 .with_deadline(deadline);
@@ -1010,6 +1028,7 @@ impl Session<'_> {
             })?;
             Ok::<_, Failure>((params, input))
         };
+        let input_bytes = write_input_bytes(text_len, given)?;
         let full = kala_query::Limits::default();
         if let Some(tx) = &mut self.transaction {
             let account = self
@@ -1017,11 +1036,7 @@ impl Session<'_> {
                 .as_ref()
                 .map(|id| format!("{}@{}", id.principal, id.host))
                 .ok_or_else(Failure::invalid)?;
-            let param_size =
-                crate::packstream::encode_with_limits(&Value::Map(given.clone()), max, depth)
-                    .map_err(|_| Failure::new(INVALID, "parameter limit exceeded"))?
-                    .len();
-            write::charge(&mut tx.bytes, text_len.saturating_add(param_size))?;
+            write::charge(&mut tx.bytes, input_bytes)?;
             let (params, input) = prepare(tx.world(), full)?;
             // Pin BEGIN even for the one empty input row of a blind CREATE.
             // A later MATCH reads that same snapshot.
@@ -1036,7 +1051,7 @@ impl Session<'_> {
                     result.rows,
                     result.tick,
                     Default::default(),
-                    query::RenderOptions::write(stop, max, depth),
+                    query::RenderOptions::write(stop, max, depth, &result.row_ticks),
                 )?;
                 Ok::<_, Failure>((output, result.staged, result.retained_bytes))
             })?;
@@ -1131,6 +1146,8 @@ impl Session<'_> {
                     // statement while nothing is committed. Final IDs can
                     // only be a few digits wider (a commit renumbering over
                     // another process's writes), hence the margin.
+                    let mut total = input_bytes;
+                    write::charge(&mut total, staged.retained_bytes)?;
                     if !fields.is_empty() {
                         query::render(
                             query::RenderWorld::Staged(&tx),
@@ -1138,7 +1155,7 @@ impl Session<'_> {
                             staged.rows.clone(),
                             staged.tick,
                             Default::default(),
-                            query::RenderOptions::write(stop, max.saturating_sub(64), depth)
+                            query::RenderOptions::write(stop, max.saturating_sub(64), depth, &staged.row_ticks)
                                 .preview(),
                         )?;
                     }
@@ -1179,7 +1196,7 @@ impl Session<'_> {
                         rows,
                         staged.tick,
                         Default::default(),
-                        query::RenderOptions::write(stop, max, depth),
+                        query::RenderOptions::write(stop, max, depth, &staged.row_ticks),
                     )
                     .map_err(|_| after_commit())?;
                     let ops = staged.staged.clone().complete(&result).ops;
@@ -1201,19 +1218,50 @@ impl Session<'_> {
         &mut self,
         db: &str,
         text: &str,
+        given: &Map,
+        policy: kala_lang::ParamPolicy,
         options: &Options,
         read: bool,
     ) -> Result<query::Output, Failure> {
-        let forms = kala_lang::write::write_forms(text).map_err(write::parse_error)?;
-        // Every form of the RUN is parsed and admitted (its privileges and
-        // its place in the transaction) before a writable handle is opened
-        // or anything is staged: a syntax error or a privilege refusal
-        // anywhere in the text means this RUN staged and committed nothing.
-        // The text is bounded by the message limit and the forms by the
-        // parser's own limits.
-        let forms = forms
+        let input_bytes = write_input_bytes(text.len(), given)?;
+        let templates = kala_lang::write::prepare_write_forms(text)
+            .map_err(write::parse_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(write::parse_error)?;
+        let used: std::collections::BTreeSet<_> =
+            templates.iter().flat_map(|t| t.parameter_names()).collect();
+        if given.keys().any(|k| !used.contains(k.as_str())) {
+            return Err(Failure::new(INVALID, "unknown parameter for write forms"));
+        }
+        // A missing parameter needs no schema to detect: refuse the whole
+        // RUN for it before any form is staged or committed.
+        if let Some(name) = used.iter().find(|name| !given.contains_key(**name)) {
+            return Err(Failure::new(
+                crate::error::MISSING,
+                format!("missing parameter `?{}`", crate::error::escape(name)),
+            ));
+        }
+        // A parameter's type follows the attribute it is written to, so a
+        // form is bound just before it is staged, against the schema its
+        // transaction sees (`Txn::base_world`): declarations staged by
+        // earlier forms of an explicit transaction, or committed by earlier
+        // forms of the same auto-commit RUN, included.
+        let bind = |world: &kala_core::World,
+                    template: &kala_lang::write::WriteTemplate,
+                    remaining: &mut usize| {
+            template
+                .bind_parameters(
+                    world,
+                    |kinds| query::parameters(world, kinds, given, policy),
+                    form_binding_error,
+                )
+                .and_then(|params| {
+                    template
+                        .bind_with_budget(world, &params, remaining)
+                        .map_err(form_binding_error)
+                })
+                .map_err(|e| write::parameter_binding_error(e, read))
+        };
         // Write slots are counted per authenticated account (user and the
         // host selector that matched), as the identity names it.
         let account = self
@@ -1232,27 +1280,23 @@ impl Session<'_> {
         let max_message = self.config.max_message_bytes;
         let max_depth = self.config.max_depth;
         if let Some(tx) = &mut self.transaction {
-            tx.bytes = tx
-                .bytes
-                .checked_add(text.len())
-                .filter(|n| *n <= write::MAX_STAGED_BYTES)
-                .ok_or_else(|| {
-                    Failure::new(INVALID, "transaction exceeds the staged-text byte limit")
-                })?;
-            for (index, form) in forms.iter().enumerate() {
+            write::charge(&mut tx.bytes, input_bytes)?;
+            for (index, template) in templates.iter().enumerate() {
                 write::admit(
-                    form,
+                    template.prototype(),
                     tx.forms.len() + index + usize::from(tx.mode_set),
                     held,
                 )?;
             }
+            let mut remaining = write::MAX_STAGED_BYTES - tx.bytes;
             let mut data = false;
-            for (index, form) in forms.iter().enumerate() {
+            for (index, template) in templates.iter().enumerate() {
                 let expires = tx.deadline;
                 let owned = tx.writer(self.registry, self.config, &account, held.admin)?;
                 let staged = owned.with(|t| {
                     t.set_deadline(expires);
-                    write::stage(t, form, read)
+                    let form = bind(t.base_world(), template, &mut remaining)?;
+                    write::stage(t, &form, read)
                 })?;
                 data |= staged.ops.iter().any(|op| write::writes_data(op.kind));
                 // Label using the transaction so provisional node types resolve.
@@ -1269,6 +1313,7 @@ impl Session<'_> {
                 })?;
                 tx.forms.push(staged);
             }
+            tx.bytes = write::MAX_STAGED_BYTES - remaining;
             self.run_type = if tx.summary_reads {
                 "rw"
             } else if data {
@@ -1278,8 +1323,8 @@ impl Session<'_> {
             };
         } else {
             // Each form is its own transaction, the first of it.
-            for form in &forms {
-                write::admit(form, 0, held)?;
+            for template in &templates {
+                write::admit(template.prototype(), 0, held)?;
             }
             let deadline = self.started + options.timeout;
             let mut summary = write::Summary::new(self.config.max_message_bytes);
@@ -1290,8 +1335,9 @@ impl Session<'_> {
                     .min(deadline.saturating_duration_since(Instant::now())),
                 options.bookmark,
                 |world| {
+                    let mut remaining = write::MAX_STAGED_BYTES - input_bytes;
                     let mut committed = 0;
-                    for (index, form) in forms.iter().enumerate() {
+                    for (index, template) in templates.iter().enumerate() {
                         let prior = committed;
                         let result = (|| {
                             if Instant::now() >= deadline {
@@ -1301,7 +1347,8 @@ impl Session<'_> {
                             tx.set_concurrency(options.concurrency);
                             tx.set_deadline(deadline);
                             tx.set_schema_additions_only(!held.admin);
-                            let staged = write::stage(&mut tx, form, read)?;
+                            let form = bind(tx.base_world(), template, &mut remaining)?;
+                            let staged = write::stage(&mut tx, &form, read)?;
                             // Check record size before durable append; final IDs have fixed encoding bounds.
                             let mut preview = write::output();
                             let mut preview_ops = staged.ops.clone();
@@ -1456,6 +1503,25 @@ impl Session<'_> {
 /// may hand to the write clauses (10,000) and the statement's deadline bound
 /// it as everywhere else.
 const UNDER_WRITER_STEPS: u64 = 1_000_000;
+
+fn write_input_bytes(text: usize, params: &Map) -> Result<usize, Failure> {
+    let mut total = text;
+    let bytes = crate::packstream::map_size(params, write::MAX_STAGED_BYTES)
+        .map_err(|_| Failure::new(INVALID, "parameters exceed the 16 MiB transaction limit"))?;
+    write::charge(&mut total, bytes)?;
+    Ok(total)
+}
+
+fn form_binding_error(e: kala_lang::write::FormError) -> Failure {
+    use kala_lang::write::FormErrorKind;
+    let code = match e.kind {
+        FormErrorKind::TypeMismatch => crate::error::TYPE,
+        FormErrorKind::UnboundVariable => crate::error::MISSING,
+        FormErrorKind::Limit => INVALID,
+        _ => crate::error::SYNTAX,
+    };
+    Failure::new(code, e.to_string())
+}
 
 fn refusal_reason(failure: &Failure) -> &'static str {
     if failure.code == crate::error::FORBIDDEN {

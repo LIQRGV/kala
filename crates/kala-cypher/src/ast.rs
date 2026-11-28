@@ -1,4 +1,5 @@
 //! Parsed Cypher, before variable and time resolution.
+pub(crate) mod row_params;
 use kala_query::{Expr, Orientation, Term};
 /// One node pattern.
 #[derive(Clone, Debug)]
@@ -147,7 +148,9 @@ pub enum Statement {
 pub struct WriteStatement {
     pub(crate) read: Query,
     pub(crate) writes: Vec<Update>,
-    pub(crate) tick: Option<Term>,
+    pub(crate) tick: Option<Expr<String>>,
+    /// An authored read tick also supplies the fallback of a NULL write tick.
+    pub(crate) has_read_tick: bool,
     pub(crate) returns: Vec<Item>,
     pub(crate) params: Vec<String>,
 }
@@ -186,14 +189,14 @@ pub(crate) enum Update {
 }
 
 impl Update {
-    fn paths(&self) -> &[Path] {
+    pub(crate) fn paths(&self) -> &[Path] {
         match self {
             Self::Create(paths) => paths,
             Self::Merge { path, .. } => std::slice::from_ref(path),
             _ => &[],
         }
     }
-    fn assignments(&self) -> impl Iterator<Item = &Assignment> {
+    pub(crate) fn assignments(&self) -> impl Iterator<Item = &Assignment> {
         let (a, b): (&[Assignment], &[Assignment]) = match self {
             Self::Assign(items) => (items, &[]),
             Self::Merge {
@@ -214,11 +217,17 @@ impl WriteStatement {
                 .writes
                 .iter()
                 .any(|w| !matches!(w, Update::Create(_) | Update::Constraint { .. }))
-            || self.write_expressions().iter().any(|expr| {
-                let mut props = vec![];
-                expr.attributes(&mut props);
-                !props.is_empty()
-            })
+            // The parser admits no graph read in a write tick; scanning it
+            // here keeps the privilege check independent of that rule.
+            || self
+                .write_expressions()
+                .into_iter()
+                .chain(self.tick.as_ref())
+                .any(|expr| {
+                    let mut props = vec![];
+                    expr.attributes(&mut props);
+                    !props.is_empty()
+                })
     }
     /// Whether the statement only declares schema (a type constraint): its
     /// summary type is `s`, and it stores no facts.
@@ -262,6 +271,7 @@ impl WriteStatement {
         for e in self
             .write_expressions()
             .into_iter()
+            .chain(self.tick.as_ref())
             .chain(self.returns.iter().map(|i| &i.expr))
         {
             e.attributes(&mut names);
