@@ -57,7 +57,7 @@ impl Parser<'_> {
         self.write_values = false;
         let explicit_write_tick = if self.kw("AT") {
             self.need_kw("TICK")?;
-            Some(self.integer(false)?)
+            Some(self.expression(0, 0)?)
         } else {
             None
         };
@@ -69,14 +69,27 @@ impl Parser<'_> {
             }
         });
         let read_tick = pipeline_tick.or(local_tick);
+        // A trailing scalar tick also supplies the historical MATCH default.
+        // A row expression is only known after MATCH has run.
+        let constant_tick = match &explicit_write_tick {
+            Some(Expr::Value(Value::I64(t))) => Some(Term::Const(Value::I64(*t))),
+            _ => None,
+        };
         for c in &mut clauses {
             if let Clause::Match(m) = c
                 && m.tick.is_none()
             {
-                m.tick = read_tick.as_ref().or(explicit_write_tick.as_ref()).cloned();
+                m.tick = read_tick.as_ref().or(constant_tick.as_ref()).cloned();
             }
         }
-        let tick = explicit_write_tick.or(read_tick);
+        let has_read_tick = read_tick.is_some();
+        let tick = explicit_write_tick.or_else(|| {
+            read_tick.map(|t| match t {
+                Term::Const(v) => Expr::Value(v),
+                Term::Param(p) => Expr::Param(p),
+                _ => unreachable!("read ticks are integer literals or parameters"),
+            })
+        });
         if self.is_kw("CANON") {
             return Err(self.err("CANON is not allowed in a write statement"));
         }
@@ -127,6 +140,7 @@ impl Parser<'_> {
         Ok(Statement::Write(WriteStatement {
             read,
             writes,
+            has_read_tick,
             tick,
             returns,
             params,
@@ -222,6 +236,7 @@ impl Parser<'_> {
                 if_not_exists,
             }],
             tick: None,
+            has_read_tick: false,
             returns: vec![],
             params: vec![],
         }))
@@ -373,7 +388,7 @@ impl Parser<'_> {
             } else if !remove && self.sym("+") {
                 self.need("=")?;
                 if !matches!(self.token().kind, Kind::Symbol("{")) {
-                    return Err(self.err("SET += requires a property map"));
+                    return Err(self.err("SET += requires a property map literal; use row.key for each map row field"));
                 }
                 for (key, e) in self.props()? {
                     self.update_expr(&e, bindings)?;

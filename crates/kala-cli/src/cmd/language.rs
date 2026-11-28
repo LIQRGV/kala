@@ -40,6 +40,18 @@ impl Language {
             .prepare(world, text, &kala_lang::refuse_nothing)
             .map_err(|e| CliError::User(format!("query: {e}")))
     }
+    /// Bind the parameters used by one statement in a transaction file.
+    pub(crate) fn write_params(
+        &self,
+        world: &World,
+        kinds: &[(String, ParamKind)],
+        given: &[(String, String)],
+    ) -> Result<QueryParams, CliError> {
+        self.0
+            .parameter_policy()
+            .bind_write_text(world, kinds, given)
+            .map_err(|e| CliError::User(e.to_string()))
+    }
     /// Parses the `--param` texts by the kinds the prepared query declares:
     /// each a scalar of its inferred kind, or (where the language's
     /// parameters are nullable) also NULL or a list.

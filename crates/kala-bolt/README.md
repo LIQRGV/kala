@@ -357,7 +357,7 @@ RUN parameters use the front-end's inferred kinds: integers for ticks/i64,
 floats for f64, booleans, strings for strings, handles or readable IDs for
 entities, and a nonnegative integer or `tx#N`/`N` string for canon. No numeric
 coercion; NaN, byte arrays and other mismatched types are TypeError. Cypher
-value parameters also accept NULL and lists, while ticks/canon remain integers. Undeclared params are
+value parameters also accept NULL and lists. A direct UNWIND source accepts a list of row maps. Read ticks and canon retain their scalar kinds. Undeclared params are
 ignored. Fields omit the variable's `?`; aggregate names retain their text.
 
 ## Errors and limits
@@ -415,7 +415,7 @@ sorted sets (no order or duplicates); labels consist of one node type plus
 `label` values. Cardinality-one overlaps also return lists. Ref properties
 return graph references or lists of them. Node/Relationship/Path enrichment always
 uses the plan's default tick; explicit `v.key` uses its binding clause's tick.
-Cypher parameters support NULL and lists (with input order preserved). Native
+Cypher parameters support NULL, ordered lists and lists of maps for direct UNWIND sources. Native
 ref-to-edge targets remain edge references in unlabelled relationship endpoints;
 standalone node scans exclude edges.
 Every explicit system-world `password_hash` reference is refused before
@@ -493,8 +493,11 @@ Cypher and Datalog both stage native writes. A blind Cypher CREATE needs
 `write`. Reading clauses, SET, REMOVE, DELETE, MERGE, property reads and
 RETURN also need `read`. Admission checks the entire statement before opening
 a writer. Both languages use the same database, mode and privilege checks,
-with reduced diagnostics for a write-only identity. Pass an empty parameter
-map for Datalog writes. Cypher accepts parameters in both pipelines and updates,
+with reduced diagnostics for a write-only identity. Bind Datalog write values in the RUN parameter
+map with bare names. For `[:assert ?e :name ?v :at ?t]`, supply a handle
+string as `e`, the name as `v` and an integer as `t`. Datalog accepts
+scalars. Attribute names, node types, verbs and schema declarations stay
+in the query text. Cypher accepts parameters in both pipelines and updates,
 converted with the kinds the statement gives them as for a read query (a handle
 string for a ref position names the entity; a wrong type is a TypeError before
 anything runs). `UNWIND … CREATE` has a reading part, so it needs `read` as well
@@ -563,7 +566,9 @@ A Cypher write returns rows only for RETURN. Auto-commit renders the committed
 properties and final IDs. Inside BEGIN, write RETURN sees the transaction's
 staged changes. A subsequent query reads the snapshot. The committed
 `kala.ops` list gives operation positions, kinds, ticks, changed counts and
-entry IDs. `ops_omitted` counts operations left out to fit the response.
+entry IDs. `kala.tick_min` and `kala.tick_max` report the range across
+Cypher primitives, and `kala.tick_count` counts those primitives, including
+ones that changed nothing. `ops_omitted` counts operations left out to fit the response.
 `relationships-created` counts newly interned edges in both languages,
 `relationships-deleted` counts retracted reference facts, and `labels-added`
 and `labels-removed` count changes to the label attribute. Nodes keep their
@@ -833,9 +838,10 @@ request can't make every writer replay the log.
 
 Durations accept `ms`, `s`, `m` or bare seconds. Native defaults live in
 `ServerConfig`. Each transaction accepts at most 256 forms. The 16 MiB transaction budget
-includes write text and, for Cypher, parameters and the estimated memory for
-expanded primitive operations and their reports. Datalog also observes its
-per-form limits.
+includes write text and encoded RUN parameters for both languages.
+Every parameter supplied to a Datalog write RUN must appear in its forms. Datalog also charges
+expanded parameter occurrences. Cypher charges estimated memory for expanded
+primitives and their reports.
 Materialized write records are capped at 16 MiB per RUN. Socket messages remain
 bounded by `max_message_bytes` and `max_depth`. The idle clock starts when a
 response has been sent and stops when the next request has arrived: a statement

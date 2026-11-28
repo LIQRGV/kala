@@ -62,12 +62,23 @@ pub(crate) fn row_text(r: &[JValue]) -> String {
 /// entities shown at the result's own default tick and canon. Shared with
 /// `kala doctor --checks`.
 pub(crate) fn table(world: &World, rs: &ResultSet) -> (Vec<String>, Vec<Vec<JValue>>) {
-    let l = Labeler::new(world, rs.canon, rs.tick);
+    table_at_ticks(world, rs, &[])
+}
+
+pub(crate) fn table_at_ticks(
+    world: &World,
+    rs: &ResultSet,
+    ticks: &[kala_core::Tick],
+) -> (Vec<String>, Vec<Vec<JValue>>) {
     let columns = rs.columns.iter().map(|v| column_name(&v.0)).collect();
     let rows = rs
         .rows
         .iter()
-        .map(|r| r.iter().map(|d| l.datum(d)).collect())
+        .enumerate()
+        .map(|(i, r)| {
+            let l = Labeler::new(world, rs.canon, ticks.get(i).copied().unwrap_or(rs.tick));
+            r.iter().map(|d| l.datum(d)).collect()
+        })
         .collect();
     (columns, rows)
 }

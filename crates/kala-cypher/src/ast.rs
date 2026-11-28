@@ -1,4 +1,5 @@
 //! Parsed Cypher, before variable and time resolution.
+pub(crate) mod row_params;
 use kala_query::{Expr, Orientation, Term};
 /// One node pattern.
 #[derive(Clone, Debug)]
@@ -147,7 +148,9 @@ pub enum Statement {
 pub struct WriteStatement {
     pub(crate) read: Query,
     pub(crate) writes: Vec<Update>,
-    pub(crate) tick: Option<Term>,
+    pub(crate) tick: Option<Expr<String>>,
+    /// An authored read tick also supplies the fallback of a NULL write tick.
+    pub(crate) has_read_tick: bool,
     pub(crate) returns: Vec<Item>,
     pub(crate) params: Vec<String>,
 }
@@ -262,6 +265,7 @@ impl WriteStatement {
         for e in self
             .write_expressions()
             .into_iter()
+            .chain(self.tick.as_ref())
             .chain(self.returns.iter().map(|i| &i.expr))
         {
             e.attributes(&mut names);

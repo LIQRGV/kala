@@ -361,3 +361,20 @@ fn malformed_query_keeps_the_parsers_specific_error() {
     assert!(stderr(&o).contains(":find"), "{}", stderr(&o));
     assert!(!stderr(&o).contains("or a write"), "{}", stderr(&o));
 }
+
+#[test]
+fn bulk_params_repl_uses_dot_params_for_datalog_writes() {
+    let f = build(EMPTY);
+    let output = repl(
+        &f,
+        ".param e greg\n.param v 37\n.param t -42\n[:assert ?e :age ?v :at ?t]\n.quit\n",
+        &["--write"],
+    );
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let w = World::open_read_only(&f.path).unwrap();
+    let e = w.entity_by_handle("greg").unwrap();
+    assert_eq!(
+        w.as_of(e, "age", kala_core::Tick(-42)).unwrap(),
+        [kala_core::Value::I64(37)]
+    );
+}

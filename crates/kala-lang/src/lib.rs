@@ -433,5 +433,8 @@ pub mod write {
         execute_in, execute_with, stage, stage_with,
     };
     pub use kala_datalog::ast::WriteTxn;
-    pub use kala_datalog::{parse_write, parse_writes, write_forms};
+    pub use kala_datalog::{
+        DatalogError as FormError, ErrorKind as FormErrorKind, WriteTemplate, parse_write,
+        parse_writes, prepare_write_forms, write_forms,
+    };
 }

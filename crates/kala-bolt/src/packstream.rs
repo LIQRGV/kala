@@ -39,13 +39,15 @@ pub fn encode_with_limits(
     max_bytes: usize,
     max_depth: usize,
 ) -> Result<Vec<u8>, Error> {
+    let mut bytes = Vec::new();
     let mut encoder = Encoder {
-        bytes: Vec::new(),
+        bytes: Some(&mut bytes),
+        size: 0,
         max: max_bytes,
         depth: max_depth.min(32),
     };
     encoder.value(value, 0)?;
-    Ok(encoder.bytes)
+    Ok(bytes)
 }
 /// Decode exactly one value within explicit byte and nesting limits.
 /// Depth is capped at 32 even if the caller asks for more (native stack bound).
@@ -167,17 +169,32 @@ impl<'a> Decoder<'a> {
         Ok(values)
     }
 }
-struct Encoder {
-    bytes: Vec<u8>,
+/// Count the encoded parameter map with the same markers as the encoder.
+pub(crate) fn map_size(map: &BTreeMap<String, Value>, max: usize) -> Result<usize, Error> {
+    let mut counter = Encoder {
+        bytes: None,
+        size: 0,
+        max,
+        depth: 32,
+    };
+    counter.map(map, 0)?;
+    Ok(counter.size)
+}
+struct Encoder<'a> {
+    bytes: Option<&'a mut Vec<u8>>,
+    size: usize,
     max: usize,
     depth: usize,
 }
-impl Encoder {
+impl Encoder<'_> {
     fn put(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        if bytes.len() > self.max.saturating_sub(self.bytes.len()) {
+        if bytes.len() > self.max.saturating_sub(self.size) {
             return Err(Error("message size limit exceeded"));
         }
-        self.bytes.extend_from_slice(bytes);
+        self.size += bytes.len();
+        if let Some(buf) = &mut self.bytes {
+            buf.extend_from_slice(bytes);
+        }
         Ok(())
     }
     fn len(&mut self, n: usize, tiny: u8, wide: u8) -> Result<(), Error> {
@@ -193,6 +210,15 @@ impl Encoder {
             self.put(&[wide + 2])?;
             self.put(&n.to_be_bytes())
         }
+    }
+    fn map(&mut self, map: &BTreeMap<String, Value>, depth: usize) -> Result<(), Error> {
+        self.len(map.len(), 0xa0, 0xd8)?;
+        for (key, value) in map {
+            self.len(key.len(), 0x80, 0xd0)?;
+            self.put(key.as_bytes())?;
+            self.value(value, depth + 1)?;
+        }
+        Ok(())
     }
     fn value(&mut self, value: &Value, depth: usize) -> Result<(), Error> {
         if depth > self.depth {
@@ -245,15 +271,7 @@ impl Encoder {
                 }
                 Ok(())
             }
-            Value::Map(v) => {
-                self.len(v.len(), 0xa0, 0xd8)?;
-                for (key, value) in v {
-                    self.len(key.len(), 0x80, 0xd0)?;
-                    self.put(key.as_bytes())?;
-                    self.value(value, depth + 1)?;
-                }
-                Ok(())
-            }
+            Value::Map(v) => self.map(v, depth),
             Value::Structure(tag, fields) => {
                 if fields.len() > 15 {
                     return Err(Error("too many structure fields"));

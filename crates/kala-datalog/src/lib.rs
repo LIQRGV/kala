@@ -180,7 +180,10 @@ pub fn completeness(text: &str) -> Completeness {
 pub use lex::CompletenessScanner;
 
 mod write;
-pub use write::{FormKind, form_kind, parse_write, parse_writes, restore_forms, write_forms};
+pub use write::{
+    FormKind, WriteTemplate, form_kind, parse_write, parse_writes, prepare_write_forms,
+    restore_forms, write_forms,
+};
 /// Most operations per transaction.
 pub const MAX_WRITE_OPS: usize = 256;
 /// Most transactions per input file.

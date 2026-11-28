@@ -383,6 +383,13 @@ impl Stager {
         })
     }
 
+    /// Change the default for the next input row while keeping the statement's
+    /// primitive, byte and read budgets and its operation history.
+    pub fn set_row_tick(&mut self, tx: &Txn<'_>, at: Option<Tick>) {
+        self.state.form_tick = at;
+        self.state.fallback = tx.report_tick(at);
+    }
+
     /// A text form with a bounded operation count before staging. Only its
     /// replacement operations need an aggregate byte budget: a fact literal
     /// from the source cannot expand across rows.

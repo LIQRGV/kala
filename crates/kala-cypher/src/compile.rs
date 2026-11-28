@@ -163,6 +163,24 @@ impl Compiler<'_> {
                     .0
                     .clone(),
             ),
+            Expr::RowParameter(p) => {
+                self.param(p, ParamKind::Unwind)?;
+                Expr::RowParameter(p.clone())
+            }
+            Expr::RowField {
+                parameter,
+                row,
+                key,
+            } => Expr::RowField {
+                parameter: parameter.clone(),
+                row: self
+                    .bindings
+                    .get(row)
+                    .ok_or_else(|| self.error("unbound parameter row"))?
+                    .0
+                    .clone(),
+                key: key.clone(),
+            },
             Expr::Value(v) => Expr::Value(v.clone()),
             Expr::Null => Expr::Null,
             Expr::Function(f, e) => Expr::Function(*f, Box::new(self.expr(e)?)),

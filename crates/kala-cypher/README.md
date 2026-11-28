@@ -213,10 +213,22 @@ ON CREATE SET n.name = $names[i]
 ```
 
 Positions start at zero. Negative offsets count from the end, and a missing
-element produces NULL. Parameters support scalars, lists and NULL.
-Map-valued parameters (`UNWIND $rows AS row … row.name`) are not supported
-yet; use parallel lists. `UNWIND … CREATE` has a reading part, so it is a
-reading statement: over Bolt it needs `read` as well as `write`.
+element produces NULL. Drivers can also supply a list of maps directly:
+
+```cypher
+UNWIND $rows AS row
+MERGE (n:NPC {kala_handle: row.handle})
+SET n.name = row.name AT TICK row.tick
+```
+
+For example, pass `rows=[{"handle":"kael","name":"Kael","tick":-20}]`.
+Read a field with `row.key` in a read or write expression. A missing field
+yields NULL. A field holds a scalar, NULL or a list of scalars. Its type must
+agree across rows that supply a non-NULL value. Keys are data, including
+keys that happen to share a graph property's name. Maps must arrive through
+a direct parameter UNWIND. Returning, comparing or storing the row itself,
+nesting maps and `SET n += row` are errors. `UNWIND … CREATE` requires both
+`read` and `write` over Bolt.
 
 Parameters take the kind their position gives them, as in a read query: a
 handle string given where the reading part compares a ref attribute
@@ -277,13 +289,19 @@ relationship's own properties keep their history too. `kala doctor` can
 warn about a property held on an inactive edge. Summaries count retracted
 relationships and omit a nodes-deleted counter.
 
-One `AT TICK` applies to both reads and writes. Supply it after MATCH and
-again after the writes to choose different ticks. A tick-less write uses
-the transaction's starting latest tick. Corrections use the Datalog
-`[:correct …]` form: a same-tick conflict from any clause (SET, CREATE,
-MERGE, labels, DELETE) names the entry that holds the tick and the
-`[:correct N …]` to use, or, when the same statement or transaction staged
-it, the operation to change.
+A read-side `AT TICK` takes one integer literal or parameter. After the
+write clauses, `AT TICK` accepts an expression over the input row, such as
+`row.tick` or `$ticks[i]`. Each integer selects that row's write tick.
+NULL uses the read-side tick if supplied, then the transaction default,
+then the transaction's starting latest tick. A trailing integer literal or
+scalar tick parameter also supplies the MATCH tick when MATCH has none.
+
+Bolt's write summary reports `kala.tick_min`, `kala.tick_max` and
+`kala.tick_count` for the reported operations. Each operation counts once,
+including a no-op. A same-tick conflict in a map-row write or a write with
+a per-row tick identifies the zero-based input row. For a literal write the
+conflict names the occupying entry or the earlier staged operation.
+Corrections use the Datalog `[:correct …]` form.
 
 ### Declaring a property type
 
@@ -313,7 +331,7 @@ and ignored. Uniqueness, existence, key and relationship constraints,
 
 A write without RETURN produces zero records. RETURN accepts bound variables,
 property access, literals and parameters. Auto-commit renders graph values
-at the write tick with final IDs and committed properties. Within BEGIN,
+at each row's write tick with final IDs and committed properties. Within BEGIN,
 write RETURN can read staged properties. Sending a provisional identity
 protects it against renumbering at COMMIT. A later MATCH still reads the
 transaction snapshot. Ordering, aggregation and a new reading pipeline

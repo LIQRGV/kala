@@ -601,6 +601,22 @@ class WriteDriverTests(unittest.TestCase):
                 self.assertEqual(summary.metadata["kala"]["changed"], 0)
             self.assertEqual(names(), handles)
 
+    def test_map_row_parameters_write_at_independent_ticks(self):
+        rows = [
+            {"handle": "py_sparrow", "name": "Sparrow", "tick": -12},
+            {"handle": "py_warbler", "name": "Warbler", "tick": 4},
+        ]
+        query = ("UNWIND $rows AS row MERGE (n:CHARACTER {kala_handle:row.handle}) "
+                 "SET n.name=row.name AT TICK row.tick")
+        with self.driver().session(database="annex") as session:
+            session.execute_write(lambda tx: tx.run(query, rows=rows).consume())
+            for row in rows:
+                for tick, expected in [(row["tick"] - 1, None), (row["tick"], row["name"])]:
+                    actual = session.run(
+                        "MATCH (n {kala_handle:$h}) AT TICK $t RETURN n.name",
+                        h=row["handle"], t=tick).single()[0]
+                    self.assertEqual(actual, expected)
+
     def test_cypher_parallel_list_merge_with_native_driver_parameters(self):
         query = ("UNWIND $indices AS i MERGE (n:CHARACTER {kala_handle:$handles[i]}) "
                  "ON CREATE SET n.name=$names[i] AT TICK 8240")

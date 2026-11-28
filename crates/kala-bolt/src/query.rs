@@ -176,6 +176,7 @@ fn execute(
             system,
             result_bytes: limits.max_bytes,
             preview: false,
+            row_ticks: &[],
         },
     )
 }
@@ -251,6 +252,7 @@ pub(crate) struct RenderOptions<'a> {
     max_depth: usize,
     system: bool,
     result_bytes: usize,
+    row_ticks: &'a [Tick],
     /// A size check before a commit: nothing is sent, so nothing is read on
     /// the client's behalf and no read at all is recorded on the
     /// transaction (`Txn::without_read_recording`).
@@ -263,13 +265,19 @@ impl<'a> RenderOptions<'a> {
             ..self
         }
     }
-    pub fn write(stop: Stop<'a>, max_message: usize, max_depth: usize) -> Self {
+    pub fn write(
+        stop: Stop<'a>,
+        max_message: usize,
+        max_depth: usize,
+        row_ticks: &'a [Tick],
+    ) -> Self {
         Self {
             stop,
             max_message,
             max_depth,
             system: false,
             result_bytes: crate::write::MAX_STAGED_BYTES,
+            row_ticks,
             preview: false,
         }
     }
@@ -311,6 +319,7 @@ pub(crate) fn render(
         system,
         result_bytes,
         preview: _,
+        row_ticks,
     } = options;
     let limits = Limits {
         max_bytes: result_bytes,
@@ -330,7 +339,8 @@ pub(crate) fn render(
     };
     let mut rows = VecDeque::new();
     let mut exposes = VecDeque::new();
-    for row in records {
+    for (index, row) in records.into_iter().enumerate() {
+        let tick = row_ticks.get(index).copied().unwrap_or(tick);
         let mut provisional = false;
         budget.step(&meter)?;
         let mut values = Vec::new();
@@ -376,11 +386,11 @@ pub(crate) fn parameters(
     policy: kala_lang::ParamPolicy,
 ) -> Result<QueryParams, Failure> {
     policy
-        .bind(kinds, |name, kind| {
+        .bind(kinds, |name, kind, remaining| {
             use kala_lang::params::ParameterTree;
             given
                 .get(name)
-                .map(|v| policy.convert(world, kind, v.input(), 0))
+                .map(|v| policy.convert(world, kind, v.input(), remaining))
                 .transpose()
         })
         .map_err(|e| {
@@ -403,6 +413,7 @@ impl kala_lang::params::ParameterTree for Value {
             Self::Float(f) => Input::Float(*f),
             Self::String(s) => Input::String(s),
             Self::List(xs) => Input::List(xs),
+            Self::Map(m) => Input::Map(Box::new(m.iter())),
             _ => Input::Unsupported,
         }
     }

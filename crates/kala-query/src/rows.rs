@@ -13,6 +13,14 @@ pub enum Expr<V = Var, C = Value> {
     Null,
     /// A scalar, NULL or list query parameter.
     Param(String),
+    /// Direct UNWIND source. A row parameter expands to ordered row indices.
+    RowParameter(String),
+    /// Read a field from the parameter row at its bound index.
+    RowField {
+        parameter: String,
+        row: V,
+        key: String,
+    },
     /// An optional property read at the variable's binding tick.
     Property {
         entity: V,
@@ -68,7 +76,12 @@ impl<V, C> Expr<V, C> {
                 Self::Path { .. } => {}
                 Self::List(xs) => todo.extend(xs),
                 Self::Aggregate { argument, .. } => todo.extend(argument.as_deref()),
-                Self::Var(_) | Self::Value(_) | Self::Null | Self::Param(_) => {}
+                Self::Var(_)
+                | Self::Value(_)
+                | Self::Null
+                | Self::Param(_)
+                | Self::RowField { .. }
+                | Self::RowParameter(_) => {}
             }
         }
     }

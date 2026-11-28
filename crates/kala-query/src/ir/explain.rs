@@ -381,7 +381,12 @@ fn expr_text(e: &crate::Expr, world: &World, depth: usize, out: &mut String) {
             distinct,
             argument,
         } => bag_aggregate_text(*function, *distinct, argument.as_deref(), world, out),
-        Expr::Param(p) => out.push_str(&param_text(p)),
+        Expr::RowField { row, key, .. } => {
+            out.push_str(&var_text(row));
+            out.push('.');
+            push_name(out, key);
+        }
+        Expr::Param(p) | Expr::RowParameter(p) => out.push_str(&param_text(p)),
         Expr::Property { entity, key, tick } => {
             out.push_str(&var_text(entity));
             out.push('.');

@@ -1,4 +1,5 @@
 //! Write syntax shares the query lexer and bounded EDN reader.
+mod params;
 use crate::ast::{Attr, Item, Replacement, WriteOp, WriteTxn, WriteValue};
 use crate::error::{DatalogError, Span, show};
 use crate::lex::{Bracket, Lexer, Tok};
@@ -8,6 +9,8 @@ use kala_core::{
     AttributeOptions, Cardinality, Concurrency, EntryId, Kind, MigrationOptions, Op, Precision,
     RefDirection, Tick, ValueType,
 };
+pub use params::WriteTemplate;
+use params::{Bindings, Position};
 
 /// The first element of a form selects its language operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,17 +102,32 @@ pub fn write_forms(
     text: &str,
 ) -> Result<impl Iterator<Item = Result<WriteTxn, DatalogError>> + '_, DatalogError> {
     size(text)?;
-    Ok(forms(text, false))
+    Ok(forms(text, false, |f| {
+        transaction(f, false, &mut Bindings::Literal)
+    }))
 }
 
 /// Parse a local restore script without byte, operation or form limits.
 /// Bracket depth remains bounded by `MAX_DEPTH`; execution must require a
 /// leading genesis and validate every operation through the native store.
 pub fn restore_forms(text: &str) -> impl Iterator<Item = Result<WriteTxn, DatalogError>> + '_ {
-    forms(text, true)
+    forms(text, true, |f| transaction(f, true, &mut Bindings::Literal))
 }
 
-fn forms(text: &str, restore: bool) -> impl Iterator<Item = Result<WriteTxn, DatalogError>> + '_ {
+/// Parse write forms with typed placeholders at data positions. Structural positions
+/// continue through the literal grammar and never consult supplied parameters.
+pub fn prepare_write_forms(
+    text: &str,
+) -> Result<impl Iterator<Item = Result<WriteTemplate, DatalogError>> + '_, DatalogError> {
+    size(text)?;
+    Ok(forms(text, false, WriteTemplate::prepare))
+}
+
+fn forms<'a, T>(
+    text: &'a str,
+    restore: bool,
+    parse: impl Fn(Form) -> Result<T, DatalogError> + 'a,
+) -> impl Iterator<Item = Result<T, DatalogError>> + 'a {
     let mut lex = Lexer::new(text);
     let mut count = 0;
     let mut done = false;
@@ -137,7 +155,7 @@ fn forms(text: &str, restore: bool) -> impl Iterator<Item = Result<WriteTxn, Dat
                 format!("more than {MAX_WRITE_FORMS} transaction forms"),
             ))
         } else {
-            read_form(&mut lex, text.len()).and_then(|f| transaction(f, restore))
+            read_form(&mut lex, text.len()).and_then(&parse)
         };
         done = result.is_err();
         Some(result.map_err(|e| e.locate(text)))
@@ -174,7 +192,10 @@ fn named(f: Form) -> Result<(String, Span), DatalogError> {
         f => keyword(f),
     }
 }
-fn tick(f: Form) -> Result<Tick, DatalogError> {
+fn tick(f: Form, vars: &mut Bindings<'_>) -> Result<Tick, DatalogError> {
+    if let Some(kala_core::Value::I64(n)) = vars.take(&f, Position::Tick)? {
+        return Ok(Tick(n));
+    }
     let span = f.span();
     match f {
         Form::Atom {
@@ -209,7 +230,10 @@ fn precision(f: Form) -> Result<Precision, DatalogError> {
         )
     })
 }
-fn reference(f: Form) -> Result<Item, DatalogError> {
+fn reference(f: Form, vars: &mut Bindings<'_>) -> Result<Item, DatalogError> {
+    if let Some(kala_core::Value::Str(s)) = vars.take(&f, Position::Reference)? {
+        return Ok(Item::Str(s, f.span()));
+    }
     match item(f)? {
         i @ (Item::Keyword(..) | Item::Id(..)) => Ok(i),
         i => Err(DatalogError::syntax(
@@ -220,7 +244,14 @@ fn reference(f: Form) -> Result<Item, DatalogError> {
 }
 /// A write value: an edge reference `[source :attribute target]`, a tagged
 /// scalar (see [`tagged_scalar`]) or a literal.
-fn value(f: Form) -> Result<WriteValue, DatalogError> {
+fn value(
+    f: Form,
+    position: Position<'_>,
+    vars: &mut Bindings<'_>,
+) -> Result<WriteValue, DatalogError> {
+    if let Some(v) = vars.take(&f, position)? {
+        return Ok(WriteValue::Bound(v));
+    }
     if matches!(&f, Form::Seq { .. }) {
         let (items, span) = vector(f)?;
         if let Some(scalar) = tagged_scalar(&items) {
@@ -235,9 +266,9 @@ fn value(f: Form) -> Result<WriteValue, DatalogError> {
         };
         let (name, span) = named(a)?;
         Ok(WriteValue::Edge {
-            source: reference(s)?,
+            source: reference(s, vars)?,
             attr: Attr { name, span },
-            target: reference(t)?,
+            target: reference(t, vars)?,
         })
     } else {
         match item(f)? {
@@ -286,7 +317,7 @@ fn tagged_scalar(items: &[Form]) -> Option<WriteValue> {
 /// an optional leading `:at tick` (or, in a restore script, `:genesis`). The
 /// first op of a vector may be `[:concurrency :weak]` or `[:concurrency
 /// :optimistic]`: the transaction's own concurrency mode, not an op.
-fn transaction(f: Form, restore: bool) -> Result<WriteTxn, DatalogError> {
+fn transaction(f: Form, restore: bool, vars: &mut Bindings<'_>) -> Result<WriteTxn, DatalogError> {
     let (mut items, span) = vector(f)?;
     let genesis =
         matches!(items.first(), Some(Form::Atom { tok: Tok::Keyword(k), .. }) if k == "genesis");
@@ -311,7 +342,7 @@ fn transaction(f: Form, restore: bool) -> Result<WriteTxn, DatalogError> {
             genesis: false,
             concurrency: None,
             at: None,
-            ops: vec![operation(items, span, restore)?],
+            ops: vec![operation(items, span, restore, vars)?],
             span,
         });
     }
@@ -319,7 +350,7 @@ fn transaction(f: Form, restore: bool) -> Result<WriteTxn, DatalogError> {
         at,
         concurrency,
         ops,
-    } = transaction_ops(items, span, restore)?;
+    } = transaction_ops(items, span, restore, vars)?;
     if ops.is_empty() && !genesis {
         return Err(DatalogError::syntax(
             span,
@@ -349,17 +380,23 @@ struct Parts {
     ops: Vec<WriteOp>,
 }
 /// The parts of a multi-op transaction.
-fn transaction_ops(items: Vec<Form>, span: Span, restore: bool) -> Result<Parts, DatalogError> {
+fn transaction_ops(
+    items: Vec<Form>,
+    span: Span,
+    restore: bool,
+    vars: &mut Bindings<'_>,
+) -> Result<Parts, DatalogError> {
     let mut it = items.into_iter().peekable();
     let mut at = None;
     let mut concurrency = None;
     let mut ops = Vec::new();
     if matches!(it.peek(), Some(Form::Atom{tok:Tok::Keyword(k),..}) if k=="at") {
         it.next();
-        at =
-            Some(tick(it.next().ok_or_else(|| {
-                DatalogError::syntax(span, ":at needs a tick")
-            })?)?);
+        at = Some(tick(
+            it.next()
+                .ok_or_else(|| DatalogError::syntax(span, ":at needs a tick"))?,
+            vars,
+        )?);
     }
     for f in it {
         if !restore && ops.len() >= MAX_WRITE_OPS {
@@ -380,7 +417,7 @@ fn transaction_ops(items: Vec<Form>, span: Span, restore: bool) -> Result<Parts,
             concurrency = Some(concurrency_mode(items, s)?);
             continue;
         }
-        ops.push(operation(items, s, restore)?);
+        ops.push(operation(items, s, restore, vars)?);
     }
     Ok(Parts {
         at,
@@ -452,7 +489,12 @@ impl Args {
     }
 }
 /// One write operation `[:keyword …]`: the keyword selects the form.
-fn operation(items: Vec<Form>, span: Span, restore: bool) -> Result<WriteOp, DatalogError> {
+fn operation(
+    items: Vec<Form>,
+    span: Span,
+    restore: bool,
+    vars: &mut Bindings<'_>,
+) -> Result<WriteOp, DatalogError> {
     let mut args = Args {
         it: items.into_iter(),
         span,
@@ -473,11 +515,11 @@ fn operation(items: Vec<Form>, span: Span, restore: bool) -> Result<WriteOp, Dat
             "[:concurrency …] is not a transaction by itself; put it first in a vector of \
              ops: [[:concurrency :weak] [:set …]]",
         )),
-        "create" => create_op(args, restore),
-        "set" => set_op(args),
-        "assert" => fact_op(Op::Assert, args),
-        "retract" => fact_op(Op::Retract, args),
-        "correct" => correct_op(args),
+        "create" => create_op(args, restore, vars),
+        "set" => set_op(args, vars),
+        "assert" => fact_op(Op::Assert, args, vars),
+        "retract" => fact_op(Op::Retract, args, vars),
+        "correct" => correct_op(args, vars),
         _ => Err(DatalogError::syntax(
             ks,
             format!(
@@ -567,7 +609,11 @@ fn schema_op(kind: &str, mut args: Args) -> Result<WriteOp, DatalogError> {
     Ok(op)
 }
 /// `[:create TYPE]` or `[:create TYPE handle]`.
-fn create_op(mut args: Args, restore: bool) -> Result<WriteOp, DatalogError> {
+fn create_op(
+    mut args: Args,
+    restore: bool,
+    vars: &mut Bindings<'_>,
+) -> Result<WriteOp, DatalogError> {
     let (node_type, _) = named(args.required()?)?;
     let handle_form = args.it.next();
     // Restore preserves the historic plain-create spelling of a handle named
@@ -581,7 +627,15 @@ fn create_op(mut args: Args, restore: bool) -> Result<WriteOp, DatalogError> {
             ":if-missing requires a handle",
         ));
     }
-    let handle = handle_form.map(named).transpose()?.map(|(name, _)| name);
+    let handle = handle_form
+        .map(|f| {
+            if let Some(kala_core::Value::Str(s)) = vars.take(&f, Position::Handle)? {
+                Ok(s)
+            } else {
+                named(f).map(|(name, _)| name)
+            }
+        })
+        .transpose()?;
     let if_missing = if let Some(f) = args.it.next() {
         let (option, span) = keyword(f)?;
         if option != "if-missing" {
@@ -621,9 +675,9 @@ fn create_op(mut args: Args, restore: bool) -> Result<WriteOp, DatalogError> {
 /// So an edge triple as the single value must be wrapped
 /// (`[[:edwin :ally_of :mara]]`): a bare `[:edwin :ally_of :mara]` is three
 /// members.
-fn set_op(mut args: Args) -> Result<WriteOp, DatalogError> {
+fn set_op(mut args: Args, vars: &mut Bindings<'_>) -> Result<WriteOp, DatalogError> {
     let span = args.span;
-    let subject = value(args.required()?)?;
+    let subject = value(args.required()?, Position::Reference, vars)?;
     if let WriteValue::Scalar(i) = &subject
         && !matches!(i, Item::Keyword(..) | Item::Id(..))
     {
@@ -648,12 +702,12 @@ fn set_op(mut args: Args) -> Result<WriteOp, DatalogError> {
             }
             items
                 .into_iter()
-                .map(value)
+                .map(|f| value(f, Position::Attribute(&name), vars))
                 .collect::<Result<Vec<_>, _>>()?
         }
-        scalar => vec![value(scalar)?],
+        scalar => vec![value(scalar, Position::Attribute(&name), vars)?],
     };
-    let options = options(args.it, false, span)?;
+    let options = options(args.it, None, span, vars)?;
     Ok(WriteOp::Set {
         subject,
         attr: Attr { name, span: aspan },
@@ -664,9 +718,9 @@ fn set_op(mut args: Args) -> Result<WriteOp, DatalogError> {
     })
 }
 /// `[:assert subject attribute value option…]`, or the same with `:retract`.
-fn fact_op(op: Op, mut args: Args) -> Result<WriteOp, DatalogError> {
+fn fact_op(op: Op, mut args: Args, vars: &mut Bindings<'_>) -> Result<WriteOp, DatalogError> {
     let span = args.span;
-    let subject = value(args.required()?)?;
+    let subject = value(args.required()?, Position::Reference, vars)?;
     if let WriteValue::Scalar(i) = &subject
         && !matches!(i, Item::Keyword(..) | Item::Id(..))
     {
@@ -676,8 +730,8 @@ fn fact_op(op: Op, mut args: Args) -> Result<WriteOp, DatalogError> {
         ));
     }
     let (name, aspan) = named(args.required()?)?;
-    let value = value(args.required()?)?;
-    let options = options(args.it, false, span)?;
+    let value = value(args.required()?, Position::Attribute(&name), vars)?;
+    let options = options(args.it, None, span, vars)?;
     Ok(WriteOp::Fact {
         op,
         subject,
@@ -689,18 +743,22 @@ fn fact_op(op: Op, mut args: Args) -> Result<WriteOp, DatalogError> {
     })
 }
 /// `[:correct entry :delete]` or `[:correct entry :replace option…]`.
-fn correct_op(mut args: Args) -> Result<WriteOp, DatalogError> {
+fn correct_op(mut args: Args, vars: &mut Bindings<'_>) -> Result<WriteOp, DatalogError> {
     let span = args.span;
     let f = args.required()?;
     let es = f.span();
-    let n = match f {
-        Form::Atom {
-            tok: Tok::Int(n), ..
-        } => n.and_then(|n| u64::try_from(n).ok()),
-        Form::Atom {
-            tok: Tok::Id(s), ..
-        } => s.strip_prefix("entry#").and_then(|s| s.parse().ok()),
-        _ => None,
+    let n = if let Some(kala_core::Value::I64(n)) = vars.take(&f, Position::Entry)? {
+        u64::try_from(n).ok()
+    } else {
+        match f {
+            Form::Atom {
+                tok: Tok::Int(n), ..
+            } => n.and_then(|n| u64::try_from(n).ok()),
+            Form::Atom {
+                tok: Tok::Id(s), ..
+            } => s.strip_prefix("entry#").and_then(|s| s.parse().ok()),
+            _ => None,
+        }
     }
     .ok_or_else(|| DatalogError::syntax(es, "entry ID must be a non-negative u64 or entry#N"))?;
     let (mode, ms) = keyword(args.required()?)?;
@@ -711,7 +769,7 @@ fn correct_op(mut args: Args) -> Result<WriteOp, DatalogError> {
             }
             None
         }
-        "replace" => Some(options(args.it, true, span)?),
+        "replace" => Some(options(args.it, Some(EntryId(n)), span, vars)?),
         _ => {
             return Err(DatalogError::syntax(
                 ms,
@@ -727,8 +785,9 @@ fn correct_op(mut args: Args) -> Result<WriteOp, DatalogError> {
 }
 fn options(
     mut it: impl Iterator<Item = Form>,
-    replace: bool,
+    entry: Option<EntryId>,
     span: Span,
+    vars: &mut Bindings<'_>,
 ) -> Result<Replacement, DatalogError> {
     let mut out = Replacement::default();
     let mut seen = std::collections::BTreeSet::new();
@@ -743,11 +802,13 @@ fn options(
         let v = it
             .next()
             .ok_or_else(|| DatalogError::syntax(span, "write option needs a value"))?;
-        match k.as_str() {
-            "at" => out.at = Some(tick(v)?),
-            "precision" => out.precision = Some(precision(v)?),
-            "value" if replace => out.value = Some(value(v)?),
-            "op" if replace => {
+        match (k.as_str(), entry) {
+            ("at", _) => out.at = Some(tick(v, vars)?),
+            ("precision", _) => out.precision = Some(precision(v)?),
+            ("value", Some(entry)) => {
+                out.value = Some(value(v, Position::Correction(entry), vars)?);
+            }
+            ("op", Some(_)) => {
                 let (o, s) = keyword(v)?;
                 out.op = Some(match o.as_str() {
                     "assert" => Op::Assert,

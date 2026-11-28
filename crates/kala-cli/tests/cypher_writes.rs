@@ -159,3 +159,67 @@ fn cli_imports_parallel_lists_and_repeating_the_script_keeps_identical_bytes() {
     assert_eq!(again["changed"], 0);
     assert_eq!(fs::read(&fx.path).unwrap(), bytes);
 }
+
+#[test]
+fn bulk_params_transact_map_rows_parallel_lists_and_datalog_write_identical_logs() {
+    let fx = common::varrow();
+    let map_path = fx.dir.path().join("maps.kala");
+    let list_path = fx.dir.path().join("lists.kala");
+    for path in [&map_path, &list_path] {
+        fs::copy(&fx.path, path).unwrap();
+    }
+    let input = fx.dir.path().join("bulk");
+    fs::write(&input, "UNWIND $rows AS row MERGE (n:CHARACTER {kala_handle:row.handle}) SET n.name=row.name AT TICK row.tick;").unwrap();
+    let output = transact(
+        &map_path,
+        &input,
+        &[
+            "--param",
+            r#"rows=[{"handle":"rook","name":"Rook","tick":-17},{"handle":"finch","name":"Finch","tick":9}]"#,
+        ],
+    );
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    fs::write(&input, "UNWIND $indices AS i MERGE (n:CHARACTER {kala_handle:$handles[i]}) SET n.name=$names[i] AT TICK $ticks[i];").unwrap();
+    let output = transact(
+        &list_path,
+        &input,
+        &[
+            "--param",
+            "indices=[0,1]",
+            "--param",
+            r#"handles=["rook","finch"]"#,
+            "--param",
+            r#"names=["Rook","Finch"]"#,
+            "--param",
+            "ticks=[-17,9]",
+        ],
+    );
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    fs::write(&input, "[[:create :CHARACTER ?a :if-missing] [:set ?a :name ?na :at ?ta] [:create :CHARACTER ?b :if-missing] [:set ?b :name ?nb :at ?tb]]").unwrap();
+    let output = fx.run(
+        "transact",
+        &[
+            input.to_str().unwrap(),
+            "--param",
+            "a=rook",
+            "--param",
+            "b=finch",
+            "--param",
+            "na=Rook",
+            "--param",
+            "nb=Finch",
+            "--param",
+            "ta=-17",
+            "--param",
+            "tb=9",
+        ],
+    );
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let expected = fs::read(&fx.path).unwrap();
+    for other in [map_path, list_path] {
+        assert!(
+            fs::read(other).unwrap() == expected,
+            "write paths appended different entries"
+        );
+    }
+}

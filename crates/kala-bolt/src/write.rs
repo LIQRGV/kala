@@ -17,7 +17,7 @@ pub(crate) const BOOKMARK: &str = "Neo.ClientError.Transaction.InvalidBookmark";
 const SEMANTIC: &str = "Neo.ClientError.Statement.SemanticError";
 const CONSTRAINT: &str = "Neo.ClientError.Schema.ConstraintValidationFailed";
 pub(crate) const MAX_FORMS: usize = 256;
-pub(crate) const MAX_STAGED_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) use kala_lang::params::MAX_STAGED_BYTES;
 
 /// Charge retained statement data across the entire explicit transaction.
 pub(crate) fn charge(total: &mut usize, bytes: usize) -> Result<(), Failure> {
@@ -123,6 +123,21 @@ pub(crate) fn write_error(error: write::WriteError, read: bool) -> Failure {
 }
 pub(crate) fn statement_error(error: write::StatementError, read: bool) -> Failure {
     match error {
+        e @ write::StatementError::RowData { .. } => {
+            let message = e.to_string();
+            let write::StatementError::RowData { cause, .. } = e else {
+                unreachable!()
+            };
+            let mut failure = statement_error(*cause, read);
+            if read {
+                failure.message = message;
+            }
+            failure
+        }
+        e @ write::StatementError::RowTick { .. } => Failure::new(TYPE, e.to_string()),
+        e @ write::StatementError::RowConflict { .. } => {
+            store_rule(CONSTRAINT, e.to_string(), read)
+        }
         write::StatementError::Stage(e)
             if matches!(
                 e.cause,
@@ -140,6 +155,23 @@ pub(crate) fn statement_error(error: write::StatementError, read: bool) -> Failu
         e => store_rule(SEMANTIC, e.to_string(), read),
     }
 }
+/// Keep parameter data out of diagnostics from store rules. Preserve the
+/// failure class, including reduced diagnostics for write-only identities.
+pub(crate) fn parameter_binding_error(failure: Failure, read: bool) -> Failure {
+    if failure.code == TYPE && !read {
+        Failure::new(crate::error::EXECUTION, REDUCED)
+    } else {
+        failure
+    }
+}
+
+pub(crate) fn parameter_error(mut failure: Failure, bound: bool) -> Failure {
+    if bound && matches!(failure.code, TYPE | SEMANTIC | CONSTRAINT | CONFLICT) {
+        failure.message = "parameterized write failed a store rule".into();
+    }
+    failure
+}
+
 /// What the connection's identity holds on the database a write targets.
 #[derive(Clone, Copy)]
 pub(crate) struct Privileges {
@@ -376,6 +408,7 @@ pub(crate) struct Summary {
     labels_removed: usize,
     ops: Vec<Value>,
     ops_omitted: usize,
+    ticks: Option<(i64, i64, usize)>,
     cypher: bool,
     properties: usize,
     pub tx: u64,
@@ -440,6 +473,10 @@ impl Summary {
     pub fn operations(&mut self, form: usize, ops: &[WriteOperation]) {
         self.cypher = true;
         for op in ops {
+            let (lo, hi, count) = self.ticks.get_or_insert((op.tick.0, op.tick.0, 0));
+            *lo = (*lo).min(op.tick.0);
+            *hi = (*hi).max(op.tick.0);
+            *count += 1;
             let cost = 192usize.saturating_add(op.entries.len().saturating_mul(9));
             if cost > self.remaining {
                 self.ops_omitted += 1;
@@ -602,6 +639,11 @@ impl Summary {
             ("entries".into(), ids(&self.entries)),
         ]
         .into();
+        if let Some((lo, hi, count)) = self.ticks {
+            kala.insert("tick_min".into(), Value::Integer(lo));
+            kala.insert("tick_max".into(), Value::Integer(hi));
+            kala.insert("tick_count".into(), int(count));
+        }
         if self.cypher {
             kala.insert("ops".into(), Value::List(self.ops));
         }

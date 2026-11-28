@@ -28,7 +28,9 @@ pub fn parse(text: &str) -> Result<ast::Query, CypherError> {
 }
 /// Parse one complete statement before opening a writer or checking privileges.
 pub fn parse_statement(text: &str) -> Result<ast::Statement, CypherError> {
-    parse::parse(text)
+    let mut stmt = parse::parse(text)?;
+    ast::row_params::resolve(&mut stmt);
+    Ok(stmt)
 }
 /// Parse and compile against the world's schema.
 pub fn prepare(world: &kala_core::World, text: &str) -> Result<Prepared, CypherError> {

@@ -1,7 +1,7 @@
 //! Terminal writes are adapters over the native transaction API.
 use super::{
     Done,
-    query::{read_text_file, row_text, table},
+    query::{read_text_file, row_text, table_at_ticks},
     read::core_err as read_core_err,
 };
 use crate::error::{CONFLICT_ADVICE, CliError, Conflicted};
@@ -32,6 +32,12 @@ struct Operation {
     created: Option<bool>,
     #[serde(skip)]
     handle: Option<String>,
+}
+#[derive(Serialize)]
+struct TickSummary {
+    tick_min: i64,
+    tick_max: i64,
+    tick_count: usize,
 }
 #[derive(Serialize)]
 struct Warnings {
@@ -75,6 +81,8 @@ pub struct Report {
     entries: Vec<u64>,
     edges: Vec<String>,
     ops: Vec<Operation>,
+    #[serde(flatten)]
+    ticks: Option<TickSummary>,
     warnings: Warnings,
     /// Present only when another writer's commit moved the world's latest
     /// tick while this transaction ran (its tick-less writes stayed on the
@@ -367,6 +375,7 @@ fn committed_report(w: &World, result: WriteReport) -> Report {
             .map(|e| w.format_id((*e).into()))
             .collect(),
         ops,
+        ticks: None,
         warnings: Warnings {
             introduced: overlap_lines(&result.warnings.introduced),
             resolved: overlap_lines(&result.warnings.resolved),
@@ -416,6 +425,15 @@ pub fn render(report: &Report, json: bool) -> String {
             }
         ),
     };
+    if let Some(ticks) = &report.ticks
+        && ticks.tick_min != ticks.tick_max
+    {
+        let _ = writeln!(
+            s,
+            "  {} operations at ticks {} through {}",
+            ticks.tick_count, ticks.tick_min, ticks.tick_max
+        );
+    }
     for change in &report.schema_text {
         let _ = writeln!(s, "  {change}");
     }
@@ -487,13 +505,19 @@ pub fn render(report: &Report, json: bool) -> String {
 }
 
 enum Input<'a> {
-    Form(WriteTxn),
+    Form(kala_lang::write::WriteTemplate),
     Statement(&'a str),
 }
 impl Input<'_> {
-    fn execute(self, world: &mut World, mode: Concurrency) -> Result<Report, CliError> {
+    fn execute(
+        self,
+        world: &mut World,
+        mode: Concurrency,
+        lang: super::language::Language,
+        given: &[(String, String)],
+    ) -> Result<Report, CliError> {
         match self {
-            Self::Form(form) => execute(world, &form, None, mode),
+            Self::Form(form) => execute_template(world, &form, None, mode, lang, given),
             Self::Statement(text) => {
                 let statement = match kala_lang::classify(
                     &kala_lang::Cypher,
@@ -514,10 +538,34 @@ impl Input<'_> {
                         ));
                     }
                 };
-                execute_cypher(world, &statement, mode)
+                execute_cypher(world, &statement, mode, lang, given)
             }
         }
     }
+}
+
+pub(super) fn execute_template(
+    world: &mut World,
+    template: &kala_lang::write::WriteTemplate,
+    default: Option<Tick>,
+    mode: Concurrency,
+    lang: super::language::Language,
+    given: &[(String, String)],
+) -> Result<Report, CliError> {
+    let kinds = template
+        .parameter_kinds(world)
+        .map_err(|e| user(e.to_string()))?;
+    let params = lang.write_params(world, &kinds, given)?;
+    let form = template
+        .bind(world, &params)
+        .map_err(|e| user(e.to_string()))?;
+    execute(world, &form, default, mode).map_err(|e| {
+        if template.is_parameterized() {
+            e.map_message(|_| "parameterized write failed a store rule".into())
+        } else {
+            e
+        }
+    })
 }
 
 /// Use the transaction's starting snapshot for input, then project final IDs
@@ -526,13 +574,18 @@ fn execute_cypher(
     world: &mut World,
     stmt: &kala_lang::write::WriteStatement,
     mode: Concurrency,
+    lang: super::language::Language,
+    given: &[(String, String)],
 ) -> Result<Report, CliError> {
-    use kala_lang::write::{Failure, StatementError, prepare_statement, stage_statement};
-    let params = kala_query::QueryParams::new();
+    use kala_lang::write::{
+        Failure, StatementError, compile_statement, run_statement, stage_statement,
+    };
+    let compiled = compile_statement(world, stmt).map_err(|e| user(e.to_string()))?;
+    let params = lang.write_params(world, compiled.parameter_kinds(), given)?;
     let staged = (|| {
         let mut tx = world.begin();
         tx.set_concurrency(mode);
-        let input = prepare_statement(tx.base_world(), stmt, &params, Default::default())?;
+        let input = run_statement(tx.base_world(), stmt, compiled, &params, Default::default())?;
         let staged = stage_statement(&mut tx, stmt, input, &params)?;
         let result = tx.commit().map_err(|error| {
             let operation = match &error {
@@ -567,7 +620,7 @@ fn execute_cypher(
         Ok(None)
     } else {
         staged.committed_rows(world, &result.ids).map(|rows| {
-            let (columns, rows) = table(
+            let (columns, rows) = table_at_ticks(
                 world,
                 &kala_query::ResultSet {
                     columns: fields.into_iter().map(kala_query::Var).collect(),
@@ -575,6 +628,7 @@ fn execute_cypher(
                     tick: staged.tick,
                     canon: world.latest_tx(),
                 },
+                &staged.row_ticks,
             );
             Some(Returned { columns, rows })
         })
@@ -592,6 +646,16 @@ fn execute_cypher(
         .collect();
     let mut report = committed_report(world, written);
     report.item = "statement";
+    if let (Some(lo), Some(hi)) = (
+        report.ops.iter().map(|op| op.tick).min(),
+        report.ops.iter().map(|op| op.tick).max(),
+    ) {
+        report.ticks = Some(TickSummary {
+            tick_min: lo,
+            tick_max: hi,
+            tick_count: report.ops.len(),
+        });
+    }
     for (op, handle) in report.ops.iter_mut().zip(handles) {
         op.handle = handle;
     }
@@ -609,6 +673,7 @@ pub fn run(args: &TransactArgs) -> Result<Done, CliError> {
     let mode = crate::cli::concurrency(&args.concurrency);
     let mut w = open_target(args)?;
     let cypher = args.lang == "cypher";
+    let lang = super::language::front_end(&args.lang)?;
     let forms: Box<dyn Iterator<Item = Result<Input<'_>, CliError>> + '_> = if cypher {
         Box::new(
             kala_lang::write::statements(&text)
@@ -616,7 +681,7 @@ pub fn run(args: &TransactArgs) -> Result<Done, CliError> {
         )
     } else {
         Box::new(
-            kala_datalog::write_forms(&text)
+            kala_lang::write::prepare_write_forms(&text)
                 .map_err(|e| user(e.to_string()))?
                 .map(|f| f.map(Input::Form).map_err(|e| user(e.to_string()))),
         )
@@ -630,23 +695,24 @@ pub fn run(args: &TransactArgs) -> Result<Done, CliError> {
     };
     let mut count = 0;
     for (i, form) in forms.enumerate() {
-        let mut report =
-            match form.and_then(|input| input.execute(preview.as_mut().unwrap_or(&mut w), mode)) {
-                Ok(report) => report,
-                Err(e) => {
-                    let e = item_failed(
-                        if cypher { "statement" } else { "form" },
-                        i + 1,
-                        count,
-                        dry_run,
-                        e,
-                    );
-                    if let (true, CliError::Conflict(conflict)) = (json, &e) {
-                        print(&conflict_json(i + 1, count, conflict))?;
-                    }
-                    return Err(e);
+        let mut report = match form.and_then(|input| {
+            input.execute(preview.as_mut().unwrap_or(&mut w), mode, lang, &args.params)
+        }) {
+            Ok(report) => report,
+            Err(e) => {
+                let e = item_failed(
+                    if cypher { "statement" } else { "form" },
+                    i + 1,
+                    count,
+                    dry_run,
+                    e,
+                );
+                if let (true, CliError::Conflict(conflict)) = (json, &e) {
+                    print(&conflict_json(i + 1, count, conflict))?;
                 }
-            };
+                return Err(e);
+            }
+        };
         report.form = i + 1;
         report.dry_run = dry_run;
         print(&render(&report, json))?;

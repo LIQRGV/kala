@@ -287,6 +287,38 @@ impl Compiler<'_, '_> {
                     "aggregate must be lowered to Group".into(),
                 ));
             }
+            Expr::RowParameter(p) => {
+                if let Some(crate::ParameterValue::Rows(rows)) = self.params.binding(p) {
+                    let list = self.row_column(rows, None, depth)?;
+                    Expr::Value(list)
+                } else {
+                    self.row_expr(&Expr::Param(p.clone()), bound, depth)?
+                }
+            }
+            Expr::RowField {
+                parameter,
+                row,
+                key,
+            } => {
+                let index = input_slot(self.slots, bound, row, "parameter row")?;
+                match self.params.binding(parameter) {
+                    Some(crate::ParameterValue::Rows(rows)) => Expr::ListIndex(
+                        Box::new(Expr::Value(self.row_column(rows, Some(key), depth)?)),
+                        Box::new(Expr::Var(index)),
+                    ),
+                    Some(crate::ParameterValue::Datum(crate::Datum::List(xs)))
+                        if xs.iter().all(|v| matches!(v, crate::Datum::Null)) =>
+                    {
+                        Expr::Null
+                    }
+                    Some(crate::ParameterValue::Datum(crate::Datum::Null)) => Expr::Null,
+                    _ => {
+                        return Err(QueryError::TypeMismatch(
+                            "row.key requires an UNWIND parameter containing map rows".into(),
+                        ));
+                    }
+                }
+            }
             Expr::Param(p) => {
                 let value = if let Some(v) = self.parameter_constants.get(p) {
                     v.clone()
@@ -327,6 +359,37 @@ impl Compiler<'_, '_> {
             Expr::Not(e) => Expr::Not(Box::new(self.row_expr(e, bound, depth + 1)?)),
             Expr::IsNull(e) => Expr::IsNull(Box::new(self.row_expr(e, bound, depth + 1)?)),
         })
+    }
+    /// Compile only the requested column. Index bindings and column values
+    /// use shared, interned lists, so copying a pipeline row copies no map.
+    fn row_column(
+        &mut self,
+        rows: &[std::collections::BTreeMap<String, crate::Datum>],
+        key: Option<&str>,
+        depth: usize,
+    ) -> Result<Val, QueryError> {
+        let bytes = 64usize.saturating_add(rows.len().saturating_mul(std::mem::size_of::<Val>()));
+        self.budget.charge_bytes(bytes)?;
+        let mut column = Vec::with_capacity(rows.len());
+        for (i, row) in rows.iter().enumerate() {
+            self.budget.step(1)?;
+            let value = match key {
+                Some(key) => self.row_constant(
+                    crate::ParameterValue::Datum(row.get(key).unwrap_or(&crate::Datum::Null)),
+                    depth + 1,
+                )?,
+                None => Val::I64(
+                    i64::try_from(i)
+                        .map_err(|_| QueryError::TypeMismatch("row index overflow".into()))?,
+                ),
+            };
+            column.push(value);
+        }
+        let (value, new) = self.interner.list(column, self.budget.limits.max_bytes)?;
+        if !new {
+            self.budget.release_bytes(bytes);
+        }
+        Ok(value)
     }
     fn check_parameter_value(
         &mut self,
@@ -396,6 +459,7 @@ impl Compiler<'_, '_> {
                 }
                 Ok(v)
             }
+            ParameterValue::Rows(_) => Err(QueryError::TypeMismatch("map rows are only allowed as a direct UNWIND source and must be accessed through row.key".into())),
             _ => Err(QueryError::TypeMismatch(
                 "unsupported parameter value".into(),
             )),

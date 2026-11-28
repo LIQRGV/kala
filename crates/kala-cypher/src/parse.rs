@@ -706,14 +706,15 @@ impl Parser<'_> {
             }
             _ => return Err(self.unsupported("variable, property, literal or parameter")),
         };
-        if (matches!(e, Expr::Param(_)) || self.write_values && matches!(e, Expr::Var(_)))
+        if (matches!(e, Expr::Param(_) | Expr::Property { .. })
+            || self.write_values && matches!(e, Expr::Var(_)))
             && self.sym("[")
         {
             let index = self.item_depth(depth + 1)?;
             self.need("]")?;
             if !matches!(
                 index,
-                Expr::Var(_) | Expr::Param(_) | Expr::Value(_) | Expr::Null
+                Expr::Var(_) | Expr::Param(_) | Expr::Value(_) | Expr::Null | Expr::Property { .. }
             ) {
                 return Err(self.err("list offset must be an integer, variable or parameter"));
             }
@@ -811,7 +812,12 @@ impl Parser<'_> {
             let bytes = match e {
                 Expr::Var(v) => v.len(),
                 Expr::Value(Value::Str(s)) => s.len(),
-                Expr::Param(p) => p.len(),
+                Expr::Param(p) | Expr::RowParameter(p) => p.len(),
+                Expr::RowField {
+                    row,
+                    parameter,
+                    key,
+                } => row.len() + parameter.len() + key.len(),
                 Expr::Property { entity, key, .. } => entity.len() + key.len(),
                 Expr::Value(_) | Expr::Null => 0,
                 Expr::Path { start, segments } => {

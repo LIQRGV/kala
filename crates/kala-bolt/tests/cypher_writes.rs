@@ -733,3 +733,359 @@ fn dotted_names_through_bolt_preserve_the_world() {
         vec![vec![Value::Null]]
     );
 }
+
+fn supplied_rows(rows: Vec<Value>) -> Value {
+    map(&[("rows", Value::List(rows))])
+}
+
+#[test]
+fn bulk_params_map_keys_are_input_data_and_missing_keys_are_null() {
+    let server = writable_server();
+    let mut c = Client::ready(&server);
+    let rows = vec![
+        map(&[
+            ("password_hash", string("client data")),
+            (
+                "aliases",
+                Value::List(vec![string("Sparrow"), string("Scout")]),
+            ),
+        ]),
+        map(&[("password_hash", Value::Null)]),
+    ];
+    c.run(
+        "UNWIND $rows AS row WITH * RETURN row.password_hash, row.aliases",
+        supplied_rows(rows.clone()),
+        map(&[("db", string("system"))]),
+    );
+    assert_eq!(
+        c.pull(-1).0,
+        vec![
+            vec![
+                string("client data"),
+                Value::List(vec![string("Sparrow"), string("Scout")])
+            ],
+            vec![Value::Null, Value::Null],
+        ]
+    );
+    let (code, _) = failure(
+        &mut c,
+        "UNWIND $rows AS row MATCH (n) RETURN row.password_hash, n.password_hash",
+        supplied_rows(rows),
+        map(&[("db", string("system"))]),
+    );
+    assert_eq!(code, FORBIDDEN);
+}
+
+#[test]
+fn bulk_params_map_positions_and_inconsistent_columns_fail_before_commit() {
+    let server = writable_server();
+    let mut c = Client::ready(&server);
+    let before = world(&server).latest_tx();
+    let row = map(&[("name", string("marker-never-echo"))]);
+    let write = "UNWIND $rows AS row CREATE (:NPC {name:row.name})";
+    for (query, params, expected) in [
+        ("RETURN $rows", supplied_rows(vec![row.clone()]), "unwind"),
+        (
+            "UNWIND $rows AS row WITH * RETURN row",
+            supplied_rows(vec![row.clone()]),
+            "row",
+        ),
+        (
+            "UNWIND $rows AS row RETURN size(row)",
+            supplied_rows(vec![row.clone()]),
+            "row",
+        ),
+        (
+            "UNWIND $rows AS row WITH * WHERE row = row RETURN row.name",
+            supplied_rows(vec![row.clone()]),
+            "row",
+        ),
+        (
+            "UNWIND $rows AS row CREATE (:NPC {name:row})",
+            supplied_rows(vec![row.clone()]),
+            "row",
+        ),
+        (
+            "UNWIND $rows AS row CREATE (n:NPC) SET n += row",
+            supplied_rows(vec![row.clone()]),
+            "map",
+        ),
+        (write, map(&[("rows", row.clone())]), "map"),
+        (
+            write,
+            supplied_rows(vec![map(&[("name", row.clone())])]),
+            "map",
+        ),
+        (
+            write,
+            supplied_rows(vec![row.clone(), map(&[("name", Value::Integer(5))])]),
+            "row 1",
+        ),
+    ] {
+        let (_, message) = failure(&mut c, query, params, map(&[]));
+        assert!(
+            message.to_ascii_lowercase().contains(expected),
+            "{query}: {message}"
+        );
+        if expected == "row 1" {
+            assert!(message.contains("name"), "{message}");
+        }
+        assert!(
+            !message.contains("marker-never-echo"),
+            "{query} echoed a parameter value"
+        );
+        assert_eq!(world(&server).latest_tx(), before, "{query}");
+    }
+}
+
+#[test]
+fn bulk_params_datalog_reports_missing_and_wrong_typed_bindings() {
+    let server = writable_server();
+    let mut c = Client::ready(&server);
+    let before = world(&server).latest_tx();
+    let stmt = "// kala:datalog\n[:assert ?e :name ?v :at ?t]";
+    for (params, code) in [
+        (
+            map(&[("e", string("greg")), ("v", string("Scout"))]),
+            "Neo.ClientError.Statement.ParameterMissing",
+        ),
+        (
+            map(&[
+                ("e", string("greg")),
+                ("v", Value::Null),
+                ("t", Value::Integer(-4)),
+            ]),
+            "Neo.ClientError.Statement.TypeError",
+        ),
+        (
+            map(&[
+                ("e", string("greg")),
+                ("v", Value::List(vec![string("Scout")])),
+                ("t", Value::Integer(-4)),
+            ]),
+            "Neo.ClientError.Statement.TypeError",
+        ),
+        (
+            map(&[
+                ("e", string("greg")),
+                ("v", string("Scout")),
+                ("t", string("marker-never-echo")),
+            ]),
+            "Neo.ClientError.Statement.TypeError",
+        ),
+    ] {
+        let (actual, message) = failure(&mut c, stmt, params, map(&[]));
+        assert_eq!(actual, code, "{message}");
+        assert!(!message.contains("marker-never-echo"));
+        assert_eq!(world(&server).latest_tx(), before);
+    }
+    c.run(
+        stmt,
+        map(&[
+            ("e", string("greg")),
+            ("v", string("Scout")),
+            ("t", Value::Integer(-4)),
+        ]),
+        map(&[]),
+    );
+    c.pull(-1);
+    let w = world(&server);
+    assert!(
+        w.as_of(w.entity_by_handle("greg").unwrap(), "name", Tick(-4))
+            .unwrap()
+            .contains(&kala_core::Value::Str("Scout".into()))
+    );
+}
+
+#[test]
+fn bulk_params_null_tick_uses_the_statement_default_and_wrong_tick_identifies_the_row() {
+    let server = writable_server();
+    let mut c = Client::ready(&server);
+    let w = world(&server);
+    let before = w.latest_tx();
+    let default = w.latest_tick();
+    let write =
+        "UNWIND $rows AS row CREATE (:NPC {kala_handle:row.handle, score:7}) AT TICK row.tick";
+    let row = |handle: &str, tick| map(&[("handle", string(handle)), ("tick", tick)]);
+    let (_, message) = failure(
+        &mut c,
+        write,
+        supplied_rows(vec![
+            row("bulk_early", Value::Null),
+            row("bulk_bad", string("marker-never-echo")),
+        ]),
+        map(&[]),
+    );
+    assert!(
+        message.contains("row 1") && message.to_ascii_lowercase().contains("tick"),
+        "{message}"
+    );
+    assert!(!message.contains("marker-never-echo"));
+    assert_eq!(world(&server).latest_tx(), before);
+    c.run(
+        write,
+        supplied_rows(vec![
+            row("bulk_early", Value::Integer(i64::MIN)),
+            row("bulk_default", Value::Null),
+            row("bulk_late", Value::Integer(i64::MAX)),
+        ]),
+        map(&[]),
+    );
+    let (_, summary) = c.pull(-1);
+    let Value::Map(detail) = &summary["kala"] else {
+        panic!("expected the write summary");
+    };
+    assert_eq!(detail["tick_min"], Value::Integer(i64::MIN));
+    assert_eq!(detail["tick_max"], Value::Integer(i64::MAX));
+    assert_eq!(detail["tick_count"], Value::Integer(6));
+    let w = world(&server);
+    for (handle, tick) in [
+        ("bulk_early", Tick(i64::MIN)),
+        ("bulk_default", default),
+        ("bulk_late", Tick(i64::MAX)),
+    ] {
+        let e = w.entity_by_handle(handle).unwrap();
+        assert_eq!(w.history(e, "score").unwrap()[0].tick, tick);
+    }
+}
+
+#[test]
+fn bulk_params_per_row_write_preserves_optimistic_read_conflicts() {
+    let server = writable_server();
+    let mut a = Client::ready(&server);
+    let mut b = Client::ready(&server);
+    begin(&mut a);
+    a.query("MATCH (n {kala_handle:'greg'}) RETURN n.name");
+    b.query("MATCH (n {kala_handle:'greg'}) SET n.name='Captain' AT TICK 2000");
+    let committed = world(&server).latest_tx();
+    a.run(
+        "UNWIND $rows AS row CREATE (:NPC {kala_handle:row.handle,score:2}) AT TICK row.tick",
+        supplied_rows(vec![map(&[
+            ("handle", string("stale")),
+            ("tick", Value::Integer(0)),
+        ])]),
+        map(&[]),
+    );
+    a.pull(-1);
+    a.send(0x12, vec![]);
+    a.failure(CONFLICT);
+    assert_eq!(world(&server).latest_tx(), committed);
+    assert!(world(&server).entity_by_handle("stale").is_none());
+}
+
+#[test]
+fn bulk_params_datalog_counts_bound_strings_toward_the_transaction_budget() {
+    let server = writable_server();
+    let mut c = Client::ready(&server);
+    c.query("// kala:datalog\n[:attribute :bulk_note :string :unindexed]");
+    let before = world(&server).latest_tx();
+    begin(&mut c);
+    // Repeating one assertion is a no-op after the first. Its supplied bytes
+    // still belong to each RUN, and all the RUNs share a single 16 MiB limit.
+    let params = map(&[("note", Value::String("x".repeat(512 * 1024)))]);
+    let mut refused = false;
+    for attempt in 0..33 {
+        c.send(
+            0x10,
+            vec![
+                string("// kala:datalog\n[:assert :greg :bulk_note ?note]"),
+                params.clone(),
+                map(&[]),
+            ],
+        );
+        let response = c.recv();
+        if matches!(response, Value::Structure(0x7f, _)) {
+            let m = client::metadata(response, 0x7f);
+            let Value::String(message) = &m["message"] else {
+                panic!("expected failure detail");
+            };
+            assert!(attempt > 0, "the first write fits in the budget: {message}");
+            assert!(message.contains("byte limit"), "{message}");
+            refused = true;
+            c.reset();
+            break;
+        }
+        client::metadata(response, 0x70);
+        c.pull(-1);
+    }
+    assert!(
+        refused,
+        "transaction accepted more than 16 MiB in parameters"
+    );
+    assert_eq!(world(&server).latest_tx(), before);
+}
+
+#[test]
+fn bulk_params_returned_nodes_and_properties_use_each_rows_tick() {
+    for explicit in [true, false] {
+        let server = writable_server();
+        let mut c = Client::ready(&server);
+        if explicit {
+            begin(&mut c);
+        }
+        let rows = [(8, "Scout"), (32, "Guide")].map(|(tick, name)| {
+            map(&[
+                ("names", Value::List(vec![string(name)])),
+                ("tick", Value::Integer(tick)),
+            ])
+        });
+        c.run("UNWIND $rows AS row MERGE (n:NPC {kala_handle:'wren_two_ticks'}) SET n.name=row.names[0] AT TICK row.tick RETURN n, n.name",
+            supplied_rows(rows.to_vec()), map(&[]));
+        let (written, _) = c.pull(-1);
+        assert_eq!(written.len(), 2);
+        for (row, want) in written.iter().zip(["Scout", "Guide"]) {
+            let Value::Structure(0x4e, node) = &row[0] else {
+                panic!("expected a node");
+            };
+            let Value::Map(properties) = &node[2] else {
+                panic!("expected node properties");
+            };
+            assert_eq!(properties["name"], string(want));
+            assert_eq!(row[1], string(want));
+        }
+        if explicit {
+            commit(&mut c);
+        }
+    }
+}
+
+#[test]
+fn bulk_params_duplicate_handle_is_refused_without_echoing_the_supplied_value() {
+    let server = writable_server();
+    let mut c = Client::ready(&server);
+    let before = world(&server).latest_tx();
+    let row = map(&[("handle", string("client_only_marker"))]);
+    let (_, message) = failure(
+        &mut c,
+        "UNWIND $rows AS row CREATE (:NPC {kala_handle:row.handle})",
+        supplied_rows(vec![row.clone(), row]),
+        map(&[]),
+    );
+    assert!(!message.contains("client_only_marker"));
+    assert_eq!(world(&server).latest_tx(), before);
+}
+
+#[test]
+fn bulk_params_blind_write_reports_schema_type_failures_like_literal_writes() {
+    let server = socket_server(true, false);
+    let mut c = login(&server, "writer");
+    let literal = failure(
+        &mut c,
+        "// kala:datalog\n[:assert :greg :name 37]",
+        map(&[]),
+        map(&[]),
+    );
+    assert_eq!(literal.0, "Neo.ClientError.Statement.ExecutionFailed");
+    for explicit in [false, true] {
+        if explicit {
+            begin(&mut c);
+        }
+        let parameterized = failure(
+            &mut c,
+            "// kala:datalog\n[:assert :greg :name ?v]",
+            map(&[("v", Value::Integer(37))]),
+            map(&[]),
+        );
+        assert_eq!(parameterized, literal);
+    }
+}
