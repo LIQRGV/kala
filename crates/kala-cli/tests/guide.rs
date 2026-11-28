@@ -541,14 +541,22 @@ fn guide_two_terminals_share_one_world() {
 #[test]
 fn guide_cypher_move_and_merge_scripts_are_rerunnable() {
     const MOVE: &str = "MATCH (g {kala_handle:'greg'}), (a {kala_handle:'ashford'}) SET g.located_in = a AT TICK 225;";
-    const IMPORT: &str =
-        "MERGE (n:CHARACTER {kala_handle:'kael2'}) ON CREATE SET n.name = 'Kael' AT TICK 700;";
+    const IMPORT: &str = "UNWIND $rows AS row MERGE (n:CHARACTER {kala_handle:row.handle}) ON CREATE SET n.name = row.name AT TICK row.tick;";
+    const ROWS: &str = r#"rows=[{"handle":"kael2","name":"Kael","tick":700}]"#;
     let f = fixture_through_cli();
-    let prose = normalized(&guide());
-    for (filename, statement, changed) in [("move.cypher", MOVE, 2), ("import.cypher", IMPORT, 1)] {
+    let prose = normalized(&guide().replace("\\\n", " "));
+    for (filename, statement, param, changed) in [
+        ("move.cypher", MOVE, None, 2),
+        ("import.cypher", IMPORT, Some(ROWS), 1),
+    ] {
         let path = f.dir.path().join(filename);
         fs::write(&path, statement).unwrap();
-        let arguments = ["--lang", "cypher", path.to_str().unwrap()];
+        let mut arguments = vec!["--lang", "cypher", path.to_str().unwrap()];
+        let mut command = format!("kala transact --lang cypher varrow.kala {filename}");
+        if let Some(param) = param {
+            arguments.extend(["--param", param]);
+            command.push_str(&format!(" --param '{param}'"));
+        }
         let first = f.json("transact", &arguments);
         assert_eq!(first["changed"], changed);
         assert!(
@@ -564,10 +572,21 @@ fn guide_cypher_move_and_merge_scripts_are_rerunnable() {
             prose.contains(&normalized(statement)),
             "example missing from GUIDE: {statement}"
         );
-        let command = format!("kala transact --lang cypher varrow.kala {filename}");
         assert!(
             prose.contains(&command),
             "command missing from GUIDE: {command}"
         );
     }
+    let world = kala_core::World::open_read_only(&f.path).unwrap();
+    let kael = world.entity_by_handle("kael2").unwrap();
+    assert!(
+        world
+            .as_of(kael, "name", kala_core::Tick(699))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        world.as_of(kael, "name", kala_core::Tick(700)).unwrap(),
+        [kala_core::Value::Str("Kael".into())]
+    );
 }
