@@ -3,7 +3,8 @@
 Run `./e2e/run.sh` from the repository. It creates a Python virtual environment,
 installs the pinned Python driver, builds Kala, and starts a temporary Varrow
 world on a loopback port. It also runs the official Neo4j Go v5 driver pinned
-in `go/go.mod` when Go 1.18 or newer is installed. The first Go run downloads
+in `go/go.mod` when the Go that file asks for (its `go` line: 1.18) or a newer
+one is installed; the script checks `go version`. The first Go run downloads
 the module and checks it against `go/go.sum`. The harness stops the server and
 removes its worlds on exit. It requires Python 3 with venv and pip, Bash, and
 Cargo. The Rust workspace tests run independently of both drivers.
@@ -14,8 +15,15 @@ For a Bolt review, require both Go and TLS:
 KALA_E2E_REQUIRE_GO=1 KALA_E2E_REQUIRE_TLS=1 ./e2e/run.sh
 ```
 
-Without Go the harness prints `SKIPPED: Go driver tests (go not found)`.
-Setting `KALA_E2E_REQUIRE_GO=1` makes that a failure.
+Without Go the harness prints `SKIPPED: Go driver tests (go not found)`; with
+an older one, `SKIPPED: Go driver tests (go 1.17.13 found, go/go.mod needs 1.18
+or newer)`. Either way the Python tests still run. Setting
+`KALA_E2E_REQUIRE_GO=1` makes both a failure.
+
+`./e2e/test_run_sh.sh` checks the harness itself in about a second, without a
+server: the Go version rule above (with a stand-in `go`), and that `run.sh`
+expands no possibly empty array in a way bash older than 4.4 rejects under
+`set -u`.
 
 The TLS tests (`test_tls_driver.py`: `bolt+ssc://`, `bolt+s://` with a test CA,
 `neo4j+ssc://` routing, certificate rotation with SIGUSR1) need certificates
