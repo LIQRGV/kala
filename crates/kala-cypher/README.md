@@ -304,9 +304,11 @@ scalar tick parameter also supplies the MATCH tick when MATCH has none.
 
 Bolt's write summary reports `kala.tick_min`, `kala.tick_max` and
 `kala.tick_count` for the reported operations. Each operation counts once,
-including a no-op. A same-tick conflict in a map-row write or a write with
-a per-row tick identifies the zero-based input row. For a literal write the
-conflict names the occupying entry or the earlier staged operation.
+including a no-op. A same-tick conflict names the subject, the attribute,
+the tick and what holds it: the occupying entry with its `[:correct …]`
+form, or the earlier staged operation. In a map-row write or a write with a
+per-row tick the same message starts with the zero-based input row
+(`row 3: …`).
 Corrections use the Datalog `[:correct …]` form.
 
 ### Declaring a property type

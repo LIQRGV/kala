@@ -34,9 +34,13 @@ pub enum WriteError {
     RowTick {
         row: usize,
     },
-    /// Opposite changes at the same tick in a parameterized statement.
+    /// A same-tick conflict in a statement driven by rows, with the
+    /// zero-based input row that met it. The cause keeps what an author
+    /// needs to resolve it: the subject, attribute, tick, and the entry
+    /// holding the tick with its `[:correct …]` form.
     RowConflict {
         row: usize,
+        cause: Box<native::WriteError>,
     },
     /// A store diagnostic whose original text would include a row value.
     RowData {
@@ -71,10 +75,7 @@ impl fmt::Display for WriteError {
                 cause.data_rule().unwrap_or("write refused")
             ),
             Self::RowTick { row } => write!(f, "row {row}: write tick requires an integer or NULL"),
-            Self::RowConflict { row } => write!(
-                f,
-                "row {row}: same-tick conflict; the opposite operation is already stored at this tick"
-            ),
+            Self::RowConflict { row, cause } => write!(f, "row {row}: {cause}"),
         }
     }
 }
@@ -721,11 +722,18 @@ fn apply(
             .tick
             .as_ref()
             .is_some_and(|e| !matches!(e, Expr::Value(_) | Expr::Param(_) | Expr::Null));
-        if (has_rows || per_row_tick)
-            && matches!(&error, WriteError::Stage(e) if matches!(e.cause, native::Failure::SameTick(_)))
-        {
-            return Err(WriteError::RowConflict { row: current_row });
-        }
+        let error = match error {
+            WriteError::Stage(cause)
+                if (has_rows || per_row_tick)
+                    && matches!(cause.cause, native::Failure::SameTick(_)) =>
+            {
+                return Err(WriteError::RowConflict {
+                    row: current_row,
+                    cause: Box::new(cause),
+                });
+            }
+            other => other,
+        };
         if has_rows && error.data_rule().is_some() {
             return Err(WriteError::RowData {
                 row: current_row,

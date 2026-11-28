@@ -278,3 +278,44 @@ fn a_set_member_cannot_be_picked_by_position() {
         assert!(parsed.is_ok(), "{text}: {:?}", parsed.err());
     }
 }
+
+#[test]
+fn a_row_same_tick_conflict_names_the_entity_tick_entry_and_correction() {
+    let mut w = World::in_memory(Schema::new().node_type("NPC")).unwrap();
+    let report = kala_datalog::apply::execute(
+        &mut w,
+        &kala_datalog::parse_write(
+            r#"[[:create :NPC :rook] [:assert :rook :name "first" :at 17]]"#,
+        )
+        .unwrap(),
+        None,
+    )
+    .unwrap();
+    let entry = report.entries.last().unwrap().0;
+    let before = w.latest_tx();
+    let mut p = QueryParams::new();
+    let rows = ["wren", "rook"]
+        .map(|handle| {
+            BTreeMap::from([
+                ("handle".into(), Value::Str(handle.into()).into()),
+                ("name".into(), Value::Str("second".into()).into()),
+                ("tick".into(), Value::I64(17).into()),
+            ])
+        })
+        .into_iter()
+        .collect();
+    p.insert_rows("rows".into(), rows).unwrap();
+    let error = write(&mut w, MERGE, &p).unwrap_err().to_string();
+    for part in [
+        "row 1: ",
+        "same-tick conflict",
+        "rook",
+        "\"name\"",
+        "at tick 17",
+        &format!("entry#{entry}"),
+        &format!("[:correct {entry} :delete]"),
+    ] {
+        assert!(error.contains(part), "missing {part:?}: {error}");
+    }
+    assert_eq!(w.latest_tx(), before);
+}
