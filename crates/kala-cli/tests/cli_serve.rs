@@ -1,5 +1,10 @@
 //! The actual CLI binds loopback, announces its selected port and shuts down
 //! cleanly, without exposing auth tokens in either output stream.
+#[path = "common/bolt.rs"]
+mod bolt;
+#[path = "common/serving.rs"]
+mod serving;
+
 use kala_bolt::packstream::{Value, decode, encode};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -135,6 +140,34 @@ fn exchange(stream: &mut TcpStream, tag: u8, fields: Vec<Value>) -> Value {
         "{response:?}"
     );
     response
+}
+
+#[test]
+fn accounts_mode_logs_each_skipped_filename_once_across_startup_and_discovery() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Before.kala"), []).unwrap();
+    let server = serving::Serving::start(dir.path(), &["127.0.0.1:0"], &["--auth", "accounts"]);
+    std::fs::write(dir.path().join("After.kala"), []).unwrap();
+    let mut stream = TcpStream::connect(&server.addresses[0]).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    bolt::log_on(&mut stream);
+    exchange(
+        &mut stream,
+        0x10,
+        vec![
+            Value::String("SHOW DATABASES".into()),
+            Value::Map(Default::default()),
+            Value::Map([("db".into(), Value::String("system".into()))].into()),
+        ],
+    );
+
+    let log = server.stderr();
+    for file in ["Before.kala", "After.kala"] {
+        let event = format!("event=bolt_database_skipped name={file:?}");
+        assert_eq!(log.lines().filter(|l| *l == event).count(), 1, "{event}");
+    }
 }
 
 #[test]

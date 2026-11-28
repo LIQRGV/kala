@@ -177,6 +177,10 @@ impl std::fmt::Display for ReplayFault {
                 "revision {found} of entry#{} where {expected} was next",
                 of.0
             ),
+            ReplayFault::Refused(e @ Error::DottedName(_)) => write!(
+                f,
+                "{e}. To open this world, dump it with the older binary, rename the identifier and its references in the dump, then reload it"
+            ),
             ReplayFault::Refused(e) => write!(f, "{e}"),
         }
     }
@@ -606,7 +610,7 @@ impl World {
     pub(crate) fn from_genesis(genesis: &[LogEntry]) -> Result<World, Error> {
         let defines = genesis.split_last().map_or(&[][..], |(_, d)| d);
         let mut world = World::in_memory(genesis_schema(defines)?)
-            .map_err(|e| Error::Corrupt(format!("genesis schema: {e}")))?;
+            .map_err(|e| Error::Corrupt(format!("genesis schema: {}", ReplayFault::Refused(e))))?;
         // Keep the genesis entries as the file has them, not as this build
         // would re-encode them: `entry` reports what the log says. Kept
         // as given, not through `record_one`: `World::open`'s scan has

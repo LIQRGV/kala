@@ -507,6 +507,14 @@ is separate and has ordinary fact history. Schema names beginning with `kala_`
 are reserved, as are new `_KALA_` names. `edge` is reserved only for node types,
 so attributes and inverse names may use `edge`.
 
+Attribute names, inverse names, node types and handles in a user world cannot
+contain a period. Use a handle such as `npc_durn` if your source IDs need a
+type prefix. To record an inventory, create an `ITEM` entity for the rope,
+assert a `carries` edge from its owner to the rope, and set `qty` on that edge.
+This lets you query everyone who carries rope and how much each carried at a
+given tick. A single attribute named `items.rope.qty` cannot represent that
+relationship.
+
 ## Ask with Cypher
 
 The terminal also accepts a Cypher read subset. The REPL remains Datalog;
@@ -600,3 +608,9 @@ executable write, retry, bookmark and rollback examples, and the
 [Bolt README](crates/kala-bolt/README.md#writing-and-transactions) for permissions
 and result fields. This Python example is covered by the driver suite rather
 than the Rust `guide.rs` CLI tests.
+
+A running server finds new worlds in its directory by itself. Create them
+there with `kala create` or `kala load`, or move (`mv`) a finished file in;
+never `cp` a world into a served directory. A half-copied file looks like a
+world with an incomplete last transaction, and the server refuses it until the
+copy is done.

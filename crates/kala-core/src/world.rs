@@ -437,7 +437,8 @@ impl World {
     /// Creates an empty in-memory world (no file) with the given schema.
     ///
     /// Fails with [`Error::InvalidName`] for an empty node type, attribute
-    /// or inverse name, [`Error::DuplicateName`] if a node type or an
+    /// or inverse name, [`Error::DottedName`] for a period in any of them,
+    /// [`Error::DuplicateName`] if a node type or an
     /// attribute is declared twice (the two are separate namespaces; inverse
     /// names share the attribute namespace), [`Error::InvalidDirection`] if
     /// an attribute's direction or inverse doesn't fit it (see
@@ -937,9 +938,7 @@ impl World {
     /// a system world. Shared write appliers refuse such a world unless
     /// their caller explicitly allows it (account management and restores).
     pub fn is_system(&self) -> bool {
-        self.catalog
-            .node_type_by_name
-            .contains_key(crate::SYSTEM_NODE_TYPE)
+        self.catalog.is_system()
     }
 
     /// Every declared node type name, in ID (= declaration) order.

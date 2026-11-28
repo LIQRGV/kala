@@ -70,6 +70,8 @@ pub enum Error {
     InvalidHandle(String),
     /// A node type or attribute name in the schema isn't valid (e.g. empty).
     InvalidName(String),
+    /// An attribute, inverse, node type or user-world handle contains a period.
+    DottedName(String),
     /// A schema name uses [`BUILTIN_NAME_PREFIX`](crate::BUILTIN_NAME_PREFIX),
     /// or a post-genesis edit introduces [`RESERVED_NAME_PREFIX`](crate::RESERVED_NAME_PREFIX).
     /// Both prefixes belong to Kala. Holds the name.
@@ -505,6 +507,11 @@ impl fmt::Display for Error {
             }
             Error::InvalidHandle(h) => write!(f, "invalid handle {}", Quoted(h)),
             Error::InvalidName(name) => write!(f, "invalid schema name {}", Quoted(name)),
+            Error::DottedName(name) => write!(
+                f,
+                "invalid name {}: names may not contain '.'",
+                Quoted(name)
+            ),
             Error::Unconvertible {
                 attr,
                 from,

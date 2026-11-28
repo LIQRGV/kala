@@ -3,8 +3,11 @@
 A Bolt 5.0–5.4 server with Cypher and Datalog writes and explicit transactions over Kala's Cypher and Datalog front-ends
 and shared query executor. `kala serve DIR` exposes each regular
 `DIR/<name>.kala` file as a database (`[a-z0-9_-]+` names only). Symlinks and
-invalid names are skipped with a startup diagnostic. Files are discovered at
-startup; readers open immutable snapshots on first RUN. File stamps (length, modification time, file identity and commit tail) trigger a reload of
+invalid names are skipped with one diagnostic per name while the name stays in the directory. After startup, an
+authorized lookup of an unknown database or a `SHOW DATABASES` request rescans
+the directory. Sessions share one rescan per second. A lookup of an unknown name that arrives less than a second after the last rescan waits for the rest of that second and is answered by the next rescan (shared with every other waiting lookup), so a world created just before a request is found by that request, and `DatabaseNotFound` can take up to a second. `SHOW DATABASES` never waits: within that second it lists the worlds registered so far. A directory entry that can't be read is left for the next scan, and a scan that can't list the directory at all is logged (`event=bolt_discovery_failed`) and answered from the worlds already registered: `SHOW DATABASES` lists them and an unknown name is `DatabaseNotFound`. **Move (rename) a world into the directory; never copy it in place** (see "Adding worlds while the server runs"). Readers open immutable snapshots on first
+RUN and retry a failed open on the next request. Removing a file leaves its
+name registered until restart. File stamps (length, modification time, file identity and commit tail) trigger a reload of
 committed transactions; each result pins one snapshot. A damaged tail is never acknowledged or cut by this server unless it was started with `--acknowledge-recovery` (see "Damaged tails"); otherwise an operator must acknowledge recovery through the CLI. The served directory and its files
 are trusted local input: concurrent replacement of directory entries is outside
 the network security boundary.
@@ -25,8 +28,11 @@ client socket, cancels queries and joins connection threads; `kala serve` sets
 it on SIGINT or SIGTERM, so `systemctl stop` and `docker stop`
 shut down cleanly and remove Unix socket files.
 
-A single discovered user database is the implicit default (`system` is excluded). With multiple databases,
-set `--default-db` or supply the driver's session database. The library exports
+A single user database at startup is the implicit default (`system` is excluded).
+The default stays fixed until restart. With several user databases, set
+`--default-db` or supply the driver's session database. With zero user
+databases, start the server without a default and name each new world in the
+driver session. The library exports
 `Server`, `ServerConfig`, PackStream values/codecs and `auth::Authenticator`.
 `Server::bind_accounts` implements the default CLI policy.
 `Server::bind` retains its loopback-only `NoAuth` library behavior; it never
@@ -367,6 +373,7 @@ ignored. Fields omit the variable's `?`; aggregate names retain their text.
 | Unknown or ambiguous database | `Neo.ClientError.Database.DatabaseNotFound` |
 | Invalid message/state or unsupported operation | `Neo.ClientError.Request.Invalid` |
 | Store error | `Neo.DatabaseError.General.UnknownError`: "the world could not be read" |
+| A world added while the server ran whose last transaction is incomplete (see "Adding worlds while the server runs") | `Neo.TransientError.Transaction.LockAcquisitionTimeout` |
 
 Defaults: 64 connection threads, 10-second total handshake deadline,
 10-minute complete-message/idle deadline, 10-second response-batch write
@@ -799,7 +806,7 @@ refresh). Future bookmarks fail transiently after that bound.
 | Missing privilege (`write`, `read` or `admin`), revoked grant or dropped account, system write, read-only server | Neo.ClientError.Security.Forbidden |
 | Write in read transaction | Neo.ClientError.Transaction.ForbiddenDueToTransactionType |
 | Optimistic conflict (also: queried before another commit, then wrote), diverged handle, future bookmark, write-slot cap (total or per account) | Neo.TransientError.Transaction.DeadlockDetected |
-| Writer lock busy timeout | Neo.TransientError.Transaction.LockAcquisitionTimeout |
+| Writer lock busy timeout; a world added while the server ran whose last transaction is incomplete | Neo.TransientError.Transaction.LockAcquisitionTimeout |
 | Transaction expiry | Neo.ClientError.Transaction.TransactionTimedOut |
 | Malformed bookmark | Neo.ClientError.Transaction.InvalidBookmark |
 | Recovery required or store I/O failure | Neo.DatabaseError.General.UnknownError |
@@ -851,6 +858,44 @@ slot and never reloads the reader snapshot). The mutex is never held across
 client I/O, and a panic while it was held costs only that handle, which is
 rebuilt from the log. Reader file stamps make subsequent connections see
 committed writes.
+
+### Adding worlds while the server runs
+
+Put a new world into the served directory in one step: create it elsewhere on
+the same file system and `mv` it in, or let `kala create` / `kala load` write
+it there (both write a temporary file and rename it into place). **Never
+`cp` a world into the directory**, and never write one there with a tool that
+fills the file in place: a file that is still being copied looks exactly like
+a world whose writer crashed mid-transaction (a torn tail).
+
+The server guards against that. A world that appears after startup is
+*unverified* until one open of it finds its last transaction complete. While it
+is unverified and its tail is torn or damaged, every read and write of it is
+refused with `Neo.TransientError.Transaction.LockAcquisitionTimeout` and
+
+```text
+world NAME was added while the server ran and its last transaction is incomplete; if it is still being copied, retry when the copy is done; otherwise restart the server or repair it with the CLI
+```
+
+and nothing is cut, quarantined or written: the file stays byte-identical, also
+under `--acknowledge-recovery`. stderr gets
+`event=bolt_database_incomplete db=<name> cause=<Torn|Damaged> bytes=<n>` once
+per state of the file; while the file doesn't change, further requests are
+refused without replaying it. The code is transient so that a driver's managed
+transaction (`execute_read` / `execute_write`) retries until the copy is done;
+it reuses the lock-timeout code because, as there, another process still has
+the file, and because drivers attach no side effect to it
+(`DatabaseUnavailable` makes some drivers drop their pooled connections to the
+whole server). The first complete open verifies the world for good, at the
+cost of at most one extra replay (a first *write* looks read-only before it
+opens its writable handle; that look becomes the reader snapshot). From then on
+it behaves like a world present at startup, as do all worlds after a restart: a
+torn tail is cut by the next commit and a damaged one follows "Damaged tails".
+
+This is a guard, not a guarantee: a copy that happens to pause exactly between
+two transactions looks like a complete, shorter world, is verified, and a
+write to it would then race the rest of the copy. Renaming into place has no
+such window.
 
 ### Damaged tails
 

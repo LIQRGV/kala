@@ -1,7 +1,7 @@
 //! Validate fixture shape before opening a world.
 use std::collections::{HashMap, HashSet};
 
-use kala_core::schema::{AttrDef, Cardinality, Kind, Schema};
+use kala_core::schema::{AttrDef, Cardinality, Kind, Schema, check_undotted_name};
 use kala_core::{Echo, Error, Op, Precision, Tick, ValueType};
 
 use crate::error::{FixtureError, FixtureErrorKind, OpRef, err, invalid, store};
@@ -121,6 +121,20 @@ pub(super) fn plan(yaml: &str) -> Result<Plan, FixtureError> {
     let mut txns = Vec::with_capacity(raw_txns.len());
     for (ti, (tick, ops, _bare)) in raw_txns.into_iter().enumerate() {
         txns.push(plan_txn(ti, tick, ops, &mut labels)?);
+    }
+    // Check handle declarations before load_fixture_to creates the log.
+    // References and scalar strings in the fixture are not declarations.
+    if !node_types.iter().any(|t| t == kala_core::SYSTEM_NODE_TYPE) {
+        for (_, handles) in &entities {
+            for handle in handles {
+                check_undotted_name(handle).map_err(|e| store(None, e))?;
+            }
+        }
+        for (at, op) in txns.iter().flat_map(|txn| &txn.ops) {
+            if let POp::Create { handle, .. } = op {
+                check_undotted_name(handle).map_err(|e| store(Some(at.clone()), e))?;
+            }
+        }
     }
     Ok(Plan {
         schema,

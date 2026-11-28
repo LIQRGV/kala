@@ -275,6 +275,10 @@ impl Catalog {
             if h.is_empty() {
                 return Err(Error::InvalidHandle(h.to_owned()));
             }
+            // Account handles include the host, which may be an IP address.
+            if !self.is_system() {
+                crate::schema::check_undotted_name(h)?;
+            }
             if self.entity_by_handle.contains_key(h) || staged.handles.contains_key(h) {
                 return Err(Error::DuplicateHandle(h.to_owned()));
             }
