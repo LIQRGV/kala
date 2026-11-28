@@ -705,3 +705,31 @@ fn a_snapshot_read_after_a_blind_create_conflicts_with_a_renamed_attribute() {
     assert_eq!(committed.latest_tx(), renamed);
     assert!(committed.entity_by_handle("independent").is_none());
 }
+
+#[path = "../../kala-lang/tests/common/dotted_names.rs"]
+mod dotted_names;
+
+#[test]
+fn dotted_names_through_bolt_preserve_the_world() {
+    let server = writable_server();
+    let mut client = Client::ready(&server);
+    let path = server.dir.path().join("varrow.kala");
+    let before = std::fs::read(&path).unwrap();
+    for &(lang, name, query) in dotted_names::WRITES {
+        let query = format!("// kala:{lang}\n{query}");
+        let (code, reason) = failure(&mut client, &query, map(&[]), map(&[]));
+        assert!(code.starts_with("Neo.ClientError."), "{code}: {reason}");
+        assert!(
+            reason.contains(name) && reason.contains("may not contain '.'"),
+            "{query}: {reason}"
+        );
+        assert!(std::fs::read(&path).unwrap() == before, "{query}");
+    }
+    let datalog_read = format!("// kala:datalog\n{}", dotted_names::DATALOG_READ);
+    let (_, reason) = failure(&mut client, &datalog_read, map(&[]), map(&[]));
+    assert!(reason.contains("unknown attribute `:a.b`"), "{reason}");
+    assert_eq!(
+        client.query(dotted_names::CYPHER_READ),
+        vec![vec![Value::Null]]
+    );
+}

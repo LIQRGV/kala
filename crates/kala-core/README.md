@@ -177,6 +177,14 @@ assert_eq!(world.format_id(greg), "CHARACTER#3");
 
 ## Main API
 
+Attribute names, inverse names, node types and user-world handles cannot contain
+a period. Handles are unique across node types within a world. Model an
+inventory with a rope `ITEM`, a `carries` edge from its owner, and a `qty`
+property on the edge. This preserves the history of the quantity and lets you
+look up the owners of an item. An older world containing a name such as
+`items.rope.qty` must be dumped with the older binary. Rename the identifier
+and its references in the dump, then reload it.
+
 - `Schema`, `AttrDef`: node types and attributes (`ValueType`, `Kind`,
   `Cardinality`; `.bidirectional()`, `.inverse(..)`, `.reverse_one()`,
   `.unindexed()`).

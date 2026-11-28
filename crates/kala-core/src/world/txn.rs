@@ -663,7 +663,7 @@ impl Txn<'_> {
     /// transaction can use the entity as subject or `ref` value. It exists
     /// for everyone else only after [`Txn::commit`]. Fails (poisoning the
     /// transaction) with [`Error::UnknownNodeType`],
-    /// [`Error::InvalidHandle`], [`Error::DuplicateHandle`] or
+    /// [`Error::InvalidHandle`], [`Error::DottedName`], [`Error::DuplicateHandle`] or
     /// [`Error::Id`].
     pub fn create_entity(
         &mut self,

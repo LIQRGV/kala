@@ -507,6 +507,14 @@ is separate and has ordinary fact history. Schema names beginning with `kala_`
 are reserved, as are new `_KALA_` names. `edge` is reserved only for node types,
 so attributes and inverse names may use `edge`.
 
+Attribute names, inverse names, node types and handles in a user world cannot
+contain a period. Use a handle such as `npc_durn` if your source IDs need a
+type prefix. To record an inventory, create an `ITEM` entity for the rope,
+assert a `carries` edge from its owner to the rope, and set `qty` on that edge.
+This lets you query everyone who carries rope and how much each carried at a
+given tick. A single attribute named `items.rope.qty` cannot represent that
+relationship.
+
 ## Ask with Cypher
 
 The terminal also accepts a Cypher read subset. The REPL remains Datalog;

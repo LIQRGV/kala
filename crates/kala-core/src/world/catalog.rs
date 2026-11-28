@@ -42,6 +42,10 @@ pub(super) struct Catalog {
 type AttrNames = (HashMap<String, AttrId>, HashMap<String, AttrId>);
 
 impl Catalog {
+    pub(super) fn is_system(&self) -> bool {
+        self.node_type_by_name.contains_key(crate::SYSTEM_NODE_TYPE)
+    }
+
     /// The catalog of a new world declaring `schema`'s node types and
     /// attributes as its genesis (tx#0): no entities, no edges and no
     /// settings yet (settings are schema edits, applied by the caller).

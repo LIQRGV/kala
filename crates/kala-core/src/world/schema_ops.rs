@@ -21,6 +21,7 @@ pub(super) enum OrderedEntry {
 }
 
 pub(super) fn check_name(name: &str) -> Result<(), Error> {
+    crate::schema::check_undotted_name(name)?;
     if name.is_empty() || name.contains('@') {
         return Err(Error::InvalidName(name.to_owned()));
     }

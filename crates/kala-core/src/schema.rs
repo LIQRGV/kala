@@ -316,6 +316,15 @@ pub(crate) fn check_setting_key(key: &str) -> Result<(), crate::Error> {
     )))
 }
 
+/// Check the shared period restriction on schema names and user-world handles.
+/// Importers can check declarations before creating a world file.
+pub fn check_undotted_name(name: &str) -> Result<(), crate::Error> {
+    if name.contains('.') {
+        return Err(crate::Error::DottedName(name.to_owned()));
+    }
+    Ok(())
+}
+
 /// The node type that marks Kala's own `system` (accounts) world. It is a
 /// reserved name, so only a genesis schema can carry it: a world either has
 /// the marker from its first entry or never gets it. See

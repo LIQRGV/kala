@@ -2733,3 +2733,34 @@ fn a_referenced_handle_over_256_bytes_is_invalid_not_unknown() {
         assert!(e.to_string().len() < 400, "{}", e.to_string().len());
     }
 }
+
+#[test]
+fn dotted_names_in_yaml_report_the_offending_identifier() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("refused.kala");
+    for (name, yaml) in [
+        ("N.PC", "schema: {node_types: [N.PC]}"),
+        ("a.b", "schema: {attributes: [{name: a.b, type: i64}]}"),
+        (
+            "carried.by",
+            "schema: {attributes: [{name: carries, type: ref, inverse: carried.by}]}",
+        ),
+        (
+            "npc.durn",
+            "schema: {node_types: [NPC]}\nentities: {NPC: [npc.durn]}",
+        ),
+        (
+            "npc.durn",
+            "schema: {node_types: [NPC]}\noperations: [{create: [NPC, npc.durn]}]",
+        ),
+    ] {
+        let text = err(yaml).to_string();
+        let disk_error = load_fixture_to(yaml, &path).expect_err("accepted dotted identifier");
+        assert_eq!(disk_error.to_string(), text);
+        assert!(!path.exists(), "created a world for {yaml}");
+        assert!(
+            text.contains(name) && text.contains("may not contain '.'"),
+            "{yaml}: {text}"
+        );
+    }
+}
