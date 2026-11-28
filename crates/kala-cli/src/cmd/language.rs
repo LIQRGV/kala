@@ -11,6 +11,8 @@ pub(crate) use kala_lang::NAMES;
 use kala_query::{ParamKind, Prepared, QueryParams};
 
 use crate::error::CliError;
+use crate::escape;
+use kala_lang::params::BindError;
 
 /// A query language the CLI can prepare: a shared front-end plus the CLI's
 /// own error mapping and `--param` parsing.
@@ -50,7 +52,7 @@ impl Language {
         self.0
             .parameter_policy()
             .bind_write_text(world, kinds, given)
-            .map_err(|e| CliError::User(e.to_string()))
+            .map_err(|e| self.bind_error(e, given))
     }
     /// Parses the `--param` texts by the kinds the prepared query declares:
     /// each a scalar of its inferred kind, or (where the language's
@@ -64,7 +66,44 @@ impl Language {
         self.0
             .parameter_policy()
             .bind_text(world, kinds, given)
-            .map_err(|e| CliError::User(e.to_string()))
+            .map_err(|e| self.bind_error(e, given))
+    }
+    /// A binding error as the author reads it. The shared seam names the
+    /// parameter and the kind its position takes, never the value (over
+    /// Bolt it may be a secret). Here the author typed the value, so a
+    /// refused scalar text is quoted back, as the slice-5 arguments of that
+    /// kind are.
+    fn bind_error(&self, error: BindError, given: &[(String, String)]) -> CliError {
+        use kala_core::ValueType;
+        let policy = self.0.parameter_policy();
+        let BindError::Type { name, kind } = &error else {
+            return CliError::User(error.to_string());
+        };
+        let bare = |n: &str| n.trim_start_matches(['?', '$']).to_owned();
+        let text = given
+            .iter()
+            .find(|(n, _)| bare(n) == bare(name))
+            .map(|(_, text)| text)
+            // A list or a quoted JSON text is not one scalar to quote back.
+            .filter(|text| !policy.text_is_json(kind, text));
+        let Some(text) = text else {
+            return CliError::User(error.to_string());
+        };
+        let name = escape::value(name);
+        let text = escape::value(text);
+        CliError::User(match kind {
+            ParamKind::Entity | ParamKind::Value(ValueType::Ref) => format!(
+                "unknown entity `{text}`: not a handle or an ID of this world (parameter `{name}`)"
+            ),
+            ParamKind::Tick | ParamKind::Canon => format!(
+                "`{text}` is not {} for parameter `{name}`",
+                kala_lang::params::expected(kind)
+            ),
+            _ => format!(
+                "`{text}` is not {} (the type of parameter `{name}`)",
+                kala_lang::params::expected(kind)
+            ),
+        })
     }
 }
 

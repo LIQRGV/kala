@@ -19,6 +19,8 @@ pub struct ParamPolicy {
     pub nulls: bool,
     pub lists: bool,
     pub map_rows: bool,
+    /// How the language writes a parameter (`?name`, `$name`), for messages.
+    pub sigil: char,
 }
 
 impl ParamPolicy {
@@ -26,11 +28,13 @@ impl ParamPolicy {
         nulls: false,
         lists: false,
         map_rows: false,
+        sigil: '?',
     };
     pub const COLLECTIONS: Self = Self {
         nulls: true,
         lists: true,
         map_rows: true,
+        sigil: '$',
     };
 
     /// Convert the parameters a statement uses. A transport supplies the
@@ -47,8 +51,10 @@ impl ParamPolicy {
         let mut out = QueryParams::new();
         let mut remaining = MAX_STAGED_BYTES;
         for (name, kind) in kinds {
-            let value = lookup(name, kind, &mut remaining)?
-                .ok_or_else(|| BindError::Missing(name.clone()))?;
+            let named = || format!("{}{name}", self.sigil);
+            let value = lookup(name, kind, &mut remaining)
+                .map_err(|e| e.named(named()))?
+                .ok_or_else(|| BindError::Missing(named()))?;
             match value {
                 BoundParameter::Value(v) => {
                     out.insert(name.clone(), v);
@@ -133,7 +139,7 @@ impl ParamPolicy {
         depth: usize,
     ) -> Result<Datum, BindError> {
         if depth > 32 {
-            return Err(BindError::Type);
+            return Err(wrong(kind));
         }
         let collections = !matches!(kind, ParamKind::Tick | ParamKind::Canon);
         let v = match value {
@@ -161,13 +167,13 @@ impl ParamPolicy {
             Input::Float(f)
                 if matches!(kind, ParamKind::Scalar | ParamKind::Value(ValueType::F64)) =>
             {
-                Value::f64(f).map_err(|_| BindError::Type)?
+                Value::f64(f).map_err(|_| wrong(kind))?
             }
             Input::Integer(n)
                 if *kind == ParamKind::Value(ValueType::F64) && n.unsigned_abs() <= 1 << 53 =>
             {
                 #[allow(clippy::cast_precision_loss)] // exact within 2^53
-                Value::f64(n as f64).map_err(|_| BindError::Type)?
+                Value::f64(n as f64).map_err(|_| wrong(kind))?
             }
             Input::String(s)
                 if matches!(kind, ParamKind::Scalar | ParamKind::Value(ValueType::Str)) =>
@@ -182,7 +188,7 @@ impl ParamPolicy {
                         .entity_by_handle(s)
                         .or_else(|| world.parse_id(s))
                         .filter(|id| world.is_defined(*id))
-                        .ok_or(BindError::Type)?,
+                        .ok_or_else(|| wrong(kind))?,
                 )
             }
             Input::String(s) if *kind == ParamKind::Canon => Value::I64(
@@ -191,12 +197,21 @@ impl ParamPolicy {
                     .parse::<i64>()
                     .ok()
                     .filter(|n| *n >= 0)
-                    .ok_or(BindError::Type)?,
+                    .ok_or_else(|| wrong(kind))?,
             ),
             Input::Map(_) => return Err(BindError::Invalid(MAP_RULE)),
-            _ => return Err(BindError::Type),
+            _ => return Err(wrong(kind)),
         };
         Ok(Datum::Value(v))
+    }
+}
+
+/// The value is not what the parameter's position takes. [`ParamPolicy::bind`]
+/// adds the parameter's name.
+fn wrong(kind: &ParamKind) -> BindError {
+    BindError::Type {
+        name: String::new(),
+        kind: kind.clone(),
     }
 }
 
@@ -253,18 +268,67 @@ pub trait ParameterTree: Sized {
 
 const MAP_RULE: &str = "a map is only allowed in a list of rows used directly by UNWIND";
 
+/// Why parameters could not be bound. A message names the parameter and
+/// what its position takes, never the supplied value: an adapter that may
+/// show the value to its user (the CLI, whose author typed it) adds it.
 #[derive(Debug)]
 pub enum BindError {
+    /// The statement uses this parameter and it was not supplied.
     Missing(String),
+    /// A supplied name the statement does not use.
+    Unknown(String),
+    /// A name supplied twice (`who` and `?who` are one name).
+    Duplicate(String),
     Row(String),
-    Type,
+    /// `name` was given something that is not a `kind`.
+    Type {
+        name: String,
+        kind: ParamKind,
+    },
     Invalid(&'static str),
 }
+impl BindError {
+    fn named(self, name: String) -> Self {
+        match self {
+            Self::Type { kind, .. } => Self::Type { name, kind },
+            other => other,
+        }
+    }
+}
+
+/// What a parameter of this kind takes, as a message names it.
+pub fn expected(kind: &ParamKind) -> &'static str {
+    match kind {
+        ParamKind::Scalar => "a scalar value (a string, an integer, a float or a bool)",
+        ParamKind::Unwind(_) => "a list, or a scalar value",
+        ParamKind::Entity | ParamKind::Value(ValueType::Ref) => {
+            "an entity (a handle or an ID of this world)"
+        }
+        ParamKind::Value(ValueType::Str) => "a string",
+        ParamKind::Value(ValueType::I64) => "an i64",
+        ParamKind::Value(ValueType::F64) => "an f64",
+        ParamKind::Value(ValueType::Bool) => "a bool (`true` or `false`)",
+        ParamKind::Tick => "a tick (a signed 64-bit integer)",
+        ParamKind::Canon => "a canon (`tx#N` or `N`)",
+    }
+}
+
 impl std::fmt::Display for BindError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Missing(name) => write!(f, "missing parameter `?{name}`"),
-            Self::Type => f.write_str("wrong type for query parameter"),
+            Self::Missing(name) => write!(f, "missing parameter `{name}`"),
+            Self::Unknown(name) => {
+                write!(
+                    f,
+                    "unknown parameter `{name}`: the statement doesn't use it"
+                )
+            }
+            Self::Duplicate(name) => write!(f, "parameter `{name}` is given twice"),
+            Self::Type { name, kind } => write!(
+                f,
+                "wrong type for query parameter `{name}`: expected {}",
+                expected(kind)
+            ),
             Self::Row(message) => f.write_str(message),
             Self::Invalid(message) => f.write_str(message),
         }
@@ -335,10 +399,10 @@ impl ParamPolicy {
                 .or_else(|| self.lists.then(|| name.strip_prefix('$')).flatten())
                 .unwrap_or(name);
             if reject_unused && !kinds.iter().any(|(n, _)| n == name) {
-                return Err(BindError::Invalid("unknown parameter"));
+                return Err(BindError::Unknown(format!("{}{name}", self.sigil)));
             }
             if texts.insert(name, text).is_some() {
-                return Err(BindError::Invalid("parameter given twice"));
+                return Err(BindError::Duplicate(format!("{}{name}", self.sigil)));
             }
         }
         self.bind(kinds, |name, kind, remaining| {
@@ -356,10 +420,7 @@ impl ParamPolicy {
         s: &str,
         remaining: &mut usize,
     ) -> Result<BoundParameter, BindError> {
-        if self.lists
-            && !matches!(kind, ParamKind::Tick | ParamKind::Canon)
-            && (s == "null" || s.trim_start().starts_with(['[', '{', '"']))
-        {
+        if self.text_is_json(kind, s) {
             let json: serde_json::Value = serde_json::from_str(s)
                 .map_err(|_| BindError::Invalid("invalid JSON query parameter"))?;
             return self.convert(world, kind, json.input(), remaining);
@@ -373,17 +434,30 @@ impl ParamPolicy {
                 .or_else(|| numeric_float(s).map(Input::Float))
                 .unwrap_or(Input::String(s)),
             ParamKind::Tick | ParamKind::Value(ValueType::I64) => {
-                Input::Integer(s.parse().map_err(|_| BindError::Type)?)
+                Input::Integer(s.parse().map_err(|_| wrong(kind))?)
             }
-            ParamKind::Value(ValueType::F64) => {
-                Input::Float(s.parse().map_err(|_| BindError::Type)?)
-            }
-            ParamKind::Value(ValueType::Bool) => {
-                Input::Bool(s.parse().map_err(|_| BindError::Type)?)
-            }
+            ParamKind::Value(ValueType::F64) => Input::Float(s.parse().map_err(|_| wrong(kind))?),
+            ParamKind::Value(ValueType::Bool) => Input::Bool(s.parse().map_err(|_| wrong(kind))?),
             _ => Input::String(s),
         };
         self.convert(world, kind, raw, remaining)
+    }
+
+    /// Whether a parameter's text is read as JSON rather than as one scalar
+    /// of its kind. Only a language with NULL and lists has JSON text: for
+    /// an ordinary parameter, exactly `null`, a text that starts with `[` (a
+    /// list) or one that starts with `"` (a quoted string). Any other text
+    /// is the value itself, so `{draft}` and ` [x` stay strings. A direct
+    /// UNWIND source may be a list of map rows, so its text is JSON whenever
+    /// it starts, after whitespace, like a JSON list, map or string.
+    pub fn text_is_json(self, kind: &ParamKind, s: &str) -> bool {
+        if !self.lists || matches!(kind, ParamKind::Tick | ParamKind::Canon) {
+            return false;
+        }
+        if matches!(kind, ParamKind::Unwind(_)) {
+            return s == "null" || s.trim_start().starts_with(['[', '{', '"']);
+        }
+        s == "null" || s.starts_with(['[', '"'])
     }
 }
 

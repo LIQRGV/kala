@@ -927,6 +927,12 @@ and `query --json` work with either language. Parameters are typed by usage;
 unconstrained scalar parameters infer bool/integer/float, otherwise string.
 Cypher also accepts JSON lists and `null` in `--param`; quote a JSON string to
 distinguish the string `"null"` from NULL. List input order is preserved.
+A value is read as JSON only when it is exactly `null` or starts with `[` or
+`"`; a direct `UNWIND $rows` source (a list of map rows) is JSON when it
+starts, after any whitespace, with `[`, `{` or `"`. Any other text is the
+value itself, so `--param 'x={draft}'` and `--param 'note= [x'` are strings.
+A refused value names its parameter and the kind its position takes
+(``unknown entity `gregg`: not a handle or an ID of this world (parameter `?who`)``).
 JSON keeps the existing document/column/row shape; NULL cells are
 `{"type":"null","value":null}` and lists are `{"type":"list","value":[...]}`
 containing typed cells. Output preserves ORDER BY and duplicate Cypher rows.

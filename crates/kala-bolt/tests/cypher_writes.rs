@@ -1117,3 +1117,42 @@ fn bulk_params_wire_map_rows_over_the_limit_allow_reset_and_reuse() {
         vec![vec![Value::Integer(1)]]
     );
 }
+
+#[test]
+fn bulk_params_binding_error_names_the_parameter_and_kind_never_the_value() {
+    let server = writable_server();
+    let mut c = Client::ready(&server);
+    for (text, name, kind) in [
+        (
+            "MATCH (n:CHARACTER) WHERE n.located_in = $place RETURN count(*)",
+            "`$place`",
+            "an entity",
+        ),
+        (
+            "// kala:datalog\n[:assert :greg :alias \"G\" :at ?place]",
+            "`?place`",
+            "a tick",
+        ),
+        (
+            "// kala:datalog\n[:find ?e :in ?place :where [?e :located_in ?place]]",
+            "`?place`",
+            "an entity",
+        ),
+    ] {
+        let (code, message) = failure(
+            &mut c,
+            text,
+            map(&[("place", string("client_only_marker"))]),
+            map(&[]),
+        );
+        assert_eq!(
+            code, "Neo.ClientError.Statement.TypeError",
+            "{text}: {message}"
+        );
+        assert!(
+            message.contains(name) && message.contains(kind),
+            "{text}: {message}"
+        );
+        assert!(!message.contains("client_only_marker"), "{text}: {message}");
+    }
+}

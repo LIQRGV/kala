@@ -329,19 +329,27 @@ fn a_row_field_compared_with_a_ref_attribute_names_an_entity_like_a_scalar_param
                 r#"rows=[{"place":"nowhere"}]"#,
             ],
         );
-        let scalar_unknown = fx.fails(
-            1,
-            "query",
-            &[
-                "--lang",
-                "cypher",
-                "MATCH (n:CHARACTER) WHERE n.located_in = $p RETURN count(*)",
-                "--param",
-                "p=nowhere",
-            ],
+        assert!(
+            unknown.contains("wrong type for query parameter `$rows`: expected an entity"),
+            "{query}: {unknown}"
         );
-        assert_eq!(unknown.replace("$rows", "$p"), scalar_unknown, "{query}");
     }
+    // The scalar parameter's refusal is the same binding error (its text can be quoted back).
+    let scalar_unknown = fx.fails(
+        1,
+        "query",
+        &[
+            "--lang",
+            "cypher",
+            "MATCH (n:CHARACTER) WHERE n.located_in = $p RETURN count(*)",
+            "--param",
+            "p=nowhere",
+        ],
+    );
+    assert!(
+        scalar_unknown.contains("unknown entity `nowhere`"),
+        "{scalar_unknown}"
+    );
 
     // The write form: SET on the nodes the row's place selects.
     let input = fx.dir.path().join("by-place.cypher");
@@ -377,5 +385,148 @@ fn a_row_field_compared_with_a_ref_attribute_names_an_entity_like_a_scalar_param
     assert!(
         both.contains("row field") && both.contains("entity") && both.contains("x"),
         "{both}"
+    );
+}
+
+#[test]
+fn cypher_text_parameters_that_only_look_like_json_stay_strings() {
+    let fx = common::varrow();
+    let input = fx.dir.path().join("note.cypher");
+    fs::write(
+        &input,
+        "MATCH (n:CHARACTER {kala_handle:'greg'}) SET n.note = $note AT TICK 700;",
+    )
+    .unwrap();
+    for (tick, note) in ["{draft}", " [x", "{\"a\":1}", " \"quoted\""]
+        .iter()
+        .enumerate()
+    {
+        // Read: the text is compared as a string, not refused as bad JSON.
+        let found = fx.json(
+            "query",
+            &[
+                "--lang",
+                "cypher",
+                "MATCH (n:CHARACTER) WHERE n.name = $x RETURN count(*)",
+                "--param",
+                &format!("x={note}"),
+            ],
+        );
+        assert_eq!(found["rows"][0][0]["value"], 0, "{note}");
+        // Write: it is stored exactly as typed.
+        fs::write(
+            &input,
+            format!(
+                "MATCH (n:CHARACTER {{kala_handle:'greg'}}) SET n.note = $note AT TICK {};",
+                700 + tick
+            ),
+        )
+        .unwrap();
+        let o = transact(&fx.path, &input, &["--param", &format!("note={note}")]);
+        assert_eq!(code(&o), 0, "{note}: {}", stderr(&o));
+        let w = kala_core::World::open_read_only(&fx.path).unwrap();
+        let greg = w.entity_by_handle("greg").unwrap();
+        assert_eq!(
+            w.as_of(greg, "note", kala_core::Tick(700 + tick as i64))
+                .unwrap(),
+            [kala_core::Value::Str((*note).into())],
+            "{note}"
+        );
+    }
+    // What was JSON before still is: NULL, a list, a quoted string.
+    let count = |query: &str, param: &str| {
+        fx.json("query", &["--lang", "cypher", query, "--param", param])["rows"][0][0]["value"]
+            .clone()
+    };
+    let by_list = "UNWIND $hs AS h MATCH (n:CHARACTER {kala_handle: h}) RETURN count(*)";
+    assert_eq!(count(by_list, r#"hs=["greg","edwin"]"#), 2);
+    let by_handle = "MATCH (n:CHARACTER) WHERE n.kala_handle = $h RETURN count(*)";
+    assert_eq!(count(by_handle, r#"h="greg""#), 1);
+    assert_eq!(count(by_handle, "h=null"), 0);
+    let bad = fx.fails(
+        1,
+        "query",
+        &["--lang", "cypher", by_list, "--param", "hs=[x"],
+    );
+    assert!(bad.contains("invalid JSON"), "{bad}");
+    // A map-row source is JSON even after leading whitespace.
+    let by_rows = "UNWIND $rows AS row MATCH (n:CHARACTER {kala_handle: row.h}) RETURN count(*)";
+    assert_eq!(count(by_rows, r#"rows= [{"h":"greg"}]"#), 1);
+    let map = fx.fails(
+        1,
+        "query",
+        &[
+            "--lang",
+            "cypher",
+            by_rows,
+            "--param",
+            r#"rows={"h":"greg"}"#,
+        ],
+    );
+    assert!(
+        map.contains("a map is only allowed in a list of rows"),
+        "{map}"
+    );
+}
+
+#[test]
+fn a_refused_text_parameter_names_the_parameter_its_kind_and_the_offending_text() {
+    let fx = common::varrow();
+    let query = |text: &str, param: &str| fx.fails(1, "query", &[text, "--param", param]);
+    let allies = "[:find ?e :in ?who :where [?e :ally_of ?who]]";
+    assert_eq!(
+        query(allies, "who=gregg").trim_end(),
+        "kala: error: unknown entity `gregg`: not a handle or an ID of this world (parameter `?who`)"
+    );
+    assert_eq!(
+        query("[:find ?e :in ?t :at ?t :where [?e :ally_of _]]", "t=abc").trim_end(),
+        "kala: error: `abc` is not a tick (a signed 64-bit integer) for parameter `?t`"
+    );
+    assert_eq!(
+        query(
+            "[:find ?e :in ?c :canon ?c :where [?e :ally_of _]]",
+            "c=soon"
+        )
+        .trim_end(),
+        "kala: error: `soon` is not a canon (`tx#N` or `N`) for parameter `?c`"
+    );
+    let unknown = query(allies, "whom=greg");
+    assert!(unknown.contains("unknown parameter `?whom`"), "{unknown}");
+    let twice = fx.fails(
+        1,
+        "query",
+        &[allies, "--param", "who=greg", "--param", "?who=greg"],
+    );
+    assert!(twice.contains("parameter `?who` is given twice"), "{twice}");
+    let missing = fx.fails(1, "query", &[allies]);
+    assert!(missing.contains("missing parameter `?who`"), "{missing}");
+
+    // Cypher names its parameters with `$`.
+    let cypher = |text: &str, param: &str| {
+        fx.fails(1, "query", &["--lang", "cypher", text, "--param", param])
+    };
+    let located = "MATCH (n:CHARACTER) WHERE n.located_in = $p RETURN count(*)";
+    assert_eq!(
+        cypher(located, "p=nowhere").trim_end(),
+        "kala: error: unknown entity `nowhere`: not a handle or an ID of this world (parameter `$p`)"
+    );
+    // A JSON value is not echoed: the message names the parameter and its kind.
+    let list = cypher(located, r#"p=[1]"#);
+    assert!(
+        list.contains("parameter `$p`") && list.contains("an entity"),
+        "{list}"
+    );
+
+    // A write form's parameter is refused the same way.
+    let input = fx.dir.path().join("tick");
+    fs::write(&input, "[:assert :greg :alias \"G\" :at ?t]").unwrap();
+    let o = fx.fails(
+        1,
+        "transact",
+        &[input.to_str().unwrap(), "--param", "t=abc"],
+    );
+    assert!(
+        o.contains("`abc` is not a tick (a signed 64-bit integer) for parameter `?t`"),
+        "{o}"
     );
 }
